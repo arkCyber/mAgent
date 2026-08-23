@@ -1,0 +1,37 @@
+[package]
+name = "magent-email-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Email MCP server (IMAP/SMTP) for mAgent — stdio transport"
+
+[[bin]]
+name = "magent-email-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# MCP stdio transport is just JSON-RPC over newline-delimited stdio,
+# so we only need serde + serde_json + async I/O + email crates.
+serde = { version = "1.0", features = ["derive"], default-features = false }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+anyhow = { version = "1.0", features = ["std"] }
+thiserror = { version = "1.0" }
+log = { version = "0.4", default-features = false }
+env_logger = "0.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "io-std", "net", "time", "sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+toml = "0.8"
+
+# IMAP / SMTP
+async-imap = { version = "0.10" }
+# async-native-tls 0.5 uses async-std by default; we need tokio.
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+lettre = { version = "0.11", default-features = false, features = ["tokio1-native-tls", "smtp-transport", "builder"] }
+mailparse = "0.15"
+futures-util = "0.3"
+base64 = "0.22"
+
+[lints]
+workspace = true

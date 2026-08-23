@@ -1,0 +1,27 @@
+[package]
+name = "mcp-tool-executor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Async MCP tool executor: spawns magent-email-mcp as a stdio subprocess and dispatches ble_send → email tools"
+
+[dependencies]
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt-multi-thread", "macros"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+thiserror = "1.0"
+# Only needed for the `ToolExecutor` impl — guard with the same feature
+# gate used by magent-core's host-only modules.
+magent-core = { path = "../../magent-core", optional = true, features = ["std"] }
+
+[features]
+default = []
+# Enables the `ToolExecutor` impl that bridges to `magent-core`.
+# When enabled, pulls in `magent-core` with its `std` feature so that
+# `agent_runner::ToolExecutor` is available.
+std = ["dep:magent-core", "magent-core/std"]
+
+[dev-dependencies]
+tokio-test = "0.4"

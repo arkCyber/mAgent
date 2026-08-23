@@ -1,0 +1,16 @@
+[package]
+name = "wearable-pipeline"
+version = "0.1.0"
+edition = "2021"
+description = "Wearable health pipeline: sensor → mqtt + email + summary routing"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "wearable-pipeline"
+path = "src/main.rs"
+
+# Standalone — no magent-core dependency. The pipeline is a
+# faithful in-process simulation of the production multi-protocol
+# routing the on-watch health agent performs.
+[dependencies]

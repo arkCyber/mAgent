@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# Workspace-level Cargo configuration.
+#
+# IMPORTANT: we deliberately do NOT set a default `[build] target`.
+# Each member crate targets a different architecture:
+#
+#   * firmware/nrf52-app, firmware/integration-test → thumbv7em-none-eabihf
+#   * firmware/esp32-app                             → riscv32imc / xtensa-esp32*-espidf
+#   * magent-core, host/*, tools                     → host arch (x86_64/aarch64)
+#
+# Picking a default here used to silently break host builds, because every
+# `cargo check` from the root would try to compile *all* members for the
+# ARM target. Per-crate targets now live in each crate's own `.cargo/config.toml`
+# (or are passed explicitly via `cargo build --target`).
+# ---------------------------------------------------------------------------
+
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip nRF52840_xxAA"
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+]
+
+# PATCHED (MicroAgent): RISC-V linker for ESP32-C6/C61 firmware
+# This must be in the workspace config, not just the esp32-app config,
+# because the final link step uses the workspace-level linker setting.
+[target.riscv32imac-esp-espidf]
+linker = "/Users/arksong/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-gcc"
+
+[env]
+DEFMT_LOG = "info"
+
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+# Profile settings live in the workspace root `Cargo.toml` under
+# `[profile.*]`. We deliberately do NOT redeclare them here —
+# declaring profiles in both places used to produce "profiles for the
+# non root package will be ignored" warnings on every `cargo`
+# invocation.
+# ---------------------------------------------------------------------------

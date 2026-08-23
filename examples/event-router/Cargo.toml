@@ -1,0 +1,13 @@
+[package]
+name = "event-router"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-protocol event router: mqtt + email + summary sinks with topic-prefix routing"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "event-router"
+path = "src/main.rs"
+
+[dependencies]

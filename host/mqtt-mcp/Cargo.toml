@@ -1,0 +1,39 @@
+[package]
+name = "magent-mqtt-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "MQTT 3.1.1 MCP server (TCP transport) for mAgent — exposes publish/subscribe tools over stdio"
+
+[[bin]]
+name = "magent-mqtt-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# MCP stdio transport is just JSON-RPC over newline-delimited stdio,
+# so we only need serde + serde_json + async I/O. The MQTT client
+# lives in `rumqttc` (pure-Rust, tokio-compatible).
+serde = { version = "1.0", features = ["derive"], default-features = false }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+anyhow = { version = "1.0", features = ["std"] }
+thiserror = "1.0"
+log = { version = "0.4", default-features = false }
+env_logger = "0.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "io-std", "net", "time", "sync"] }
+toml = "0.8"
+futures-util = "0.3"
+# `bytes` is what `rumqttc::AsyncClient::publish` consumes — the
+# helper `publish_bytes` in 0.24 takes a `Bytes` slice, not a
+# `&[u8]`, so we copy into one before handing off.
+bytes = "1"
+
+# MQTT 3.1.1 client. We use the tokio-compatible eventloop
+# (`tokio` feature) with the default transport (plain TCP).
+# TLS is intentionally NOT enabled; the embedded nRF52 gateway
+# doesn't have the ROM budget for it, and an opt-in `tls`
+# feature can be added later behind a separate Cargo feature.
+rumqttc = { version = "0.24", default-features = false, features = ["default"] }
+
+[lints]
+workspace = true

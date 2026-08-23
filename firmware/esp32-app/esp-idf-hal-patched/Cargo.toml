@@ -1,0 +1,10 @@
+[package]
+name = "esp-idf-hal-patched"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+esp-idf-hal = { workspace = true }
+
+[patch.crates-io]
+esp-idf-hal = { path = "esp-idf-hal-patched" }

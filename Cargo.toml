@@ -1,0 +1,317 @@
+[workspace]
+resolver = "2"
+members = [
+    # Chip-agnostic core library (no_std by default).
+    "magent-core",
+
+    # Chip-agnostic HAL trait surface + host-side nRF52840 / ESP32
+    # adapters. Pulled out of `magent-core` so the chip-faithful
+    # nRF52840 simulator (~1.2k lines) doesn't bloat the core's build
+    # graph, and so firmware crates can depend on the HAL surface
+    # without dragging in the agent runtime.
+    "magent-hal",
+
+    # Firmware crates — one per supported chip. Each one targets a
+    # specific chip family and exposes a `main` / `#[entry]` function.
+    "firmware/nrf52-app",
+    "firmware/esp32-app",
+    "firmware/integration-test",
+
+    # Host-side tooling — used for testing on x86_64 / Linux / macOS.
+    "host/simulator",
+    "host/nrf52-simulator",
+    "host/email-mcp",
+    "host/mqtt-mcp",
+    "host/mcp-tool-executor",
+
+    # Command-line tool — `magent run …`. Standalone binary that wires
+    # `magent-core` to an Ollama server (or the canned mock backend).
+    "cli",
+
+    # Loose dev tools (benchmarks, algorithm demos, E2E simulators).
+    # These were previously `*.rs` files at the workspace root; moving
+    # them into a crate gives them proper build orchestration and lets
+    # `cargo run -p magent-tools --bin <name>` replace the old
+    # `rustc file.rs && ./file` workflow.
+    "tools",
+
+    # Application-case examples. Each one is a standalone crate
+    # with its own README and `cargo run` entry point. They're
+    # workspace members so they share `[workspace.package]`
+    # metadata and the build cache, but they're ALSO standalone —
+    # `cd examples/<name> && cargo build` works without the
+    # workspace context.
+    #
+    # We add them as globs so a new example dropped under
+    # `examples/` is automatically picked up by `cargo build` at
+    # the workspace root.
+    "examples/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["mAgent Contributors"]
+license = "MIT"
+repository = "https://github.com/arksong/magent"
+homepage = "https://github.com/arksong/magent"
+readme = "README.md"
+keywords = ["ai", "agent", "embedded", "nrf52840", "bare-metal"]
+categories = ["embedded", "no-std"]
+
+# ---------------------------------------------------------------------------
+# Workspace-wide lints
+# ---------------------------------------------------------------------------
+# These lints are applied to every member crate that opts in via
+# `[lints] workspace = true` in its own `Cargo.toml`. Member crates
+# that haven't opted in yet (firmware/*, host/*) are unaffected until
+# they adopt the new pattern.
+#
+# The level matches what `magent-core` already enforces at the crate
+# level (`#![warn(missing_docs)]`, `#![warn(clippy::all)]`,
+# `#![deny(unsafe_op_in_unsafe_fn)]`) so a member crate that adopts
+# `[lints] workspace = true` keeps the same enforcement.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+# ---------------------------------------------------------------------------
+# Workspace-wide clippy lints.
+# ---------------------------------------------------------------------------
+# Aerospace-grade policy: only safety-critical correctness lints are
+# promoted to `deny`. Style lints (`useless_vec`, `doc_overindented_list_items`,
+# …) stay at `warn` so they show up in `cargo clippy` output but do not
+# block CI. The reasoning: an aerospace team's CI bandwidth is finite;
+# prioritizing safety lints lets staff focus on the items that actually
+# move the design assurance level.
+#
+# Demote a lint to `allow` only after a `TRACE: REQ-…` comment is added
+# to the workspace explaining why (e.g. opt-out for a vendor out-of-tree
+# patch).
+[workspace.lints.clippy]
+# === Safety-critical (deny) ==========================================
+# `correctness` is the umbrella group; it ships as `correctness::correctness`
+# in newer clippy versions, so we deny the individual lints instead of the
+# whole group to avoid the "lint group `correctness` has the same priority (0)"
+# encounter error.
+# Correctness — must not compile.
+mutex_atomic = "deny"
+# == unsafe
+# SAFETY: `unsafe_op_in_unsafe_fn` is in `[workspace.lints.rust]`, not here.
+# == arithmetic overflow (deprecated alias; promoted to `rustc`)
+# == panic-in-result
+panic_in_result_fn = "deny"
+# == silent error swallows
+# `let_underscore_must_use` is at "allow" because (1) every `writeln!`
+# / `writeln!` into a `heapless::String` returns `Result<(), Infallible>`,
+# so the lint demands a per-call `#[allow(...)]` pure noise; (2) the
+# genuine safety concern (swallowing fallible `Result`s) is caught by
+# the `clippy::must_use_candidate` family and surfaces in `cargo clippy`.
+# Re-promote to `warn`/`deny` once every `let _ = writeln!` is annotated
+# with a `return-on-Result` path.
+let_underscore_must_use = "allow"
+# === Style (warn, don't deny) =======================================
+useless_vec = "warn"
+doc_overindented_list_items = "warn"
+if_same_then_else = "warn"
+vec_init_then_push = "warn"
+needless_late_init = "warn"
+let_unit_value = "warn"
+unnecessary_fallible_conversions = "warn"
+or_fun_call = "warn"
+single_char_pattern = "warn"
+redundant_closure_for_method_calls = "warn"
+redundant_closure = "warn"
+useless_format = "warn"
+needless_borrow = "warn"
+useless_conversion = "warn"
+too_many_arguments = "warn"
+
+[workspace.dependencies]
+# Embedded framework
+# `embassy-executor` is architecture-agnostic; the architecture is
+# selected by enabling one of its `arch-*` features in the *consumer*
+# crate (e.g. `magent-app` enables `arch-cortex-m`, `magent-esp32-app`
+# enables `arch-riscv` / `arch-xtensa`). We deliberately do NOT
+# hard-code `arch-cortex-m` here so a single workspace can target both
+# ARM and ESP chips.
+embassy-executor = { version = "0.5.0", features = ["integrated-timers"] }
+embassy-time = { version = "0.3.0", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-nrf = { version = "0.1.0", features = ["nrf52840", "time-driver-rtc1", "gpiote"] }
+embassy-net = { version = "0.4.0", features = ["tcp", "udp", "dhcpv4", "proto-ipv4", "medium-ethernet"] }
+embassy-sync = "0.5.0"
+
+# ESP-IDF (std, used by `magent-esp32-app` on N8R2 boards with PSRAM).
+# Versions must stay in lockstep: esp-idf-sys 0.37 matches ESP-IDF v6.0.x.
+# TRACE: REQ-FW-001, REQ-NET-001.
+esp-idf-sys = { version = "0.37", default-features = false }
+esp-idf-svc = { version = "0.52", default-features = false, features = ["experimental"] }
+
+# PATCHED (MicroAgent): Force rustls-tls for all reqwest usage.
+# The default `native-tls` feature requires OpenSSL headers at compile time,
+# which breaks cross-compilation to RISC-V targets that don't have OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Note: rustls crypto backend is patched in [patch.crates-io] below
+
+# Embedded HAL
+embedded-hal = "1.0.0"
+embedded-hal-async = "1.0.0"
+# PATCHED (MicroAgent): bump `embedded-io` 0.6 → 0.7. The 0.6
+# release removed `ErrorKind::WouldBlock`, which broke the
+# `link_adapters` adapters on the firmware (UartDriver from
+# esp-idf-hal 0.46.2 implements embedded-io 0.7). The 0.7
+# release re-introduced `WouldBlock`. magent-core only uses
+# embedded-io through doc-comments / optional feature gating, so
+# the bump is safe.
+embedded-io = "0.7"
+embedded-io-async = "0.7"
+embedded-storage = "0.3.1"
+embedded-storage-async = "0.4.0"
+
+# Serialization
+serde = { version = "1.0.203", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.117", default-features = false, features = ["alloc"] }
+postcard = { version = "1.0.8", features = ["alloc"] }
+
+# Error handling
+defmt = "0.3.8"
+defmt-rtt = "0.4.1"
+panic-probe = { version = "0.3.1", features = ["print-defmt"] }
+
+# Utilities
+# PATCHED (MicroAgent): bump heapless 0.7 → 0.9 to align with
+# `embedded-svc 0.29` (which requires heapless 0.9). Enable the
+# `serde` feature so `#[derive(Serialize, Deserialize)]` on
+# `heapless::String<N>` / `heapless::Vec<T, N>` fields works.
+heapless = { version = "0.9", features = ["serde"] }
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7.3"
+# level: cortex-m 0.7's `critical-section-single-core` feature,
+# riscv 0.11's `critical-section-single-hart` feature, and esp-hal's
+# `xtensa` feature all mutually-exclusively enable different
+# `critical-section/restore-state-*` features. A bare workspace
+# declaration would pull in critical-section with default features
+# (which include `std`) and conflict with whatever chip-specific
+# crate is being built. Crates that need a direct dependency should
+# declare it themselves.
+static_cell = "2.0.0"
+
+# Architecture-specific bare-metal crates (used by ESP32 firmware).
+# These are NOT pulled in by the workspace's default feature set; the
+# `magent-core` chip-family features gate them.
+riscv = "0.11"
+riscv-rt = "0.12"
+xtensa-lx = "0.9"
+xtensa-lx-rt = { version = "0.16" }
+
+# Logging
+log = "0.4.21"
+
+# ---------------------------------------------------------------------------
+# Web3 / asymmetric crypto (used by `magent-core`'s `web3` feature)
+# ---------------------------------------------------------------------------
+# `ed25519-dalek` v2 implements RFC 8032 Ed25519 with constant-time signing
+# and verification. It pulls in `curve25519-dalek`, `ed25519`, and `sha2`
+# transitively. We pin `fast` + `std` for `ed25519-dalek` because the
+# `web3` module is gated to host builds (`--features web3 --features std`)
+# — constant-time FieldElement ops in the `fast` backend require `std`.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "fast"] }
+# `bs58` is used to encode the Ed25519 public key as a `did:key` multibase
+# string. We enable `alloc` so the `into_vec()` / `into_string()`
+# builders are available; without it, only the streaming `Decoder` /
+# `Encoder` traits compile. We deliberately do NOT enable the `check`
+# feature (that enables *base58check*, the Bitcoin-style
+# checksummed encoding) — `did:key` multibase is plain base58btc
+# with no checksum.
+bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
+# `rand_core` is the standard byte-source interface that `ed25519-dalek`
+# uses for keypair generation. The `getrandom` feature plugs in
+# `getrandom`'s OS-backed RNG on host builds.
+rand_core = { version = "0.6", default-features = false, features = ["std"] }
+
+# ---------------------------------------------------------------------------
+# CLI-only: encrypted-on-disk keystore for `magent web3`
+# ---------------------------------------------------------------------------
+# These power the CLI's passphrase-encrypted secret-key vault. The web3
+# *module* in `magent-core` is `no_std`-friendly and pulls no encryption
+# crates; the encrypted vault is purely a host-side convenience for CLI
+# users who'd rather not type `--from-seed` every time. Both crates are
+# `default-features = false` to keep the binary lean — `chacha20poly1305`
+# is the AEAD, `argon2` is the KDF for passphrase → key material.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["std"] }
+argon2 = { version = "0.5", default-features = false, features = ["std", "password-hash", "alloc"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+
+# Build
+[profile.dev]
+opt-level = "s"
+debug = true
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"
+
+[profile.release.package."*"]
+opt-level = "z"
+
+# `magent-tools` is a collection of host-only dev tools (benchmarks,
+# demos, E2E simulators) that spend most of their time in stdlib I/O.
+# The workspace's blanket `opt-level = "z"` is too aggressive for
+# them — bump them to full speed. This only affects `magent-tools`'s
+# own compilation units; the libs it depends on keep the workspace
+# default.
+[profile.release.package."magent-tools"]
+opt-level = 3
+
+# ---------------------------------------------------------------------------
+# Patches
+# ---------------------------------------------------------------------------
+# `esp-wifi 0.7.1` contains two type mismatches that only show up on
+# newer rustc (1.78+), due to tightened `transmute` rules and stricter
+# pointer-type unification:
+#
+#   * `src/wifi/mod.rs:1253` — `transmute::<[u8; 3], [i8; 3]>(cntry_code)`
+#     is rejected because `transmute` on arrays now performs a stricter
+#     element-wise check. We rewrite the surrounding code to build the
+#     `[i8; 3]` array directly.
+#   * `src/common_adapter/mod.rs:314` —
+#     `static mut EVT: i8 = 0; static mut WIFI_EVENT: esp_event_base_t =
+#     unsafe { addr_of!(EVT) }` fails because newer `esp-sys` declares
+#     `esp_event_base_t` as `*const u8` instead of `*const i8`. We
+#     change `EVT` to `u8` and cast at the call site.
+#
+# These are Cargo.lock-level rebuilds; the upstream fix is pending
+# in `esp-wifi` 0.8.x but that line drops the `esp-hal 0.19` API we
+# currently depend on, so we patch in-tree until the toolchain set
+# moves forward.
+[patch.crates-io]
+# PATCHED (MicroAgent): libc 0.2.187 for espidf target
+# Adds AT_FDCWD and other filesystem constants required by std's unix fs module
+# See: https://github.com/rust-lang/libc/issues/XXXX
+libc = { path = ".cargo-patches/libc-0.2.187" }
+
+# PATCHED (MicroAgent): Conditionally apply link_section attributes for espidf target
+# Prevents Mach-O errors on macOS when compiling for host target
+esp-idf-hal = { path = ".cargo-patches/esp-idf-hal-0.46.2" }
+
+# PATCHED (MicroAgent): Fix lock API and libc type issues for ESP-IDF v6
+esp-idf-svc = { path = ".cargo-patches/esp-idf-svc-0.52.1-patched" }
+
+esp-wifi = { path = ".cargo-patches/esp-wifi-0.7.1" }
+esp-idf-sys = { path = ".cargo-patches/esp-idf-sys-0.37.2" }
+
+# PATCHED (MicroAgent): Use aws_lc_rs instead of ring for RISC-V support.
+# Ring doesn't support 32-bit RISC-V architecture (needed for ESP32-C6/C61).
+# Note: Patching multiple 0.23.x versions since different deps need different versions.
+rustls = { path = ".cargo-patches/rustls-0.23.43" }
+rustls_0_23_42 = { path = ".cargo-patches/rustls-0.23.42", package = "rustls" }
+rustls_0_23_41 = { path = ".cargo-patches/rustls-0.23.41", package = "rustls" }
+rustls_0_23_40 = { path = ".cargo-patches/rustls-0.23.40", package = "rustls" }
+rustls-webpki = { path = ".cargo-patches/rustls-webpki-0.102.8" }
+
+# PATCHED (MicroAgent): Use embuild 0.33.3 with espidf feature and esp32c61 support.
+embuild = { path = ".cargo-patches/embuild-0.31.4", features = ["espidf"] }

@@ -1,0 +1,14 @@
+# Per-crate build config for the nRF52840 integration test runner.
+#
+# Pins the target so `cargo build`/`cargo run` from inside this crate
+# always produce an ARM Cortex-M4 binary, even when the workspace root
+# no longer sets a default target (see ../../.cargo/config.toml).
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip nRF52840_xxAA"
+
+[env]
+DEFMT_LOG = "info"

@@ -1,0 +1,156 @@
+[build]
+# ---------------------------------------------------------------------------
+# ESP32-C61-DevKitC-1-N8R2 target
+# ---------------------------------------------------------------------------
+# ESP32-C61 inherits the C6's RISC-V feature set: rv32imac (M=integer
+# multiply/divide, A=atomic, C=compressed). The official esp-idf-svc
+# 0.52 mapping (see https://github.com/esp-rs/esp-idf-template) uses
+# `riscv32imac-esp-espidf` for the C6/H2/P4 family. We follow that.
+#
+# This is a Tier 3 target — no pre-built std/core are available, so
+# `build-std = ["std", "panic_abort"]` below is MANDATORY. The cargo
+# unstable feature rebuilds std from the rust source tree using the
+# nightly toolchain.
+#
+# PATCHED (MicroAgent): the toolchain is selected by `rust-toolchain.toml`
+# (currently `stable-aarch64-apple-darwin` + `RUSTC_BOOTSTRAP=1` for
+# `-Z build-std`). We deliberately do NOT set `[build] toolchain` here:
+# setting `toolchain = "esp"` here conflicted with `rust-toolchain.toml` and
+# produced an "unused config key `build.toolchain`" warning, because
+# `rust-toolchain.toml` takes precedence over the cargo config.
+# TRACE: REQ-FW-001.
+# ---------------------------------------------------------------------------
+target = "riscv32imac-esp-espidf"
+
+# PATCHED (MicroAgent): link with `ldproxy` so the RISC-V cross-GCC
+# from PlatformIO sees the ESP-IDF component libraries that
+# `esp-idf-sys` builds under `target/.../build/esp-idf-sys-*/out`.
+# Without `ldproxy`, `rust-lld` (cargo's default linker for RISC-V
+# tier-3 targets) tries to link a bare-metal ELF and fails with
+# `undefined reference to 'memcpy'`, `free`, `pthread_setspecific`,
+# `_g_esp_netif_netstack_default_wifi_sta`, etc. The pio build driver
+# in esp-idf-sys patches `ldproxy` to find the right linker via the
+# `--ldproxy-linker=<path>` directive it emits.
+[target.riscv32imac-esp-espidf]
+# PATCHED (MicroAgent): link directly with the RISC-V ESP GCC. Use full path to avoid PATH issues.
+# REVERTED (was changed to ldproxy): ldproxy requires exactly one positional
+# argument scheme that doesn't match the upstream platform-support docs and
+# fails with "No such file or directory" when invoked by cargo's stable linker
+# driver. The direct gcc link path is well-tested and works.
+linker = "/Users/arksong/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-gcc"
+# PATCHED (MicroAgent): link with libgcc (for builtins like memcpy),
+# libpthread_stubs (for pthread_mutex_lock stub symbols referenced
+# from libgcc's gthr-default.h on bare-metal targets), and the
+# PlatformIO ESP-IDF toolchain's libc.a (picolibc) for newlib
+# symbols. -lc_nano was tried first but the official Espressif
+# `~/.espressif/tools/riscv32-esp-elf/esp-15.2.0...` toolchain
+# doesn't ship a `rv32imac` variant of `libc_nano.a` (only imafc
+# and imc), and the imac one ends up linking against picolibc's
+# `libc.a` anyway via pio's framework linker script. We use
+# `riscv32-esp-elf-gcc -L<pio_picolibc_lib>/rv32imac_zicsr_zifencei/ilp32 -lc_nano`
+# to point the linker at the correct picolibc directory.
+rustflags = [
+    "-C", "link-arg=-L/Users/arksong/.platformio/packages/toolchain-riscv32-esp/riscv32-esp-elf/lib/rv32imac_zicsr_zifencei/ilp32",
+    "-C", "link-arg=-lgcc",
+    "-C", "link-arg=-lgloss",
+    # PATCHED (MicroAgent): pass the ESP-IDF sysroot include path so
+    # the linker can resolve ESP-IDF's __assert_func / stdlib PROBABLY
+    # needs -L<esp-idf>/components/.../lib for the per-component archives
+    # that ESP-IDF's link wrapper expects.
+]
+
+[unstable]
+# `riscv32imac-esp-espidf` is a Tier 3 target with no pre-built
+# std. `build-std` rebuilds std from the rust source tree using
+# the nightly toolchain. This is the OFFICIAL esp-idf-svc 0.52
+# setup (see https://github.com/esp-rs/esp-idf-template).
+# `panic_abort` matches `[profile.release] panic = "abort"`.
+# PATCHED (MicroAgent): include `compiler_builtins` so that the
+# `core`/`alloc` `memcpy`/`memset`/`memcmp` intrinsics are sourced
+# from rustc's `compiler-builtins` crate (built from the rust-src
+# tree) instead of from the host's libgcc. With
+# `LLVM_COMPILER_RT_LIB=/.../libclang_rt.builtins.a` set in `[env]`
+# (see below), `compiler-builtins` skips its in-tree compiler-rt
+# source compile and points the linker at the prebuilt Espressif
+# libclang_rt.builtins.a instead. This avoids the
+# `RUST_COMPILER_RT_ROOT=...does not exist` panic that the stable
+# toolchain hits on Apple Silicon (no compiler-rt source under
+# rustlib/src/rust/library/compiler-builtins/compiler-rt).
+build-std = ["std", "panic_abort", "compiler_builtins", "core", "alloc"]
+
+[env]
+# ---------------------------------------------------------------------------
+# Toolchain bootstrap
+# ---------------------------------------------------------------------------
+# PATCHED (MicroAgent): CC/CXX must point to the RISC-V cross-compiler
+# for target C code. For host-only crates (ring, etc.), we prevent them
+# from being compiled via feature flags instead.
+CC = "/Users/arksong/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-gcc"
+CXX = "/Users/arksong/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-g++"
+
+# PATCHED (MicroAgent): RUSTC_BOOTSTRAP removed. The `esp` toolchain
+# is the official ESP-rs custom nightly (1.95.0-nightly 2026-04-15)
+# and accepts `build-std` natively without needing bootstrap.
+# `LLVM_COMPILER_RT_LIB` is also removed — the `esp` toolchain's
+# `compiler-builtins` is built against the configured Espressif
+# `riscv32-esp-elf` GCC's libgcc.a and doesn't need a prebuilt
+# libclang_rt.builtins.a.
+# ---------------------------------------------------------------------------
+# ESP-IDF toolchain locations
+# ---------------------------------------------------------------------------
+# Tell esp-idf-sys to use the system's already-installed ESP-IDF
+# toolchain (NOT PlatformIO). Our ESP-IDF v6.0 install lives under
+# ~/.espressif/ and the matching RISC-V GCC under
+# ~/.espressif/tools/riscv32-esp-elf/esp-15.2.0_20251204/.
+ESP_IDF_TOOLS_INSTALL_DIR = "fromenv"
+# PATCHED (MicroAgent): point to the ESP-IDF v6 installation.
+ESP_IDF_PATH = "/Users/arksong/.espressif/esp-idf"
+IDF_PATH = "/Users/arksong/.espressif/esp-idf"
+# PATCHED (MicroAgent): point the native build driver at our
+# sdkconfig.defaults. ESP-IDF reads this env var and feeds it to
+# idf.py's --sdkconfig-defaults.
+ESP_IDF_SDKCONFIG_DEFAULTS = "/Users/arksong/MicroAgent/firmware/esp32-app/sdkconfig.defaults"
+# PATCHED (MicroAgent): Tell esp-idf-sys this is the root crate
+# so it can properly configure the build for RISC-V target.
+ESP_IDF_SYS_ROOT_CRATE = "magent-esp32-app"
+# ---------------------------------------------------------------------------
+# PATCHED (MicroAgent): chip is ESP32-C61. We previously forced MCU=esp32c6
+# because PlatformIO espressif32@7.0.1 didn't ship a board JSON for the
+# esp32c61 MCU. As of the bootloader-fix patch, we have:
+#   1. Added /Users/arksong/.platformio/platforms/espressif32@7.0.1/boards/esp32-c61-devkitc-1.json
+#   2. Patched espressif32/builder/frameworks/espidf.py to recognise
+#      esp32c61 as a RISC-V chip (same toolchain as esp32c6).
+#   3. Patched esp-idf-sys/config.rs to default MCU=esp32c61 instead
+#      of the upstream hard-coded esp32c6.
+# With these three in place, MCU="ESP32C61" (uppercase to match what PlatformIO
+# reports via `pio boards --json-output`) makes PlatformIO compile a
+# bootloader.bin with chip_id=20 (ESP32-C61) instead of 6 (ESP32-C3 fallback).
+# embuild 0.31.4 does a literal string equality check between this value and
+# `board.mcu` from `pio boards --json-output`, so the case must match.
+# TRACE: REQ-FW-001.
+MCU = "ESP32C61"
+# Verbose esp-idf-svc logging during bring-up; flip to "warn" once stable.
+ESP_IDF_SVC_LOG = "info"
+# Defmt log level — used by magent-core's tracing shims.
+DEFMT_LOG = "info"
+# ---------------------------------------------------------------------------
+# macOS-specific paths
+# ---------------------------------------------------------------------------
+# PATCHED (MicroAgent): Use PlatformIO's esp-clang for bindgen, NOT Homebrew LLVM.
+# The ESP-IDF headers use riscv32-esp-elf sysroot headers that are incompatible
+# with Homebrew clang's macOS headers (causes "typedef redefinition with different
+# types ('struct __sFILE' vs 'struct __file')").
+# Point to the actual clang binary directory so bindgen can find it
+CLANG_PATH = "/Users/arksong/.platformio/packages/tool-esp-clang/bin/clang"
+# PATCHED (MicroAgent): Add ESP-IDF tools and RISC-V toolchain to PATH.
+PATH = "/Users/arksong/.platformio/packages/framework-espidf/tools:/Users/arksong/.espressif/python_env/idf6.0_py3.14_env/bin:/Users/arksong/.espressif/tools/riscv32-esp-elf/esp-15.2.0_20251204/riscv32-esp-elf/bin:/Users/arksong/.platformio/packages/toolchain-riscv32-esp/bin:/Users/arksong/.platformio/packages/tool-esp-clang/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# ---------------------------------------------------------------------------
+# Platform-specific OpenSSL
+# ---------------------------------------------------------------------------
+# Homebrew ships OpenSSL in a non-standard location; some Cargo build
+# dependencies (cargo-edit, cargo-binstall, openssl-sys on host crates)
+# need explicit hints. Set in the macOS shell rc, not here, so the same
+# config.toml works on Linux CI where the path differs.
+OPENSSL_DIR = "/opt/homebrew/opt/openssl@3"
+OPENSSL_INCLUDE_DIR = "/opt/homebrew/opt/openssl@3/include"
+OPENSSL_LIB_DIR = "/opt/homebrew/opt/openssl@3/lib"

@@ -1,0 +1,145 @@
+[package]
+name = "magent-esp32-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "mAgent firmware for the ESP32-C61-DevKitC-1-N8R2 (N8R2, std)"
+
+# TRACE: REQ-FW-001 — this crate only compiles with the ESP-IDF toolchain.
+# Building on a host OS requires `esp-idf-svc`'s build.rs to run (delegates to
+# `embuild::build()`), which downloads ESP-IDF v6.0 if not present.
+
+[dependencies]
+# Chip-agnostic core — the `esp32` feature activates RISC-V HAL deps.
+# The `std` feature is needed because esp-idf-svc provides std:: threads.
+magent-core = { path = "../../magent-core", default-features = false, features = ["esp32", "link_adapters", "ingress", "web3"] }
+
+# ---------------------------------------------------------------------------
+# ESP-IDF integration (the std story for the C61-N8R2).
+# ---------------------------------------------------------------------------
+# esp-idf-svc wraps the ESP-IDF C stack with idiomatic Rust. It provides:
+#   - esp_idf_svc::wifi (Wi-Fi STA / AP)
+#   - esp_idf_svc::nvs (non-volatile storage)
+#   - esp_idf_svc::http::client (HTTP/RPC calls to LLM backend)
+#   - esp_idf_svc::sysloop (the event loop that drives the above)
+#   - esp_idf_svc::log (global logger via esp-idf's logging subsystem)
+#
+# The `experimental` feature exposes async wrappers (EspTimer, etc.)
+# that are useful for the ReAct loop. TRACE: REQ-FW-001, REQ-NET-001.
+esp-idf-svc = { workspace = true, features = ["experimental", "std"] }
+# PATCHED (MicroAgent): Use native driver with PlatformIO ESP-IDF.
+esp-idf-sys = { workspace = true, default-features = false, features = ["pio"] }
+
+# esp-idf-svc requires std. `std` is implied by the espidf feature above
+# but we set it explicitly so the dependency graph is self-documenting.
+#
+# NOTE: we deliberately drop all `esp-hal` / `embassy-*` deps from the
+# old bare-metal path. The embassy executor is incompatible with
+# esp-idf-svc's thread model and would cause double-scheduling.
+# Once this std path is verified on real hardware, the old
+# `esp-hal + embassy` path can be archived. TRACE: REQ-FW-001.
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+# esp-idf-svc::log re-exports the esp-idf logging C code through Rust.
+# `esp_idf_svc::log::EspLogger` implements `log::Log` and installs as the
+# global logger in `main()`. The log level is controlled by `sdkconfig.defaults`.
+log = { workspace = true }
+
+# Hex encoding for diagnostic logging (used by link_adapters fallback).
+hex = "0.4"
+
+# Random number generation backed by the ESP32 HW RNG via esp-idf's
+# `getrandom` shim. Required by `LinkAdapter::provision_random_seed`.
+getrandom = { version = "0.2", features = ["custom"] }
+
+# esp_println is a tiny no-deps `println!` macro that routes to
+# esp-idf's `esp_log_write`. We use it in the panic handler so we can
+# print diagnostics even when the global logger hasn't been installed
+# yet (e.g. if std::rt init fails). The `esp32c6` feature gates the
+# actual chip-specific formatting; PlatformIO sees us as esp32c6
+# (no esp32c61 feature exists yet in esp-println).
+esp-println = { version = "0.13", features = ["esp32c6"] }
+
+# ---------------------------------------------------------------------------
+# Communication adapters — UART + button via embedded-io traits.
+# These are `no_std`-clean so they work in the esp-idf-svc std context.
+# ---------------------------------------------------------------------------
+embedded-hal = { workspace = true }
+embedded-io = { workspace = true }
+# PATCHED (MicroAgent): direct heapless dep so we can refer to
+# `heapless::String<N>` in `link_adapters::source_kind` for the
+# `IngressSource` bridge (magent-core's heapless 0.9 type).
+heapless = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Std library utilities needed by the esp-idf-svc integration.
+# ---------------------------------------------------------------------------
+critical-section = "1.1"
+once_cell = "1"
+
+# `futures::executor::block_on` drives the `MiniAgent::run` future
+# synchronously on a bare esp-idf-svc std thread. We deliberately do
+# NOT pull in Tokio — the agent only does poll-based cooperative work
+# (LLM request, tool call, parse) and never spawns threads. TRACE: REQ-FW-002.
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+
+# ---------------------------------------------------------------------------
+# Build-time
+# ---------------------------------------------------------------------------
+[build-dependencies]
+embuild = "0.31"
+# PATCHED (MicroAgent): `cc` is used by build.rs to compile
+# `src/sysenv_stubs.c` (POSIX symbol stubs for stable Rust's
+# Unix PAL on ESP-IDF — see src/sysenv_stubs.c for the full
+# rationale).
+cc = "1"
+# PATCHED (MicroAgent): `which` is used to locate the ESP-IDF
+# GCC toolchain (riscv32-esp-elf-gcc) during build script execution.
+which = "4.4"
+
+# ---------------------------------------------------------------------------
+# Target-gating
+# ---------------------------------------------------------------------------
+# When targeting Xtensa (ESP32 / ESP32-S3), override the default
+# `riscv32imac` target in `.cargo/config.toml` with:
+#   --target xtensa-esp32-espidf
+# The esp-idf-svc build.rs detects the target automatically and sets up
+# the correct toolchain (Xtensa GCC or RISC-V GCC).
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+# `wifi` — enable the Wi-Fi STA adapter (needed for LLM RPC).
+# `ble`  — enable BLE (ESP32-C61 supports BLE 5 only).
+# `ota`  — enable OTA partition support (controlled by sdkconfig.defaults).
+[features]
+default = ["wifi", "uart"]
+wifi = []
+ble = []
+ota = []
+# UART0 adapter for ingress gateway. PATCHED (MicroAgent): enabled by default
+# so the ingress thread registers a real UART0 driver instead of running in
+# dummy mode. UART0 TX/RX are GPIO10/GPIO11 on the ESP32-C61 DevKit (the same
+# pins the console uses); the ingress driver reads RX while the console writes
+# TX, so they can coexist on the same UART0 hardware.
+uart = []
+
+# ---------------------------------------------------------------------------
+# esp-idf-sys metadata (consumed by `esp-idf-sys` 0.37 build.rs)
+# ---------------------------------------------------------------------------
+# Restrict which ESP-IDF components are built. Excluding openthread,
+# esp_openthread and protocomm prevents their C headers from being
+# included in the bindgen step (they reference headers like
+# `esp_openthread.h` whose public/private include layout changed in
+# ESP-IDF v6 and are not safe to bindgen into the Rust bindings).
+# TRACE: REQ-FW-001.
+[package.metadata.esp-idf-sys]
+esp_idf_components = ["driver", "esp_adc", "esp_event", "esp_hw_support", "esp_lcd", "esp_netif", "esp_phy", "esp_pm", "esp_rom", "esp_system", "esp_timer", "esp_wifi", "espcoredump", "esptool_py", "freertos", "hal", "heap", "log", "lwip", "mbedtls", "newlib", "nvs_flash", "nvs_secure", "port", "pthread", "riscv", "sdmmc", "soc", "spi_flash", "spiffs", "tcp_transport", "ulp", "vfs", "wear_levelling", "wifi_provisioning", "wpa_supplicant", "xtensa"]

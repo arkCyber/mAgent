@@ -1,0 +1,13 @@
+# Name,   Type, SubType, Offset,   Size, Flags
+# mAgent ESP32-C61-N8R2 partition table.
+# 8MB flash (N8) + 2MB PSRAM (R2). The factory app lives at the standard
+# 0x10000 offset and OTA update partitions allow secure field upgrades.
+nvs,      data, nvs,     0x9000,  0x6000
+phy_init, data, phy,     0xf000,  0x1000
+factory,  app,  factory, 0x10000, 0x180000
+ota_0,    app,  ota_0,   0x190000,0x180000
+ota_1,    app,  ota_1,   0x310000,0x180000
+storage,  data, spiffs,  0x490000,0x100000
+coredump, data, coredump,0x590000,0x40000
+nvs_keys, data, nvs_keys,0x5d0000,0x1000
+otadata,  data, ota,     0x5d1000,0x2000

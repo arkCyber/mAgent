@@ -1,0 +1,19 @@
+[package]
+name = "mqtt-roundtrip"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Real MQTT 3.1.1 round-trip over loopback TCP: in-process broker + rumqttc pub/sub"
+publish = false
+
+[[bin]]
+name = "mqtt-roundtrip"
+path = "src/main.rs"
+
+[dependencies]
+# Same rumqttc version as the production `magent-mqtt-mcp` server,
+# so this example doubles as a wire-protocol regression test.
+rumqttc = { version = "0.24", default-features = false, features = ["default"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
+bytes = "1"

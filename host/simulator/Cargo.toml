@@ -1,0 +1,31 @@
+[package]
+name = "magent-simulator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Standalone mAgent simulator for testing"
+
+# This crate is intentionally independent of `magent-core` (it has its
+# own simulator stack). It still inherits the workspace metadata and
+# version so it stays in lock-step with the rest of the workspace.
+
+[[bin]]
+name = "magent-simulator"
+path = "src/main.rs"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "blocking"], default-features = false }
+serde = { version = "1.0", features = ["derive"], default-features = false }
+serde_json = { version = "1.0", default-features = false }
+anyhow = { version = "1.0", features = ["std"] }
+log = { version = "0.4", default-features = false }
+env_logger = "0.11"
+rand = "0.8"
+
+[target.'cfg(not(target_arch = "thumb"))'.dependencies]
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = { version = "1.0", features = ["std"] }
+log = { version = "0.4" }

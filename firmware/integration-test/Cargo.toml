@@ -1,0 +1,45 @@
+[package]
+name = "magent-integration-test"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "Embedded end-to-end integration test runner for magent-core (nRF52840 / Embassy)."
+
+# ---------------------------------------------------------------------------
+# This crate is a `#![no_std]` `#![no_main]` firmware binary that runs the
+# integration tests *on real hardware* (or under `probe-rs` against a
+# simulated nRF52840). It used to live as a loose `tests/integration_test.rs`
+# file at the workspace root, where it wasn't actually compiled by Cargo.
+#
+# To run:
+#
+#   cargo run -p magent-integration-test --release
+#
+# See `firmware/nrf52-app/Cargo.toml` for similar build flags.
+# ---------------------------------------------------------------------------
+
+[dependencies]
+magent-core = { path = "../../magent-core", default-features = false, features = ["nrf52"] }
+
+# Embassy / nRF52 runtime. Uses the standard thread executor with an
+# interrupt-driven timer; the spawner is wired to the SWI/SVC handler.
+embassy-executor   = { workspace = true, features = ["arch-cortex-m", "executor-thread", "integrated-timers"] }
+embassy-time        = { workspace = true }
+embassy-nrf         = { workspace = true, features = ["nrf52840", "time-driver-rtc1", "gpiote"] }
+
+# Embedded HAL bindings / runtime
+cortex-m = { workspace = true }
+cortex-m-rt = { workspace = true }
+embedded-hal = { workspace = true }
+panic-probe = { workspace = true }
+defmt       = { workspace = true }
+defmt-rtt   = { workspace = true }
+heapless    = { workspace = true }
+static_cell = { workspace = true }
+embedded-alloc = "0.5"

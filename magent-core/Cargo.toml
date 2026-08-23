@@ -1,0 +1,478 @@
+[package]
+name = "magent-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# ---------------------------------------------------------------------------
+# Always-on, chip-agnostic dependencies (no_std + alloc)
+# ---------------------------------------------------------------------------
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+heapless = { workspace = true }
+log = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Optional: host-side testing
+# ---------------------------------------------------------------------------
+# Pulled in by `std` and `host` features. Used by the desktop simulator
+# build to talk to Ollama.
+# PATCHED (MicroAgent): Use workspace reqwest with rustls-tls to avoid
+# OpenSSL cross-compilation issues on RISC-V targets.
+reqwest = { workspace = true, optional = true }
+# Regex for the web tools' HTML/fragment extractors. Host-only.
+regex = { version = "1.10", optional = true }
+
+# `magent-hal` holds the chip-agnostic HAL traits and the host-side
+# nRF52840 simulator. It's only useful on a host build (it is itself
+# `std`-only), so it's optional and gated behind the `std` feature.
+# For backwards compatibility, `magent-core::hal::*` and
+# `magent-core::nrf52_hal::*` are re-exported from `magent-hal::*`
+# (see `src/lib.rs`); the re-exports are also gated on `std` so they
+# compile on embedded targets.
+magent-hal = { path = "../magent-hal", optional = true }
+
+# ---------------------------------------------------------------------------
+# Optional: Web3 / asymmetric crypto (host-only, std-backed)
+# ---------------------------------------------------------------------------
+# `ed25519-dalek` is constant-time, RFC 8032 compliant, and the de-facto
+# Rust Ed25519 implementation. The `web3` feature is opt-in so it does
+# NOT pull into embedded (no_std) builds — Web3 identity lives on the
+# host side or in larger firmware that has the flash budget.
+ed25519-dalek = { workspace = true, optional = true }
+bs58 = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+sha3 = { version = "0.10", optional = true, default-features = false }
+# Secp256k1 for Ethereum transaction signing
+secp256k1 = { version = "0.29", optional = true, default-features = false, features = ["alloc", "recovery", "rand"] }
+
+# ---------------------------------------------------------------------------
+# Optional: architecture-level crates (chip-agnostic)
+# ---------------------------------------------------------------------------
+# These provide the CPU startup code, critical-section impls, and
+# architecture intrinsics that any bare-metal embedded target needs.
+# They are intentionally NOT chip-specific so a single feature flag
+# (e.g. `arch-cortex-m`) enables them for every Cortex-M chip.
+#
+# NOTE: `critical-section` is NOT declared here. cortex-m 0.7's
+# `critical-section-single-core` feature, riscv 0.11's
+# `critical-section-single-hart` feature, and esp-hal's `xtensa`
+# feature each pick a mutually-exclusive `critical-section/restore-state-*`
+# variant, so any single declaration at this level would conflict with
+# whichever chip family is actually being built. cortex-m's and
+# riscv's feature flags already pull in critical-section transitively
+# with the correct variant.
+cortex-m = { workspace = true, optional = true }
+cortex-m-rt = { workspace = true, optional = true }
+# `critical-section` is declared locally (not via the workspace) so we
+# can pick its `restore-state-*` variant alongside cortex-m / riscv /
+# esp-hal without forcing a workspace-wide conflict. The matching
+# variant is selected by the chip crate that pulls in
+# `magent-core` (cortex-m enables `restore-state-bool`, esp-hal's
+# `xtensa` enables `restore-state-u32`, etc.). We do not pick a
+# variant here ourselves — whoever enables `magent-core/<chip>`
+# does, via the chip driver crate.
+critical-section = { version = "1.1.2", optional = true }
+# RISC-V / Xtensa bare-metal support. These are always declared as
+# optional dependencies because the `arch-riscv` / `arch-xtensa`
+# features below may be enabled on a host build for type-checking
+# (e.g. by running `cargo check --features esp32 --target x86_64`).
+# They only actually *link* when the matching target is selected.
+riscv = { version = "0.11", optional = true }
+riscv-rt = { workspace = true, optional = true }
+xtensa-lx = { version = "0.9", optional = true }
+xtensa-lx-rt = { workspace = true, optional = true }
+
+# Embedded logging & HAL traits (chip-agnostic)
+defmt = { version = "0.3.8", optional = true }
+embedded-hal = { workspace = true, optional = true }
+embedded-hal-async = { workspace = true, optional = true }
+embedded-io = { workspace = true, optional = true }
+embedded-io-async = { workspace = true, optional = true }
+embedded-storage = { workspace = true, optional = true }
+embedded-storage-async = { workspace = true, optional = true }
+# `portable-atomic` is what we use on bare-metal targets (e.g.
+# `riscv32imc-unknown-none-elf`) whose `core::sync::atomic` only
+# supports `load`/`store` and emulates the rest. Anywhere we need
+# `fetch_add` / `compare_exchange_weak` (budget counters, lock state,
+# …) goes through `portable_atomic::AtomicUsize` so the same source
+# compiles on Cortex-M (real atomics) and RISC-V (single-core
+# fallback). On hosted builds the `core` types are used directly and
+# this dep is dormant.
+portable-atomic = { version = "1.1", default-features = false, optional = true }
+
+# Embassy executor is also architecture-agnostic — the specific arch
+# support comes from a feature flag (`arch-cortex-m`, etc.).
+embassy-executor = { workspace = true, optional = true }
+embassy-time = { workspace = true, optional = true }
+embassy-sync = { workspace = true, optional = true }
+
+# ---------------------------------------------------------------------------
+# Optional: chip-family HAL drivers
+# ---------------------------------------------------------------------------
+# nRF52840 (ARM Cortex-M + BLE SoftDevice)
+embassy-nrf = { workspace = true, optional = true }
+# `nrf-softdevice` is declared under `[target.'cfg(target_arch = "arm")'.dependencies]`
+# below — it only compiles for ARM targets, so a top-level declaration
+# would break the host build.
+
+# ESP32 family (Xtensa LX6/LX7 or RISC-V). These crates are pulled in only
+# when the `esp32` feature is enabled. They are still optional at the
+# Cargo level so x86_64 builds aren't affected.
+# Versions are pinned to a known-coherent set from late 2024; bumping
+# any one of them usually requires bumping the others too.
+#
+# NOTE: the `esp-hal`/`esp-wifi` driver crates are intentionally NOT
+# declared here. They are large, fast-moving, and bring in compiler-rt
+# targets that conflict with the host build. The `firmware/esp32-app`
+# crate is the single source of truth for those deps and the right
+# place to keep them in sync with the `esp-hal` release branch. We only
+# keep the architecture-level crates (`riscv`, `xtensa-lx*`) here so
+# that the `arch-riscv` / `arch-xtensa` features can be enabled
+# without forcing the consumer to chase `esp-hal` versions.
+
+# ---------------------------------------------------------------------------
+# Target-gated dependencies
+# ---------------------------------------------------------------------------
+# Some bare-metal crates only compile for specific target
+# architectures. Rather than declare them at the top level and then
+# re-declare under a target guard (which Cargo treats as a
+# duplicate), we declare them once here, inside the target guard.
+[target.'cfg(target_arch = "arm")'.dependencies]
+nrf-softdevice = { version = "0.1.0", optional = true, features = ["nrf52840", "ble-peripheral", "ble-central", "s140"] }
+
+# `esp-hal` / `esp-wifi` live in the `firmware/esp32-app` crate to keep
+# their version pinning isolated. The bare-metal architecture crates
+# (`riscv` / `xtensa-lx`) are listed as optional in `[dependencies]`
+# above so they don't need re-declaration here.
+
+# ---------------------------------------------------------------------------
+# Feature flags
+# ---------------------------------------------------------------------------
+# Design overview
+# ---------------
+# `magent-core` is a no_std library with **orthogonal** feature flags:
+#
+#   * `std` / `host`   - host-side testing on x86_64/Linux/macOS.
+#   * `arch-*`         - CPU architecture support (Cortex-M / RISC-V / Xtensa).
+#                         These unlock the runtime startup code and
+#                         architecture intrinsics needed by ANY chip on
+#                         that architecture.
+#   * `nrf52`          - nRF52840 chip-specific drivers (BLE SoftDevice,
+#                         embassy-nrf peripherals).
+#   * `esp32`          - ESP32 family drivers (esp-hal, esp-wifi).
+#   * `ble` / `wifi` / `thread` / `monitoring` - optional cross-cutting
+#                         capabilities that build on whichever chip
+#                         driver is selected.
+#
+# At least one of (`std`, `arch-cortex-m`, `arch-riscv`, `arch-xtensa`)
+# should be enabled; selecting a chip family implicitly pulls in the
+# right architecture feature (see the aliases below).
+#
+# Default is empty so a plain `cargo build` doesn't drag in any chip-
+# specific or host-specific dependencies — useful for CI / docs builds.
+[features]
+default = []
+
+# Optional observability stack. Declared as a stub so the
+# `#[cfg(feature = "monitoring")]` gates in `agent.rs` don't trip
+# the `unexpected_cfgs` warning. The actual monitoring module is
+# only compiled when this feature is enabled together with one of
+# the chip-family features (e.g. `--features monitoring,nrf52`).
+monitoring = []
+
+# Host-side testing on a desktop OS.
+std = ["dep:reqwest", "dep:regex", "dep:magent-hal", "serde/std", "serde_json/std", "log/std"]
+host = ["std"]  # alias
+
+# ---------------------------------------------------------------------------
+# HTTP backend gates (used by `web3/blockchain/http_client.rs`)
+# ---------------------------------------------------------------------------
+# `reqwest` is the host-side HTTP backend. It is automatically pulled in
+# by the `std` feature above; declaring it here too is purely so the
+# `#[cfg(feature = "reqwest")]` checks in `http_client.rs` don't trip
+# the unexpected-cfg lint. It is *not* a separate feature path.
+reqwest = ["dep:reqwest"]
+
+# ---------------------------------------------------------------------------
+# Architecture features
+# ---------------------------------------------------------------------------
+# Pick whichever architecture your target chip uses. You usually don't
+# enable these directly — the chip-family features below turn them on.
+#
+# We list `dep:critical-section` here so the architecture features
+# enable the local optional dep, but we deliberately do NOT pick a
+# `restore-state-*` variant. The variant is chosen by whichever chip
+# driver crate (cortex-m / riscv / esp-hal) is built against the
+# feature — Cargo's feature resolver unifies the right one in.
+arch-cortex-m = [
+    "dep:cortex-m",
+    "dep:cortex-m-rt",
+    "dep:critical-section",
+    "dep:defmt",
+]
+arch-riscv = [
+    "dep:riscv",
+    "dep:riscv-rt",
+    "dep:critical-section",
+    # `safety.rs` uses `fetch_add`/`fetch_sub` on its budget
+    # counters. The `core::sync::atomic` API on `riscv32imc` (the
+    # default target for `arch-riscv` / `esp32`) does not provide
+    # them, so we route through `portable-atomic` instead. The
+    # target-gated alias in `safety.rs` picks `portable-atomic` on
+    # the same targets that lack native atomics.
+    "dep:portable-atomic",
+]
+arch-xtensa = [
+    "dep:xtensa-lx",
+    "dep:xtensa-lx-rt",
+    "dep:critical-section",
+    # esp-hal's `xtensa` feature (pulled in by `firmware/esp32-app`)
+    # activates `critical-section/restore-state-u32`, which is what
+    # `portable-atomic` requires on Xtensa targets. We do not pull
+    # `esp-hal` in here because its version is owned by the firmware
+    # crate; the consumer is responsible for enabling its `xtensa`
+    # feature alongside `arch-xtensa`.
+    "dep:portable-atomic",
+]
+
+# ---------------------------------------------------------------------------
+# Chip-family features
+# ---------------------------------------------------------------------------
+# Each chip feature pulls in the architecture dep + the chip-specific
+# HAL drivers. This is what firmware crates enable in their Cargo.toml.
+nrf52 = [
+    "arch-cortex-m",
+    "dep:embassy-nrf",
+    "dep:embassy-executor",
+    "dep:embassy-time",
+    "dep:embedded-storage",
+    "dep:embedded-storage-async",
+    "dep:embedded-hal",
+    "dep:embedded-hal-async",
+    "dep:embedded-io",
+    "dep:embedded-io-async",
+    "dep:nrf-softdevice",
+]
+esp32 = [
+    # PATCHED (MicroAgent): ESP32 firmware feature WITHOUT reqwest/ring.
+    # ESP32 uses esp-idf's native HTTP client (EspHttpClient via esp_idf_svc::http)
+    # which uses mbedtls, not rustls/reqwest. This avoids pulling in ring/rustls
+    # which don't support 32-bit RISC-V targets.
+    "dep:defmt",
+    "dep:embedded-storage",
+    "dep:embedded-storage-async",
+    "dep:critical-section",
+]
+
+# ---------------------------------------------------------------------------
+# Cross-cutting protocol / interface features
+# ---------------------------------------------------------------------------
+# `link_adapters` - `LinkAdapter` / `AsyncLinkAdapter` traits + the
+#                   shared `IngressSource` enum. Pure `core` / `alloc` —
+#                   compiles in `no_std`. Use this feature to access
+#                   the trait surface from an embedded firmware crate.
+# `mqtt`          - MQTT adapter (host-only, uses std::net).
+# `manual`        - Manual / stdin adapter (host-only).
+# `ingress`       - `IngressGateway` (routes adapter bytes into the
+#                   agent, signs with web3::Identity when in `Signed`
+#                   mode). Pulls in `web3` for `Identity` / `SignedMessage`
+#                   + `alloc` (already always-on via `extern crate alloc`).
+#                   Compiles on `no_std` targets so ESP32 firmware can
+#                   use it; the `link_adapters`/`manual`/`mqtt` flags
+#                   decide which concrete adapters are available.
+link_adapters = []
+mqtt = ["link_adapters", "std"]
+manual = ["link_adapters", "std"]
+ingress = [
+    "link_adapters",
+    "web3",
+]
+
+# ---------------------------------------------------------------------------
+# Verifiable Credentials
+# ---------------------------------------------------------------------------
+# W3C VC Data Model 2.0 support. Provides:
+# - VerifiableCredential issuance and verification
+# - VerifiablePresentation for selective disclosure
+# - Credential schemas and validation
+# - Credential status (revocation lists)
+#
+# To enable:
+#   cargo build -p magent-core --features verifiable_credentials,web3,std
+verifiable_credentials = ["serde_json/std", "dep:ed25519-dalek", "dep:bs58", "dep:rand_core", "std", "web3"]
+
+# ---------------------------------------------------------------------------
+# Web3 identity & asymmetric cryptography
+# ---------------------------------------------------------------------------
+web3 = [
+    "dep:ed25519-dalek",
+    "dep:bs58",
+    "dep:rand_core",
+    "dep:sha3",
+    "dep:secp256k1",
+]
+
+# Alias for web3 with std (host-side with reqwest)
+web3_std = [
+    "web3",
+    "std",
+]
+
+web3_app = [
+    "dep:ed25519-dalek",
+    "dep:bs58",
+    "dep:rand_core",
+    "dep:sha3",
+    "dep:secp256k1",
+    "std",
+    "web3",
+]
+
+# ---------------------------------------------------------------------------
+# Blockchain Integration
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# HTTP client for std environments
+# ---------------------------------------------------------------------------
+blockchain = [
+    "dep:ed25519-dalek",
+    "dep:bs58",
+    "dep:rand_core",
+    "dep:portable-atomic",
+    "dep:sha3",
+    "dep:secp256k1",
+    "dep:reqwest",
+    "std",
+    "web3",
+]
+
+# Backward-compatibility alias: old code used `embedded` to mean
+# "Cortex-M + nRF52 drivers". Keep it working.
+embedded = ["nrf52"]
+
+# ---------------------------------------------------------------------------
+# Dev profile
+# ---------------------------------------------------------------------------
+[dev-dependencies]
+serde_json = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+futures = "0.3"
+
+# ---------------------------------------------------------------------------
+# Test targets
+# ---------------------------------------------------------------------------
+# All integration tests require the `std` feature so that the host-only
+# modules (`simulator`, `real_tools`, `agent_runner`, `nrf52_hal`) are
+# available. We list them explicitly here instead of relying on auto-
+# discovery so that `required-features` is enforced — running
+# `cargo test -p magent-core` *without* `--features std` will compile
+# nothing, which is the right behaviour for CI on embedded targets.
+[[test]]
+name = "agent_runner_tests"
+path = "tests/agent_runner_tests.rs"
+required-features = ["std"]
+
+[[test]]
+name = "agent_tests"
+path = "tests/agent_tests.rs"
+required-features = ["std"]
+
+[[test]]
+name = "comprehensive_agent_tests"
+path = "tests/comprehensive_agent_tests.rs"
+required-features = ["std"]
+
+# ---------------------------------------------------------------------------
+# Lints
+# ---------------------------------------------------------------------------
+# Opt into the workspace-wide lint table (defined in the root
+# `Cargo.toml` under `[workspace.lints.rust]`). This replaces the
+# inline `#![warn(missing_docs)]` / `#![deny(unsafe_op_in_unsafe_fn)]`
+# annotations at the top of `src/lib.rs`, so the policy lives in one
+# place.
+[lints]
+workspace = true
+
+[[test]]
+name = "nrf52_simulation_tests"
+path = "tests/nrf52_simulation_tests.rs"
+required-features = ["std"]
+
+[[test]]
+name = "nrf52_comprehensive_tests"
+path = "tests/nrf52_comprehensive_tests.rs"
+required-features = ["std"]
+
+# Web3 / asymmetric cryptography integration tests. Gated on
+# `web3` (which itself pulls in `std`); running
+# `cargo test -p magent-core` without `--features web3` skips
+# this target, matching the policy used by the other integration
+# tests (which require `std`).
+[[test]]
+name = "web3_tests"
+path = "tests/web3_tests.rs"
+required-features = ["web3"]
+
+# `web3_app` integration tests — exercise the end-to-end signed
+# report envelope, including domain-separation and tamper-detection
+# paths. Requires `web3_app` (which pulls in `web3` + `std`).
+[[test]]
+name = "web3_app_tests"
+path = "tests/web3_app_tests.rs"
+required-features = ["web3_app"]
+
+# `web3_app` integration tests for the signed-prompt envelope —
+# the second payload type built on top of the generic
+# `Envelope<P>` machinery. Pins cross-payload domain
+# separation (`magent/prompt:v1` vs `magent/run_report:v1`),
+# length-cap enforcement, and JSON round-trip.
+[[test]]
+name = "web3_prompt_tests"
+path = "tests/web3_prompt_tests.rs"
+required-features = ["web3_app"]
+
+# Blockchain integration tests (placeholder).
+[[test]]
+name = "blockchain_tests"
+path = "tests/blockchain_tests.rs"
+required-features = ["web3"]
+
+# Blockchain end-to-end integration tests — sign + recover + binding
+# round-trips, validation gating, Wei/ETH pipeline consistency.
+[[test]]
+name = "blockchain_integration_tests"
+path = "tests/blockchain_integration_tests.rs"
+required-features = ["blockchain"]
+
+# Verifiable credentials tests (placeholder).
+[[test]]
+name = "vc_tests"
+path = "tests/vc_tests.rs"
+required-features = ["web3"]
+
+# Ingress gateway end-to-end tests — exercise MqttAdapter (stub) +
+# ManualAdapter as concrete LinkAdapter implementations feeding an
+# IngressGateway in both `Transparent` and `Signed` modes. Verifies
+# that Signed-mode envelopes round-trip through the public
+# `web3::verify_signed_message` API so the gateway is wired into the
+# existing identity layer correctly.
+#
+# The test exercises the real `MqttAdapter` and `MqttError` types
+# (and references them by name to define the test-only
+# `ChainedAdapter` impl), so `mqtt` must be in `required-features`.
+# Without it the file fails to compile with `could not find 'mqtt' in
+# 'communication'`. The `web3` feature is required by
+# `verify_signed_message` (it lives in the `web3` module).
+[[test]]
+name = "ingress_tests"
+path = "tests/ingress_tests.rs"
+required-features = ["ingress", "mqtt", "web3"]

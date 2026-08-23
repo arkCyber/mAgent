@@ -1,0 +1,127 @@
+[package]
+name = "magent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "mAgent command-line tool — runs the embedded AI agent against an Ollama or DeepSeek backend, or in mocked mode."
+
+# ---------------------------------------------------------------------------
+# Architecture
+# ---------------------------------------------------------------------------
+# The CLI is a thin host binary that wires three things together:
+#
+#   1. `magent_core::agent_runner::RealAgentRunner` — the ReAct loop.
+#   2. `magent_core::real_tools::SimulatorExecutor` — the tool backend.
+#      This is the *simulated* hardware (sensors, BLE, flash, GPIO) that
+#      also serves as the `cargo test --features std` backend. Swapping
+#      in a real executor (BLE dongle, MQTT gateway, …) is a one-line
+#      change.
+#   3. `magent_core::agent_runner::{OllamaClient, DeepSeekClient}` —
+#      the LLM backend, pointed at a local Ollama instance
+#      (`--provider ollama`, default) or DeepSeek's hosted API
+#      (`--provider deepseek`).
+#
+# Subcommands are hand-parsed from `std::env::args()` so the binary stays
+# dependency-light (no `clap`). The parser covers what users actually need
+# today; if it grows past ~10 flags we'll pull in `clap` and migrate.
+# ---------------------------------------------------------------------------
+
+[[bin]]
+name = "magent"
+path = "src/main.rs"
+
+[dependencies]
+# Core library — we always need the std feature on the host so that
+# `agent_runner`, `real_tools`, and the simulator are available.
+magent-core = { path = "../magent-core", features = ["std"] }
+
+# MCP email tool executor. Pulled in only when the user passes
+# `--email-tools`; conditional compilation keeps the binary lean by default.
+mcp-tool-executor = { path = "../host/mcp-tool-executor", features = ["std"], optional = true }
+
+# JSON serialisation for `--json` output envelopes.
+serde_json = { workspace = true }
+
+# `serde` is needed by `prompt.rs` which derives `Serialize` /
+# `Deserialize` on `PromptRecord`. We use the `derive` feature so the
+# CLI doesn't have to hand-roll the impls.
+serde = { workspace = true, features = ["derive"] }
+
+# `reqwest` is pulled in transitively via `magent-core/std` for the
+# Ollama client. We don't call it directly from the CLI.
+
+# Logging. We use the `log` facade everywhere (magent-core already
+# routes critical paths through it) and `env_logger` as the host-side
+# backend so `--verbose` / `RUST_LOG` just work for users without
+# any extra setup. Embedded builds don't pull this in because the
+# CLI is host-only.
+log = { workspace = true }
+env_logger = { version = "0.11", default-features = false }
+
+# ---------------------------------------------------------------------------
+# Web3 keystore (host-only)
+# ---------------------------------------------------------------------------
+# Passphrase-encrypted vault for `magent web3 new | sign | verify`. These
+# crates are only pulled in by the binary when the `web3` feature is
+# enabled (they're listed as `optional = true` and the feature gates
+# them in). The web3 module in `magent-core` itself stays
+# `no_std`-compatible and is also gated behind `magent-core/web3`.
+chacha20poly1305 = { workspace = true, optional = true }
+argon2 = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+# `rand_core` provides the OS RNG used to generate salts / nonces in
+# the encrypted vault. The web3 module in `magent-core` uses the
+# same dep transitively; declaring it here lets us call `OsRng`
+# directly from `web3.rs`.
+rand_core = { workspace = true, optional = true }
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+# `email-tools` is a default-off feature gated behind `--email-tools`.
+# When enabled it pulls in `mcp-tool-executor`, which in turn pulls in
+# `tokio` (with multi-thread runtime) and `magent-core/std`. The binary
+# remains lean for the common case (sensor/BLE/flash tools only).
+#
+# `web3` is also default-off. It pulls in the encrypted vault deps
+# (Argon2, ChaCha20-Poly1305, base64) and the `web3` feature on
+# `magent-core` (which brings in ed25519-dalek, bs58, rand_core). The
+# `magent web3` subcommand is only compiled into the binary when this
+# feature is on; the rest of the CLI is unaffected.
+# ---------------------------------------------------------------------------
+[features]
+default = []
+email-tools = ["dep:mcp-tool-executor"]
+web3 = ["dep:chacha20poly1305", "dep:argon2", "dep:base64", "dep:rand_core", "magent-core/web3"]
+# `web3_app` layers the signed-envelope helpers (signed run
+# reports, signed prompts, …) on top of the bare `web3` CLI. It
+# pulls in `magent-core/web3_app`, which itself pulls in all of
+# `web3` + `std`. Enabling this feature unlocks `magent run
+# --sign …` / `magent run --verify …` so the CLI can produce and
+# consume cryptographically-verifiable run reports. Without it,
+# `magent run` works exactly as before.
+# `web3_app` layers the signed-envelope helpers (signed run
+# reports, signed prompts, …) on top of the bare `web3` CLI. It
+# pulls in `magent-core/web3_app`, which itself pulls in all of
+# `web3` + `std`. Enabling this feature unlocks `magent run
+# --sign …` / `magent run --verify …` so the CLI can produce and
+# consume cryptographically-verifiable run reports. Without it,
+web3_app = ["web3", "magent-core/web3_app"]
+# Blockchain executor for the agent work loop. Pulls in the
+# `magent-core/blockchain` feature (which itself enables
+# `web3`, `std`, `secp256k1`, `sha3`, and `reqwest`). Enabling
+# this feature lets the CLI dispatch blockchain tool calls
+# (`get_balance`, `send_transaction`, `poll_transaction`, …)
+# from inside the work loop.
+blockchain = ["web3_app", "magent-core/blockchain"]
+# `esp32_blockchain` enables the blockchain client targeting the
+# `esp32` feature flag. Pulling it in pulls in the embassy /
+# critical-section / portable-atomic crates, so we keep it
+# strictly opt-in.
+esp32_blockchain = ["blockchain", "magent-core/esp32"]

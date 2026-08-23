@@ -1,0 +1,13 @@
+[package]
+name = "email-mqtt-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Email → MQTT bridge: decode SMTP messages and publish to MQTT topics"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "email-mqtt-bridge"
+path = "src/main.rs"
+
+[dependencies]

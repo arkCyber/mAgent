@@ -1,0 +1,51 @@
+[package]
+name = "magent-hal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "Chip-agnostic HAL trait surface for mAgent, plus host-side stubs for nRF52840 and ESP32."
+
+# ---------------------------------------------------------------------------
+# Architecture
+# ---------------------------------------------------------------------------
+# `magent-hal` is a small `std`-only library that defines the chip-agnostic
+# hardware abstraction layer traits used by mAgent, plus the host-side
+# adapters that satisfy them for the two chips we currently support:
+#
+#   * nRF52840  — `nrf52::{mod, sim}` (thin trait adapters + rich simulator)
+#   * ESP32     — `esp32`             (thin trait stubs)
+#
+# It was extracted from `magent-core` so that:
+#
+#   1. The chip-agnostic trait surface can evolve independently of the
+#      core agent engine.
+#   2. The 1200+ line nRF52 simulator (`nrf52::sim`) does not need to
+#      be compiled by every crate that just wants the trait surface.
+#   3. Firmware crates can depend on `magent-hal` directly (or via the
+#      `magent_core::hal` re-export shim) without pulling in `magent-core`
+#      and its full build graph.
+#
+# For backwards compatibility, `magent-core` re-exports every public
+# item here under its old path (`magent_core::hal::*`,
+# `magent_core::nrf52_hal::*`), so existing user code keeps compiling
+# unchanged. New code is encouraged to import from `magent_hal::*`
+# directly.
+# ---------------------------------------------------------------------------
+
+[dependencies]
+# `heapless` is used by the rich nRF52 simulator (BLE advertising data
+# struct keeps a fixed-capacity service-UUID list). It's also used by
+# `magent-core`, so the workspace already has it pinned.
+heapless = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Lints
+# ---------------------------------------------------------------------------
+[lints]
+workspace = true

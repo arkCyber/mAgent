@@ -1,0 +1,6 @@
+[target.thumbv7em-none-eabihf]
+# Use the official ARM embedded cross-compilation Docker image
+image = "ghcr.io/rust-embedded/cross:nightly-thumbv7em-none-eabihf"
+
+[build]
+default-target = "thumbv7em-none-eabihf"

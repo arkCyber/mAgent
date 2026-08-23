@@ -1,0 +1,32 @@
+[toolchain]
+# ---------------------------------------------------------------------------
+# PATCHED (MicroAgent): pin the working stable toolchain.
+# ---------------------------------------------------------------------------
+# The default `stable-aarch64-apple-darwin` resolves to whichever
+# stable release rustup points at, which after rustup-1.29 re-installs
+# is rustc 1.97.1. We've confirmed:
+#   * rustc + cargo Mach-O arm64 binaries present in
+#     ~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/
+#   * RISC-V bare-metal targets riscv32{imc,imac,imafc}-unknown-none-elf
+#     installed (Tier 2, pre-built)
+#   * rust-src component installed (needed by `build-std`)
+#   * std source tree present in lib/rustlib/src/rust/library/std/
+#     (verified file sys/fs/unix.rs exists)
+#
+# The `riscv32imac-esp-espidf` Tier 3 target has no pre-built std;
+# `build-std` rebuilds std from source for that target. We use a
+# stable channel override (`RUSTC_BOOTSTRAP=1` set via the workspace-
+# level `cargo config.toml`'s `[build]` env on macOS) so that
+# build-std is allowed on stable.
+#
+# Why not nightly? Nightly 1.100 from `rustup update` has a `gimli`
+# bootstrap breakage (`alloc::sync::Arc` on bare-metal RISC-V), and
+# nightly 1.95.0.0 (Xtensa Rust fork) lacks RISC-V rust-std prebuilts.
+# Stable 1.97.1 + RUSTC_BOOTSTRAP is the only path that reaches a
+# working toolchain today.
+# TRACE: REQ-FW-001.
+# ---------------------------------------------------------------------------
+channel = "stable-aarch64-apple-darwin"
+components = ["rust-src", "rustfmt", "clippy"]
+targets = ["riscv32imac-unknown-none-elf", "riscv32imafc-unknown-none-elf", "riscv32imc-unknown-none-elf"]
+profile = "minimal"

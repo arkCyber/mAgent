@@ -1,0 +1,13 @@
+[package]
+name = "topic-watcher"
+version = "0.1.0"
+edition = "2021"
+description = "Topic watcher: head/tail window compression for conversation history"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "topic-watcher"
+path = "src/main.rs"
+
+[dependencies]

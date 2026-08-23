@@ -1,0 +1,35 @@
+[package]
+name = "magent-mqtt-ingest"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "End-to-end MQTT ingestion: rumqttc::AsyncClient → MqttAdapter → IngressGateway (Signed mode) with web3 envelope verification"
+publish = false
+
+[[bin]]
+name = "magent-mqtt-ingest"
+path = "src/main.rs"
+
+[dependencies]
+# Chip-agnostic core. We enable `ingress` (so we get IngressGateway),
+# `mqtt` (the in-memory MqttAdapter + push_frame), and `web3`
+# (Identity + SignedMessage + verify_signed_message). Crucially we
+# do NOT enable `std` here via a separate feature — the core
+# already pulls `std` transitively through `web3` because that's
+# where the cryptography lives.
+magent-core = { path = "../../magent-core", features = ["ingress", "mqtt", "web3"] }
+
+# Real MQTT client. Pulls in `tokio` and friends, which is exactly
+# why this lives in an `examples/` crate and not in `magent-core`.
+#
+# We deliberately match the rumqttc version pinned by `mqtt-roundtrip`
+# so the two examples exercise the same wire-level behaviour.
+rumqttc = { version = "0.24", default-features = false }
+
+# Broker helpers re-used from `mqtt-roundtrip`. Using `path =` keeps
+# the example self-contained (no publishing step needed) and avoids
+# copying the ~250-line broker source.
+bytes = "1"
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }

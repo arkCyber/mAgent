@@ -1,0 +1,16 @@
+{
+  "payload_type": "magent/run_report:v1",
+  "issued_at_unix": 1786853969,
+  "payload": {
+    "answer": "Task completed successfully",
+    "iterations": 2,
+    "tool_calls": 1,
+    "provider": "mock",
+    "using_ollama": false,
+    "state": "Finished",
+    "final_messages": 5,
+    "approx_tokens": 678
+  },
+  "signer": "did:key:z6MkwBBZnXvhFGvHZqNsBP1hG2i1XM9v2fX7pUu6oZ4fgzKQ",
+  "signature_hex": "70fabb30d48799a677a881816b79563167ba6ef8e8c0317ac237ae7c6ae4e6fa7d9b46300cd66572f02d52ab20c5d103aaa5b7be54a6252d0527bd140ed2350b"
+}

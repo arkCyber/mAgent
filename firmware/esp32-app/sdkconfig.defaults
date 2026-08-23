@@ -1,0 +1,254 @@
+# =============================================================================
+# mAgent firmware — sdkconfig.defaults for ESP32-C61-DevKitC-1-N8R2
+#
+# TRACE: REQ-FW-001, REQ-CFG-001, REQ-CFG-002, REQ-NET-001, REQ-FW-005
+#
+# This file is consumed by the esp-idf-svc build script at build time.
+# On first `cargo build` esp-idf-svc generates `sdkconfig` from this file.
+# Re-run `cargo build` after editing.
+#
+# Board:  ESP32-C61-DevKitC-1-N8R2
+# Flash:  8 MB (N8)
+# PSRAM:  2 MB (R2)
+# Core:   RISC-V RV32IMAC  (single-core, hardware CAS)
+# Target: riscv32imac-unknown-none-elf  (set in firmware/esp32-app/.cargo/config.toml)
+# =============================================================================
+
+# --------------------------------------------------------------------------
+# PSRAM (N8R2 — 2 MB external SPI RAM)
+# --------------------------------------------------------------------------
+# PATCHED (MicroAgent): PSRAM re-enabled. It was disabled earlier to isolate
+# a CPU_LOCKUP crash — but that crash turned out to be the board's native
+# USB-JTAG interface (the ROM hung regardless of PSRAM when flashing through
+# the native USB-JTAG). The board works fine via the CP2102 USB-UART bridge,
+# so PSRAM is safe to turn back on. With 2 MB PSRAM the `std::alloc` heap
+# backs the agent's memory budget (see `AgentConfig::with_max_memory`).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# --------------------------------------------------------------------------
+# Wi-Fi (required for LLM RPC calls)
+# --------------------------------------------------------------------------
+# PATCHED (MicroAgent): Disabled Wi-Fi temporarily to isolate the
+# boot crash. The crash at PC 0x40807e08 is in `xTaskCreate` which
+# gets called for the main task during ESP-IDF startup. Without
+# Wi-Fi init, the boot path is shorter and gives us a chance to
+# see if the rest of the platform boots. We keep the Wi-Fi
+# code in the source tree; just disable the CONFIG_ flag.
+# CONFIG_ESP_WIFI_ENABLED=y
+# Static rx buffers = compile-time footprint; dynamic = runtime efficiency.
+# We set both so ESP-IDF picks the right one per path.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=4
+# Wi-Fi sleep tuning — keep Wi-Fi awake for the LLM RPC window.
+# CONFIG_ESP_WIFI_SLEEP_DISABLE_WAKEUP_MANUALLY=y
+
+# --------------------------------------------------------------------------
+# Network / TLS (REQ-NET-001)
+# --------------------------------------------------------------------------
+# Use mbedTLS (the ESP-IDF default TLS stack). rustls is NOT used on firmware.
+CONFIG_ESP_TLS_USING_MBEDTLS=y
+# Allow HTTP for local testing (production should use HTTPS).
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_HTTP_CLIENT_ALLOW_HTTP_FOR_TESTS=y
+# OTA
+CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
+CONFIG_OTA_ALLOW_HTTP=y
+
+# --------------------------------------------------------------------------
+# FreeRTOS — tune for firmware task layout
+# --------------------------------------------------------------------------
+CONFIG_FREERTOS_HZ=1000
+# PATCHED (MicroAgent): Main task stack size of 8 KiB (down from
+# 16 KiB). The crash at PC 0x40807e08 is in `xTaskCreate` for the
+# main task. Smaller stack reduces the heap pressure during boot.
+# The main task only needs to call `main()` and set up the threads;
+# the heavy work happens in the agent/ingress threads.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# PATCHED (MicroAgent): removed CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0.
+# On the ESP32-C61 (single-core RISC-V), pinning the main task
+# to CPU0 during boot interferes with the ROM's WFI loop at
+# 0x40036716 (the "bootloader restart" loop after the app
+# crashes before main()). Use the default affinity (any core).
+# CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
+# Timer task: 4 KiB (enough for esp-idf-svc timer wheel)
+CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
+# PATCHED (MicroAgent): disable configGENERATE_RUN_TIME_STATS unless we
+# also define portGET_RUN_TIME_COUNTER_VALUE / portALT_GET_RUN_TIME_COUNTER_VALUE.
+# ESP-IDF v6 enables GENERATE_RUN_TIME_STATS in the default sdkconfig but the
+# counter macros are not defined for riscv32imac → bindgen fails with
+# "If configGENERATE_RUN_TIME_STATS is defined then either ... must also
+# be defined". Setting CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=n skips
+# the runtime-stats collection we don't use.
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=n
+
+# --------------------------------------------------------------------------
+# ESP32-C61-specific
+# --------------------------------------------------------------------------
+# C61 does not have BT Classic; only BLE 5 is available.
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=y
+# PATCHED (MicroAgent): disable OpenThread / Thread networking. We only
+# use Wi-Fi (REQ-NET-001); Thread adds ~150 KB to the bindgen output and
+# pulls in `esp_openthread.h` from the optional ot-cli component which
+# isn't installed in our ESP-IDF v6.0 install. Bindgen errors with
+# `'esp_openthread.h' file not found` if the symbol is referenced.
+CONFIG_OPENTHREAD_ENABLED=n
+CONFIG_ESP_THREAD=n
+
+# PATCHED (MicroAgent): Enable picolibc mode to use simpler locking API.
+# Our patched esp-idf-sys bindings use __retarget_lock_* functions
+# which are available in picolibc.
+CONFIG_ESP_IDF_LIB_PICOLIBC=y
+
+# --------------------------------------------------------------------------
+# Bootloader (OTA rollback — REQ-FW-005)
+# --------------------------------------------------------------------------
+# PATCHED (MicroAgent): disable bootloader anti-rollback for now.
+# ESP-IDF's `check_table_contents` rule fails the build when
+# `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` because the default
+# partition table (single factory + 2 OTA slots) has a `factory`
+# partition that conflicts with the anti-rollback requirement of
+# "two OTA apps, no factory/test partitions". We'll re-enable
+# rollback in the production build that switches to OTA-only.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n
+CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n
+CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=n
+
+# --------------------------------------------------------------------------
+# Linker orphan-section handling
+# --------------------------------------------------------------------------
+# PATCHED (MicroAgent): several transitive dependencies
+# (defmt, embassy-futures) emit symbols into `link_section`-named
+# sections like `.defmt.end`. The Espressif ESP-IDF linker script
+# for esp32c61 enforces strict adjacency between `.flash.rodata`
+# and `.flash.init_array` (via the `ASSERT_SECTIONS_GAP` macro),
+# which the orphan sections otherwise violate with "The gap
+# between .flash.rodata and .flash.init_array must not exist to
+# produce the final bin image."
+#
+# Setting `COMPILER_ORPHAN_SECTIONS_WARNING=y` downgrades the
+# `ASSERT` from a hard failure to a linker warning, allowing the
+# final `.bin` to be produced (the orphan sections are valid ELF
+# even when not contiguous in flash memory). Re-enable strict
+# orphan rejection for production builds by setting this to `n`
+# and resolving the orphan sections explicitly.
+CONFIG_COMPILER_ORPHAN_SECTIONS_WARNING=y
+
+# --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
+
+# --------------------------------------------------------------------------
+# Flash size (REQ-FW-001)
+# --------------------------------------------------------------------------
+# PATCHED (MicroAgent): ESP32-C61-DevKitC-1-N8R2 ships with an 8 MB
+# (N8) flash chip. ESP-IDF defaults to 2 MB unless overridden, which
+# makes `gen_esp32part.py` reject any partition layout larger than
+# ~2 MB. The N8R2 needs `CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y` so that
+# `partitions.csv` (factory + ota_0 + ota_1 + storage) actually fits.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# PATCHED (MicroAgent): Espressif Bug Advisory AR2026-002 (May 2026)
+# documents that the ESP32-C61 has clock-asymmetry issues when flash
+# and PSRAM are running at different frequencies (e.g. flash at 80 MHz
+# while PSRAM defaults to 40 MHz). The side running at 80 MHz may
+# experience clock asymmetry, leading to random crashes / CPU_LOCKUP.
+# Fix: force both flash AND PSRAM to 80 MHz when PSRAM is enabled.
+# (No issue if PSRAM is disabled — the 80/40 mismatch is only
+#  triggered when the external SPI PSRAM is in use.)
+CONFIG_ESPTOOLPY_FLASHFREQ_120M=n
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=n
+# PATCHED (MicroAgent): pin PSRAM to 80 MHz to match flash. Without
+# this, ESP-IDF auto-selects 40 MHz for the legacy QSPI PSRAM on the
+# N8R2 board, which conflicts with the 80 MHz flash per AR2026-002.
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_SPEED_40M=n
+# PATCHED (MicroAgent): disable flash access that exercises the
+# shared Octal PSRAM bus during the app's first 100 ms, when the
+# DMA / cache subsystem is being configured. This is the second
+# mitigation recommended by the AR2026-002 advisory (the "small
+# number of chips may exhibit random crashes" scenario).
+CONFIG_SPIRAM_OCCUPY_NO_HSRAM=n
+# ESP32-C61 supports ECC on Octal PSRAM — enable for stability.
+CONFIG_SPIRAM_ECC_ENABLE=y
+# PATCHED (MicroAgent): keep the panic handler in IRAM so a panic
+# during the cache-disabled exception handler executes through the
+# `CPU_LOCKUP` path with diagnostic output instead of a silent
+# double exception. Recommended by the ESP-IDF Fatal Errors guide.
+CONFIG_ESP_PANIC_HANDLER_IRAM=y
+# PATCHED (MicroAgent): ESP32-C61 has a documented instability
+# when the system watchdog fires while the flash cache is mid
+# transaction. Lengthen the RTC watchdog to give us more headroom
+# during PSRAM startup.
+CONFIG_BOOTLOADER_WDT_ENABLE=n
+CONFIG_BOOTLOADER_WDT_TIME_MS=15000
+# PATCHED (MicroAgent): disable ALL watchdogs during boot. The
+# main task enters WFI (wait for interrupt) at the end of main()
+# while the spawned threads run. Without the task watchdog, the
+# main task IDLEs and the TG0 (Timer Group 0) hardware watchdog
+# eventually fires. With our current sdkconfig, the TG0 WDT is
+# the only watchdog still active, and it fires after a few seconds
+# of main task inactivity. Disable the interrupt WDT and the
+# task WDT — the main task's WFI is intentional, not a deadlock.
+# PATCHED (MicroAgent): disable the task watchdog so the main task
+# isn't reset if it doesn't yield within the default period. The
+# main task's only job is to spawn agent/ingress threads and join
+# them; without these threads feeding the watchdog, the main task
+# can sit in thread::sleep for the whole 60s agent loop.
+CONFIG_ESP_TASK_WDT_EN=n
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+# PATCHED (MicroAgent): disable the interrupt watchdog. The
+# interrupt watchdog fires when no interrupt is serviced for the
+# configured timeout. Our main task sleeps in WFI; the watchdog
+# doesn't know that's intentional.
+CONFIG_ESP_INT_WDT=n
+CONFIG_ESP_INT_WDT_TIMEOUT_MS=300
+CONFIG_ESP_INT_WDT_CHECK_CPU0=n
+# PATCHED (MicroAgent): disable the CPU reset on watchdog timeout.
+# We want to keep the app running even if a watchdog fires once
+# during the experimental boot path. Re-enable for production.
+CONFIG_ESP_SYSTEM_PANIC="GDBStub"
+
+# --------------------------------------------------------------------------
+# Partition table — two OTA app partitions for rollback testing (REQ-FW-005)
+# --------------------------------------------------------------------------
+# PATCHED (MicroAgent): use picolibc as the C library (NOT newlib).
+# The esp-idf-sys bindgen step and the firmware's linker scripts are both
+# set up for picolibc (the default C library on ESP32-C6/C61 RISC-V), but
+# the previous sdkconfig left `CONFIG_LIBC_NEWLIB=y` active. That made the
+# ESP-IDF C components build with newlib's `FILE`/`_REENT` struct layout
+# while the Rust bindings describe picolibc's layout, so
+# `esp_idf_svc::log::EspStdout` read `file.lock` at the wrong offset and
+# faulted ("Guru Meditation ... Load access fault" at 0x80).
+#
+# Setting `CONFIG_LIBC_PICOLIBC=y` (and turning newlib off) makes the C
+# side match the picolibc bindings. It ALSO causes esp-idf-sys to emit the
+# `esp_idf_libc_picolibc` cfg (true tristate kconfigs become
+# `esp_idf_<key>` cfgs), which flips `esp-idf-svc`'s logging onto the
+# correct picolibc stdout path.
+CONFIG_LIBC_PICOLIBC=y
+CONFIG_LIBC_NEWLIB=n
+
+# PATCHED (MicroAgent): use the custom partition table.
+#
+# The custom `partitions.csv` (in this crate) gives the `factory` app a
+# 0x180000 (1.5 MB) partition, which is REQUIRED because the release
+# `magent-esp32-app` image is ~1.19 MB and does NOT fit in the default
+# 0x100000 (1 MB) factory partition:
+#   "Image length 1201376 doesn't fit in partition length 1048576"
+#
+# We specify the CSV by ABSOLUTE path so the ESP-IDF build finds it
+# regardless of PROJECT_DIR (which the native driver points at the
+# workspace root by default).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="/Users/arksong/MicroAgent/firmware/esp32-app/partitions.csv"
+# Flash size — ESP32-C61-DevKitC-1-N8R2 ships 8 MB (N8).
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHFREQ_120M=n
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y

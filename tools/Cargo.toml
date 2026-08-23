@@ -1,0 +1,85 @@
+[package]
+name = "magent-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "Host-only dev tools: benchmarks, algorithm demos, and E2E simulators for mAgent."
+
+# ---------------------------------------------------------------------------
+# This crate is intentionally a *collection of binary tools* that run on the
+# host. None of them are used by firmware builds. They are useful for:
+#
+#   - Sanity-checking the algorithms in `magent-core` (wear leveling,
+#     budget enforcement, KV-store format, etc.) without firing up an
+#     embedded target.
+#   - Running micro-benchmarks during development.
+#   - Demonstrating the end-to-end ReAct flow with a simulated LLM.
+#
+# They were originally loose `*.rs` files at the workspace root that you
+# compiled with raw `rustc`. Moving them into a proper Cargo crate gives
+# us: a single build command, consistent dep management, easy CI, and
+# automatic rebuilds when `magent-core` changes.
+# ---------------------------------------------------------------------------
+[dependencies]
+# These binaries intentionally re-implement the algorithms in plain
+# std (that's the point — they're an independent reference), so they
+# don't depend on `magent-core`. If you want them to exercise the real
+# code path, swap the local functions for
+# `magent_core::wear_leveling::WearLeveler::new()` etc.
+
+# ---------------------------------------------------------------------------
+# Binaries
+# ---------------------------------------------------------------------------
+# Each binary lives at `src/bin/<name_with_underscores>.rs` so the file
+# path stays valid as a Rust identifier (and so the file name doesn't
+# have to mirror the Cargo "no-hyphens" rule). We pin the *binary* name
+# (what `cargo run --bin <name>` accepts) to a kebab-case form because
+# that's what the README, docs, and developer muscle memory use.
+#
+# Run any of them with:
+#
+#     cargo run -p magent-tools --bin <name>
+#
+# or list them all at once:
+#
+#     cargo run -p magent-tools --bin
+# ---------------------------------------------------------------------------
+
+[[bin]]
+name = "benchmarks"
+path = "src/bin/benchmarks.rs"
+
+[[bin]]
+name = "algorithm-tests"
+path = "src/bin/algorithm_tests.rs"
+
+[[bin]]
+name = "integration-tests"
+path = "src/bin/integration_tests.rs"
+
+[[bin]]
+name = "module-integration-test"
+path = "src/bin/module_integration_test.rs"
+
+[[bin]]
+name = "config-validation-test"
+path = "src/bin/config_validation_test.rs"
+
+[[bin]]
+name = "e2e-agent-test"
+path = "src/bin/e2e_agent_test.rs"
+
+# ---------------------------------------------------------------------------
+# Profile
+# ---------------------------------------------------------------------------
+# Release builds are opt-level 3 — these tools spend most of their
+# time in stdlib I/O so we want full speed. The override lives in
+# the workspace root's `Cargo.toml` under
+# `[profile.release.package."magent-tools"]` so it survives a
+# `cargo clean` and shows up in one place for the whole workspace.

@@ -1,0 +1,36 @@
+[package]
+name = "magent-nrf52-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+magent-core = { path = "../../magent-core", features = ["nrf52"] }
+embassy-executor = { workspace = true, features = ["arch-cortex-m", "executor-thread"] }
+embassy-time.workspace = true
+embassy-nrf = { workspace = true, features = ["nrf52840", "time-driver-rtc1", "gpiote"] }
+embassy-sync.workspace = true
+embedded-hal.workspace = true
+embedded-hal-async.workspace = true
+defmt.workspace = true
+defmt-rtt.workspace = true
+panic-probe.workspace = true
+cortex-m.workspace = true
+cortex-m-rt.workspace = true
+static_cell.workspace = true
+embedded-alloc = "0.5"
+embedded-storage.workspace = true
+embedded-storage-async.workspace = true
+nrf-softdevice = { version = "0.1.0", features = ["nrf52840", "ble-peripheral", "ble-central", "s140"] }
+nrf52840-pac = "0.12"
+
+[features]
+default = ["ble"]
+ble = []
+thread = []
