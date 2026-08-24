@@ -180,6 +180,21 @@ impl TraceSink for OutputTraceSink {
     }
 }
 
+/// Truncate `s` to at most `max` bytes without ever splitting a UTF-8
+/// code point. `&s[..max]` panics if `max` lands in the middle of a
+/// multi-byte character, which the human trace output hits whenever the
+/// LLM responds with non-ASCII text (e.g. Chinese weather answers).
+fn truncate_utf8(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 /// Render a `TraceEvent` as a single human-readable line. Pulled
 /// out of `event` so unit tests can pin the exact output format.
 fn render_event(event: &TraceEvent) -> String {
@@ -215,7 +230,7 @@ fn render_event(event: &TraceEvent) -> String {
         ),
         TraceEvent::LlmResponse { body } => {
             if body.len() > 200 {
-                format!("{}…", &body[..200])
+                format!("{}…", truncate_utf8(body, 200))
             } else {
                 body.clone()
             }
@@ -1811,6 +1826,26 @@ mod tests {
     }
 
     #[test]
+    fn render_event_truncation_never_splits_multibyte_utf8() {
+        // Regression: `&body[..200]` panicked with "end byte index 200 is
+        // not a char boundary" whenever the LLM replied with non-ASCII text
+        // (e.g. Chinese weather answers), because byte 200 landed inside a
+        // multi-byte character. Rendering must be char-boundary-safe.
+        let long_cn = "天气".repeat(300); // 4 bytes per char
+        let body = render_event(&TraceEvent::LlmResponse { body: long_cn.clone() });
+        assert!(body.len() < long_cn.len());
+        assert!(body.ends_with('…'));
+        // The truncated prefix must be valid UTF-8 (no panic above) and
+        // split on a char boundary.
+        assert!(body.is_char_boundary(0));
+
+        // `truncate_utf8` itself must never return an interior index.
+        let s = "a天气b天气c";
+        let t = truncate_utf8(s, 7);
+        assert!(std::str::from_utf8(t.as_bytes()).is_ok());
+    }
+
+    #[test]
     fn render_event_tool_error_marks_failure() {
         let body = render_event(&TraceEvent::ToolCallEnd {
             name: "read_sensor".to_string(),
@@ -2350,7 +2385,7 @@ impl TraceSink for ReplTraceSink {
             }
             TraceEvent::LlmResponse { body } => {
                 let preview = if body.len() > 150 {
-                    format!("{}...", &body[..150])
+                    format!("{}...", truncate_utf8(&body, 150))
                 } else {
                     body.clone()
                 };

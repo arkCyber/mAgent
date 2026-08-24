@@ -530,6 +530,23 @@ impl Message {
         }
     }
 
+    /// Build an assistant tool-call message that carries the same
+    /// `tool_call_id` the corresponding tool-result message will use.
+    ///
+    /// DeepSeek (and OpenAI-compatible APIs generally) require the
+    /// assistant's `tool_calls[].id` to match the follow-up `tool`
+    /// message's `tool_call_id`; a mismatch makes the API reject the
+    /// request with "tool_call_ids did not have response messages".
+    #[inline]
+    pub fn assistant_tool_call_id(call: ToolCall, tool_call_id: &str) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_call: Some(call),
+            tool_call_id: Some(tool_call_id.to_string()),
+        }
+    }
+
     /// Build a tool-result message linked to the assistant's
     /// tool-call by `tool_call_id`.
     #[inline]
@@ -713,6 +730,7 @@ WEB (host-side only, requires internet):
 - web_search(query): Search the web via DuckDuckGo and return up to 8 hits as JSON with title/url/snippet.
 - fetch_url(url): HTTP GET a URL and return the page body as plain text (HTML stripped, scripts removed).
 - webpage_summary(url, query?): Fetch a URL and return a short extractive summary of the page, optionally ranked by relevance to `query`.
+- get_weather(city): Current conditions + 3-day forecast for a city as compact JSON (Open-Meteo, no API key). Prefer this over fetch_url for weather questions.
 
 Rules:
 1. ALWAYS respond with ONLY JSON
@@ -1303,9 +1321,20 @@ impl DeepSeekClient {
     ) -> std::result::Result<(), String> {
         use std::io::Write;
         buf.push(b'{');
+        // We explicitly disable DeepSeek's thinking mode. DeepSeek-V4 is a
+        // reasoning model: with thinking enabled it emits a `reasoning_content`
+        // field on every assistant message and then REQUIRES that field to be
+        // passed back verbatim on the next turn (the API rejects the request
+        // with "reasoning_content in the thinking mode must be passed back").
+        // Our ReAct loop rebuilds assistant messages from `parse_tool_call` /
+        // `parse_result` and does not carry `reasoning_content`, so any
+        // multi-turn (tool) conversation would fail and silently fall back to
+        // the canned simulated response. Disabling thinking keeps the wire
+        // format compatible with the loop and makes tool calling work across
+        // turns (verified against deepseek-v4-pro / v4-flash / deepseek-chat).
         write!(
             buf,
-            "\"model\":\"{}\",\"stream\":false,\"temperature\":{},\"max_tokens\":{}",
+            "\"model\":\"{}\",\"thinking\":{{\"type\":\"disabled\"}},\"stream\":false,\"temperature\":{},\"max_tokens\":{}",
             escape_json(model),
             sampling.temperature,
             sampling.num_predict
@@ -1537,6 +1566,261 @@ fn write_message_json(buf: &mut Vec<u8>, m: &Message) -> std::io::Result<()> {
 fn write_message_into(buf: &mut Vec<u8>, m: &Message) -> std::result::Result<(), String> {
     write_message_json(buf, m).map_err(|e| format!("Write msg: {}", e))
 }
+
+// ============================================================================
+// Tool-call wire-format tolerant parsing
+// ============================================================================
+
+/// Remove a surrounding markdown code fence (and any language tag) from an
+/// LLM response so both JSON and XML tool-call payloads parse cleanly even
+/// when the model wraps them in ```` ```json ```` / ```` ```xml ```` blocks.
+fn strip_code_fence(s: &str) -> String {
+    let t = s.trim();
+    if let Some(body) = t.strip_prefix("```") {
+        // Drop the trailing fence, then any leading language-tag line.
+        let body = body.strip_suffix("```").unwrap_or(body);
+        match body.find('\n') {
+            Some(i) => body[i + 1..].trim().to_string(),
+            None => body.trim().to_string(),
+        }
+    } else {
+        t.to_string()
+    }
+}
+
+/// Find `needle` inside `haystack`, returning its byte offset.
+fn find_sub(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.find(needle)
+}
+
+/// Extract the value of a double-quoted XML attribute, e.g. `name="X"`.
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let marker = format!("{attr}=\"");
+    let idx = tag.find(&marker)?;
+    let rest = &tag[idx + marker.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Parse an Anthropic-style tool-use block:
+///
+/// ```xml
+/// <invoke name="fetch_url">
+///   <parameter name="url">https://example.com</parameter>
+/// </invoke>
+/// ```
+///
+/// Both the bare (`<invoke>` / `<parameter>`) and Claude-namespace
+/// (`<antml:invoke>` / `<antml:parameter>`) spellings are accepted. Values
+/// are surfaced as JSON strings. Returns `None` if no usable block is found.
+fn parse_anthropic_tool_call(
+    response: &str,
+) -> Option<(String, HashMap<String, serde_json::Value>)> {
+    // Normalise the `antml:` namespace prefix away so one code path handles
+    // both spellings.
+    let s = response.replace("<antml:", "<").replace("</antml:", "</");
+
+    let invoke_off = find_sub(&s, "<invoke")?;
+    let invoke_tag_end = find_sub(&s[invoke_off..], ">")? + invoke_off;
+    let invoke_tag = &s[invoke_off..invoke_tag_end];
+    let name = extract_attr(invoke_tag, "name")?;
+    if name.is_empty() {
+        return None;
+    }
+
+    let close_off = find_sub(&s[invoke_tag_end..], "</invoke>")? + invoke_tag_end;
+    let inner = &s[invoke_tag_end..close_off];
+
+    let mut args: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pos = 0;
+    while let Some(p) = find_sub(&inner[pos..], "<parameter") {
+        let p_abs = pos + p;
+        let tag_end = find_sub(&inner[p_abs..], ">")? + p_abs;
+        let tag = &inner[p_abs..tag_end];
+        if let Some(key) = extract_attr(tag, "name") {
+            let val_start = tag_end + 1;
+            if let Some(body_close_rel) = find_sub(&inner[val_start..], "</parameter>") {
+                let body_close = val_start + body_close_rel;
+                let value = inner[val_start..body_close].trim().to_string();
+                args.insert(key, serde_json::Value::String(value));
+                pos = body_close + "</parameter>".len();
+                continue;
+            }
+        }
+        // Malformed parameter block — stop to avoid an infinite loop.
+        break;
+    }
+
+    if args.is_empty() {
+        return None;
+    }
+    Some((name, args))
+}
+
+/// Minimum byte length for a plain-text (non-JSON, non-fenced) response to
+/// be treated as a final result rather than mid-loop chatter. Keeps short
+/// interjections ("OK", "Let me check") from terminating the loop early while
+/// still capturing real prose answers.
+const MIN_PROSE_RESULT_LEN: usize = 12;
+
+/// Convert a JSON `result` value to its canonical string form, preferring the
+/// most specific numeric type so an integer doesn't silently become "42.0".
+fn result_value_to_string(result: &serde_json::Value) -> String {
+    if let Some(n) = result.as_i64() {
+        return n.to_string();
+    }
+    if let Some(n) = result.as_u64() {
+        return n.to_string();
+    }
+    if let Some(n) = result.as_f64() {
+        return format!("{:.1}", n);
+    }
+    if let Some(s) = result.as_str() {
+        return s.to_string();
+    }
+    result.to_string()
+}
+
+/// Heuristic guard: does this trimmed string read like mid-plan chatter
+/// ("I'll now read the sensor…") rather than a final answer? Used so the
+/// prose fallback in `parse_result` doesn't terminate the loop prematurely.
+fn looks_like_chatter(s: &str) -> bool {
+    let low = s.to_lowercase();
+    const PREFIXES: [&str; 14] = [
+        "i will",
+        "i'll",
+        "let me",
+        "let's",
+        "now ",
+        "next",
+        "first",
+        "ok",
+        "okay",
+        "sure",
+        "alright",
+        "then ",
+        "to continue",
+        "on the other hand",
+    ];
+    PREFIXES.iter().any(|p| low.starts_with(p))
+}
+
+/// Find the first *balanced* JSON object `{...}` in `s`, skipping any prose or
+/// markdown that precedes it. Returns the object substring including braces.
+///
+/// This is how we recover a tool call or result that a model wrapped in
+/// surrounding text — a common format violation. The scanner tracks string
+/// literals and brace depth so it doesn't stop at a `}` inside a string value.
+fn find_json_object(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let mut depth = 0i32;
+            let mut j = i;
+            let mut in_string = false;
+            let mut escaped = false;
+            while j < bytes.len() {
+                let b = bytes[j];
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if b == b'\\' {
+                        escaped = true;
+                    } else if b == b'"' {
+                        in_string = false;
+                    }
+                } else {
+                    match b {
+                        b'"' => in_string = true,
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some(&s[i..=j]);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            // Unbalanced starting at `i` — try the next opening brace.
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Shared tool-call recogniser over a parsed JSON value. Covers the three JSON
+/// shapes mAgent emits/accepts; returns `None` if `json` isn't a tool call.
+fn parse_tool_call_from_json(
+    json: &serde_json::Value,
+) -> Option<(String, HashMap<String, serde_json::Value>)> {
+    // Format 1: {"tool": "name", "args": {...}}
+    if let (Some(tool), Some(args)) = (json.get("tool"), json.get("args")) {
+        let name = tool.as_str()?.to_string();
+        let args_map: HashMap<String, serde_json::Value> = args
+            .as_object()?
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        return Some((name, args_map));
+    }
+
+    // Format 2: OpenAI-style "tool_calls" array.
+    if let Some(tcs) = json.get("tool_calls").and_then(|v| v.as_array()) {
+        if let Some(first) = tcs.first() {
+            if let Some(func) = first.get("function") {
+                let name = func
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(String::from)?;
+                let args_map: HashMap<String, serde_json::Value> =
+                    if let Some(args_str) = func.get("arguments").and_then(|a| a.as_str()) {
+                        // arguments is itself a JSON string
+                        serde_json::from_str(args_str).unwrap_or_default()
+                    } else if let Some(args_obj) =
+                        func.get("arguments").and_then(|a| a.as_object())
+                    {
+                        args_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    } else {
+                        HashMap::new()
+                    };
+                return Some((name, args_map));
+            }
+        }
+    }
+
+    // Format 3: {"<tool_name>": {"args": {...}}} - generic, no whitelist.
+    if let Some(obj) = json.as_object() {
+        for key in obj.keys() {
+            if matches!(key.as_str(), "result" | "error" | "reasoning" | "thought") {
+                continue;
+            }
+            if let Some(tool_obj) = obj.get(key) {
+                if tool_obj.is_object() {
+                    let name = key.clone();
+                    let args_map: HashMap<String, serde_json::Value> =
+                        if let Some(args) = tool_obj.get("args").and_then(|a| a.as_object()) {
+                            args.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                        } else if let Some(args) = tool_obj.as_object() {
+                            args.iter()
+                                .filter(|(k, _)| *k != "args")
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect()
+                        } else {
+                            HashMap::new()
+                        };
+                    return Some((name, args_map));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 
 // ============================================================================
 // ReAct agent runner
@@ -2067,7 +2351,13 @@ while self.state != AgentState::Finished && self.state != AgentState::Error {
         // it as a structured tool_call (no need to also keep `content`).
         if let Some((name, args)) = self.parse_tool_call(&response) {
             let tc = ToolCall { name: name.clone(), arguments: args.clone() };
-            self.messages.push(Message::assistant_tool_call(tc.clone()));
+            // Allocate the call id up-front and reuse it for BOTH the
+            // assistant tool-call message and the tool-result message.
+            // DeepSeek rejects the request if these ids differ.
+            self.tool_call_count += 1;
+            let call_id = format!("call_{}", self.tool_call_count);
+            self.messages
+                .push(Message::assistant_tool_call_id(tc.clone(), &call_id));
             self.emit_trace(TraceEvent::ToolCallStart {
                 name: name.clone(),
                 arguments: serde_json::to_string(&tc.arguments)
@@ -2086,11 +2376,7 @@ while self.state != AgentState::Finished && self.state != AgentState::Error {
                 result: result_content.clone(),
                 success,
             });
-            self.tool_call_count += 1;
-            self.messages.push(Message::tool(
-                &format!("call_{}", self.tool_call_count),
-                &result_content,
-            ));
+            self.messages.push(Message::tool(&call_id, &result_content));
             if success {
                 self.state = AgentState::Executing;
             } else {
@@ -2253,93 +2539,78 @@ while self.state != AgentState::Finished && self.state != AgentState::Error {
         &self,
         response: &str,
     ) -> Option<(String, HashMap<String, serde_json::Value>)> {
-        let json: serde_json::Value = serde_json::from_str(response).ok()?;
+        let cleaned = strip_code_fence(response);
 
-        // Format 1: {"tool": "name", "args": {...}}
-        if let (Some(tool), Some(args)) = (json.get("tool"), json.get("args")) {
-            let name = tool.as_str()?.to_string();
-            let args_map: HashMap<String, serde_json::Value> = args
-                .as_object()?
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            return Some((name, args_map));
+        // 1. Whole response is a JSON object that describes a tool call.
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&cleaned) {
+            if let Some(found) = parse_tool_call_from_json(&json) {
+                return Some(found);
+            }
         }
 
-        // Format 2: OpenAI-style "tool_calls" array.
-        if let Some(tcs) = json.get("tool_calls").and_then(|v| v.as_array()) {
-            if let Some(first) = tcs.first() {
-                if let Some(func) = first.get("function") {
-                    let name = func
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .map(String::from)?;
-                    let args_map: HashMap<String, serde_json::Value> = if let Some(args_str) =
-                        func.get("arguments").and_then(|a| a.as_str())
-                    {
-                        // arguments is itself a JSON string
-                        serde_json::from_str(args_str).unwrap_or_default()
-                    } else if let Some(args_obj) = func.get("arguments").and_then(|a| a.as_object()) {
-                        args_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                    } else {
-                        HashMap::new()
-                    };
-                    return Some((name, args_map));
+        // 2. The model wrapped the tool call in prose/markdown (a common
+        //    format violation). Recover the first balanced JSON object and
+        //    re-parse it.
+        if let Some(obj) = find_json_object(&cleaned) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(obj) {
+                if let Some(found) = parse_tool_call_from_json(&json) {
+                    return Some(found);
                 }
             }
         }
 
-        // Format 3: {"<tool_name>": {"args": {...}}} - generic, no whitelist.
-        if let Some(obj) = json.as_object() {
-            // Skip well-known control keys.
-            for key in obj.keys() {
-                if matches!(key.as_str(), "result" | "error" | "reasoning" | "thought") {
-                    continue;
-                }
-                if let Some(tool_obj) = obj.get(key) {
-                    if tool_obj.is_object() {
-                        let name = key.clone();
-                        let args_map: HashMap<String, serde_json::Value> = if let Some(args) =
-                            tool_obj.get("args").and_then(|a| a.as_object())
-                        {
-                            args.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                        } else if let Some(args) = tool_obj.as_object() {
-                            // The whole object IS the args (skip "args" key).
-                            args.iter()
-                                .filter(|(k, _)| *k != "args")
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect()
-                        } else {
-                            HashMap::new()
-                        };
-                        return Some((name, args_map));
-                    }
-                }
-            }
-        }
-
-        None
+        // 3. Anthropic-style tool use. Some providers (and some model
+        //    checkpoints) emit `<invoke name="X"><parameter name="k">v</
+        //    parameter></invoke>` (optionally namespace-prefixed as
+        //    `<antml:invoke>`) instead of our JSON shape.
+        parse_anthropic_tool_call(&cleaned)
     }
 
     #[doc(hidden)]
     pub fn parse_result(&self, response: &str) -> Option<String> {
-        let json: serde_json::Value = serde_json::from_str(response).ok()?;
-        let result = json.get("result")?;
-        // Try the most-specific types first so a JSON integer doesn't
-        // silently become "42.0".
-        if let Some(n) = result.as_i64() {
-            return Some(n.to_string());
+        // 1. Strict OpenAI-style {"result": ...}.
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(response) {
+            if let Some(result) = json.get("result") {
+                return Some(result_value_to_string(result));
+            }
         }
-        if let Some(n) = result.as_u64() {
-            return Some(n.to_string());
+
+        // 2. A fenced block (code or JSON): the inner content IS the answer.
+        //    This is how a model that's asked to write code (but forgets the
+        //    {"result":...} envelope) usually responds.
+        if response.contains("```") {
+            let cleaned = strip_code_fence(response);
+            if !cleaned.is_empty() {
+                return Some(cleaned);
+            }
         }
-        if let Some(n) = result.as_f64() {
-            return Some(format!("{:.1}", n));
+
+        // 3. A {"result": ...} object embedded anywhere in prose/markdown.
+        if let Some(obj) = find_json_object(response) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(obj) {
+                if let Some(result) = v.get("result") {
+                    return Some(result_value_to_string(result));
+                }
+            }
         }
-        if let Some(s) = result.as_str() {
-            return Some(s.to_string());
+
+        // 4. Substantial plain-text final answer. `parse_tool_call` already
+        //    ran and found no tool call, so this is either a prose answer or
+        //    mid-plan chatter. We only treat reasonably long prose that
+        //    doesn't read like a plan as a final result, so we don't
+        //    terminate the loop while the model is still explaining a
+        //    multi-step approach.
+        let t = response.trim();
+        if !t.is_empty()
+            && !t.starts_with('{')
+            && !t.starts_with('[')
+            && t.len() >= MIN_PROSE_RESULT_LEN
+            && !looks_like_chatter(t)
+        {
+            return Some(t.to_string());
         }
-        Some(result.to_string())
+
+        None
     }
 
     fn first_user_message(&self) -> String {
@@ -2481,7 +2752,9 @@ while self.state != AgentState::Finished && self.state != AgentState::Error {
                 if let Some(result) = self.parse_result(&msg.content) {
                     return Ok(result);
                 }
-                return Ok(msg.content.clone());
+                // A fenced (code) answer surfaces cleanly even when
+                // parse_result doesn't classify it as a terminal result.
+                return Ok(strip_code_fence(&msg.content));
             }
         }
         Ok("Task completed".to_string())
@@ -2578,6 +2851,10 @@ mod deepseek_client_tests {
             serde_json::from_str(body_str).expect("parse generated JSON");
         assert_eq!(parsed["model"], "deepseek-chat");
         assert_eq!(parsed["stream"], false);
+        // Thinking mode is disabled so multi-turn (tool) conversations
+        // don't trip DeepSeek's "reasoning_content must be passed back"
+        // requirement.
+        assert_eq!(parsed["thinking"]["type"], "disabled");
         assert!(parsed["messages"].is_array());
         assert_eq!(parsed["messages"][0]["role"], "system");
         assert_eq!(parsed["messages"][1]["role"], "user");

@@ -134,6 +134,7 @@ magent run --provider deepseek --model deepseek-reasoner "Solve ..."
 ```json
 {
   "model": "deepseek-chat",
+  "thinking": {"type": "disabled"},
   "messages": [
     {"role": "system", "content": "..."},
     {"role": "user",   "content": "..."}
@@ -143,6 +144,13 @@ magent run --provider deepseek --model deepseek-reasoner "Solve ..."
   "stream": false
 }
 ```
+
+> **Note:** `thinking.type` is pinned to `"disabled"` because DeepSeek-V4 is a
+> reasoning model. With thinking enabled the API returns a `reasoning_content`
+> field on assistant messages and demands it be passed back verbatim on the
+> next turn; mAgent's ReAct loop doesn't carry `reasoning_content`, so tool
+> conversations would be rejected. Disabling thinking keeps multi-turn tool
+> calls working.
 
 Response:
 

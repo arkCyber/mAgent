@@ -514,6 +514,10 @@ impl AgentSimulator {
                 Ok(s) => Ok(s),
                 Err(e) => Ok(format!("error: webpage_summary failed: {e}")),
             },
+            "get_weather" => match crate::web::get_weather(args) {
+                Ok(s) => Ok(s),
+                Err(e) => Ok(format!("error: get_weather failed: {e}")),
+            },
             _ => Err(AgentError::ConfigurationError {
                 field: "tool",
                 reason: crate::error::ConfigError::MissingField,
@@ -731,5 +735,34 @@ mod tests {
             !body.contains("missing 'url'"),
             "webpage_summary should have parsed the JSON url, got {body}"
         );
+    }
+
+    #[test]
+    fn execute_tool_routes_get_weather_with_json_args() {
+        let mut sim = AgentSimulator::new();
+        // Empty city is a cheap, network-independent failure that still
+        // proves the dispatch reached `web::get_weather` (and parsed the
+        // JSON `city` arg) rather than bouncing back as an unknown tool.
+        let result = sim.execute_tool("get_weather", r#"{"city":""}"#);
+        assert!(result.is_ok());
+        let body = result.unwrap();
+        assert!(
+            body.starts_with("error: get_weather failed"),
+            "expected get_weather to be called, got {body}"
+        );
+        assert!(
+            body.contains("empty city"),
+            "expected the empty-city guard, got {body}"
+        );
+    }
+
+    #[test]
+    fn execute_tool_routes_get_weather_with_kv_args() {
+        let mut sim = AgentSimulator::new();
+        // The embedded planner (no JSON support) emits `city=...`.
+        let result = sim.execute_tool("get_weather", "city=");
+        assert!(result.is_ok());
+        let body = result.unwrap();
+        assert!(body.contains("error: get_weather failed"));
     }
 }

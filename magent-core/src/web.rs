@@ -505,6 +505,129 @@ pub fn webpage_summary(args: &str) -> std::result::Result<String, String> {
     serde_json::to_string_pretty(&summary).map_err(|e| format!("webpage_summary: serialise: {e}"))
 }
 
+/// Map a WMO weather-interpretation code to a short human description.
+fn wmo_description(code: i64) -> &'static str {
+    match code {
+        0 => "Clear",
+        1 => "Mostly clear",
+        2 => "Partly cloudy",
+        3 => "Overcast",
+        45 | 48 => "Fog",
+        51 | 53 | 55 => "Drizzle",
+        56 | 57 => "Freezing drizzle",
+        61 | 63 | 65 => "Rain",
+        66 | 67 => "Freezing rain",
+        71 | 73 | 75 => "Snow",
+        77 => "Snow grains",
+        80 | 81 | 82 => "Rain showers",
+        85 | 86 => "Snow showers",
+        95 => "Thunderstorm",
+        96 | 99 => "Thunderstorm with hail",
+        _ => "Unknown",
+    }
+}
+
+/// Top-level tool: current conditions + a short 3-day forecast for a
+/// city, returned as compact JSON.
+///
+/// Uses Open-Meteo (no API key): geocodes the city name, then fetches
+/// the forecast. The payload is deliberately small and structured so
+/// the LLM can summarise it directly — unlike `fetch_url` on a full
+/// forecast page (75 KB), which gets head+tail truncated during
+/// compression and loses the key numbers in the middle.
+///
+/// `args` accepts both `{"city":"Beijing"}` and `city=Beijing`.
+pub fn get_weather(args: &str) -> std::result::Result<String, String> {
+    let city = extract_query(args, "city")
+        .ok_or_else(|| "get_weather: missing 'city' arg".to_string())?;
+    let city = city.trim();
+    if city.is_empty() {
+        return Err("get_weather: empty city".to_string());
+    }
+
+    let geo_url = format!(
+        "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=zh&format=json",
+        url_encode(city)
+    );
+    let geo_body = blocking_get(&geo_url)?;
+    let geo: serde_json::Value = serde_json::from_str(&geo_body)
+        .map_err(|e| format!("get_weather: geocode parse: {e}"))?;
+    let result = geo
+        .get("results")
+        .and_then(|r| r.as_array())
+        .and_then(|arr| arr.first())
+        .ok_or_else(|| format!("get_weather: no results for city '{city}'"))?;
+    let lat = result
+        .get("latitude")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| "get_weather: geocode missing latitude".to_string())?;
+    let lon = result
+        .get("longitude")
+        .and_then(|v| v.as_f64())
+        .ok_or_else(|| "get_weather: geocode missing longitude".to_string())?;
+    let resolved_name = result
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(city)
+        .to_string();
+    let country = result
+        .get("country")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let fc_url = format!(
+        "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+         &current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m\
+         &daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max\
+         &timezone=auto&forecast_days=3",
+        lat = lat,
+        lon = lon,
+    );
+    let fc_body = blocking_get(&fc_url)?;
+    let fc: serde_json::Value = serde_json::from_str(&fc_body)
+        .map_err(|e| format!("get_weather: forecast parse: {e}"))?;
+
+    let current = fc.get("current").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let daily = fc.get("daily").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let current_code = current.get("weather_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+
+    // Build a compact, labelled daily summary so the LLM doesn't have to
+    // interpret raw WMO codes.
+    let arr = |k: &str| daily.get(k).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let days = arr("time");
+    let maxs = arr("temperature_2m_max");
+    let mins = arr("temperature_2m_min");
+    let codes = arr("weather_code");
+    let preps = arr("precipitation_probability_max");
+    let forecast: Vec<serde_json::Value> = (0..days.len().min(3))
+        .map(|i| {
+            serde_json::json!({
+                "date": days.get(i).cloned().unwrap_or_else(|| serde_json::Value::Null),
+                "condition": wmo_description(codes.get(i).and_then(|v| v.as_i64()).unwrap_or(-1)),
+                "max_c": maxs.get(i).cloned().unwrap_or_else(|| serde_json::Value::Null),
+                "min_c": mins.get(i).cloned().unwrap_or_else(|| serde_json::Value::Null),
+                "precip_prob_pct": preps.get(i).cloned().unwrap_or_else(|| serde_json::Value::Null),
+            })
+        })
+        .collect();
+
+    let out = serde_json::json!({
+        "city": resolved_name,
+        "country": country,
+        "current": {
+            "condition": wmo_description(current_code),
+            "temperature_c": current.get("temperature_2m"),
+            "feels_like_c": current.get("apparent_temperature"),
+            "humidity_pct": current.get("relative_humidity_2m"),
+            "wind_kmh": current.get("wind_speed_10m"),
+        },
+        "forecast": forecast,
+    });
+
+    serde_json::to_string_pretty(&out).map_err(|e| format!("get_weather: serialise: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------

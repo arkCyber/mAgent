@@ -323,6 +323,56 @@ fn parse_tool_call_returns_none_on_invalid_json() {
 }
 
 #[test]
+fn parse_tool_call_anthropic_invoke_format() {
+    let r = silent_runner(MockExecutor::default());
+    let xml = "<invoke name=\"fetch_url\">\n  <parameter name=\"url\">https://example.com</parameter>\n</invoke>";
+    let (name, args) = r.parse_tool_call(xml).unwrap();
+    assert_eq!(name, "fetch_url");
+    assert_eq!(args.get("url").and_then(|v| v.as_str()), Some("https://example.com"));
+}
+
+#[test]
+fn parse_tool_call_anthropic_antml_namespace() {
+    let r = silent_runner(MockExecutor::default());
+    // Claude namespace prefix (`antml:`) must be normalised away.
+    let xml = "<antml:invoke name=\"web_search\">\n  <antml:parameter name=\"query\">北京天气</antml:parameter>\n</antml:invoke>";
+    let (name, args) = r.parse_tool_call(xml).unwrap();
+    assert_eq!(name, "web_search");
+    assert_eq!(args.get("query").and_then(|v| v.as_str()), Some("北京天气"));
+}
+
+#[test]
+fn parse_tool_call_anthropic_multiple_parameters() {
+    let r = silent_runner(MockExecutor::default());
+    let xml = "<invoke name=\"send_health_alert\">\
+        <parameter name=\"type\">fall</parameter>\
+        <parameter name=\"severity\">high</parameter>\
+        </invoke>";
+    let (name, args) = r.parse_tool_call(xml).unwrap();
+    assert_eq!(name, "send_health_alert");
+    assert_eq!(args.get("type").and_then(|v| v.as_str()), Some("fall"));
+    assert_eq!(args.get("severity").and_then(|v| v.as_str()), Some("high"));
+}
+
+#[test]
+fn parse_tool_call_strips_code_fence_from_json() {
+    let r = silent_runner(MockExecutor::default());
+    let fenced = "```json\n{\"tool\": \"read_sensor\", \"args\": {\"sensor\": \"temperature\"}}\n```";
+    let (name, args) = r.parse_tool_call(fenced).unwrap();
+    assert_eq!(name, "read_sensor");
+    assert_eq!(args.get("sensor").and_then(|v| v.as_str()), Some("temperature"));
+}
+
+#[test]
+fn parse_tool_call_strips_code_fence_from_anthropic_xml() {
+    let r = silent_runner(MockExecutor::default());
+    let fenced = "```xml\n<invoke name=\"get_weather\"><parameter name=\"city\">Beijing</parameter></invoke>\n```";
+    let (name, args) = r.parse_tool_call(fenced).unwrap();
+    assert_eq!(name, "get_weather");
+    assert_eq!(args.get("city").and_then(|v| v.as_str()), Some("Beijing"));
+}
+
+#[test]
 fn parse_result_handles_string_number_object() {
     let r = silent_runner(MockExecutor::default());
     assert_eq!(r.parse_result(r#"{"result": "ok"}"#).unwrap(), "ok");
@@ -348,6 +398,72 @@ fn parse_result_takes_precedence_over_tool_call() {
         "result payload should not be a tool call");
     let parsed = r.parse_result(response).unwrap();
     assert_eq!(parsed, "Environmental monitoring complete");
+}
+
+// ============================================================================
+// Format / code fault-tolerance tests
+// ============================================================================
+
+#[test]
+fn parse_result_handles_fenced_code_block() {
+    // A model asked to write code but that forgets the {"result":...}
+    // envelope wraps its answer in a fenced block. We must deliver the
+    // code verbatim, without the ``` fences or the language tag.
+    let r = silent_runner(MockExecutor::default());
+    let code = "fn main() { println!(\"hi\"); }";
+    let fenced = format!("```rust\n{}\n```", code);
+    assert_eq!(r.parse_result(&fenced).unwrap(), code);
+    assert_eq!(
+        r.parse_result("```\n$ echo hello\n```").unwrap(),
+        "$ echo hello"
+    );
+}
+
+#[test]
+fn parse_result_handles_plain_prose_answer() {
+    // A model that violates the JSON-only rule and answers in prose must
+    // still be treated as a final result rather than looping until budget.
+    let r = silent_runner(MockExecutor::default());
+    let answer = "The temperature is 24.2 degrees Celsius and it is sunny.";
+    assert_eq!(r.parse_result(answer).unwrap(), answer);
+}
+
+#[test]
+fn parse_result_does_not_terminate_on_chatter() {
+    // Short plan/interjection text must NOT be treated as a final result,
+    // otherwise the loop would stop before the model finishes its plan.
+    let r = silent_runner(MockExecutor::default());
+    assert!(r.parse_result("OK").is_none());
+    assert!(r.parse_result("Let me check the sensor first").is_none());
+    assert!(r.parse_result("I'll now read the humidity sensor").is_none());
+}
+
+#[test]
+fn parse_result_extracts_embedded_result_json() {
+    // The model sometimes wraps the result JSON in surrounding text.
+    let r = silent_runner(MockExecutor::default());
+    let resp = "Here is the answer: {\"result\": \"42\"} Hope that helps.";
+    assert_eq!(r.parse_result(resp).unwrap(), "42");
+}
+
+#[test]
+fn parse_tool_call_extracts_json_from_prose() {
+    // A tool call embedded in prose (a format violation) must be recovered.
+    let r = silent_runner(MockExecutor::default());
+    let resp = "I'll use the sensor: {\"tool\": \"read_sensor\", \"args\": {\"sensor\": \"temperature\"}}. Please wait.";
+    let (name, args) = r.parse_tool_call(resp).unwrap();
+    assert_eq!(name, "read_sensor");
+    assert_eq!(args.get("sensor").and_then(|v| v.as_str()), Some("temperature"));
+}
+
+#[test]
+fn parse_tool_call_handles_string_braces_in_embedded_json() {
+    // The balanced-brace scanner must not stop at a '}' inside a string value.
+    let r = silent_runner(MockExecutor::default());
+    let resp = "Here: {\"tool\": \"fetch_url\", \"args\": {\"url\": \"https://example.com/a}\"}} done";
+    let (name, args) = r.parse_tool_call(resp).unwrap();
+    assert_eq!(name, "fetch_url");
+    assert_eq!(args.get("url").and_then(|v| v.as_str()), Some("https://example.com/a}"));
 }
 
 // ============================================================================
