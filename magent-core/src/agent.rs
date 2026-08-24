@@ -403,8 +403,12 @@ impl MiniAgent {
         let (name, args) = self.pick_tool(task);
 
         self.pending_tool = Some(ToolCall {
-            name: heapless::String::try_from(name).unwrap(),
-            arguments: heapless::String::try_from(args).unwrap(),
+            // Defense-in-depth: tool names/args are bounded heapless
+            // strings, but converting a runtime &str must not panic if it
+            // exceeds the bound — degrade to an empty value, which the
+            // executor reports as an unknown/empty tool gracefully.
+            name: heapless::String::try_from(name).unwrap_or_default(),
+            arguments: heapless::String::try_from(args).unwrap_or_default(),
         });
 
         self.add_message("assistant", "Calling tool")?;
