@@ -1089,7 +1089,12 @@ fn dtrace(s: &str) {
 /// Entry point for the `agent-thread`.
 ///
 /// Drives the `MiniAgent` ReAct loop forever. TRACE: REQ-SAFE-001.
-fn run_agent_loop(task_handle: TaskHandle, reply_outbox: TaskHandle, heartbeat: Heartbeat) {
+fn run_agent_loop(
+    task_handle: TaskHandle,
+    reply_outbox: TaskHandle,
+    heartbeat: Heartbeat,
+    safe_mode: bool,
+) {
     log::info!("[agent] thread starting");
     dtrace("agent:entry");
 
@@ -1128,16 +1133,25 @@ fn run_agent_loop(task_handle: TaskHandle, reply_outbox: TaskHandle, heartbeat: 
     // Install the DeepSeek chat-LLM backend when configured (via AT+LLMCFG
     // or the build-time default). The backend is leaked so it can be held as
     // a `&'static mut` by `MiniAgent` for the life of the process.
-    if let (Some(model), Some(key)) = (
-        nvs_load_string(NVS_KEY_LLM_MODEL),
-        nvs_load_string(NVS_KEY_LLM_API_KEY),
-    ) {
-        if !model.is_empty() && !key.is_empty() {
-            log::info!("[agent] installing DeepSeek LLM backend (model={model})");
-            let backend: &'static mut llm::Esp32DeepSeekBackend =
-                Box::leak(Box::new(llm::Esp32DeepSeekBackend::new(&model, &key)));
-            agent.set_llm_backend(backend);
+    //
+    // In safe mode the Wi-Fi / lwIP tcpip thread is NOT initialised, so a
+    // cloud HTTP call would hit `tcpip_send_msg_wait_sem (Invalid mbox)` and
+    // hard-assert (crash loop). Skip the cloud backend and rely on the local
+    // heuristic + local tools instead.
+    if !safe_mode {
+        if let (Some(model), Some(key)) = (
+            nvs_load_string(NVS_KEY_LLM_MODEL),
+            nvs_load_string(NVS_KEY_LLM_API_KEY),
+        ) {
+            if !model.is_empty() && !key.is_empty() {
+                log::info!("[agent] installing DeepSeek LLM backend (model={model})");
+                let backend: &'static mut llm::Esp32DeepSeekBackend =
+                    Box::leak(Box::new(llm::Esp32DeepSeekBackend::new(&model, &key)));
+                agent.set_llm_backend(backend);
+            }
         }
+    } else {
+        log::info!("[agent] safe mode — cloud LLM disabled (local heuristic only)");
     }
 
     log::info!("[agent] MiniAgent ready");
@@ -1476,10 +1490,13 @@ fn main() {
         let th_hb = agent_hb_for_thread.clone();
         agent_handle = thread::Builder::new()
             .name("agent-thread".into())
-            // 96 KiB: MiniAgent is heap-allocated (PSRAM), but think() still
-            // uses a few stack-local String<MAX_BUFFER_SIZE> (8 KiB) temporaries.
-            .stack_size(96 * 1024)
-            .spawn(move || run_agent_loop(th_task, th_reply, th_hb))
+            // 64 KiB: MiniAgent is heap-allocated (PSRAM), so the task stack
+            // only holds a few stack-local String<MAX_BUFFER_SIZE> (8 KiB)
+            // 64 KiB: MiniAgent is heap-allocated (PSRAM) and MAX_BUFFER_SIZE
+            // stays at 2 KiB, so the task stack only needs a few 2 KiB stack
+            // temporaries in think().
+            .stack_size(64 * 1024)
+            .spawn(move || run_agent_loop(th_task, th_reply, th_hb, safe_mode))
             .ok();
     }
     if agent_handle.is_none() {
@@ -1543,8 +1560,8 @@ fn main() {
                 let th_hb = agent_hb_for_thread.clone();
                 agent_handle = thread::Builder::new()
                     .name("agent-thread".into())
-                    .stack_size(96 * 1024)
-                    .spawn(move || run_agent_loop(th_task, th_reply, th_hb))
+                    .stack_size(64 * 1024)
+                    .spawn(move || run_agent_loop(th_task, th_reply, th_hb, safe_mode))
                     .ok();
                 if agent_handle.is_none() {
                     log::error!("[agent] thread re-spawn failed — not retrying this round");

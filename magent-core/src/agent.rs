@@ -87,6 +87,12 @@ pub trait LlmBackend {
     ) -> core::result::Result<alloc::string::String, AgentError>;
 }
 
+/// Number of `think` calls to skip the (cloud) LLM after one failure. This is
+/// the offline back-off so a dead backend doesn't cost a network timeout on
+/// every task; we retry the LLM after `LLM_SKIP_CALLS` so it re-arms the
+/// moment the network comes back.
+const LLM_SKIP_CALLS: u8 = 5;
+
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 pub struct MiniAgent {
     #[allow(dead_code)]
@@ -108,6 +114,13 @@ pub struct MiniAgent {
     /// Held as a `&'static mut` so `think` can call the (mutable) backend.
     #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
     llm: Option<&'static mut dyn LlmBackend>,
+    /// How many more `think` calls should skip the (cloud) LLM after a recent
+    /// failure. When the network / backend is down, probing it on every task
+    /// costs a full timeout (8 s on the ESP32) before falling back to the
+    /// deterministic heuristic — so we back off for a few calls and retry
+    /// periodically instead of blocking each task. 0 = try the LLM.
+    #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+    llm_skip_remaining: u8,
     #[cfg(feature = "monitoring")]
     monitor: Option<crate::monitoring::MonitoringManager>,
 }
@@ -249,6 +262,8 @@ impl MiniAgent {
             pending_tool: None,
             #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
             llm: None,
+            #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+            llm_skip_remaining: 0,
             #[cfg(feature = "monitoring")]
             monitor: None,
         })
@@ -441,8 +456,14 @@ impl MiniAgent {
         // and decide a tool call (or give a final answer). On any LLM error
         // we fall through to the deterministic heuristic so the agent still
         // makes progress offline.
+        //
+        // After a failure we back off for `LLM_SKIP_CALLS` subsequent tasks so
+        // a dead cloud backend (no Wi-Fi / timeout) doesn't block every task
+        // with a full network timeout before the heuristic runs.
         #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
-        if self.llm.is_some() {
+        if self.llm_skip_remaining > 0 {
+            self.llm_skip_remaining -= 1;
+        } else if self.llm.is_some() {
             let system = self.build_llm_system_prompt();
             if let Some(llm) = self.llm.as_deref_mut() {
                 match llm.complete(system.as_str(), task.as_str()) {
@@ -464,6 +485,8 @@ impl MiniAgent {
                     }
                     Err(e) => {
                         log::warn!("[agent] LLM backend error: {e}");
+                        // Back off — the backend/network is unavailable right now.
+                        self.llm_skip_remaining = LLM_SKIP_CALLS;
                     }
                 }
             }
