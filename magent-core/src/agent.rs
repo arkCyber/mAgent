@@ -18,6 +18,8 @@ use crate::skills::SkillsManager;
 use crate::tools::{Tool, ToolRegistry, ToolType};
 use crate::MAX_BUFFER_SIZE;
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+use crate::MAX_CONVERSATION_MESSAGES;
+#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 use heapless::Vec;
 use heapless::String;
 use serde::{Deserialize, Serialize};
@@ -94,7 +96,7 @@ pub struct MiniAgent {
     watchdog: Watchdog,
     skills: SkillsManager,
     tools: ToolRegistry,
-    conversation: Vec<Message, 10>,
+    conversation: Vec<Message, MAX_CONVERSATION_MESSAGES>,
     current_task: String<MAX_BUFFER_SIZE>,
     /// Tool call queued by `think` for `execute_tool` to consume. Using
     /// `Option` lets us detect the logic-bug case where `execute_tool`
@@ -743,9 +745,9 @@ impl MiniAgent {
 
     /// Add message to conversation
     fn add_message(&mut self, role: &str, content: &str) -> Result<()> {
-        if self.conversation.len() >= 10 {
+        if self.conversation.len() >= MAX_CONVERSATION_MESSAGES {
             return Err(AgentError::BufferOverflow {
-                capacity: 10,
+                capacity: MAX_CONVERSATION_MESSAGES,
                 attempted: self.conversation.len() + 1,
             });
         }
@@ -756,7 +758,7 @@ impl MiniAgent {
         };
 
         self.conversation.push(message).map_err(|_| AgentError::BufferOverflow {
-            capacity: 10,
+            capacity: MAX_CONVERSATION_MESSAGES,
             attempted: self.conversation.len() + 1,
         })?;
 

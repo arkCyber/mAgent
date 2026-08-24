@@ -113,6 +113,8 @@ pub fn derive_btdk() -> Result<[u8; 32], &'static str> {
     let key = boot_key::derive(&material).map_err(|e| match e {
         boot_key::BootKeyError::MaterialEmpty => "btdk:material_empty",
         boot_key::BootKeyError::MaterialTooLong => "btdk:material_too_long",
+        // Feature not compiled in — the caller can't derive a key.
+        boot_key::BootKeyError::FeatureDisabled => "btdk:feature_disabled",
     })?;
     Ok(*key.as_bytes())
 }

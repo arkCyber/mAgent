@@ -1102,7 +1102,11 @@ fn run_agent_loop(task_handle: TaskHandle, reply_outbox: TaskHandle, heartbeat: 
         .expect("memory budget in range");
     dtrace("agent:config-built");
 
-    let mut agent = match MiniAgent::new(config) {
+    // MiniAgent is heap-allocated (Box) so its large conversation buffers
+    // (20 × 8 KiB = up to 160 KiB) live on the 2 MB PSRAM heap, NOT on the
+    // 96 KiB agent-thread stack. This is what makes the larger MAX_BUFFER_SIZE
+    // / MAX_CONVERSATION_MESSAGES safe.
+    let mut agent = match MiniAgent::new(config).map(Box::new) {
         Ok(a) => a,
         Err(e) => {
             // Config is compile-time constants so this is unreachable in
@@ -1472,7 +1476,9 @@ fn main() {
         let th_hb = agent_hb_for_thread.clone();
         agent_handle = thread::Builder::new()
             .name("agent-thread".into())
-            .stack_size(64 * 1024)
+            // 96 KiB: MiniAgent is heap-allocated (PSRAM), but think() still
+            // uses a few stack-local String<MAX_BUFFER_SIZE> (8 KiB) temporaries.
+            .stack_size(96 * 1024)
             .spawn(move || run_agent_loop(th_task, th_reply, th_hb))
             .ok();
     }
@@ -1537,7 +1543,7 @@ fn main() {
                 let th_hb = agent_hb_for_thread.clone();
                 agent_handle = thread::Builder::new()
                     .name("agent-thread".into())
-                    .stack_size(64 * 1024)
+                    .stack_size(96 * 1024)
                     .spawn(move || run_agent_loop(th_task, th_reply, th_hb))
                     .ok();
                 if agent_handle.is_none() {

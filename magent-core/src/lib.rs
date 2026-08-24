@@ -319,8 +319,20 @@ pub const MAX_MEMORY_BUDGET: usize = 50 * 1024;
 /// Maximum iteration budget for ReAct loop
 pub const MAX_ITERATION_BUDGET: usize = 50;
 
-/// Maximum buffer size for messages
-pub const MAX_BUFFER_SIZE: usize = 2048;
+/// Maximum buffer size for messages (bytes).
+///
+/// Each conversation message holds up to this many bytes of content. On the
+/// ESP32-C61 the `MiniAgent` is heap-allocated (PSRAM-backed), so the
+/// conversation buffers live on the 2 MB PSRAM heap rather than the task
+/// stack — this is why 8 KiB per message is affordable. Keep the agent thread
+/// stack large enough for the few stack-local `String<MAX_BUFFER_SIZE>`
+/// temporaries during `think()`.
+pub const MAX_BUFFER_SIZE: usize = 8192;
+
+/// Maximum number of conversation messages retained by the embedded agent.
+/// Larger history means the ReAct loop can keep more tool results / turns in
+/// context before dropping the oldest. Buffers are on the PSRAM heap.
+pub const MAX_CONVERSATION_MESSAGES: usize = 20;
 
 /// Maximum number of concurrent tools
 pub const MAX_CONCURRENT_TOOLS: usize = 3;
