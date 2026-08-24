@@ -754,6 +754,17 @@ fn parse_run_args<'a, I: Iterator<Item = &'a String>>(
     // `rejects_run_with_no_task` test to fail and conflicted with the
     // safety-critical expectation that an explicit task is required
     // before the agent executes any tool call.
+    //
+    // `--verify-signed <PATH>` is a pure verification path that never
+    // executes the agent, so it's exempt from the task requirement.
+    #[cfg(feature = "web3_app")]
+    if opts.task.is_empty()
+        && !opts.repl_mode
+        && opts.verify_signed_path.is_none()
+    {
+        return Err(ParseError::MissingTask);
+    }
+    #[cfg(not(feature = "web3_app"))]
     if opts.task.is_empty() && !opts.repl_mode {
         return Err(ParseError::MissingTask);
     }
@@ -3035,6 +3046,25 @@ mod tests {
     fn rejects_run_with_no_task() {
         let err = Args::parse(&argv(["magent", "run"])).unwrap_err();
         assert!(matches!(err, ParseError::MissingTask));
+    }
+
+    #[cfg(feature = "web3_app")]
+    #[test]
+    fn run_verify_signed_does_not_require_a_task() {
+        // `--verify-signed <PATH>` is a pure verification path (it never
+        // executes the agent), so it must NOT trigger the MissingTask error.
+        let a = Args::parse(&argv(["magent", "run", "--verify-signed", "/tmp/x.json"])).unwrap();
+        match a.command {
+            Command::Run(o) => {
+                assert_eq!(o.task, "");
+                assert!(!o.repl_mode);
+                assert_eq!(
+                    o.verify_signed_path.as_deref().map(|p| p.to_str().unwrap()),
+                    Some("/tmp/x.json")
+                );
+            }
+            _ => panic!("expected Run"),
+        }
     }
 
     #[test]

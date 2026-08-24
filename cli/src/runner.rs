@@ -1390,6 +1390,15 @@ fn save_summary_after_run<E: ToolExecutor>(
     if opts.save_summary_overwrite {
         // `delete` is idempotent; ignore errors here.
         let _ = store.delete(topic);
+    } else if store.load(topic).is_ok() {
+        // Documented default (README / SUMMARY_STORE.md / RunOptions docs)
+        // is to refuse clobbering an existing summary unless
+        // `--save-summary-overwrite` is passed — mirror the probe the
+        // `summary save` subcommand already does. Without this, retried CI
+        // runs silently overwrite the previous run's summary.
+        return Err(magent_core::summary::SummaryError::AlreadyExists(
+            topic.to_string(),
+        ));
     }
 
     let save_result = store.save(record);

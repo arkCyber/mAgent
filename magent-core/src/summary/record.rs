@@ -150,6 +150,11 @@ pub enum SummaryError {
         /// `schema_version` on the right-hand side.
         rhs: u32,
     },
+    /// A summary with this topic already exists and the caller did not
+    /// ask to overwrite it. Surfaced by the `run --save-summary` path so
+    /// it refuses to silently clobber a previous run's summary (matching
+    /// the `summary save` subcommand's overwrite protection).
+    AlreadyExists(String),
 }
 
 impl fmt::Display for SummaryError {
@@ -205,6 +210,11 @@ impl fmt::Display for SummaryError {
                 f,
                 "cannot compare summary records with mismatched schema_version ({} vs {})",
                 lhs, rhs
+            ),
+            SummaryError::AlreadyExists(name) => write!(
+                f,
+                "summary {:?} already exists; pass --save-summary-overwrite to replace",
+                name
             ),
         }
     }
@@ -1028,5 +1038,11 @@ mod tests {
         let e = SummaryError::SchemaMismatch { lhs: 1, rhs: 2 };
         assert!(e.to_string().contains("1"));
         assert!(e.to_string().contains("2"));
+
+        let e = SummaryError::AlreadyExists("dup".into());
+        let s = e.to_string();
+        assert!(s.contains("already exists"));
+        assert!(s.contains("dup"));
+        assert!(s.contains("--save-summary-overwrite"));
     }
 }
