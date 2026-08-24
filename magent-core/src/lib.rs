@@ -62,6 +62,11 @@
 // Workspace-wide lints are inherited via `[lints] workspace = true`
 // in `Cargo.toml` (missing_docs, unsafe_op_in_unsafe_fn). Crate-
 // specific clippy / rustc lints should live here.
+// Aerospace-grade guard: never `panic!`/`assert!` inside a function that
+// returns `Result` — such paths must return an error instead of crashing
+// (see the `boot_key::derive` feature-stub fix). Enforced under
+// `cargo clippy` (CI); a regression becomes a hard error.
+#![deny(clippy::panic_in_result_fn)]
 
 // `alloc` is always linked (even under `std`, where it's a re-export of
 // `format!` / `vec!` from `alloc` (and `println!` / `dbg!` from `std`
