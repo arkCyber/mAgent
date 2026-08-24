@@ -35,9 +35,21 @@ bidirectional UART command interface.
 
 ### ESP32-C61 (RISC-V Platform)
 - **MCU**: ESP32-C61 (RISC-V 32-bit @ 160MHz)
-- **RAM**: 320 KB SRAM + 512 KB PSRAM
+- **RAM**: 320 KB SRAM + 2 MB PSRAM (N8R2 in-package)
 - **Flash**: 8 MB
-- **Wireless**: Wi-Fi 6, BLE 5.3
+- **Wireless**: Wi-Fi 6, BLE 5 (LE)
+
+#### Memory utilization
+The 2 MB in-package PSRAM is enabled and backs the `std::alloc` heap
+(`CONFIG_SPIRAM=y` + `CONFIG_SPIRAM_USE_MALLOC=y`, pinned to 80 MHz to match
+flash), so dynamic allocations (serde_json, larger context, the ReAct runner's
+conversation history) live on the 2 MB heap. The embedded `MiniAgent` itself
+uses bounded `heapless` buffers by design (aerospace-grade), so its own
+footprint is a small fixed amount of the 320 KB SRAM. The configured agent
+memory budget defaults to 512 KiB and is configurable up to
+`MAX_CONFIGURABLE_MEMORY` (1 MiB) — a safety ceiling, not the available RAM.
+Free-heap is logged periodically by the health monitor and triggers a warning
+below 64 KiB.
 
 ## ✅ Build Status
 

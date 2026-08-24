@@ -1098,7 +1098,7 @@ fn run_agent_loop(task_handle: TaskHandle, reply_outbox: TaskHandle, heartbeat: 
         .expect("agent name fits")
         .with_max_iterations(20)
         .expect("iterations in range")
-        .with_max_memory(256 * 1024) // 256 KiB — max allowed; PSRAM now enabled (2 MB heap)
+        .with_max_memory(512 * 1024) // 512 KiB budget on the 2 MB PSRAM heap
         .expect("memory budget in range");
     dtrace("agent:config-built");
 

@@ -43,9 +43,9 @@ MCU=esp32c6 cargo build --release
 
 - **Board**: ESP32-C61-DevKitC-1-N8R2
 - **MCU**: ESP32-C61 (RISC-V 32-bit @ 160MHz)
-- **RAM**: 320 KB SRAM + 512 KB PSRAM
+- **RAM**: 320 KB SRAM + 2 MB PSRAM (N8R2 in-package)
 - **Flash**: 8 MB
-- **Connectivity**: Wi-Fi 6 (802.11ax), BLE 5.3
+- **Connectivity**: Wi-Fi 6 (802.11ax), BLE 5 (LE)
 
 ## 🛠️ Architecture
 

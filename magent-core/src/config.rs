@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 /// Maximum configuration field length
 const MAX_FIELD_LENGTH: usize = 64;
 
+/// Upper bound for the configurable agent memory budget (bytes).
+///
+/// Reflects the ESP32-C61 N8R2 target (320 KB internal SRAM + 2 MB in-package
+/// PSRAM). 1 MiB is a deliberate safety ceiling on the `std::alloc` heap; the
+/// agent's own `heapless` buffers stay well below it, and larger budgets exist
+/// for context stored on the 2 MB PSRAM heap. Kept as one constant so the
+/// validation and the builder cannot drift apart.
+pub const MAX_CONFIGURABLE_MEMORY: u32 = 1024 * 1024; // 1 MiB
+
 /// Agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -83,7 +92,12 @@ impl AgentConfig {
                 reason: ConfigError::OutOfRange,
             });
         }
-        if self.max_memory > 256 * 1024 {
+        // Upper bound reflects the ESP32-C61 N8R2 target (320 KB internal
+        // SRAM + 2 MB in-package PSRAM). 1 MiB is a deliberate safety ceiling
+        // for the std::alloc heap — the agent's heapless buffers stay far
+        // below it, and larger budgets are for context that lives on the
+        // 2 MB PSRAM heap. (Historically this was hard-capped at 256 KiB.)
+        if self.max_memory > MAX_CONFIGURABLE_MEMORY {
             return Err(AgentError::ConfigurationError {
                 field: "max_memory",
                 reason: ConfigError::OutOfRange,
@@ -161,7 +175,7 @@ impl AgentConfig {
 
     /// Set max memory
     pub fn with_max_memory(mut self, max: u32) -> Result<Self> {
-        if max == 0 || max > 256 * 1024 {
+        if max == 0 || max > MAX_CONFIGURABLE_MEMORY {
             return Err(AgentError::ConfigurationError {
                 field: "max_memory",
                 reason: ConfigError::OutOfRange,
@@ -197,6 +211,28 @@ impl AgentConfig {
             field: "deserialization",
             reason: ConfigError::TypeMismatch,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_memory_allows_full_psram_budget() {
+        // The ESP32-C61 N8R2 has 2 MB PSRAM; the configurable budget must
+        // permit a 512 KiB budget (what the firmware requests) and the 1 MiB
+        // ceiling. It must still reject absurd values.
+        assert!(AgentConfig::default()
+            .with_max_memory(512 * 1024)
+            .is_ok());
+        assert!(AgentConfig::default()
+            .with_max_memory(MAX_CONFIGURABLE_MEMORY)
+            .is_ok());
+        assert!(AgentConfig::default()
+            .with_max_memory(MAX_CONFIGURABLE_MEMORY + 1)
+            .is_err());
+        assert!(AgentConfig::default().with_max_memory(0).is_err());
     }
 }
 
