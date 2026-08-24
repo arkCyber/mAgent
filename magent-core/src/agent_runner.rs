@@ -322,10 +322,20 @@ impl SharedTraceSink {
         Self::default()
     }
 
+    /// Lock the sink list, recovering from a poisoned mutex.
+    ///
+    /// A panic in *another* thread while it held this mutex would poison it;
+    /// `expect`-ing here would then cascade into a second panic inside the
+    /// trace/logging path. The guarded data is still valid — only the poison
+    /// flag is set — so recover the guard and keep going.
+    fn lock_sinks(&self) -> std::sync::MutexGuard<'_, Vec<BoxedTraceSink>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Append `sink` to the list. Subsequent events are delivered
     /// to every installed sink, in installation order.
     pub fn install(&self, sink: BoxedTraceSink) {
-        let mut guard = self.inner.lock().expect("trace sink poisoned");
+        let mut guard = self.lock_sinks();
         guard.push(sink);
     }
 
@@ -337,7 +347,7 @@ impl SharedTraceSink {
         &self,
         f: impl FnOnce(&mut [&mut dyn TraceSink]) -> R,
     ) -> Option<R> {
-        let mut guard = self.inner.lock().expect("trace sink poisoned");
+        let mut guard = self.lock_sinks();
         if guard.is_empty() {
             return None;
         }
@@ -353,7 +363,7 @@ impl SharedTraceSink {
     /// Drop every installed sink. After this call the runner is
     /// back to its default silent behaviour.
     pub fn clear(&self) {
-        let mut guard = self.inner.lock().expect("trace sink poisoned");
+        let mut guard = self.lock_sinks();
         guard.clear();
     }
 
@@ -361,7 +371,7 @@ impl SharedTraceSink {
     /// diagnostics — production callers should treat the sink
     /// list as opaque.
     pub fn len(&self) -> usize {
-        let guard = self.inner.lock().expect("trace sink poisoned");
+        let guard = self.lock_sinks();
         guard.len()
     }
 
@@ -373,7 +383,7 @@ impl SharedTraceSink {
 
 impl std::fmt::Debug for SharedTraceSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let guard = self.inner.lock().expect("trace sink poisoned");
+        let guard = self.lock_sinks();
         f.debug_struct("SharedTraceSink")
             .field("installed", &guard.len())
             .finish()
