@@ -257,15 +257,17 @@ impl<A: LinkAdapter> IngressGateway<A> {
                 envelope_json: None,
             }),
             IngressMode::Signed => {
-                let signer = self.signer.as_ref().ok_or_else(|| {
+                let signer = self.signer.as_ref().ok_or({
                     IngressError::Web3(Web3ErrorKind::InvalidSignature { actual_len: 0 })
                 })?;
                 let signed: SignedMessage = signer.sign(bytes).map_err(IngressError::Web3)?;
-                let json = signed.to_json();
+                // PATCHED (MicroAgent): serialise into a bounded stack buffer
+                // via `to_json_into` instead of the per-frame heap allocation
+                // of `to_json()` (see `communication/mod.rs` TODO).
                 let mut json_buf: heapless::String<MAX_PAYLOAD> = heapless::String::new();
-                json_buf
-                    .push_str(&json)
-                    .map_err(|_| IngressError::PayloadTooLarge { size: json.len() })?;
+                signed
+                    .to_json_into(&mut json_buf)
+                    .map_err(|_| IngressError::PayloadTooLarge { size: bytes.len() })?;
                 Ok(IngressFrame {
                     source,
                     payload,

@@ -27,7 +27,7 @@ log = { workspace = true }
 # build to talk to Ollama.
 # PATCHED (MicroAgent): Use workspace reqwest with rustls-tls to avoid
 # OpenSSL cross-compilation issues on RISC-V targets.
-reqwest = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = ["blocking"] }
 # Regex for the web tools' HTML/fragment extractors. Host-only.
 regex = { version = "1.10", optional = true }
 
@@ -51,6 +51,15 @@ ed25519-dalek = { workspace = true, optional = true }
 bs58 = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 sha3 = { version = "0.10", optional = true, default-features = false }
+# `digest` is pulled in transitively by `sha3`, but we need the
+# `mac` feature for HMAC-SHA256 (used by `wifi_pass_seal_v2`).
+# Declaring it explicitly so the feature is visible to Cargo's
+# resolver — `sha3` doesn't expose a `mac` feature of its own.
+digest = { version = "0.10", optional = true, default-features = false, features = ["mac", "core-api"] }
+# HMAC-SHA256 for `wifi_pass_seal_v2`'s per-entry MAC. Both
+# `hmac` and `sha2` are pure-Rust, no_std-compatible, and tiny.
+hmac = { version = "0.12", optional = true, default-features = false }
+sha2 = { version = "0.10", optional = true, default-features = false }
 # Secp256k1 for Ethereum transaction signing
 secp256k1 = { version = "0.29", optional = true, default-features = false, features = ["alloc", "recovery", "rand"] }
 
@@ -189,8 +198,11 @@ default = []
 # the chip-family features (e.g. `--features monitoring,nrf52`).
 monitoring = []
 
-# Host-side testing on a desktop OS.
-std = ["dep:reqwest", "dep:regex", "dep:magent-hal", "serde/std", "serde_json/std", "log/std"]
+# Host-side testing on a desktop OS. `std` also enables the `reqwest`
+# feature flag so `web.rs` / `web3/blockchain/http_client.rs`'s
+# `#[cfg(feature = "reqwest")]` HTTP paths are compiled whenever `std` is on
+# (the dependency alone is not enough — the cfg flag is what gates the code).
+std = ["dep:reqwest", "reqwest", "dep:regex", "dep:magent-hal", "serde/std", "serde_json/std", "log/std"]
 host = ["std"]  # alias
 
 # ---------------------------------------------------------------------------
@@ -318,7 +330,19 @@ web3 = [
     "dep:bs58",
     "dep:rand_core",
     "dep:sha3",
+    "dep:digest",
+    "dep:hmac",
+    "dep:sha2",
     "dep:secp256k1",
+]
+
+# Boot-time-derived device key for sealing `dev_identity` (BTDK).
+# Pulls in `sha3` for Keccak256. Firmware targets enable this; the
+# default host test build does NOT (so the existing test suite stays
+# lightweight), but `cargo test -p magent-core --features boot-key`
+# exercises the boot_key module on the host with synthetic material.
+boot-key = [
+    "dep:sha3",
 ]
 
 # Alias for web3 with std (host-side with reqwest)
@@ -439,6 +463,14 @@ required-features = ["web3_app"]
 name = "web3_prompt_tests"
 path = "tests/web3_prompt_tests.rs"
 required-features = ["web3_app"]
+
+# AT command parser integration tests. Host-only (`std` feature). The
+# parser is itself `no_std`, so these tests only require host to
+# compile and exercise it.
+[[test]]
+name = "at_tests"
+path = "tests/at_tests.rs"
+required-features = ["std"]
 
 # Blockchain integration tests (placeholder).
 [[test]]

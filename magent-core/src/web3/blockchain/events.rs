@@ -59,6 +59,7 @@ pub struct Event {
 
 impl Event {
     /// Create a new event.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         signature: Hash,
         address: Address,
@@ -533,7 +534,7 @@ impl EventLog {
     pub fn parse(&self) -> Result<Event, Web3ErrorKind> {
         let topics = self.topics.clone();
 
-        let signature = topics.first().copied().unwrap_or(Hash::zero());
+        let signature = topics.first().copied().unwrap_or_else(Hash::zero);
 
         let data_bytes = hex_decode(&self.data)?;
         let block_number = parse_hex_u64(&self.block_number)?;

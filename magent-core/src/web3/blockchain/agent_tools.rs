@@ -4,11 +4,11 @@
 //! providing tools for:
 //! - Querying wallet balance
 #![allow(irrefutable_let_patterns)]
-//! The `cfg(esp32)` / `cfg(std)` branches carry the same `if let` shape
-//! because the `BlockchainBackend` enum's std/esp32 variants are mutually
-//! exclusive at compile time. The clippy lint flags the surviving branch
-//! as "irrefutable", which is harmless here but produces noise on every
-//! CI run.
+//!   The `cfg(esp32)` / `cfg(std)` branches carry the same `if let` shape
+//!   because the `BlockchainBackend` enum's std/esp32 variants are mutually
+//!   exclusive at compile time. The clippy lint flags the surviving branch
+//!   as "irrefutable", which is harmless here but produces noise on every
+//!   CI run.
 //! - Querying transaction status
 //! - Sending transactions
 //! - Signing messages
@@ -787,7 +787,7 @@ fn backend_poll_transaction(
 /// Decode hex (with optional `0x` prefix) into raw bytes.
 #[allow(dead_code)]
 fn hex_decode(s: &str) -> core::result::Result<alloc::vec::Vec<u8>, AgentError> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(AgentError::ConfigurationError {
             field: "blockchain_hex",
             reason: crate::error::ConfigError::MissingField,
@@ -1114,7 +1114,7 @@ pub fn verify_signature(
     //    (not by re-signing). `verify_signature` returns true/false for
     //    any cryptographic failure with no panics.
     let valid = crate::web3::verify_signature(
-        &identity.public_key(),
+        identity.public_key(),
         signature_hex,
         message_bytes,
     );

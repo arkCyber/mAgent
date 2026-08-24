@@ -54,7 +54,7 @@ pub struct ToolRegistry {
 /// `flash_read` still works with `address=0x1000`). Whitespace is
 /// trimmed. Values are not unescaped — we surface raw strings to the
 /// caller, who can decide whether to JSON-parse them.
-fn parse_args(args: &str) -> Vec<(&str, &str), 8> {
+pub(crate) fn parse_args(args: &str) -> Vec<(&str, &str), 8> {
     let mut out: Vec<(&str, &str), 8> = Vec::new();
     for part in args.split(',') {
         let trimmed = part.trim();
@@ -83,7 +83,7 @@ fn parse_args(args: &str) -> Vec<(&str, &str), 8> {
 
 /// Pull the value for `key` from a parsed `Vec<(&str, &str)>`.
 /// Returns `default` if the key is absent or the value is empty.
-fn arg<'a>(args: &'a Vec<(&'a str, &'a str), 8>, key: &str, default: &'a str) -> &'a str {
+pub(crate) fn arg<'a>(args: &'a Vec<(&'a str, &'a str), 8>, key: &str, default: &'a str) -> &'a str {
     for &(k, v) in args.iter() {
         if k == key {
             return if v.is_empty() { default } else { v };
@@ -349,6 +349,7 @@ impl ToolRegistry {
             "ecg" => "HR:72, Rhythm:Normal",
             "stress" => "Level:Moderate, HRV:55ms",
             "battery" => "Battery:85%, Voltage:3700mV",
+            "memory" => "free_heap=128000 B min_free_heap=118000 B",
             _ => {
                 return Ok(ToolResult {
                     tool_name: heapless::String::try_from("read_sensor").unwrap(),

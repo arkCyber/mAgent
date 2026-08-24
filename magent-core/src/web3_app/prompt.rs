@@ -32,7 +32,6 @@
 //! generic.
 
 use std::string::String;
-use std::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 

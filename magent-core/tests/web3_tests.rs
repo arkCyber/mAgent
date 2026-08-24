@@ -191,6 +191,32 @@ fn signed_message_json_round_trip() {
 }
 
 #[test]
+fn signed_message_json_into_round_trip() {
+    use heapless::String as HString;
+    let alice = Identity::generate().unwrap();
+    let payload = b"audit event payload".to_vec();
+    let signed = alice.sign(&payload).unwrap();
+
+    // The bounded serialiser must emit the identical canonical JSON as
+    // the heap-allocating `to_json()`.
+    let json_heap = signed.to_json();
+    let mut json_buf: HString<2048> = HString::new();
+    signed.to_json_into(&mut json_buf).unwrap();
+    assert_eq!(json_buf.as_str(), json_heap);
+
+    // And the bounded output must round-trip through from_json + verify.
+    let parsed = SignedMessage::from_json(json_buf.as_str()).unwrap();
+    assert_eq!(parsed.signer, signed.signer);
+    assert_eq!(parsed.payload_bytes(), payload.as_slice());
+    assert!(alice.verify(&parsed, &payload));
+
+    // A buffer too small must fail cleanly (no panic, no partial write).
+    let mut tiny: HString<8> = HString::new();
+    assert!(signed.to_json_into(&mut tiny).is_err());
+    assert!(tiny.is_empty(), "buffer is cleared on failure");
+}
+
+#[test]
 fn signed_message_rejects_garbage_json() {
     // Garbage JSON → `Web3ErrorKind::Parse { kind: InvalidJson }`.
     // (The previous version of this test asserted `HexDecode`

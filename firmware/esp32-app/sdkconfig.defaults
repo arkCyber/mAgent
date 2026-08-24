@@ -52,6 +52,15 @@ CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=4
 CONFIG_ESP_TLS_USING_MBEDTLS=y
 # Allow HTTP for local testing (production should use HTTPS).
 CONFIG_ESP_TLS_INSECURE=y
+# PATCHED (MicroAgent): compile in the mbedTLS CA certificate bundle so
+# `AT+HTTPGET=<https-url>` can verify server certs (needed because the
+# esp-idf-svc TLS client requires a verification option and INSECURE
+# alone isn't propagated into the mbedTLS client config).
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+# PATCHED (MicroAgent): DYNAMIC_BUFFER / KEEP_PEER_CERTIFICATE were tried to
+# shrink mbedTLS for HTTPS, but they caused the TLS handshake to HANG and
+# left the network stack in a bad state. Reverted — HTTPS on this C61 board
+# fails fast with a memory error instead, and HTTP (non-TLS) works reliably.
 CONFIG_ESP_HTTP_CLIENT_ALLOW_HTTP_FOR_TESTS=y
 # OTA
 CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
@@ -66,7 +75,11 @@ CONFIG_FREERTOS_HZ=1000
 # main task. Smaller stack reduces the heap pressure during boot.
 # The main task only needs to call `main()` and set up the threads;
 # the heavy work happens in the agent/ingress threads.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# PATCHED (MicroAgent): 16 KiB — `main()` now holds the setup_platform
+# result (`IngressUartParts`/UartDriver), an Identity clone, and spawn
+# closures on its stack; 8 KiB triggered a stack-protection fault right
+# after boot phase 7/8.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 # PATCHED (MicroAgent): removed CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0.
 # On the ESP32-C61 (single-core RISC-V), pinning the main task
 # to CPU0 during boot interferes with the ROM's WFI loop at
@@ -213,7 +226,7 @@ CONFIG_ESP_INT_WDT_CHECK_CPU0=n
 # PATCHED (MicroAgent): disable the CPU reset on watchdog timeout.
 # We want to keep the app running even if a watchdog fires once
 # during the experimental boot path. Re-enable for production.
-CONFIG_ESP_SYSTEM_PANIC="GDBStub"
+CONFIG_ESP_SYSTEM_PANIC="PrintAndReboot"
 
 # --------------------------------------------------------------------------
 # Partition table — two OTA app partitions for rollback testing (REQ-FW-005)
@@ -247,7 +260,7 @@ CONFIG_LIBC_NEWLIB=n
 # regardless of PROJECT_DIR (which the native driver points at the
 # workspace root by default).
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="/Users/arksong/MicroAgent/firmware/esp32-app/partitions.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="firmware/esp32-app/partitions.csv"
 # Flash size — ESP32-C61-DevKitC-1-N8R2 ships 8 MB (N8).
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_ESPTOOLPY_FLASHFREQ_120M=n

@@ -247,10 +247,60 @@ $ printf 'turn on the led\n' > /dev/cu.usbserial-10
 RESULT[turn on the led]: Task: Tool result: GPIO13 set to high (err=0)
 ```
 
+**Provision the device with AT commands:** text starting with `AT` is
+intercepted by the parser and dispatched deterministically — no LLM, no token
+budget, no ReAct loop. This is the recommended path for factory provisioning,
+field maintenance, and crash-loop recovery. See
+[`docs/AT_COMMAND_REFERENCE.md`](docs/AT_COMMAND_REFERENCE.md) for the full
+subset. Quick taste:
+```
+$ printf 'AT+GMR\r\n'                  > /dev/cu.usbserial-10
++GMR:mAgent v0.1.0 / AT v0.2 / esp32-c61
+OK
+$ printf 'AT+CWJAP="HomeWifi","hunter2"\r\n' > /dev/cu.usbserial-10
+OK                                                # credentials saved to NVS
+$ printf 'AT+IDENT?\r\n'                > /dev/cu.usbserial-10
++IDENT:7e3b9c4a13d6a...                               # device's did:key pubkey
+OK
+```
+
 **Host-Side Tools:**
 ```bash
 cargo build -p magent --release
 ```
+
+## ☁️ Cloud LLM Backends & Web Tools
+
+The agent runner talks to "the LLM" through a small trait, so you can switch
+providers without touching the ReAct loop. See [docs/LLM_BACKENDS.md](docs/LLM_BACKENDS.md).
+
+**Local (Ollama):**
+```bash
+magent run "Read the temperature"                       # localhost:11434, llama3.2
+magent run --ollama http://gpu:11434 --model qwen2.5:7b "Summarise the logs"
+```
+
+**Hosted (DeepSeek, OpenAI-compatible):**
+```bash
+DEEPSEEK_API_KEY=sk-... magent run --provider deepseek "Query the weather"
+magent run --provider deepseek --model deepseek-reasoner "Solve this PDE"
+```
+
+**Web / weather tools** (host-side, require internet) are exposed to the LLM
+as ordinary tools and work end-to-end:
+
+```bash
+# Search the web, then read a page
+magent run --provider deepseek "用 web_search 搜索 Rust 2026 新特性，再用 fetch_url 打开最相关链接"
+
+# Weather via a dedicated compact tool (Open-Meteo, no API key)
+magent run --provider deepseek "用 get_weather 查上海天气"
+```
+
+The ReAct loop is fault-tolerant about how the model formats its output: it
+accepts strict JSON, fenced code blocks, JSON wrapped in prose, and Anthropic
+`<invoke>` tool calls, and strips code fences so code answers are delivered
+verbatim.
 
 ## 📚 Documentation
 
@@ -263,6 +313,44 @@ cargo build -p magent --release
 | [ESP32-C61 Build Guide](docs/ESP32_C61_BUILD.md) | ESP32-C61 detailed guide |
 | [ESP32-C61 Boot & Hardware Notes](docs/ESP32_C61_BOARD_BOOT_FAILURE.md) | Bring-up diagnosis, fixes, and verification |
 | [Platform Comparison](docs/PLATFORM_COMPARISON.md) | Platform analysis |
+| [AT Command Reference](docs/AT_COMMAND_REFERENCE.md) | AT (Hayes / ESP-AT) provisioning subset |
+| [LLM Backends](docs/LLM_BACKENDS.md) | DeepSeek / Ollama provider wiring |
+| [Summary Store](docs/SUMMARY_STORE.md) | Run-summary schema & CLI |
+| [Aerospace Code Audit](docs/AUDIT_AEROSPACE_2026.md) | Panic-freedom / bounded-memory audit |
+
+## 🧠 Run Summaries
+
+`magent run` can persist a compact head/tail "compression window" of the
+conversation for later reuse — handy for sketching context into a fresh
+session without replaying the whole transcript. Summaries are stored as
+one JSON file per topic under the user's XDG data directory (override with
+`$MAGENT_SUMMARIES_DIR` or `--dir <PATH>`); the file layout and schema are
+documented in [docs/SUMMARY_STORE.md](docs/SUMMARY_STORE.md).
+
+Save a summary for the current run:
+
+```bash
+magent run "Fix the boot hang" --save-summary boot-hang
+magent run "Fix the boot hang" --save-summary boot-hang --save-summary-overwrite
+```
+
+Load it back into a later run:
+
+```bash
+magent run "Continue the boot-hang work" --load-summary boot-hang
+```
+
+The summaries are also managed directly via the `magent summary` subcommand:
+
+```bash
+magent summary save    boot-hang --from run.txt   # save from a file
+magent summary show    boot-hang                   # pretty-print the window
+magent summary list                                # all stored topics
+magent summary load    boot-hang                   # print as a JSON array
+magent summary export  boot-hang > out.json        # raw JSON to stdout
+magent summary delete  boot-hang                   # remove a topic
+magent summary rollback boot-hang 2                # promote history[2] to active
+```
 
 ## 📊 Features Matrix
 
@@ -281,9 +369,19 @@ cargo build -p magent --release
 | Web3 Identity (Ed25519) | ✅ | ✅ |
 | Ingress Gateway | ✅ | ✅ |
 | Bidirectional UART (command → result reply) | ✅ | ✅ |
+| **AT command subset (ESP-AT compatible provisioning)** | ✅ | ✅ |
+| **AT-managed secrets stored device-bound sealed (DBO2, HKDF + HMAC)** | ✅ | ✅ |
+| **`AT+WIFIPASSUPGRADE=1` (DBO1 → DBO2 in-place migration)** | ✅ | ✅ |
 | Crash-loop detection + safe mode | ✅ | ✅ |
 | Health monitoring (heartbeat, free-heap) | ✅ | ✅ |
 | OTA Updates | 🔄 | 🔄 |
+| **Cloud LLM backends (DeepSeek / Ollama, pluggable)** | ✅ | ✅ |
+| **Web browsing (`web_search` / `fetch_url` / `webpage_summary`)** | ✅ (host) | ✅ (host) |
+| **Weather query (`get_weather`, Open-Meteo, no key)** | ✅ (host) | ✅ (host) |
+| **Blockchain tools (`get_balance` / `send_transaction` / …)** | ✅ | ✅ |
+| **Email MCP tools (`--email-tools`)** | ✅ (host) | ❌ |
+| **Run summaries (`--save-summary` / `--load-summary`)** | ✅ | ✅ |
+| **Web3 signed run reports (`magent run --sign`)** | ✅ | ✅ |
 
 ## 🛡️ Reliability & Error-Handling
 
@@ -304,7 +402,13 @@ unattended / low-trust environments:
   loop never blocks forever on input.
 - **`RecoveryManager`** (in `magent-core`) now actually applies exponential
   backoff between retries, with a pluggable delay hook.
-- 281 `magent-core` unit tests pass.
+- **Format / code fault tolerance** — the ReAct loop parses malformed or mixed
+  LLM output (fenced code blocks, prose-wrapped JSON, Anthropic `<invoke>` tool
+  calls, plain-text answers) instead of looping or dropping the answer.
+- **Panic-cascade safety** — the trace-sink and boot-key paths never `panic!`
+  inside a `Result`; `#![deny(clippy::panic_in_result_fn)]` is enforced under
+  CI to keep it that way.
+- 400+ `magent-core` unit tests pass, 0 failures.
 
 ## 🤝 Contributing
 

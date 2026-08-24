@@ -69,6 +69,23 @@ pub struct Message {
 
 /// Mini agent for embedded systems
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+/// A chat-LLM backend the agent can call to reason about a task and decide
+/// tool calls. Implementations are chip-specific (e.g. the ESP32 firmware's
+/// DeepSeek HTTP client). The returned text is either a plain answer or a
+/// JSON tool-call directive `{"tool":"<name>","args":"<key=value,...>"}`.
+#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+pub trait LlmBackend {
+    /// Send the system prompt + user task and return the assistant text.
+    /// Implementations may block (e.g. a network round-trip); the caller
+    /// drives this from the agent loop.
+    fn complete(
+        &mut self,
+        system: &str,
+        user: &str,
+    ) -> core::result::Result<alloc::string::String, AgentError>;
+}
+
+#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 pub struct MiniAgent {
     #[allow(dead_code)]
     config: AgentConfig,
@@ -83,6 +100,12 @@ pub struct MiniAgent {
     /// `Option` lets us detect the logic-bug case where `execute_tool`
     /// runs without a preceding think.
     pending_tool: Option<ToolCall>,
+    /// Optional chat-LLM backend. When present, `think` asks it to reason
+    /// about the task and decide a tool call (or give a final answer);
+    /// when absent, the deterministic heuristic (`pick_tool`) is used.
+    /// Held as a `&'static mut` so `think` can call the (mutable) backend.
+    #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+    llm: Option<&'static mut dyn LlmBackend>,
     #[cfg(feature = "monitoring")]
     monitor: Option<crate::monitoring::MonitoringManager>,
 }
@@ -222,6 +245,8 @@ impl MiniAgent {
             conversation: Vec::new(),
             current_task: String::new(),
             pending_tool: None,
+            #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+            llm: None,
             #[cfg(feature = "monitoring")]
             monitor: None,
         })
@@ -248,6 +273,16 @@ impl MiniAgent {
     /// keep the built-in simulation.
     pub fn set_tool_handler(&mut self, handler: &'static dyn crate::tools::ToolHandler) {
         self.tools.set_handler(handler);
+    }
+
+    /// Install a chat-LLM backend (e.g. the ESP32 firmware's DeepSeek HTTP
+    /// client). When set, `think` asks the LLM to reason about the task and
+    /// decide a tool call instead of using the deterministic heuristic.
+    /// The backend must be a `'static` shared instance (the agent holds a
+    /// reference, not ownership).
+    #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+    pub fn set_llm_backend(&mut self, backend: &'static mut dyn LlmBackend) {
+        self.llm = Some(backend);
     }
 
     /// Run a task
@@ -398,17 +433,80 @@ impl MiniAgent {
             return Ok(());
         }
 
-        // Pick the tool based on the current task text.
-        let task = self.current_task.as_str();
-        let (name, args) = self.pick_tool(task);
+        let task = self.current_task.clone();
+
+        // If an LLM backend is configured, ask it to reason about the task
+        // and decide a tool call (or give a final answer). On any LLM error
+        // we fall through to the deterministic heuristic so the agent still
+        // makes progress offline.
+        #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+        if self.llm.is_some() {
+            let system = self.build_llm_system_prompt();
+            if let Some(llm) = self.llm.as_deref_mut() {
+                match llm.complete(system.as_str(), task.as_str()) {
+                    Ok(reply) => {
+                        if let Some((tool, args)) = parse_llm_tool_call(&reply) {
+                            self.pending_tool = Some(ToolCall {
+                                name: heapless::String::try_from(tool.as_str()).unwrap_or_default(),
+                                arguments: heapless::String::try_from(args.as_str())
+                                    .unwrap_or_default(),
+                            });
+                            self.add_message("assistant", reply.as_str())?;
+                            self.state = AgentState::Executing;
+                            return Ok(());
+                        }
+                        // Plain-text answer — the task is complete.
+                        self.add_message("assistant", reply.as_str())?;
+                        self.state = AgentState::Finished;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        log::warn!("[agent] LLM backend error: {e}");
+                    }
+                }
+            }
+        }
+
+        // Pick the tool based on the current task text (heuristic fallback).
+        let (name, args) = self.pick_tool(task.as_str());
+
+        // For GPIO writes, honor an explicit pin number mentioned in the
+        // task (e.g. "set gpio 5 high") instead of always using pick_tool's
+        // default pin=13.
+        let arguments = if name == "write_gpio" {
+            match self.extract_gpio_pin(task.as_str()) {
+                Some(pin) => {
+                    // Decide the state from the task text directly ("low" /
+                    // "off" / "0" → low), because pick_tool only checks for
+                    // "off" and would mis-route "set gpio 7 low".
+                    let lower = task.to_ascii_lowercase();
+                    let state = if lower.contains("low")
+                        || lower.contains("off")
+                        || lower.contains("=0")
+                    {
+                        "low"
+                    } else {
+                        "high"
+                    };
+                    let mut a = heapless::String::<128>::new();
+                    use core::fmt::Write as _;
+                    let _ = write!(a, "pin={pin},state={state}");
+                    a
+                }
+                None => heapless::String::try_from(args).unwrap_or_default(),
+            }
+        } else {
+            heapless::String::try_from(args).unwrap_or_default()
+        };
 
         self.pending_tool = Some(ToolCall {
-            // Defense-in-depth: tool names/args are bounded heapless
-            // strings, but converting a runtime &str must not panic if it
-            // exceeds the bound — degrade to an empty value, which the
-            // executor reports as an unknown/empty tool gracefully.
+            // Defense-in-depth: `pick_tool` only emits hardcoded short names
+            // today, but converting an unbounded `&str` into a bounded
+            // `String<32>` must not be able to panic. `unwrap_or_default()`
+            // (matching the LLM path above) degrades a too-long name to
+            // "unknown tool", which the executor handles gracefully.
             name: heapless::String::try_from(name).unwrap_or_default(),
-            arguments: heapless::String::try_from(args).unwrap_or_default(),
+            arguments,
         });
 
         self.add_message("assistant", "Calling tool")?;
@@ -416,27 +514,127 @@ impl MiniAgent {
         Ok(())
     }
 
+    /// Build the system prompt handed to the LLM backend: the agent's role,
+    /// the tool-call contract, and the live tool inventory.
+    #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+    fn build_llm_system_prompt(&self) -> String<MAX_BUFFER_SIZE> {
+        let mut out = String::new();
+        let _ = out.push_str(concat!(
+            "You are mAgent, an embedded AI agent. Use a tool when it helps, ",
+            "otherwise answer concisely. To call a tool reply with ONLY this JSON: ",
+            "{\"tool\":\"<name>\",\"args\":\"<key=value,...>\"}. Available tools:\n"
+        ));
+        let _ = out.push_str(self.tools.describe().as_str());
+        out
+    }
+
     /// Pick the most appropriate tool call for the current task text.
-    /// Returns the tool name and its JSON argument string. Used by the
+    /// Returns the tool name and its argument string. Used by the
     /// heuristic-driven `think` phase.
+    ///
+    /// NOTE (MicroAgent): the args are emitted in the `key=value,key=value`
+    /// form that every `ToolRegistry` executor (and the firmware's
+    /// `ToolHandler`) parses via [`crate::tools::parse_args`]. The previous
+    /// JSON-object form (`{"sensor":"temperature"}`) could NOT be parsed by
+    /// `parse_args` (which splits on `,` and `=`), so every heuristic sensor
+    /// read silently returned "Unknown sensor".
     fn pick_tool(&self, task: &str) -> (&'static str, &'static str) {
         let lower = task.to_ascii_lowercase();
-        if lower.contains("temperature") {
-            ("read_sensor", r#"{"sensor":"temperature"}"#)
-        } else if lower.contains("heart") {
-            ("read_sensor", r#"{"sensor":"heart_rate"}"#)
-        } else if lower.contains("led") || lower.contains("gpio") {
-            ("write_gpio", r#"{"pin":13,"state":"high"}"#)
+        // ---- sensor reads ----
+        if lower.contains("temperature") || lower.contains("temp") {
+            ("read_sensor", "sensor=temperature")
+        } else if lower.contains("heart") || lower.contains("pulse") {
+            ("read_sensor", "sensor=heart_rate")
+        } else if lower.contains("hrv") {
+            ("read_sensor", "sensor=hrv")
+        } else if lower.contains("glucose") || lower.contains("blood sugar") {
+            ("read_sensor", "sensor=glucose")
+        } else if lower.contains("ecg") || lower.contains("ekg") {
+            ("read_sensor", "sensor=ecg")
+        } else if lower.contains("stress") {
+            ("read_sensor", "sensor=stress")
+        } else if lower.contains("humidity") || lower.contains("humid") {
+            ("read_sensor", "sensor=humidity")
+        } else if lower.contains("pressure") || lower.contains("baro") || lower.contains("altitude") {
+            ("read_sensor", "sensor=pressure")
+        } else if lower.contains("light") || lower.contains("lux") {
+            ("read_sensor", "sensor=light")
+        } else if lower.contains("accelerometer") || lower.contains("accel") || lower.contains("imu") {
+            ("read_sensor", "sensor=accelerometer")
+        } else if lower.contains("battery") || lower.contains("batt") {
+            ("read_sensor", "sensor=battery")
+        } else if lower.contains("memory")
+            || lower.contains("free_heap")
+            || lower.contains("free heap")
+            || lower.contains("heap")
+            || lower.contains("sram")
+        {
+            ("read_sensor", "sensor=memory")
+        }
+        // ---- action tools ----
+        else if lower.contains("led") || lower.contains("gpio") {
+            if lower.contains("off") {
+                ("write_gpio", "pin=13,state=low")
+            } else {
+                ("write_gpio", "pin=13,state=high")
+            }
         } else if lower.contains("flash") {
-            ("flash_read", r#"{"address":0,"length":16}"#)
-        } else if lower.contains("battery") {
-            ("read_sensor", r#"{"sensor":"battery"}"#)
+            if lower.contains("write") || lower.contains("store") || lower.contains("save") {
+                ("flash_write", "address=0,data=CONFIG_V1")
+            } else {
+                ("flash_read", "address=0,length=16")
+            }
+        } else if lower.contains("voice") || lower.contains("speak") || lower.contains("tts") {
+            ("voice_output", "text=Hello from mAgent")
+        } else if lower.contains("notif") || lower.contains("alert") {
+            ("send_notification", "text=Notification from mAgent,priority=normal")
+        } else if lower.contains("ble") || lower.contains("bluetooth") {
+            ("ble_send", "data=hello,characteristic=default")
         } else {
             // Fallback: at least one round-trip through `read_sensor`
             // so the loop makes forward progress and the user sees
             // *something* happen.
-            ("read_sensor", r#"{"sensor":"temperature"}"#)
+            ("read_sensor", "sensor=temperature")
         }
+    }
+
+    /// Extract an explicit GPIO pin number from a task's natural-language
+    /// text, e.g. "set gpio 5 high" or "pin 7 low". Returns `None` when no
+    /// pin is mentioned, so the caller falls back to `pick_tool`'s default.
+    /// The pin is bounded to a `u8` (ESP32 GPIOs are in 0..=48).
+    fn extract_gpio_pin(&self, task: &str) -> Option<u8> {
+        let lower = task.to_ascii_lowercase();
+        for marker in ["pin", "gpio"] {
+            let mut search: &str = lower.as_str();
+            while let Some(idx) = search.find(marker) {
+                let rest = &search[idx + marker.len()..];
+                // Skip optional separators: "pin 5", "pin=5", "pin:5", ...
+                let rest = rest.trim_start_matches(|c: char| {
+                    c == ' ' || c == '=' || c == ':' || c == '#' || c == '-' || c == '_'
+                });
+                // Read the first run of digits after the marker.
+                let mut n: u32 = 0;
+                let mut any = false;
+                for c in rest.chars() {
+                    match c.to_digit(10) {
+                        Some(d) => {
+                            n = n.saturating_mul(10).saturating_add(d);
+                            any = true;
+                            if n > u32::from(u8::MAX) {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                if any && n <= u32::from(u8::MAX) {
+                    return Some(n as u8);
+                }
+                // No valid pin here (none / out of range) — keep looking.
+                search = rest;
+            }
+        }
+        None
     }
 
     /// Number of thinking iterations already performed in the current
@@ -457,11 +655,9 @@ impl MiniAgent {
         // Pull the pending call that `think` queued. If there isn't one
         // we treat that as a logic bug and surface a configuration
         // error instead of silently dropping the iteration.
-        let tool_call = self.pending_tool.take().ok_or_else(|| {
-            AgentError::ConfigurationError {
-                field: "agent",
-                reason: crate::error::ConfigError::MissingField,
-            }
+        let tool_call = self.pending_tool.take().ok_or(AgentError::ConfigurationError {
+            field: "agent",
+            reason: crate::error::ConfigError::MissingField,
         })?;
 
         // Execute via the tool registry.
@@ -629,6 +825,29 @@ impl MiniAgent {
     }
 }
 
+/// Parse an LLM tool-call directive `{"tool":"<name>","args":"<kv>"}`.
+/// Returns `None` for a plain-text answer (no `tool` field). A tiny,
+/// dependency-free parser keeps `MiniAgent` usable in `no_std`.
+#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+fn parse_llm_tool_call(reply: &str) -> Option<(alloc::string::String, alloc::string::String)> {
+    let tool = extract_json_field(reply, "tool")?;
+    let args = extract_json_field(reply, "args").unwrap_or_default();
+    Some((tool, args))
+}
+
+/// Extract the value of the first `"<key>": "..."` occurrence in `s`.
+#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+fn extract_json_field(s: &str, key: &str) -> Option<alloc::string::String> {
+    use alloc::string::ToString;
+    let pat = alloc::format!("\"{key}\"");
+    let idx = s.find(&pat)?;
+    let rest = s[idx + pat.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 #[cfg(all(test, any(feature = "nrf52", feature = "esp32", feature = "embedded")))]
 mod tests {
     use super::*;
@@ -657,6 +876,46 @@ mod tests {
     }
 
     #[test]
+    fn extract_gpio_pin_from_task_text() {
+        let agent = MiniAgent::new(make_cfg()).expect("agent");
+        assert_eq!(agent.extract_gpio_pin("set gpio 5 high"), Some(5));
+        assert_eq!(agent.extract_gpio_pin("turn pin 7 low"), Some(7));
+        assert_eq!(agent.extract_gpio_pin("gpio=12 high"), Some(12));
+        assert_eq!(agent.extract_gpio_pin("pin: 3"), Some(3));
+        assert_eq!(agent.extract_gpio_pin("led off"), None);
+        assert_eq!(agent.extract_gpio_pin("what is the temperature"), None);
+        // Pin out of u8 range falls back to None (not a truncated value).
+        assert_eq!(agent.extract_gpio_pin("gpio 500 high"), None);
+    }
+
+    #[test]
+    fn parse_llm_tool_call_directive() {
+        use alloc::string::ToString;
+        assert_eq!(
+            parse_llm_tool_call("{\"tool\":\"read_sensor\",\"args\":\"sensor=temperature\"}"),
+            Some(("read_sensor".to_string(), "sensor=temperature".to_string()))
+        );
+        // Plain-text answers (no `tool` field) yield None.
+        assert!(parse_llm_tool_call("Just a plain answer.").is_none());
+        assert!(parse_llm_tool_call("{not json").is_none());
+    }
+
+    #[test]
+    fn pick_tool_routes_memory_to_read_sensor() {
+        let agent = MiniAgent::new(make_cfg()).expect("agent");
+        for task in [
+            "what is the free memory",
+            "how much heap is free",
+            "report the free_heap",
+            "check sram usage",
+        ] {
+            let (name, args) = agent.pick_tool(task);
+            assert_eq!(name, "read_sensor", "task {task:?}");
+            assert!(args.contains("memory"), "task {task:?} args={args:?}");
+        }
+    }
+
+    #[test]
     fn pick_tool_routes_heartrate_to_heart_rate_sensor() {
         let agent = MiniAgent::new(make_cfg()).expect("agent");
         let (name, args) = agent.pick_tool("What's my heart rate?");
@@ -670,6 +929,117 @@ mod tests {
         let (name, args) = agent.pick_tool("Tell me a joke");
         assert_eq!(name, "read_sensor");
         assert!(args.contains("temperature"));
+    }
+
+    // ---- pick_tool vocabulary coverage (MicroAgent) ----
+    // Regression: the args must be in `key=value` form so the tool
+    // executors (which use `parse_args`) can actually read them, and the
+    // full sensor/action vocabulary must route to the right tool.
+
+    #[test]
+    fn pick_tool_routes_every_sensor_keyword() {
+        let agent = MiniAgent::new(make_cfg()).expect("agent");
+        let cases = [
+            ("what is my heart rate", "heart_rate"),
+            ("check my pulse", "heart_rate"),
+            ("read hrv", "hrv"),
+            ("glucose reading", "glucose"),
+            ("blood sugar level", "glucose"),
+            ("show ecg", "ecg"),
+            ("measure ekg", "ecg"),
+            ("stress level", "stress"),
+            ("humidity please", "humidity"),
+            ("barometric pressure", "pressure"),
+            ("ambient light", "light"),
+            ("accelerometer data", "accelerometer"),
+            ("imu orientation", "accelerometer"),
+            ("battery level", "battery"),
+            ("batt status", "battery"),
+        ];
+        for (task, expect) in cases {
+            let (name, args) = agent.pick_tool(task);
+            assert_eq!(name, "read_sensor", "task: {task}");
+            assert!(
+                args.contains(expect),
+                "task {task:?}: args {args:?} should contain {expect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pick_tool_routes_action_keywords() {
+        let agent = MiniAgent::new(make_cfg()).expect("agent");
+        assert_eq!(agent.pick_tool("turn off the led").0, "write_gpio");
+        assert_eq!(agent.pick_tool("turn off the led").1, "pin=13,state=low");
+        assert_eq!(agent.pick_tool("set gpio high").0, "write_gpio");
+        assert_eq!(agent.pick_tool("write config to flash").0, "flash_write");
+        assert_eq!(agent.pick_tool("read from flash").0, "flash_read");
+        assert_eq!(agent.pick_tool("speak the result").0, "voice_output");
+        assert_eq!(agent.pick_tool("send a notification").0, "send_notification");
+        assert_eq!(agent.pick_tool("send over ble").0, "ble_send");
+    }
+
+    #[test]
+    fn pick_tool_args_parse_back_to_the_intended_sensor() {
+        // The whole point of the key=value fix: the args `pick_tool` emits
+        // must be consumable by `parse_args`/`arg`, otherwise the executor
+        // returns "Unknown sensor".
+        use crate::tools::{arg, parse_args};
+        let agent = MiniAgent::new(make_cfg()).expect("agent");
+        for (task, expect) in [
+            ("read temperature", "temperature"),
+            ("heart rate", "heart_rate"),
+            ("glucose", "glucose"),
+            ("ecg", "ecg"),
+            ("stress", "stress"),
+            ("humidity", "humidity"),
+            ("pressure", "pressure"),
+            ("light", "light"),
+            ("accelerometer", "accelerometer"),
+            ("battery", "battery"),
+        ] {
+            let (name, args) = agent.pick_tool(task);
+            assert_eq!(name, "read_sensor");
+            let parsed = parse_args(args);
+            let sensor = arg(&parsed, "sensor", "");
+            assert_eq!(sensor, expect, "task {task:?} should select sensor {expect:?}, got {sensor:?}");
+        }
+    }
+
+    // ---- end-to-end MiniAgent loop ----
+    // These drive `MiniAgent::run` through the heuristic ReAct loop and
+    // assert the *actual value* is surfaced. Before the pick_tool arg fix
+    // they all returned "Task: Tool result: Unknown sensor".
+
+    #[test]
+    fn run_reports_real_temperature_value() {
+        let mut agent = MiniAgent::new(make_cfg()).expect("agent");
+        let out = futures::executor::block_on(agent.run("Read the temperature")).unwrap();
+        assert!(out.contains("°C"), "expected °C in reply, got: {out}");
+        assert!(!out.contains("Unknown sensor"), "sensor not parsed: {out}");
+    }
+
+    #[test]
+    fn run_reports_real_heart_rate_value() {
+        let mut agent = MiniAgent::new(make_cfg()).expect("agent");
+        let out = futures::executor::block_on(agent.run("what's my heart rate")).unwrap();
+        assert!(out.contains("BPM"), "expected BPM in reply, got: {out}");
+    }
+
+    #[test]
+    fn run_reports_real_glucose_value() {
+        let mut agent = MiniAgent::new(make_cfg()).expect("agent");
+        let out = futures::executor::block_on(agent.run("check my glucose")).unwrap();
+        assert!(out.contains("mg/dL"), "expected mg/dL in reply, got: {out}");
+    }
+
+    #[test]
+    fn run_routes_voice_and_led_actions() {
+        let mut agent = MiniAgent::new(make_cfg()).expect("agent");
+        let out = futures::executor::block_on(agent.run("speak the answer")).unwrap();
+        assert!(out.contains("Voice queued"), "expected voice reply, got: {out}");
+        let out2 = futures::executor::block_on(agent.run("turn on the led")).unwrap();
+        assert!(out2.contains("set to high"), "expected gpio reply, got: {out2}");
     }
 
     #[test]

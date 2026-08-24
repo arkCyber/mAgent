@@ -18,7 +18,7 @@ description = "mAgent firmware for the ESP32-C61-DevKitC-1-N8R2 (N8R2, std)"
 [dependencies]
 # Chip-agnostic core — the `esp32` feature activates RISC-V HAL deps.
 # The `std` feature is needed because esp-idf-svc provides std:: threads.
-magent-core = { path = "../../magent-core", default-features = false, features = ["esp32", "link_adapters", "ingress", "web3"] }
+magent-core = { path = "../../magent-core", default-features = false, features = ["esp32", "link_adapters", "ingress", "web3", "boot-key"] }
 
 # ---------------------------------------------------------------------------
 # ESP-IDF integration (the std story for the C61-N8R2).
@@ -35,6 +35,13 @@ magent-core = { path = "../../magent-core", default-features = false, features =
 esp-idf-svc = { workspace = true, features = ["experimental", "std"] }
 # PATCHED (MicroAgent): Use native driver with PlatformIO ESP-IDF.
 esp-idf-sys = { workspace = true, default-features = false, features = ["pio"] }
+# Trait surface for the esp-idf-svc HTTP client (used by `AT+HTTPGET=<url>`
+# and the DeepSeek LLM backend). Aligned with esp-idf-svc's transitive
+# `embedded-svc 0.29`.
+embedded-svc = "0.29"
+# JSON for the DeepSeek chat-completions request/response parsing (the LLM
+# backend installed into the agent).
+serde_json = { workspace = true }
 
 # esp-idf-svc requires std. `std` is implied by the espidf feature above
 # but we set it explicitly so the dependency graph is self-documenting.

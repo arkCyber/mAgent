@@ -151,6 +151,10 @@ impl HttpRpcClient {
                 #[cfg(not(feature = "esp32"))]
                 let (code, message) = (error.code, error.message.clone());
                 let rpc_err = super::http_types::RpcError {
+                    // `code` is `i32` on the esp32 path (`error.code()`) but
+                    // already `i64` on host (`error.code`), so the `.into()`
+                    // is cfg-dependent; silence the useless-conversion lint.
+                    #[allow(clippy::useless_conversion)]
                     code: code.into(),
                     message,
                 };
@@ -477,7 +481,7 @@ fn parse_hex_wei(hex: &str) -> Result<Wei, Web3ErrorKind> {
 #[cfg(feature = "std")]
 fn parse_hex_bytes(hex: &str) -> Result<Vec<u8>, Web3ErrorKind> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(Web3ErrorKind::BlockchainError("odd hex length".to_string()));
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
@@ -590,7 +594,11 @@ mod tests {
         assert_eq!(client.rpc_url(), "https://eth.llamarpc.com");
     }
 
+    // PATCHED (MicroAgent): this test only makes sense when `reqwest` is OFF
+    // (it asserts the no-reqwest error path). Now that `std` enables `reqwest`
+    // by default, gate it on the feature being disabled.
     #[test]
+    #[cfg(not(feature = "reqwest"))]
     fn test_client_post_without_reqwest_returns_error() {
         // Without the `reqwest` feature, `http_post` returns a clear error
         // explaining what to enable. This avoids silently doing nothing.

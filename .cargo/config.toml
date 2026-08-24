@@ -30,6 +30,31 @@ linker = "/Users/arksong/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-
 DEFMT_LOG = "info"
 
 # ---------------------------------------------------------------------------
+# Default Wi-Fi credentials (provisioned on first boot).
+#
+# `firmware/esp32-app/src/main.rs::provision_and_load_wifi_credentials`
+# reads these at compile time via `option_env!` and, when the device has
+# no `wifi_ssid`/`wifi_pass` in NVS and `AT+SYSSTORE` is enabled, writes
+# them into NVS so the board comes up joined to this AP.
+#
+# NOTE: a real process environment variable (e.g. exported in your shell
+# before running cargo) overrides these, so you can point a specific build
+# at a different AP without editing this file.
+#
+# SECURITY: the values below are GENERIC placeholders so no real credentials
+# are committed. Export `MAGENT_WIFI_SSID` / `MAGENT_WIFI_PASS` in your build
+# shell to provision a specific AP (these defaults will not join any network).
+MAGENT_WIFI_SSID = "MySSID"
+MAGENT_WIFI_PASS = "password"
+
+# Default LLM backend parameters (used by the agent via `AT+LLMCFG` and the
+# DeepSeek HTTP backend). Override with real shell env vars before building.
+# NOTE: the API key is intentionally left EMPTY — export `MAGENT_LLM_API_KEY`
+# in your build shell instead of committing a secret.
+MAGENT_LLM_MODEL = "deepseek-chat"
+MAGENT_LLM_API_KEY = ""
+
+# ---------------------------------------------------------------------------
 # Profiles
 # ---------------------------------------------------------------------------
 # Profile settings live in the workspace root `Cargo.toml` under

@@ -66,7 +66,7 @@ fn write_gpio(args: &str) -> ToolResult {
         0
     };
 
-    let mut last = 0;
+    let mut last;
     unsafe {
         last = sys::gpio_reset_pin(pin);
         if last == 0 {
@@ -116,12 +116,18 @@ fn read_sensor(args: &str) -> ToolResult {
         let ok = last == 0;
         let data = std::format!("temperature={celsius:.1} C (err={last})");
         tool_result("read_sensor", data, ok)
-    } else {
+    } else if sensor.contains("mem") || sensor.contains("heap") || sensor.contains("sram") {
         // Free heap — a real, changing memory status.
         let free = unsafe { sys::esp_get_free_heap_size() };
         let min = unsafe { sys::esp_get_minimum_free_heap_size() };
         let data = std::format!("free_heap={free} B min_free_heap={min} B");
         tool_result("read_sensor", data, true)
+    } else {
+        // Unknown sensor (e.g. battery, glucose on hardware that has none).
+        // Report "unsupported" honestly instead of silently returning heap
+        // data that would look like a real reading.
+        let data = std::format!("unsupported sensor: {sensor}");
+        tool_result("read_sensor", data, false)
     }
 }
 

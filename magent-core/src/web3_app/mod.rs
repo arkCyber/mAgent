@@ -41,6 +41,10 @@
 //! Gated on `web3_app`, which transitively enables `web3` + `std`.
 //! Embedded (`no_std`) builds do not pull in this module.
 
+// `ToString` is needed at runtime (this crate is `#![no_std]`, so the std
+// prelude — and its `ToString` impl — is NOT auto-imported), even though
+// clippy flags it as unused on host builds.
+#[allow(unused_imports)]
 use std::string::{String, ToString};
 use std::vec::Vec;
 
@@ -165,13 +169,13 @@ impl RunReportFields {
     /// variant on overflow so callers can surface the problem.
     pub fn validate(&self) -> Result<(), Web3ErrorKind> {
         if self.answer.len() > ANSWER_MAX {
-            return Err(Web3ErrorKind::InvalidSecretKeyLength { actual: self.answer.len() })?;
+            Err(Web3ErrorKind::InvalidSecretKeyLength { actual: self.answer.len() })?;
         }
         if self.provider.len() > PROVIDER_MAX {
-            return Err(Web3ErrorKind::InvalidSecretKeyLength { actual: self.provider.len() })?;
+            Err(Web3ErrorKind::InvalidSecretKeyLength { actual: self.provider.len() })?;
         }
         if self.state.len() > STATE_MAX {
-            return Err(Web3ErrorKind::InvalidSecretKeyLength { actual: self.state.len() })?;
+            Err(Web3ErrorKind::InvalidSecretKeyLength { actual: self.state.len() })?;
         }
         Ok(())
     }

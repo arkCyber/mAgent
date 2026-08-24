@@ -16,8 +16,10 @@ use sha3::{Digest, Keccak256};
 
 /// Transaction type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum TransactionType {
     /// Legacy transaction (EIP-155).
+    #[default]
     Legacy,
     /// EIP-2930: Access List transaction.
     Eip2930,
@@ -36,11 +38,6 @@ impl TransactionType {
     }
 }
 
-impl Default for TransactionType {
-    fn default() -> Self {
-        TransactionType::Legacy
-    }
-}
 
 /// A transaction request before signing.
 #[derive(Debug, Clone)]
@@ -205,20 +202,21 @@ impl TransactionRequest {
 
     /// Encode as legacy RLP.
     fn encode_legacy_rlp(&self) -> Vec<u8> {
-        let mut items = Vec::new();
-        items.push(rlp_encode_uint(self.nonce));
-        items.push(rlp_encode_uint128(self.gas_price.as_wei()));
-        items.push(rlp_encode_uint(self.gas_limit));
-        items.push(match &self.to {
-            Some(addr) => rlp_encode_address(addr),
-            None => vec![0x80], // Empty address
-        });
-        items.push(rlp_encode_uint128(self.value.as_wei()));
-        items.push(rlp_encode_bytes(&self.data));
-        items.push(rlp_encode_uint(self.chain_id));
-        items.push(vec![0x80]); // v = 0
-        items.push(rlp_encode_uint(0)); // r = 0
-        items.push(rlp_encode_uint(0)); // s = 0
+        let items = vec![
+            rlp_encode_uint(self.nonce),
+            rlp_encode_uint128(self.gas_price.as_wei()),
+            rlp_encode_uint(self.gas_limit),
+            match &self.to {
+                Some(addr) => rlp_encode_address(addr),
+                None => vec![0x80], // Empty address
+            },
+            rlp_encode_uint128(self.value.as_wei()),
+            rlp_encode_bytes(&self.data),
+            rlp_encode_uint(self.chain_id),
+            vec![0x80],        // v = 0
+            rlp_encode_uint(0), // r = 0
+            rlp_encode_uint(0), // s = 0
+        ];
 
         rlp_encode_list(&items)
     }
@@ -228,23 +226,24 @@ impl TransactionRequest {
         let mut result = Vec::new();
         result.push(TransactionType::Eip1559.type_byte());
 
-        let mut items = Vec::new();
-        items.push(rlp_encode_uint(self.chain_id));
-        items.push(rlp_encode_uint(self.nonce));
-        items.push(rlp_encode_uint128(
-            self.max_priority_fee_per_gas.unwrap_or(Wei::ZERO).as_wei()
-        ));
-        items.push(rlp_encode_uint128(
-            self.max_fee_per_gas.unwrap_or(self.gas_price).as_wei()
-        ));
-        items.push(rlp_encode_uint(self.gas_limit));
-        items.push(match &self.to {
-            Some(addr) => rlp_encode_address(addr),
-            None => vec![0x80],
-        });
-        items.push(rlp_encode_uint128(self.value.as_wei()));
-        items.push(rlp_encode_bytes(&self.data));
-        items.push(self.encode_access_list_rlp());
+        let items = vec![
+            rlp_encode_uint(self.chain_id),
+            rlp_encode_uint(self.nonce),
+            rlp_encode_uint128(
+                self.max_priority_fee_per_gas.unwrap_or(Wei::ZERO).as_wei(),
+            ),
+            rlp_encode_uint128(
+                self.max_fee_per_gas.unwrap_or(self.gas_price).as_wei(),
+            ),
+            rlp_encode_uint(self.gas_limit),
+            match &self.to {
+                Some(addr) => rlp_encode_address(addr),
+                None => vec![0x80],
+            },
+            rlp_encode_uint128(self.value.as_wei()),
+            rlp_encode_bytes(&self.data),
+            self.encode_access_list_rlp(),
+        ];
 
         result.extend(rlp_encode_list(&items));
         result
@@ -255,18 +254,19 @@ impl TransactionRequest {
         let mut result = Vec::new();
         result.push(TransactionType::Eip2930.type_byte());
 
-        let mut items = Vec::new();
-        items.push(rlp_encode_uint(self.chain_id));
-        items.push(rlp_encode_uint(self.nonce));
-        items.push(rlp_encode_uint128(self.gas_price.as_wei()));
-        items.push(rlp_encode_uint(self.gas_limit));
-        items.push(match &self.to {
-            Some(addr) => rlp_encode_address(addr),
-            None => vec![0x80],
-        });
-        items.push(rlp_encode_uint128(self.value.as_wei()));
-        items.push(rlp_encode_bytes(&self.data));
-        items.push(self.encode_access_list_rlp());
+        let items = vec![
+            rlp_encode_uint(self.chain_id),
+            rlp_encode_uint(self.nonce),
+            rlp_encode_uint128(self.gas_price.as_wei()),
+            rlp_encode_uint(self.gas_limit),
+            match &self.to {
+                Some(addr) => rlp_encode_address(addr),
+                None => vec![0x80],
+            },
+            rlp_encode_uint128(self.value.as_wei()),
+            rlp_encode_bytes(&self.data),
+            self.encode_access_list_rlp(),
+        ];
 
         result.extend(rlp_encode_list(&items));
         result

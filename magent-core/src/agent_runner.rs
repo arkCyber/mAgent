@@ -895,7 +895,7 @@ impl OllamaClient {
     /// `--doctor` flow and for the runner's optional backend probe.
     pub fn check_connection(&self) -> bool {
         self.client
-            .get(format!("{}/api/tags", &self.base_url))
+            .get(format!("{}/api/tags", self.base_url))
             .send()
             .map(|r| r.status().is_success())
             .unwrap_or(false)
@@ -914,7 +914,7 @@ impl OllamaClient {
         self.write_chat_body(messages, sampling)?;
         let body = std::mem::take(&mut self.body_buf);
 
-        let url = format!("{}/api/chat", &self.base_url);
+        let url = format!("{}/api/chat", self.base_url);
         let response = self
             .client
             .post(&url)
@@ -1001,7 +1001,7 @@ impl OllamaClient {
     /// calling `GET /api/tags`. Returns an empty list on any error
     /// (network failure, non-JSON body, missing `models` array).
     pub fn get_models(&self) -> Vec<String> {
-        if let Ok(response) = self.client.get(format!("{}/api/tags", &self.base_url)).send() {
+        if let Ok(response) = self.client.get(format!("{}/api/tags", self.base_url)).send() {
             if let Ok(json) = response.json::<serde_json::Value>() {
                 return json["models"]
                     .as_array()
@@ -1048,7 +1048,7 @@ impl OllamaClient {
 
         let response = self
             .client
-            .post(format!("{}/api/generate", &self.base_url))
+            .post(format!("{}/api/generate", self.base_url))
             .json(&request_body)
             .send()
             .map_err(|e| format!("Request failed: {}", e))?;
@@ -1263,7 +1263,7 @@ impl DeepSeekClient {
         let mut body = std::mem::take(&mut self.body_buf);
         DeepSeekClient::write_chat_body_into(&mut body, &self.model, messages, sampling)?;
 
-        let url = format!("{}/chat/completions", &self.base_url);
+        let url = format!("{}/chat/completions", self.base_url);
         let response = self
             .client
             .post(&url)
@@ -1474,7 +1474,7 @@ impl LlmBackend for DeepSeekClient {
             return false;
         }
         self.client
-            .get(format!("{}/models", &self.base_url))
+            .get(format!("{}/models", self.base_url))
             .header(
                 reqwest::header::AUTHORIZATION,
                 format!("Bearer {}", self.api_key.0),

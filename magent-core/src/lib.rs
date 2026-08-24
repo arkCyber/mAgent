@@ -62,11 +62,72 @@
 // Workspace-wide lints are inherited via `[lints] workspace = true`
 // in `Cargo.toml` (missing_docs, unsafe_op_in_unsafe_fn). Crate-
 // specific clippy / rustc lints should live here.
+
 // Aerospace-grade guard: never `panic!`/`assert!` inside a function that
 // returns `Result` — such paths must return an error instead of crashing
 // (see the `boot_key::derive` feature-stub fix). Enforced under
 // `cargo clippy` (CI); a regression becomes a hard error.
 #![deny(clippy::panic_in_result_fn)]
+
+/// AT command parser. Pure `no_std`, host-tested in `tests/at_tests.rs`.
+///
+/// NOTE: this is a chip-agnostic parser only — the firmware-side
+/// dispatcher (which actually touches the Wi-Fi driver, NVS, GPIO,
+/// identity, …) lives in `firmware/esp32-app/src/at_dispatch.rs` so
+/// the parser can be exercised on the host without an SoC.
+pub mod at;
+
+/// Result type for AT command dispatch — moved from firmware into
+/// the core so the pure-logic validators in [`at_validate`] can
+/// return it without dragging in firmware-side dependencies.
+pub mod at_dispatch_outcome;
+
+/// Pure-logic decision helpers for AT command validation. Lives
+/// in the core (not firmware) so the security-sensitive rules
+/// (length caps, NUL rejection, encoding checks, mode
+/// restrictions) can be exercised on the host with hundreds of
+/// unit tests against malicious / pathological inputs.
+pub mod at_validate;
+
+/// Device-bound XOR-stream obfuscation for the Wi-Fi password (and
+/// other medium-sensitivity secrets stored in NVS).
+///
+/// See the module-level docs for the threat model, wire format,
+/// and aerograde properties. Lives in `magent-core` (not in
+/// firmware) so the seal / open round-trip can be exercised on
+/// the host by `cargo test` without an ESP-IDF toolchain.
+pub mod wifi_pass_seal;
+
+/// DBO2: stronger successor to `wifi_pass_seal` (DBO1).
+///
+/// Same threat model (NVS-dump attacker, no physical access)
+/// but adds:
+///
+///   * **Cipher key stretching** — device_key + nonce are mixed
+///     through HKDF-SHA256 to derive a per-entry cipher key.
+///     Re-using the same device_key across many entries no
+///     longer gives the attacker useful algebraic structure.
+///   * **Per-entry MAC** — 16-byte HMAC-SHA256 over (nonce || ciphertext)
+///     detects tamper / wrong-key conditions on open.
+///   * **Versioned wire format** — `"DBO2:" || hex(nonce) || hex(cipher) || hex(mac)`
+///     so the dispatcher can route by prefix.
+///
+/// Migration from DBO1 is transparent: [`open_sealed_v2`] first
+/// tries DBO2, then falls back to DBO1 via the existing
+/// [`wifi_pass_seal::open_sealed_bytes`]. Anything older (raw
+/// plaintext) is treated as legacy.
+pub mod wifi_pass_seal_v2;
+
+/// Boot-time-derived key (BTDK) for sealing `dev_identity`.
+///
+/// The chicken-and-egg problem with sealing the device identity
+/// is that the device identity *is* the seal key for everything
+/// else. This module breaks the loop by deriving a per-device
+/// key from hardware-unique material that lives *outside* NVS
+/// (on ESP32: eFuse BLOCK0 + chip ID). The result is host-
+/// testable (caller provides the material); the firmware binds
+/// the material to the actual hardware.
+pub mod boot_key;
 
 // `alloc` is always linked (even under `std`, where it's a re-export of
 // `format!` / `vec!` from `alloc` (and `println!` / `dbg!` from `std`

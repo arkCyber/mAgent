@@ -31,6 +31,15 @@ Complete documentation for the MicroAgent project.
 |----------|-------------|
 | [Platform Comparison](PLATFORM_COMPARISON.md) | Feature and performance comparison |
 
+## 🛡️ Reliability & Audits
+
+| Document | Description |
+|----------|-------------|
+| [Aerospace Code Audit](AUDIT_AEROSPACE_2026.md) | Panic-freedom / bounded-memory audit |
+| [LLM Backends](LLM_BACKENDS.md) | DeepSeek / Ollama provider wiring |
+| [Summary Store](SUMMARY_STORE.md) | Run-summary schema & CLI |
+| [AT Command Reference](AT_COMMAND_REFERENCE.md) | AT (Hayes / ESP-AT) provisioning subset |
+
 ## 📁 File Structure
 
 ```

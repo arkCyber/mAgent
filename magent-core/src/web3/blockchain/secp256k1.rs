@@ -138,7 +138,7 @@ impl Secp256k1PublicKey {
         #[cfg(feature = "web3")]
         {
             let mut hasher = Keccak256::new();
-            hasher.update(&self.uncompressed);
+            hasher.update(self.uncompressed);
             let hash = hasher.finalize();
             let mut addr_bytes = [0u8; 20];
             addr_bytes.copy_from_slice(&hash[12..32]);
@@ -624,7 +624,7 @@ fn decimal_bytes(n: usize) -> Vec<u8> {
 /// Decode hex to bytes
 fn hex_decode(s: &str) -> Result<Vec<u8>, Web3ErrorKind> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(Web3ErrorKind::BlockchainError("odd hex length".to_string()));
     }
     let mut out = Vec::with_capacity(s.len() / 2);

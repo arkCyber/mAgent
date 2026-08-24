@@ -102,6 +102,10 @@ impl JsonRpcRequest {
         use core::sync::atomic::{AtomicU32 as AtomicU64, Ordering};
 
         static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+        // `fetch_add` returns the underlying integer type (u32 on 32-bit
+        // targets, u64 on 64-bit); the `.into()` widens it to u64. It's only
+        // a "useless conversion" on 64-bit hosts, so silence the lint here.
+        #[allow(clippy::useless_conversion)]
         let id: u64 = REQUEST_ID.fetch_add(1, Ordering::Relaxed).into();
 
         Self {
@@ -281,7 +285,7 @@ impl ChainClient for EvmRpcClient {
     fn get_code(&self, address: &Address) -> BlockchainResult<Vec<u8>> {
         let params = vec![serde_json::json!(address.to_hex()), Value::from("latest")];
         let result: Value = self.raw_call("eth_getCode", params)?;
-        self.parse_hex(&result.as_str().unwrap_or("0x"))
+        self.parse_hex(result.as_str().unwrap_or("0x"))
     }
 
     fn get_transaction_receipt(&self, tx_hash: &Hash) -> BlockchainResult<Option<TransactionReceipt>> {
@@ -322,7 +326,7 @@ impl ChainClient for EvmRpcClient {
             "data": format!("0x{}", hex_encode(data))
         });
         let result: Value = self.raw_call("eth_call", vec![call_object, Value::from("latest")])?;
-        self.parse_hex(&result.as_str().unwrap_or("0x"))
+        self.parse_hex(result.as_str().unwrap_or("0x"))
     }
 
     fn send_raw_transaction(&self, signed_tx: &[u8]) -> BlockchainResult<Hash> {

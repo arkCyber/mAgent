@@ -1435,9 +1435,11 @@ dependencies = [
  "embedded-io-async 0.7.0",
  "enumset",
  "heapless 0.9.3",
+ "log",
  "num_enum",
  "serde",
  "strum 0.27.2",
+ "strum_macros 0.27.2",
 ]
 
 [[package]]
@@ -1508,6 +1510,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc5801fd11762e24d1e420d01d2ac518f2a2ca4329d4fbb6639f2412b6204e0"
 dependencies = [
  "enumset_derive",
+ "serde",
 ]
 
 [[package]]
@@ -2066,6 +2069,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "home"
 version = "0.5.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2595,6 +2607,7 @@ dependencies = [
  "cortex-m-rt",
  "critical-section",
  "defmt 0.3.100",
+ "digest",
  "ed25519-dalek",
  "embassy-executor",
  "embassy-nrf",
@@ -2608,6 +2621,7 @@ dependencies = [
  "embedded-storage-async",
  "futures",
  "heapless 0.9.3",
+ "hmac",
  "log",
  "magent-hal",
  "nrf-softdevice",
@@ -2621,6 +2635,7 @@ dependencies = [
  "secp256k1",
  "serde",
  "serde_json",
+ "sha2",
  "sha3",
  "xtensa-lx",
  "xtensa-lx-rt",
@@ -2656,6 +2671,7 @@ dependencies = [
  "critical-section",
  "embedded-hal 1.0.0",
  "embedded-io 0.7.1",
+ "embedded-svc",
  "embuild 0.31.4",
  "esp-idf-svc",
  "esp-idf-sys",
@@ -2667,6 +2683,7 @@ dependencies = [
  "log",
  "magent-core",
  "once_cell",
+ "serde_json",
  "which",
 ]
 

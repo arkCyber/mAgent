@@ -253,9 +253,11 @@ impl Chain {
         self.config
             .rpc_url
             .as_deref()
-            .ok_or(Web3ErrorKind::BlockchainError(
-                "RPC URL not configured for this chain".to_string(),
-            ))
+            .ok_or_else(|| {
+                Web3ErrorKind::BlockchainError(
+                    "RPC URL not configured for this chain".to_string(),
+                )
+            })
     }
 }
 

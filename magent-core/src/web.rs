@@ -58,7 +58,7 @@ const USER_AGENT: &str = concat!(
     "Chrome/124.0.0.0 Safari/537.36 ",
     "(magent/",
     env!("CARGO_PKG_VERSION"),
-    "; +https://github.com/arksong/MicroAgent)"
+    "; +https://github.com/arkCyber/mAgent)"
 );
 
 /// DuckDuckGo HTML search endpoint. No API key required.

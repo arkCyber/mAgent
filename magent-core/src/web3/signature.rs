@@ -204,6 +204,46 @@ impl SignedMessage {
         serde_json::to_string(self).expect("SignedMessage is always serialisable")
     }
 
+    /// Serialise to JSON into a caller-provided bounded buffer, avoiding the
+    /// per-frame heap allocation that [`SignedMessage::to_json`] makes. Used
+    /// by the ingress gateway's hot path.
+    ///
+    /// The output is byte-for-byte the same canonical serde form
+    /// (`{"signer":...,"payload_hex":...,"signature_hex":...}`), including
+    /// string escaping, so the result round-trips through
+    /// [`SignedMessage::from_json`] exactly like `to_json()`'s output.
+    ///
+    /// Returns `Err(())` if `out` is too small (no partial write is left
+    /// behind — the buffer is cleared first).
+    pub fn to_json_into<const N: usize>(
+        &self,
+        out: &mut heapless::String<N>,
+    ) -> Result<(), ()> {
+        use core::fmt::Write as _;
+        out.clear();
+        out.push_str("{\"signer\":\"").map_err(|_| ())?;
+        for c in self.signer.chars() {
+            match c {
+                '"' => out.push_str("\\\"").map_err(|_| ())?,
+                '\\' => out.push_str("\\\\").map_err(|_| ())?,
+                '\n' => out.push_str("\\n").map_err(|_| ())?,
+                '\r' => out.push_str("\\r").map_err(|_| ())?,
+                '\t' => out.push_str("\\t").map_err(|_| ())?,
+                ctrl if (ctrl as u32) < 0x20 => {
+                    // serde_json escapes other control chars as \u00XX.
+                    let _ = write!(out, "\\u{:04x}", ctrl as u32);
+                }
+                other => out.push(other).map_err(|_| ())?,
+            }
+        }
+        out.push_str("\",\"payload_hex\":\"").map_err(|_| ())?;
+        out.push_str(&self.payload_hex).map_err(|_| ())?;
+        out.push_str("\",\"signature_hex\":\"").map_err(|_| ())?;
+        out.push_str(&self.signature_hex).map_err(|_| ())?;
+        out.push_str("\"}").map_err(|_| ())?;
+        Ok(())
+    }
+
     /// Parse the JSON form back into a [`SignedMessage`].
     /// `payload` is re-derived from `payload_hex` so the caller
     /// doesn't have to manually decode.
