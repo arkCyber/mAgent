@@ -434,7 +434,7 @@ impl Args {
 
         match first.as_str() {
             "run" => {
-                let opts = parse_run_args(after_first.iter())?;
+                let opts = parse_run_args(after_first.iter().peekable())?;
                 let command = match opts {
                     RunParseOutcome::Run(opts) => Command::Run(opts),
                     RunParseOutcome::Help => Command::RunHelp,
@@ -631,8 +631,8 @@ fn extract_global_flags(args: &[String], global: &mut GlobalFlags) -> Vec<String
 
 /// Parse everything after `magent run …` into either a [`RunOptions`]
 /// or a `Help` request.
-fn parse_run_args<'a, I: Iterator<Item = &'a String>>(
-    mut iter: I,
+fn parse_run_args<'a>(
+    mut iter: std::iter::Peekable<std::slice::Iter<'a, String>>,
 ) -> Result<RunParseOutcome, ParseError> {
     let mut opts = RunOptions::default();
 
@@ -668,14 +668,19 @@ fn parse_run_args<'a, I: Iterator<Item = &'a String>>(
                 #[cfg(feature = "web3_app")]
                 "sign" => opts.sign_with_vault_identity = Some("default".to_string()),
                 "email-tools" => {
-                    // `--email-tools` or `--email-tools <path>`
-                    let path = iter.next();
-                    match path {
-                        Some(v) if !v.starts_with('-') => opts.email_tools = Some(v.clone()),
-                        _ => {
-                            // Either no arg or next token is a flag: use default.
-                            opts.email_tools = Some(String::new());
+                    // `--email-tools` or `--email-tools <path>`.
+                    // Peek, don't consume: only treat the next token as the
+                    // path when it's a non-flag token. Previously we called
+                    // `iter.next()` unconditionally, which swallowed a
+                    // following flag (e.g. `--email-tools --provider deepseek`
+                    // lost `--provider`, making `deepseek` the task and the
+                    // real task an extra positional → spurious help output).
+                    match iter.peek() {
+                        Some(v) if !v.starts_with('-') => {
+                            opts.email_tools = Some((*v).clone());
+                            iter.next(); // consume the path we just peeked
                         }
+                        _ => opts.email_tools = Some(String::new()),
                     }
                 }
                 "help" => return Ok(RunParseOutcome::Help),
@@ -3062,6 +3067,33 @@ mod tests {
                     o.verify_signed_path.as_deref().map(|p| p.to_str().unwrap()),
                     Some("/tmp/x.json")
                 );
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[cfg(feature = "email-tools")]
+    #[test]
+    fn email_tools_followed_by_flag_does_not_swallow_the_flag() {
+        // Regression: `--email-tools` used `iter.next()` to peek its optional
+        // path, which consumed a following flag. So
+        // `run --email-tools --provider deepseek <task>` lost `--provider`
+        // (making `deepseek` the task and the real task an extra positional).
+        let a = Args::parse(&argv([
+            "magent",
+            "run",
+            "--email-tools",
+            "--provider",
+            "deepseek",
+            "read temperature",
+        ]))
+        .unwrap();
+        match a.command {
+            Command::Run(o) => {
+                // --email-tools followed by a flag → default (empty) path.
+                assert_eq!(o.email_tools.as_deref(), Some(""));
+                assert_eq!(o.provider, "deepseek");
+                assert_eq!(o.task, "read temperature");
             }
             _ => panic!("expected Run"),
         }
