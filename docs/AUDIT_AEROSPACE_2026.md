@@ -76,18 +76,47 @@ Remaining warnings are non-safety:
 - **R3 — `web.rs` `reqwest Client` build:** the singleton `http_client()`
   `expect`s that the client builds. Building essentially never fails, but it is
   a one-time init panic. Could be made fallible; low value, deferred.
-- **R4 — Panic-freedom sweep:** ~35 remaining production `unwrap`/`expect` are
-  on compile-time constants or validated/bounded data (verified above). Keep a
-  CI guard (e.g. `#![deny(clippy::panic)]` on firmware release) to prevent
-  regressions.
+- **R4 — Panic-freedom CI guard (implemented):** added
+  `#![deny(clippy::panic_in_result_fn)]` to `magent-core/src/lib.rs`. This is
+  the correct guard for this codebase: plain `#![deny(clippy::panic)]` would
+  reject the firmware's deliberate fail-closed `panic!("hardware TRNG is
+  required")`. `panic_in_result_fn` only rejects panics inside `Result`-returning
+  functions (the exact class of the `boot_key` bug fixed here), so it can run
+  on both the core and firmware without false positives.
 
 ---
 
-## 6. Conclusion
+## 6. Firmware deep audit (`firmware/esp32-app`)
+
+UART / AT / secure-boot paths were audited in depth.
+
+| File | Unwrap/panic/unsafe | Finding |
+|---|---|---|
+| `at_dispatch.rs` (1060) | 0 | Full input validation; bounded `ResponseBuf`; DBO2 seal with TRNG; safe-mode gating; bounded URL/hostname parsing. |
+| `device_key.rs` (301) | 0 | `copy_from_slice` behind `len()==32/64` guards; hex decode returns `Option`; bounded outputs. |
+| `link_adapters.rs` (499) | 0 | UART reads into fixed `[u8; N]` buffers; `remaining_read().unwrap_or(0)`; no `unsafe`. |
+| `llm.rs`, `local_tools.rs` | 0 | Clean. |
+| `main.rs` (1566) | 12 | All on compile-time constants, the deliberate TRNG fail-closed panic, or `#[cfg(test)]`. |
+
+Resilience verified:
+- **Crash-loop detection:** NVS consecutive-boot counter; `CRASH_LOOP_THRESHOLD=3`
+  fast reboots → safe mode (skip Wi-Fi / risky bring-up); stable 60s boot resets
+  the counter.
+- **Watchdog:** main loop feeds TG0 watchdog; ESP-IDF auto-reboots on panic.
+- **Wi-Fi connect** and peripheral failures log-and-bail (no panic → no reboot
+  loop).
+
+**Firmware verdict:** no new defects found; the secure-boot / UART / AT paths are
+well within the aerospace standard.
+
+---
+
+## 7. Conclusion
 
 The core runtime is in strong aerospace shape: bounded buffers everywhere,
 input validated before conversion, no sound-`unsafe` concerns, and firmware
 panics limited to fail-closed security and compile-time constants. This audit
-removed the remaining latent runtime panics in the agent core and made the
-observability layer panic-cascade-safe. Full test suite: magent-core **421** +
-CLI **329**, 0 failures.
+removed the remaining latent runtime panics in the agent core, made the
+observability layer panic-cascade-safe, added a CI lint guard against
+`panic`-in-`Result` regressions, and confirmed the firmware is sound.
+Full test suite: magent-core **421** + CLI **329**, 0 failures.
