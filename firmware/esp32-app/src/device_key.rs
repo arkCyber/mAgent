@@ -45,22 +45,54 @@ use heapless::String as HeaplessString;
 /// recognise both without algorithm-specific logic.
 pub const BTDK1_PREFIX: &str = "BTDK1:";
 
-/// Read hardware-bound material for the boot-time key derivation.
+/// Strength of the BTDK material actually collected.
 ///
-/// Returns up to [`magent_core::boot_key::MAX_MATERIAL_LEN`] bytes
-/// composed of:
-///   1. Factory MAC address (6 bytes, from eFuse)
-///   2. eFuse BLOCK0 first 32 bytes (raw register contents; on a
-///      stock C61 this contains the silicon-unique id, wafer
-///      coordinates, lot info, etc.)
-///   3. Package version (4 bytes, from eFuse)
+/// HARDENING (audit-2026-08 H8): previously `read_btdk_material`
+/// silently downgraded to a weaker material when BLOCK0 read failed,
+/// logging a `warn!` but returning `Ok(())` indistinguishable from the
+/// full-strength case. Callers had no way to enforce a minimum
+/// entropy policy. The new return type carries the strength as data
+/// so a strict caller (e.g. production seal pipeline) can refuse to
+/// proceed on degraded material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BtdkStrength {
+    /// MAC (6) + BLOCK0 (32) + pkg_ver (4) = 42 bytes (full strength).
+    Full,
+    /// MAC (6) + pkg_ver (4) = 10 bytes (BLOCK0 read blocked / failed).
+    /// Still unique per device but with weaker collision resistance —
+    /// acceptable for non-seal callers, NOT acceptable for production
+    /// seal pipelines.
+    MacOnly,
+}
+
+impl BtdkStrength {
+    /// Number of bytes of material actually collected.
+    pub fn material_len(self) -> usize {
+        match self {
+            BtdkStrength::Full => 6 + 32 + 4,
+            BtdkStrength::MacOnly => 6 + 4,
+        }
+    }
+}
+
+/// Read hardware-bound material for the boot-time key derivation,
+/// returning the strength alongside the raw bytes so callers can
+/// enforce a minimum-entropy policy.
 ///
-/// If BLOCK0 read fails (e.g. older silicon with BLOCK0 read
-/// protection), we degrade gracefully to MAC + pkg_ver (10 bytes
-/// total) — still enough unique material for a per-device key,
-/// just with weaker collision resistance than the BLOCK0 case.
-pub fn read_btdk_material()
--> Result<heapless::Vec<u8, { magent_core::boot_key::MAX_MATERIAL_LEN }>, &'static str> {
+/// HARDENING (audit-2026-08 H8): the original signature was
+/// `Result<Vec, &str>`. When BLOCK0 read failed the function silently
+/// returned a 10-byte `Vec` (MAC + pkg_ver) and a `warn!` log, with
+/// no signal to the caller. Refactor sites that need full-strength
+/// material can now pattern-match the `strength` field and refuse to
+/// continue on `MacOnly`. Refactor sites that genuinely don't care
+/// (debug logs, telemetry) can ignore the field.
+pub fn read_btdk_material() -> Result<
+    (
+        heapless::Vec<u8, { magent_core::boot_key::MAX_MATERIAL_LEN }>,
+        BtdkStrength,
+    ),
+    &'static str,
+> {
     use magent_core::boot_key::MAX_MATERIAL_LEN;
     let mut mat: heapless::Vec<u8, MAX_MATERIAL_LEN> = heapless::Vec::new();
 
@@ -83,13 +115,22 @@ pub fn read_btdk_material()
             256,  // size_bits = 32 bytes
         )
     };
-    if rc == 0 {
+    let strength = if rc == 0 {
         mat.extend_from_slice(&blk0).map_err(|_| "btdk:material_full")?;
+        BtdkStrength::Full
     } else {
+        // HARDENING (audit-2026-08 H8): previously this path
+        // returned Ok with no marker distinguishing it from the
+        // full-strength case. Now the strength is part of the
+        // return tuple, and the warning includes the operating
+        // mode so the operator can grep logs by `[BTDK-MAC-ONLY]`
+        // to find every device that booted without BLOCK0.
         log::warn!(
-            "[magent] BTDK1: BLOCK0 read failed (rc={rc}); falling back to MAC-only material"
+            "[magent] BTDK1: BLOCK0 read failed (rc={rc}); falling back to \
+             MAC-only material — caller must check strength"
         );
-    }
+        BtdkStrength::MacOnly
+    };
 
     // 3. Package version (4 bytes). Always succeeds on a functional SoC.
     let pkg_ver = unsafe { esp_idf_sys::esp_efuse_get_pkg_ver() } as u32;
@@ -100,20 +141,30 @@ pub fn read_btdk_material()
         return Err("btdk:material_empty");
     }
     log::info!(
-        "[magent] BTDK1 material: {} bytes (MAC + BLOCK0 + pkg_ver)",
+        "[magent] BTDK1 material: {} bytes (strength={strength:?})",
         mat.len()
     );
-    Ok(mat)
+    Ok((mat, strength))
 }
 
-/// Derive the 32-byte boot-time seal key from hardware material.
+/// Derive the 32-byte boot-time seal key from hardware material,
+/// refusing to continue on degraded material.
+///
+/// HARDENING (audit-2026-08 H8): the seal pipeline must not run on
+/// `MacOnly` strength — the resulting key would have weaker
+/// collision resistance and could collide across devices whose
+/// BLOCK0 read happens to fail uniformly. We surface that as a
+/// dedicated `Err("btdk:degraded_material")` so the caller can
+/// decide between crashing (production) and warning (dev).
 pub fn derive_btdk() -> Result<[u8; 32], &'static str> {
     use magent_core::boot_key;
-    let material = read_btdk_material()?;
+    let (material, strength) = read_btdk_material()?;
+    if strength == BtdkStrength::MacOnly {
+        return Err("btdk:degraded_material");
+    }
     let key = boot_key::derive(&material).map_err(|e| match e {
         boot_key::BootKeyError::MaterialEmpty => "btdk:material_empty",
         boot_key::BootKeyError::MaterialTooLong => "btdk:material_too_long",
-        // Feature not compiled in — the caller can't derive a key.
         boot_key::BootKeyError::FeatureDisabled => "btdk:feature_disabled",
     })?;
     Ok(*key.as_bytes())

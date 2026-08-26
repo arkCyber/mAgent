@@ -50,6 +50,9 @@ impl LlmBackend for Esp32DeepSeekBackend {
         let cfg = HttpConfig {
             // PATCHED (MicroAgent): keep this short — a hung HTTPS/TLS attempt
             // must not block the agent thread long enough to trip a watchdog.
+            // (Note: TLS on this C61 hangs regardless — see sdkconfig.defaults
+            // "Network / TLS" comment. A longer timeout here only stalls the
+            // agent longer, so we keep it bounded.)
             timeout: Some(Duration::from_secs(8)),
             crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
             ..Default::default()
@@ -87,9 +90,18 @@ impl LlmBackend for Esp32DeepSeekBackend {
             }
         }
         let v: serde_json::Value = serde_json::from_slice(&buf[..read]).map_err(|e| llm_err(e))?;
+        // HARDENING (audit-2026-08): a malformed LLM JSON response
+        // (e.g. the model returned a refusal, a tool-call-only reply,
+        // or an API error object) would previously fall through to an
+        // empty string silently, confusing the agent's ReAct loop.
+        // We propagate an explicit error so the agent can fall back
+        // gracefully.
         let content = v["choices"][0]["message"]["content"]
             .as_str()
-            .unwrap_or("")
+            .ok_or_else(|| AgentError::NetworkTimeout {
+                operation: "deepseek",
+                duration_ms: 8000,
+            })?
             .to_string();
         Ok(content)
     }

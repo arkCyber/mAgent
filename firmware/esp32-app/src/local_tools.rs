@@ -96,9 +96,30 @@ fn read_sensor(args: &str) -> ToolResult {
 
     if sensor.contains("temp") || sensor.contains("die") {
         // Internal temperature sensor (ESP32-C6/C61).
-        let mut cfg: sys::temperature_sensor_config_t = unsafe { core::mem::zeroed() };
-        cfg.range_min = -10;
-        cfg.range_max = 80;
+        //
+        // HARDENING (audit-2026-08 H2): the previous code used
+        // `core::mem::zeroed()` to build this config struct. That
+        // works for `temperature_sensor_config_t` today because every
+        // field is a primitive (range_min, range_max, …), but
+        // `zeroed` is UB if any future driver version adds a pointer
+        // or `NonNull` field that the driver later dereferences —
+        // NULL-deref at first read. We now construct the struct
+        // explicitly with only the fields the driver documents as
+        // user-settable, so a struct bump never produces surprise
+        // NULLs.
+        let cfg = sys::temperature_sensor_config_t {
+            range_min: -10,
+            range_max: 80,
+            // HARDENING (audit-2026-08 H2): the C driver defaults
+            // `clk_src` to `TEMPERATURE_SENSOR_CLK_SRC_DEFAULT` (0)
+            // and `flags.allow_pd` to 0 — we set them explicitly so
+            // a future bindgen bump that adds a new field doesn't
+            // leave it uninitialised. The previous `mem::zeroed()`
+            // would have silently zeroed a pointer field if such a
+            // field was added (NULL deref at first read).
+            clk_src: sys::soc_periph_temperature_sensor_clk_src_t_TEMPERATURE_SENSOR_CLK_SRC_DEFAULT,
+            flags: sys::temperature_sensor_config_t__bindgen_ty_1 { allow_pd: 0 },
+        };
         let mut handle: sys::temperature_sensor_handle_t = core::ptr::null_mut();
         let mut celsius: f32 = 0.0;
         let last = unsafe {

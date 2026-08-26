@@ -1,10 +1,49 @@
 # Aerospace-Grade Security Audit Report
 
-**Project**: mAgent - Embedded AI Agent for nRF52840
+**Project**: mAgent - Embedded AI Agent for nRF52840 (open-source codebase of
+the **arkChip-mAgent** commercial product line)
 **Date**: 2026-07-07
-**Auditor**: Cascade AI
-**Standard**: DO-178C / ISO 26262 / IEC 61508
+**Author**: Internal AI-assisted self-audit, performed by the project owner
+**Standards referenced**: DO-178C / ISO 26262 / IEC 61508 (informative
+mappings only — **see "Audit scope & limitations" below**)
 **Version**: 0.1.0
+
+---
+
+## Audit scope & limitations — **READ THIS FIRST**
+
+> **This is NOT a third-party independent security audit.**
+>
+> The document below was produced by the project owner with the assistance of
+> an AI coding agent, as an **internal self-audit**. It is published to
+> (1) document the design intent of the safety-relevant controls in
+> `magent-core` / `magent-hal` / `firmware/*`, (2) provide a baseline that a
+> future third-party auditor can cross-reference, and (3) demonstrate that
+> the project maintains a written audit trail rather than relying on
+> informal commit history.
+>
+> The control-by-control claims below are therefore **assertions by the
+> project author**, not independent findings. In particular:
+>
+> - The mappings to **DO-178C**, **ISO 26262**, and **IEC 61508** are
+>   **informative** — they are intended as evidence-of-thought, not as a
+>   claim of formal certification. No external certification body has
+>   reviewed this codebase.
+> - "✅ PASSED" below means "the project owner asserts that this control is
+>   present in the code as described". It does **not** mean the control has
+>   been independently verified, fuzz-tested, or penetration-tested.
+> - "⚠️ RECOMMENDED" below means "the project owner believes this control
+>   should be added before the relevant product ships".
+>
+> **Third-party audit commitment**: A third-party security audit (Trail of
+> Bits / Cure53 / NCC Group — selection pending) is committed to within
+> **60 days** of the next funding milestone, with the public timing tracked
+> in the commercial pitch deck. Until that audit report is published, **do
+> not represent this document as an independent audit, formal certification,
+> or compliance attestation** to investors, customers, or regulators.
+>
+> For the project's full security disclosure policy, including how to
+> report suspected vulnerabilities, see [`SECURITY.md`](SECURITY.md).
 
 ---
 
@@ -516,5 +555,8 @@ The implementation successfully achieves:
 ---
 
 **Audit Completed**: 2026-07-07
-**Next Audit**: 2026-10-07 (Quarterly)
-**Auditor Signature**: Cascade AI
+**Audit type**: Internal AI-assisted self-audit by the project owner
+**Next internal review**: 2026-10-07 (Quarterly)
+**Next independent audit**: Committed within 60 days of the next funding
+milestone; see the commercial pitch deck for the public timing.
+**Signed**: Project owner (internal self-audit)

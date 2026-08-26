@@ -18,7 +18,8 @@ description = "mAgent firmware for the ESP32-C61-DevKitC-1-N8R2 (N8R2, std)"
 [dependencies]
 # Chip-agnostic core — the `esp32` feature activates RISC-V HAL deps.
 # The `std` feature is needed because esp-idf-svc provides std:: threads.
-magent-core = { path = "../../magent-core", default-features = false, features = ["esp32", "link_adapters", "ingress", "web3", "boot-key"] }
+# `wallet` enables digital wallet with BIP-39, keystore, and wallet management.
+magent-core = { path = "../../magent-core", default-features = false, features = ["esp32", "link_adapters", "ingress", "web3", "boot-key", "wallet"] }
 
 # ---------------------------------------------------------------------------
 # ESP-IDF integration (the std story for the C61-N8R2).
@@ -70,10 +71,10 @@ getrandom = { version = "0.2", features = ["custom"] }
 # esp_println is a tiny no-deps `println!` macro that routes to
 # esp-idf's `esp_log_write`. We use it in the panic handler so we can
 # print diagnostics even when the global logger hasn't been installed
-# yet (e.g. if std::rt init fails). The `esp32c6` feature gates the
-# actual chip-specific formatting; PlatformIO sees us as esp32c6
-# (no esp32c61 feature exists yet in esp-println).
-esp-println = { version = "0.13", features = ["esp32c6"] }
+# yet (e.g. if std::rt init fails). The chip feature is selected by the
+# compile-time board switch (`board-c61` → `esp32c6`, `board-s3` →
+# `esp32s3`) so the same source builds for either chip.
+esp-println = { version = "0.13" }
 
 # ---------------------------------------------------------------------------
 # Communication adapters — UART + button via embedded-io traits.
@@ -85,6 +86,8 @@ embedded-io = { workspace = true }
 # `heapless::String<N>` in `link_adapters::source_kind` for the
 # `IngressSource` bridge (magent-core's heapless 0.9 type).
 heapless = { workspace = true }
+serde = { workspace = true }
+serde-json-core = "0.6.0"
 
 # ---------------------------------------------------------------------------
 # Std library utilities needed by the esp-idf-svc integration.
@@ -128,7 +131,9 @@ which = "4.4"
 # `ble`  — enable BLE (ESP32-C61 supports BLE 5 only).
 # `ota`  — enable OTA partition support (controlled by sdkconfig.defaults).
 [features]
-default = ["wifi", "uart"]
+# Default = USB-serial transport mode: BLE is DISABLED (the app talks to the
+# C61 over UART0 / USB). Re-enable BLE with `--features ble`.
+default = ["wifi", "uart", "board-c61"]
 wifi = []
 ble = []
 ota = []
@@ -140,6 +145,17 @@ ota = []
 uart = []
 
 # ---------------------------------------------------------------------------
+# Board / chip selection (compile-time switch)
+# ---------------------------------------------------------------------------
+# Exactly ONE of these must be enabled. They gate the chip-specific code
+# (BLE controller config, device name, `esp-println` chip feature, ...) so the
+# same source builds for either chip. Default is the ESP32-C61 (RISC-V, 2MB
+# PSRAM). To build for the ESP32-S3 (Xtensa, 8MB PSRAM), enable `board-s3` and
+# build with `--target xtensa-esp32s3-espidf --features board-s3`.
+board-c61 = ["esp-println/esp32c6"]   # ESP32-C61 (RISC-V, 160MHz, 2MB PSRAM)
+board-s3  = ["esp-println/esp32s3"]   # ESP32-S3 (Xtensa, 240MHz, 8MB PSRAM)
+
+# ---------------------------------------------------------------------------
 # esp-idf-sys metadata (consumed by `esp-idf-sys` 0.37 build.rs)
 # ---------------------------------------------------------------------------
 # Restrict which ESP-IDF components are built. Excluding openthread,
@@ -149,4 +165,4 @@ uart = []
 # ESP-IDF v6 and are not safe to bindgen into the Rust bindings).
 # TRACE: REQ-FW-001.
 [package.metadata.esp-idf-sys]
-esp_idf_components = ["driver", "esp_adc", "esp_event", "esp_hw_support", "esp_lcd", "esp_netif", "esp_phy", "esp_pm", "esp_rom", "esp_system", "esp_timer", "esp_wifi", "espcoredump", "esptool_py", "freertos", "hal", "heap", "log", "lwip", "mbedtls", "newlib", "nvs_flash", "nvs_secure", "port", "pthread", "riscv", "sdmmc", "soc", "spi_flash", "spiffs", "tcp_transport", "ulp", "vfs", "wear_levelling", "wifi_provisioning", "wpa_supplicant", "xtensa"]
+esp_idf_components = ["driver", "esp_adc", "esp_bt", "esp_event", "esp_hw_support", "esp_lcd", "esp_netif", "esp_phy", "esp_pm", "esp_rom", "esp_system", "esp_timer", "esp_wifi", "espcoredump", "esptool_py", "freertos", "hal", "heap", "log", "lwip", "mbedtls", "newlib", "nvs_flash", "nvs_secure", "port", "pthread", "riscv", "sdmmc", "soc", "spi_flash", "spiffs", "tcp_transport", "ulp", "vfs", "wear_levelling", "wifi_provisioning", "wpa_supplicant", "xtensa"]

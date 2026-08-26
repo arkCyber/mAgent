@@ -3,7 +3,7 @@
 //! Provides integration with Ollama local LLM API for embedded AI agent.
 //! Supports both std (testing) and no_std (embedded) environments.
 
-use crate::error::{AgentError, Result};
+use crate::error::{try_heapless, AgentError, Result};
 use crate::MAX_BUFFER_SIZE;
 
 /// Maximum number of tools in a response
@@ -113,8 +113,8 @@ impl OllamaClient {
     /// Create a new Ollama client
     pub fn new(base_url: &str, model: &str, timeout_ms: u32) -> Result<Self> {
         Ok(Self {
-            base_url: heapless::String::try_from(base_url).unwrap_or_else(|_| heapless::String::new()),
-            model: heapless::String::try_from(model).unwrap_or_else(|_| heapless::String::new()),
+            base_url: try_heapless::<64>(base_url),
+            model: try_heapless::<32>(model),
             timeout_ms,
         })
     }
@@ -137,8 +137,8 @@ impl OllamaClient {
     /// Add a message to the request
     pub fn add_message(&mut self, request: &mut OllamaRequest, role: &str, content: &str) -> Result<()> {
         let msg = OllamaMessage {
-            role: heapless::String::try_from(role).unwrap_or_else(|_| heapless::String::new()),
-            content: heapless::String::try_from(content).unwrap_or_else(|_| heapless::String::new()),
+            role: try_heapless::<16>(role),
+            content: try_heapless::<2048>(content),
             tool_calls: None,
         };
 
@@ -155,49 +155,60 @@ impl OllamaClient {
         self.add_message(request, "system", content)
     }
 
-    /// Add tool definitions
-    pub fn add_tools(&mut self, request: &mut OllamaRequest, tools: &[(&str, &str, &[(&str, &str, &str)])]) -> Result<()> {
-        let mut tool_defs: heapless::Vec<ToolDefinition, 8> = heapless::Vec::new();
+/// Add tool definitions
+///
+/// HARDENING (audit-2026-08 H7): every `heapless::String::try_from(..).unwrap()`
+/// on a caller-provided `&str` was replaced with `try_heapless` — a
+/// wrapper that truncates at a UTF-8 boundary instead of panicking
+/// when the input exceeds the buffer. A long tool name or parameter
+/// description (e.g. a typo with thousands of bytes) now yields a
+/// silent truncation rather than a worker-thread panic.
+pub fn add_tools(&mut self, request: &mut OllamaRequest, tools: &[(&str, &str, &[(&str, &str, &str)])]) -> Result<()> {
+    let mut tool_defs: heapless::Vec<ToolDefinition, 8> = heapless::Vec::new();
 
-        for (name, description, params) in tools {
-            let mut required: heapless::Vec<heapless::String<16>, 4> = heapless::Vec::new();
-            let mut properties: heapless::Vec<ParameterProperty, 4> = heapless::Vec::new();
+    for (name, description, params) in tools {
+        let mut required: heapless::Vec<heapless::String<16>, 4> = heapless::Vec::new();
+        let mut properties: heapless::Vec<ParameterProperty, 4> = heapless::Vec::new();
 
-            for (param_name, param_type, param_desc) in *params {
-                let _ = required.push(heapless::String::try_from(*param_name).unwrap());
+        for (param_name, param_type, param_desc) in *params {
+            let _ = required.push(try_heapless::<16>(param_name));
 
-                let prop = ParameterProperty {
-                    name: heapless::String::try_from(*param_name).unwrap(),
-                    param_type: heapless::String::try_from(*param_type).unwrap(),
-                    description: heapless::String::try_from(*param_desc).unwrap(),
-                };
-                let _ = properties.push(prop);
-            }
+            let prop = ParameterProperty {
+                name: try_heapless::<16>(param_name),
+                param_type: try_heapless::<16>(param_type),
+                description: try_heapless::<64>(param_desc),
+            };
+            let _ = properties.push(prop);
+        }
 
+// HARDENING (audit-2026-08 unwrap sweep): replace compile-time
+            // constant string `try_from(...).unwrap()` with `try_heapless`
+            // so a future schema rename (e.g. "function" → "tool") can't
+            // accidentally introduce a panic.
             let func_def = FunctionDefinition {
-                name: heapless::String::try_from(*name).unwrap(),
-                description: heapless::String::try_from(*description).unwrap(),
+                name: try_heapless::<32>(name),
+                description: try_heapless::<128>(description),
                 parameters: ParametersSchema {
-                    schema_type: heapless::String::try_from("object").unwrap(),
+                    schema_type: try_heapless::<16>("object"),
                     required,
                     properties,
                 },
             };
 
             let tool_def = ToolDefinition {
-                tool_type: heapless::String::try_from("function").unwrap(),
+                tool_type: try_heapless::<16>("function"),
                 function: func_def,
             };
 
-            tool_defs.push(tool_def).map_err(|_| AgentError::BufferOverflow {
-                capacity: 8,
-                attempted: tool_defs.len() + 1,
-            })?;
-        }
-
-        request.tools = Some(tool_defs);
-        Ok(())
+        tool_defs.push(tool_def).map_err(|_| AgentError::BufferOverflow {
+            capacity: 8,
+            attempted: tool_defs.len() + 1,
+        })?;
     }
+
+    request.tools = Some(tool_defs);
+    Ok(())
+}
 
     /// Serialize request to JSON (simplified for embedded)
     pub fn serialize_request(&self, request: &OllamaRequest) -> heapless::String<2048> {
@@ -267,8 +278,16 @@ impl OllamaClient {
                     let func_name = &json[actual_pos..actual_pos + func_end];
 
                     let tool_call = ToolCallSpec {
-                        name: heapless::String::try_from(func_name).unwrap(),
-                        arguments: heapless::String::try_from("{}").unwrap(),
+                        // HARDENING (audit-2026-08 unwrap sweep):
+                        // `func_name` is extracted from the LLM's
+                        // JSON response, which the model can make
+                        // arbitrarily long. The previous
+                        // `String::try_from(func_name).unwrap()`
+                        // would panic the agent on a model that
+                        // produces a >32-byte function name.
+                        // `try_heapless` truncates with a warning.
+                        name: try_heapless::<32>(func_name),
+                        arguments: try_heapless::<256>("{}"),
                     };
                     let _ = tool_calls.push(tool_call);
                 }
@@ -277,8 +296,12 @@ impl OllamaClient {
         }
 
         let message = OllamaMessage {
-            role: heapless::String::try_from("assistant").unwrap(),
-            content: heapless::String::try_from(content).unwrap(),
+            role: try_heapless::<16>("assistant"),
+            // HARDENING (audit-2026-08 unwrap sweep): `content` is
+            // the LLM's full response text, which models are free
+            // to make arbitrarily long. `try_heapless` truncates
+            // at the buffer's UTF-8 boundary instead of panicking.
+            content: try_heapless::<2048>(content),
             tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
         };
 

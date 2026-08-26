@@ -122,6 +122,10 @@ pub mod verifiable_credentials;
 #[cfg(any(feature = "web3", feature = "blockchain"))]
 pub mod blockchain;
 
+// Digital wallet (BIP-39, BIP-32, keystore) — gated on wallet feature
+#[cfg(feature = "wallet")]
+pub mod wallet;
+
 // Public re-exports — the public surface of this module. Everything
 // else (internal helpers, raw `ed25519_dalek` types) is not
 // re-exported so we can swap the backend without breaking callers.

@@ -9,7 +9,7 @@
 //! These sensors are typically connected via BLE or I2C to external
 //! devices like chest straps, smartwatches, or CGM devices.
 
-use crate::error::{AgentError, Result};
+use crate::error::{try_heapless, AgentError, Result};
 use heapless::{String, Vec};
 use serde::{Deserialize, Serialize};
 
@@ -349,8 +349,8 @@ impl Default for UserProfile {
             age: 30,
             resting_hr: 60,
             max_hr: 190,
-            emergency_contact: String::try_from("Emergency Contact").unwrap(),
-            emergency_phone: String::try_from("120").unwrap(),
+            emergency_contact: try_heapless::<64>("Emergency Contact"),
+            emergency_phone: try_heapless::<32>("120"),
             conditions: Vec::new(),
         }
     }

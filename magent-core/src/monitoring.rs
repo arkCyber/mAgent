@@ -220,3 +220,112 @@ impl Default for MonitoringManager {
         Self::with_defaults()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_stores_entries_in_order() {
+        let mut m = MonitoringManager::new();
+        m.log(LogLevel::Info, "boot").unwrap();
+        m.log(LogLevel::Warning, "low battery").unwrap();
+        let logs = m.get_logs();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].level, LogLevel::Info);
+        assert_eq!(logs[0].message.as_str(), "boot");
+        assert_eq!(logs[1].level, LogLevel::Warning);
+    }
+
+    #[test]
+    fn log_rejects_message_over_buffer() {
+        let mut m = MonitoringManager::new();
+        let long = "x".repeat(300);
+        let r = m.log(LogLevel::Info, &long);
+        assert!(matches!(r, Err(AgentError::MemoryAllocationFailed { .. })));
+        assert_eq!(m.get_logs().len(), 0, "failed log must not be appended");
+    }
+
+    #[test]
+    fn log_buffer_evicts_oldest_when_full() {
+        let mut m = MonitoringManager::new();
+        for i in 0..70 {
+            m.log(LogLevel::Debug, &format!("entry {}", i)).unwrap();
+        }
+        // Capacity is 64; the 6 oldest are evicted.
+        assert_eq!(m.get_logs().len(), 64);
+        assert!(m.get_logs()[0].message.as_str().contains("entry 6"));
+        assert!(m.get_logs()[63].message.as_str().contains("entry 69"));
+        m.clear_logs();
+        assert_eq!(m.get_logs().len(), 0);
+    }
+
+    #[test]
+    fn performance_metrics_track_operations_and_average() {
+        let mut m = MonitoringManager::new();
+        m.operation_start();
+        m.operation_success(100);
+        assert_eq!(m.get_metrics().total_operations, 1);
+        assert_eq!(m.get_metrics().successful_operations, 1);
+        assert_eq!(m.get_metrics().average_execution_time_us, 100);
+
+        m.operation_start();
+        m.operation_success(200);
+        // Rolling average: (100 + 200) / 2 = 150.
+        assert_eq!(m.get_metrics().average_execution_time_us, 150);
+
+        m.operation_start();
+        m.operation_success(300);
+        // (150*2 + 300)/3 = 200.
+        assert_eq!(m.get_metrics().average_execution_time_us, 200);
+
+        m.operation_start();
+        m.operation_failure();
+        assert_eq!(m.get_metrics().failed_operations, 1);
+        assert_eq!(m.get_metrics().total_operations, 4);
+
+        m.reset_metrics();
+        assert_eq!(m.get_metrics().total_operations, 0);
+        assert_eq!(m.get_metrics().average_execution_time_us, 0);
+    }
+
+    #[test]
+    fn health_status_aggregation() {
+        let mut m = MonitoringManager::new();
+        // No checks → Healthy.
+        assert_eq!(m.get_health_status(), HealthStatus::Healthy);
+
+        // All healthy → Healthy.
+        m.add_health_check("ble", HealthStatus::Healthy, "").unwrap();
+        assert_eq!(m.get_health_status(), HealthStatus::Healthy);
+
+        // One degraded → Degraded.
+        m.add_health_check("sensor:hr", HealthStatus::Degraded, "noisy").unwrap();
+        assert_eq!(m.get_health_status(), HealthStatus::Degraded);
+
+        // Any unhealthy dominates.
+        m.add_health_check("wifi", HealthStatus::Unhealthy, "link down").unwrap();
+        assert_eq!(m.get_health_status(), HealthStatus::Unhealthy);
+    }
+
+    #[test]
+    fn add_health_check_rejects_long_component() {
+        let mut m = MonitoringManager::new();
+        let long = "x".repeat(64);
+        let r = m.add_health_check(&long, HealthStatus::Healthy, "");
+        assert!(matches!(r, Err(AgentError::MemoryAllocationFailed { .. })));
+        assert_eq!(m.get_health_checks().len(), 0);
+    }
+
+    #[test]
+    fn health_check_buffer_evicts_oldest() {
+        let mut m = MonitoringManager::new();
+        for i in 0..20 {
+            m.add_health_check(&format!("comp{}", i), HealthStatus::Healthy, "").unwrap();
+        }
+        // Capacity is 16; the 4 oldest are evicted.
+        assert_eq!(m.get_health_checks().len(), 16);
+        assert!(m.get_health_checks()[0].component.as_str().contains("comp4"));
+        assert!(m.get_health_checks()[15].component.as_str().contains("comp19"));
+    }
+}

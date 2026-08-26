@@ -120,6 +120,7 @@ pub struct ScratchBuffer {
 }
 
 impl ScratchBuffer {
+    /// Create a zeroed scratch buffer for reuse across AT lines.
     pub const fn new() -> Self {
         Self { bytes: [0; MAX_LINE] }
     }
@@ -203,8 +204,11 @@ pub enum StringSpec {
 pub enum AtOp {
     /// `AT` (no payload).
     Ping,
-    /// `ATEn`
-    SetEcho { on: bool },
+    /// `ATEn` — echo on (`ATE1`) / off (`ATE0`).
+    SetEcho {
+        /// Whether echo is on (`true`) or off (`false`).
+        on: bool,
+    },
     /// `AT+GMR`
     GetVersion,
     /// `AT+RST`
@@ -267,6 +271,19 @@ pub enum AtOp {
     /// `AT+LLMCFG?` / `AT+LLMCFG=<model>,<api_key>` — set / query the
     /// LLM backend parameters (model name + API key) used by the agent.
     LlmCfg,
+    /// `AT+TIME?` — report the current wall-clock time as ISO 8601
+    /// UTC plus the source (SNTP / BLE CTS / NONE).
+    Time,
+    /// `AT+NTPSYNC` — force an immediate SNTP re-sync (ESP32 only;
+    /// nRF52 returns +CMDER:9 unsupported).
+    NtpSync,
+    /// `AT+TIMEZONE?` / `=offset_minutes` — query / set the
+    /// operator-supplied UTC offset used for human-readable display
+    /// (does NOT affect the canonical Unix-seconds value).
+    Timezone,
+    /// `AT+BLE?` / `AT+BLE=<ON|OFF|STATE>` — query / control the BLE
+    /// peripheral (ESP32 only; nRF52 returns unsupported).
+    Ble,
 }
 
 impl AtOp {
@@ -303,6 +320,10 @@ impl AtOp {
             AtOp::WifiPassUpgrade => "+WIFIPASSUPGRADE",
             AtOp::HttpGet => "+HTTPGET",
             AtOp::LlmCfg => "+LLMCFG",
+            AtOp::Time => "+TIME",
+            AtOp::NtpSync => "+NTPSYNC",
+            AtOp::Timezone => "+TIMEZONE",
+            AtOp::Ble => "+BLE",
         }
     }
 }
@@ -320,15 +341,23 @@ pub enum AtArg<'a> {
     /// (e.g. `"My SSID"` → `My SSID`).
     Quoted(&'a [u8]),
     /// `<key>=<value>` pair, both already un-quoted/escaped.
-    Named { key: &'a [u8], val: &'a [u8] },
+    Named {
+        /// The un-quoted key of a `<key>=<value>` argument.
+        key: &'a [u8],
+        /// The un-quoted, escaped value of a `<key>=<value>` argument.
+        val: &'a [u8],
+    },
 }
 
 /// A successfully-parsed AT command line. Owned data is borrowed from
 /// the caller's scratch buffer so parsing does not allocate.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AtCommand<'a> {
+    /// The resolved command operation (e.g. `CwJap`).
     pub op: AtOp,
+    /// Whether this is a query / set / test / execute form.
     pub kind: AtCommandKind,
+    /// Positional and named arguments, in order, up to `MAX_ARGUMENTS`.
     pub args: Vec<AtArg<'a>, MAX_ARGUMENTS>,
     /// The verb used (controls echo reply discipline: Set queries do not
     /// echo the parameters back, etc.).
@@ -336,6 +365,7 @@ pub struct AtCommand<'a> {
 }
 
 impl<'a> AtCommand<'a> {
+    /// Return the `idx`-th argument, if present.
     pub fn arg(&self, idx: usize) -> Option<&AtArg<'a>> {
         self.args.get(idx)
     }
@@ -373,14 +403,17 @@ pub enum AtParseErrorKind {
     Internal,
 }
 
+/// A parse failure with a machine-readable kind and a source column.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct AtParseError {
+    /// The specific reason parsing failed (drives the `+CMDER:<code>` reply).
     pub kind: AtParseErrorKind,
     /// 1-based column where parsing stopped. May be `0` if N/A.
     pub col: usize,
 }
 
 impl AtParseError {
+    /// Construct a parse error from a kind and a 1-based column offset.
     pub const fn new(kind: AtParseErrorKind, col: usize) -> Self {
         Self { kind, col }
     }
@@ -410,6 +443,7 @@ impl fmt::Display for AtParseError {
 /// The table follows the official convention where available; the
 /// remaining codes are reserved for `mAgent`-specific failures.
 impl AtParseError {
+    /// Map this error to the ESP-AT numeric `+CMDER:<n>` reply code.
     pub const fn numeric_code(self) -> u8 {
         match self.kind {
             AtParseErrorKind::Empty => 0,
@@ -789,6 +823,10 @@ fn classify_op(kw: &[u8]) -> Option<(AtOp, AtCommandKind)> {
         b"WIFIPASSUPGRADE" => (AtOp::WifiPassUpgrade, AtCommandKind::Set),
         b"HTTPGET" => (AtOp::HttpGet, AtCommandKind::Set),
         b"LLMCFG" => (AtOp::LlmCfg, AtCommandKind::Set),
+        b"TIME" => (AtOp::Time, AtCommandKind::Query),
+        b"NTPSYNC" => (AtOp::NtpSync, AtCommandKind::Execute),
+        b"TIMEZONE" => (AtOp::Timezone, AtCommandKind::Set),
+        b"BLE" => (AtOp::Ble, AtCommandKind::Set),
         _ => return None,
     })
 }
@@ -861,7 +899,9 @@ pub fn validate_ssid(bytes: &[u8]) -> Result<(), &'static str> {
     if bytes.len() > MAX_SSID_LEN {
         return Err("too_long");
     }
-    if bytes.iter().any(|&c| c == 0) {
+    // HARDENING (clippy/manual_contains): use `contains` instead
+    // of `iter().any` for clarity and minor performance gain.
+    if bytes.contains(&0) {
         return Err("contains_nul");
     }
     Ok(())
@@ -873,7 +913,9 @@ pub fn validate_passphrase(bytes: &[u8]) -> Result<(), &'static str> {
     if bytes.len() > 64 {
         return Err("too_long");
     }
-    if bytes.iter().any(|&c| c == 0) {
+    // HARDENING (clippy/manual_contains): use `contains` instead
+    // of `iter().any` for clarity and minor performance gain.
+    if bytes.contains(&0) {
         return Err("contains_nul");
     }
     Ok(())
@@ -993,11 +1035,13 @@ pub fn build_response<'a>(
 /// Outcome of an AT command on the wire.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AtResponseKind {
+    /// The command completed successfully.
     Ok,
+    /// The command failed.
     Error,
 }
 
-// Re-export a typed tag for the auditor / log format.
+/// A typed log tag for the audit trail, sized to a full AT line.
 pub type AtLog<'a> = String<MAX_LINE>;
 
 #[cfg(test)]
@@ -1347,6 +1391,58 @@ mod tests {
     }
 
     #[test]
+    fn parse_u32_boundary_values() {
+        // Leading zeros collapse to the numeric value.
+        assert_eq!(parse_u32(b"007"), Some(7));
+        assert_eq!(parse_u32(b"0000000000"), Some(0));
+        // u32::MAX is exactly 10 digits and is the largest accepted value.
+        assert_eq!(parse_u32(b"4294967295"), Some(u32::MAX));
+        // A 10-digit value above u32::MAX overflows via checked_add (not
+        // the length gate).
+        assert_eq!(parse_u32(b"9999999999"), None);
+        // Non-digit in any position is rejected.
+        assert_eq!(parse_u32(b"12a"), None);
+        assert_eq!(parse_u32(b"1a2"), None);
+        assert_eq!(parse_u32(b"a12"), None);
+    }
+
+    #[test]
+    fn parse_i32_signed_boundaries() {
+        // Exact extremes are accepted.
+        assert_eq!(parse_i32(b"2147483647"), Some(i32::MAX));
+        assert_eq!(parse_i32(b"-2147483648"), Some(i32::MIN));
+        // One past each extreme is rejected — never wrapped.
+        assert_eq!(parse_i32(b"2147483648"), None);
+        assert_eq!(parse_i32(b"-2147483649"), None);
+        // A bare minus sign (or empty input) is not a number.
+        assert_eq!(parse_i32(b"-"), None);
+        assert_eq!(parse_i32(b""), None);
+        // Leading zeros are fine, with or without a sign.
+        assert_eq!(parse_i32(b"0007"), Some(7));
+        assert_eq!(parse_i32(b"-0001"), Some(-1));
+        // Embedded minus is not a digit.
+        assert_eq!(parse_i32(b"1-2"), None);
+    }
+
+    #[test]
+    fn validate_mac_edge_cases() {
+        // Mixed `:` / `-` separators are both accepted.
+        assert_eq!(
+            validate_mac(b"aa:bb-cc:dd-ee:ff"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+        // Wrong total length (the gate is exactly 17 bytes).
+        assert_eq!(validate_mac(b"aa:bb:cc:dd:ee:f"), None); // 15
+        assert_eq!(validate_mac(b"aa:bb:cc:dd:ee:fff"), None); // 18
+        // Length-17 inputs that fail on part *count* (7 parts).
+        assert_eq!(validate_mac(b"aa:bb:cc:dd:ee:f:"), None);
+        // Length-17 inputs that fail on part *length* (1- and 3-char parts).
+        assert_eq!(validate_mac(b"a:bb:cc:dd:ee:fff"), None);
+        // Empty input.
+        assert_eq!(validate_mac(b""), None);
+    }
+
+    #[test]
     fn build_response_with_data() {
         let mut buf: Vec<u8, MAX_RESPONSE> = Vec::new();
         let lines: [&[u8]; 2] = [b"+CWJAP:\"foo\",6", b"+IP:1.2.3.4"];
@@ -1376,6 +1472,72 @@ mod tests {
     #[test]
     fn classify_op_returns_none_for_unknown_keyword() {
         assert!(classify_op(b"NOPE").is_none());
+    }
+
+    #[test]
+    fn classify_op_covers_every_atop_variant() {
+        // Regression guard: every non-special `AtOp` variant must be
+        // reachable from `classify_op`, with the correct command kind. If a
+        // new variant is added to the enum but not wired into the table, the
+        // distinct-op count drops below 34 and this test fails loudly instead
+        // of silently mis-parsing a command into an unrelated op.
+        let table: &[(&[u8], AtOp, AtCommandKind)] = &[
+            (b"GMR", AtOp::GetVersion, AtCommandKind::Execute),
+            (b"RST", AtOp::Reset, AtCommandKind::Execute),
+            (b"SYSRAM", AtOp::SysRam, AtCommandKind::Query),
+            (b"SYSLOG", AtOp::SysLog, AtCommandKind::Set),
+            (b"SYSSTORE", AtOp::SysStore, AtCommandKind::Set),
+            (b"CWMODE", AtOp::CwMode, AtCommandKind::Set),
+            (b"CWJAP", AtOp::CwJap, AtCommandKind::Set),
+            (b"CWQAP", AtOp::CwQap, AtCommandKind::Execute),
+            (b"CWLAP", AtOp::CwLap, AtCommandKind::Execute),
+            (b"CWHOSTNAME", AtOp::CwHostname, AtCommandKind::Set),
+            (b"CWAUTOCONN", AtOp::CwAutoconn, AtCommandKind::Set),
+            (b"CWRECONNCFG", AtOp::CwReconnCfg, AtCommandKind::Set),
+            (b"CWSTATE", AtOp::CwState, AtCommandKind::Query),
+            (b"CIPSTAMAC", AtOp::CipStaMac, AtCommandKind::Set),
+            (b"MACRAND", AtOp::MacRand, AtCommandKind::Set),
+            (b"HEAP", AtOp::Heap, AtCommandKind::Query),
+            (b"UPTIME", AtOp::Uptime, AtCommandKind::Query),
+            (b"SAFEMODE", AtOp::Safemode, AtCommandKind::Set),
+            (b"IDENT", AtOp::Ident, AtCommandKind::Query),
+            (b"IDENTROT", AtOp::IdentRot, AtCommandKind::Execute),
+            (b"SIGN", AtOp::Sign, AtCommandKind::Set),
+            (b"RESTORE", AtOp::Restore, AtCommandKind::Execute),
+            (b"IFCONFIG", AtOp::Ifconfig, AtCommandKind::Query),
+            (b"PING", AtOp::Ping6, AtCommandKind::Set),
+            (b"AGENT", AtOp::Agent, AtCommandKind::Set),
+            (b"WIFIPASSUPGRADE", AtOp::WifiPassUpgrade, AtCommandKind::Set),
+            (b"HTTPGET", AtOp::HttpGet, AtCommandKind::Set),
+            (b"LLMCFG", AtOp::LlmCfg, AtCommandKind::Set),
+            (b"TIME", AtOp::Time, AtCommandKind::Query),
+            (b"NTPSYNC", AtOp::NtpSync, AtCommandKind::Execute),
+            (b"TIMEZONE", AtOp::Timezone, AtCommandKind::Set),
+            (b"BLE", AtOp::Ble, AtCommandKind::Set),
+        ];
+
+        let mut seen: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        for &(kw, op, kind) in table {
+            assert_eq!(
+                classify_op(kw),
+                Some((op, kind)),
+                "keyword {:?} must classify to {op:?}/{kind:?}",
+                core::str::from_utf8(kw).unwrap_or("?"),
+            );
+            seen.push(alloc::format!("{op:?}"));
+        }
+        // Ping (`AT`) and SetEcho (`ATE0/1`) are handled outside `classify_op`.
+        seen.push(alloc::format!("{:?}", AtOp::Ping));
+        seen.push(alloc::format!("{:?}", AtOp::SetEcho { on: false }));
+
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            34,
+            "all 34 AtOp variants must be distinct and reachable (got {})",
+            seen.len()
+        );
     }
 
     #[test]
@@ -1445,6 +1607,96 @@ fn rejects_max_arguments() {
     }
 
     #[test]
+    fn parses_time_query() {
+        let cmd = parse_line(b"AT+TIME?").unwrap();
+        assert_eq!(cmd.op, AtOp::Time);
+        assert_eq!(cmd.kind, AtCommandKind::Query);
+    }
+
+    #[test]
+    fn parses_time_execute_form() {
+        // `AT+TIME` without `?` is the bare execute form; the
+        // firmware treats it identically to `AT+TIME?`.
+        let cmd = parse_line(b"AT+TIME").unwrap();
+        assert_eq!(cmd.op, AtOp::Time);
+        assert_eq!(cmd.kind, AtCommandKind::Execute);
+    }
+
+    #[test]
+    fn parses_ntpsync_execute() {
+        let cmd = parse_line(b"AT+NTPSYNC").unwrap();
+        assert_eq!(cmd.op, AtOp::NtpSync);
+        assert_eq!(cmd.kind, AtCommandKind::Execute);
+    }
+
+    #[test]
+    fn parses_timezone_query() {
+        let cmd = parse_line(b"AT+TIMEZONE?").unwrap();
+        assert_eq!(cmd.op, AtOp::Timezone);
+        assert_eq!(cmd.kind, AtCommandKind::Query);
+    }
+
+    #[test]
+    fn parses_timezone_set_positive() {
+        let cmd = parse_line(b"AT+TIMEZONE=480").unwrap();
+        assert_eq!(cmd.op, AtOp::Timezone);
+        assert_eq!(cmd.kind, AtCommandKind::Set);
+        match cmd.arg(0) {
+            Some(AtArg::Token(t)) => assert_eq!(*t, b"480"),
+            _ => panic!("expected token"),
+        }
+    }
+
+    #[test]
+    fn parses_timezone_set_negative() {
+        let cmd = parse_line(b"AT+TIMEZONE=-300").unwrap();
+        assert_eq!(cmd.op, AtOp::Timezone);
+        assert_eq!(cmd.kind, AtCommandKind::Set);
+        match cmd.arg(0) {
+            Some(AtArg::Token(t)) => assert_eq!(*t, b"-300"),
+            _ => panic!("expected token"),
+        }
+    }
+
+    #[test]
+    fn parses_ble_query() {
+        let cmd = parse_line(b"AT+BLE?").unwrap();
+        assert_eq!(cmd.op, AtOp::Ble);
+        assert_eq!(cmd.kind, AtCommandKind::Query);
+    }
+
+    #[test]
+    fn parses_ble_set_on() {
+        let cmd = parse_line(b"AT+BLE=ON").unwrap();
+        assert_eq!(cmd.op, AtOp::Ble);
+        assert_eq!(cmd.kind, AtCommandKind::Set);
+        match cmd.arg(0) {
+            Some(AtArg::Token(t)) => assert_eq!(*t, b"ON"),
+            _ => panic!("expected token"),
+        }
+    }
+
+    #[test]
+    fn parses_ble_set_off() {
+        let cmd = parse_line(b"AT+BLE=OFF").unwrap();
+        assert_eq!(cmd.op, AtOp::Ble);
+        assert_eq!(cmd.kind, AtCommandKind::Set);
+        assert_eq!(cmd.op.name(), "+BLE");
+    }
+
+    #[test]
+    fn rejects_timezone_set_with_extra_args() {
+        // Timezone takes exactly one arg. The parser accepts the
+        // first arg and silently ignores the rest, so we can only
+        // verify the parser succeeds here; the dispatcher must
+        // enforce single-arg semantics.
+        let cmd = parse_line(b"AT+TIMEZONE=480,extra").unwrap();
+        assert_eq!(cmd.op, AtOp::Timezone);
+        assert_eq!(cmd.kind, AtCommandKind::Set);
+        assert_eq!(cmd.args.len(), 2);
+    }
+
+    #[test]
     fn scratch_buffer_truncates_long_line() {
         let mut s = ScratchBuffer::new();
         let mut big = [b'A'; 400];
@@ -1462,5 +1714,55 @@ fn rejects_max_arguments() {
         // Don't care about success / failure — only that we don't
         // panic and the buffer is reused for the next call.
         let _ = r;
+    }
+
+    /// Security-boundary robustness: `parse_line` consumes untrusted bytes
+    /// from UART, so it must NEVER panic, whatever the input. We sweep every
+    /// single-byte and two-byte input, a deterministic three-byte subset, and
+    /// a set of structured adversarial cases (NUL / 0xFF / invalid UTF-8 /
+    /// embedded control bytes / long runs). A panic in any iteration fails
+    /// the test, and running all of them is fast because parsing is O(n).
+    #[test]
+    fn parse_line_never_panics_on_adversarial_input() {
+        // Every single byte.
+        for b in 0u8..=255 {
+            let _ = parse_line(&[b]);
+        }
+        // Every two-byte combination (65,536 inputs).
+        for hi in 0u8..=255 {
+            for lo in 0u8..=255 {
+                let _ = parse_line(&[hi, lo]);
+            }
+        }
+        // Deterministic three-byte sweep (stepped to bound wall-time).
+        for x in 0u8..=255 {
+            for y in (0u8..=255).step_by(7) {
+                for z in (0u8..=255).step_by(11) {
+                    let _ = parse_line(&[x, y, z]);
+                }
+            }
+        }
+
+        // Structured adversarial cases for a range of lengths.
+        let mut cases: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+        for n in 1..=256usize {
+            cases.push(alloc::vec![0u8; n]); // all NUL
+            cases.push(alloc::vec![0xFFu8; n]); // all 0xFF (erased-like)
+            cases.push(alloc::vec![0x80u8; n]); // invalid UTF-8 lead byte
+            cases.push((0..n as u8).collect()); // 0,1,2,..,255
+            cases.push(b"AT".repeat(n / 2 + 1)); // repeated `AT`
+            cases.push(b"AT+CWJAP=\"\x00\xFF\x80".repeat(n / 16 + 1)); // embedded control
+            // Deterministic pseudo-random bytes (LCG, no external RNG).
+            let mut acc: u32 = 0x12345678;
+            let mut v = alloc::vec::Vec::with_capacity(n);
+            for _ in 0..n {
+                acc = acc.wrapping_mul(1664525).wrapping_add(1013904223);
+                v.push((acc >> 24) as u8);
+            }
+            cases.push(v);
+        }
+        for c in &cases {
+            let _ = parse_line(c);
+        }
     }
 }

@@ -12,7 +12,7 @@
 
 use magent_core::communication::link::IngressSource;
 use magent_core::communication::mqtt::MqttAdapter;
-use magent_core::ingress::{IngressGateway, IngressMode};
+use magent_core::ingress::{IngressGateway, IngressMode, MAX_ADAPTERS};
 use magent_core::web3::{verify_signed_message, Identity};
 
 /// Pull bytes out of a `heapless::Vec<u8, N>` for assertion convenience.
@@ -144,6 +144,9 @@ struct ChainedAdapter {
     /// normal operation. Used to exercise the gateway's error-isolation
     /// path.
     fail_once: bool,
+    /// When `true`, `send` always returns `Err`. Used to exercise the
+    /// gateway's `AdapterSendFailed` path.
+    send_fail: bool,
 }
 
 impl ChainedAdapter {
@@ -152,6 +155,7 @@ impl ChainedAdapter {
             queue: heapless::Vec::new(),
             connected,
             fail_once: false,
+            send_fail: false,
         }
     }
     fn push(&mut self, frame: &[u8]) {
@@ -185,6 +189,12 @@ impl magent_core::communication::link::LinkAdapter for ChainedAdapter {
     }
 
     fn send(&mut self, _buf: &[u8]) -> Result<(), Self::Error> {
+        if self.send_fail {
+            return Err(magent_core::communication::mqtt::MqttError::FrameTooLarge {
+                size: 0,
+                capacity: 0,
+            });
+        }
         Ok(())
     }
 
@@ -253,4 +263,44 @@ fn failing_adapter_is_isolated() {
 
     let frame = gw.ingest().unwrap().expect("frame");
     assert_eq!(vec_to_slice(&frame.payload), b"recovered");
+}
+
+#[test]
+fn adapter_pool_full_errors() {
+    let mut gw: IngressGateway<ChainedAdapter> = IngressGateway::new(IngressMode::Transparent);
+    for _ in 0..MAX_ADAPTERS {
+        gw.register(ChainedAdapter::new(true)).unwrap();
+    }
+    assert_eq!(gw.adapter_count(), MAX_ADAPTERS);
+    // The (MAX_ADAPTERS + 1)-th registration must fail cleanly.
+    let err = gw.register(ChainedAdapter::new(true)).unwrap_err();
+    assert!(matches!(
+        err,
+        magent_core::ingress::IngressError::AdapterPoolFull
+    ));
+    // The pool is unchanged.
+    assert_eq!(gw.adapter_count(), MAX_ADAPTERS);
+}
+
+#[test]
+fn send_to_adapter_out_of_range_is_ok() {
+    // Sending to an index that doesn't exist is a no-op (Ok), never an error.
+    let mut gw: IngressGateway<ChainedAdapter> = IngressGateway::new(IngressMode::Transparent);
+    gw.register(ChainedAdapter::new(true)).unwrap();
+    assert!(gw.send_to_adapter(0, b"hi").is_ok());
+    assert!(gw.send_to_adapter(5, b"hi").is_ok());
+    assert!(gw.send_to_adapter(usize::MAX, b"hi").is_ok());
+}
+
+#[test]
+fn send_to_adapter_surfaces_adapter_failure() {
+    let mut gw: IngressGateway<ChainedAdapter> = IngressGateway::new(IngressMode::Transparent);
+    let mut adapter = ChainedAdapter::new(true);
+    adapter.send_fail = true;
+    gw.register(adapter).unwrap();
+    let err = gw.send_to_adapter(0, b"hi").unwrap_err();
+    assert!(matches!(
+        err,
+        magent_core::ingress::IngressError::AdapterSendFailed
+    ));
 }

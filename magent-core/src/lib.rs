@@ -129,6 +129,14 @@ pub mod wifi_pass_seal_v2;
 /// the material to the actual hardware.
 pub mod boot_key;
 
+/// Chip-agnostic time synchronisation. See module docs for the
+/// authoritative-source / monotonic-drift model, NVS wire format,
+/// and the AT surface. Pure no_std + alloc, host-tested in
+/// `tests/time_sync_tests.rs`. The firmware-side SNTP supervisor
+/// (ESP32) and BLE CTS subscriber (nRF52) are thin wrappers around
+/// this module's [`TimeSync::record`] / [`TimeSync::now_unix`].
+pub mod time_sync;
+
 // `alloc` is always linked (even under `std`, where it's a re-export of
 // `format!` / `vec!` from `alloc` (and `println!` / `dbg!` from `std`
 // when std is enabled) are needed across the crate in both `no_std`

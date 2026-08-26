@@ -35,7 +35,17 @@ static EXECUTOR: static_cell::StaticCell<Executor> = static_cell::StaticCell::ne
 
 // SAFETY: These are initialized in main() before being accessed
 static mut WATCHDOG: Option<watchdog::Watchdog> = None;
-static mut BLE_STATE: ble::BleState = ble::BleState { is_connected: false, connection_handle: None, battery_level: 100 };
+// `BleState` is an *enum* (Idle/Advertising/Connected/…); the struct that
+// carries the runtime connection fields is `BleStateManager`. The initial
+// literal below is written out explicitly (not via `new()`) so it stays a
+// const-compatible `static mut` initializer.
+static mut BLE_STATE: ble::BleStateManager = ble::BleStateManager {
+    state: ble::BleState::Idle,
+    connection_handle: None,
+    is_connected: false,
+    mtu: 23,
+    battery_level: 100,
+};
 static mut POWER_STATE: power::PowerState = power::PowerState { mode: power::PowerMode::Active, battery_level: 100, estimated_runtime_hours: 0.0, sleep_count: 0, wake_count: 0 };
 static mut AGENT: Option<MiniAgent> = None;
 

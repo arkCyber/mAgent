@@ -174,9 +174,18 @@ impl Drop for SecretKey {
     /// program output, and Rust's `Drop` is not guaranteed to run
     /// (a panic during drop can leak the value). We use
     /// [`core::ptr::write_volatile`] so the compiler cannot
-    /// elide the writes, which gives us a fighting chance of
+    /// elide the writes, and a [`core::sync::atomic::compiler_fence`]
+    /// (SeqCst) at the end so the zeroing is observed by any
+    /// later load — together these give us a fighting chance of
     /// clearing the seed from process memory before the page is
     /// handed back to the allocator.
+    ///
+    /// **HARDENING (audit-2026-08):** the prior implementation
+    /// only had `write_volatile`. That still satisfies Stacked
+    /// Borrows for the *individual* write, but does not pin the
+    /// *ordering* across the loop. Adding an explicit
+    /// `compiler_fence(SeqCst)` at the end guarantees the loop's
+    /// writes are not reordered past the fence.
     ///
     /// The *expanded* secret scalar lives inside
     /// `Identity::signing_key` (`ed25519_dalek::SigningKey`),
@@ -194,6 +203,11 @@ impl Drop for SecretKey {
             // to a valid, properly-aligned, mutable location.
             unsafe { core::ptr::write_volatile(byte, 0) };
         }
+        // Pin the zeroing: any later access that observes a
+        // non-zero byte would be a stale-read bug. SeqCst is the
+        // strongest ordering and is required for the fence to
+        // also act as a compiler barrier on every backend.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 

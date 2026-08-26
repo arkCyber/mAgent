@@ -26,6 +26,13 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 
+/// `true` if `host` is a loopback address (localhost / 127.0.0.1 / ::1).
+/// Used to decide whether sending MQTT credentials over plain TCP is safe.
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "localhost.localdomain"
+}
+
 /// Errors surfaced by [`MqttClient`].
 #[derive(Debug, thiserror::Error)]
 pub enum MqttError {
@@ -84,6 +91,21 @@ impl MqttClient {
         opts.set_keep_alive(Duration::from_secs(config.keep_alive_secs as u64));
         if !config.username.is_empty() {
             opts.set_credentials(&config.username, &config.password);
+        }
+        // The transport below is plain TCP (rumqttc without the `use-rustls`
+        // feature). Credentials are therefore transmitted in cleartext. If
+        // the operator points at a NON-localhost broker, that leaks the
+        // username/password to anyone on the network path. The embedded
+        // nRF52 gateway legitimately talks to a localhost broker, so we
+        // allow it but warn loudly when the target isn't loopback.
+        if !config.username.is_empty() && !is_loopback_host(&config.broker_host) {
+            log::warn!(
+                "mqtt: sending credentials to non-localhost broker {}:{} over plain TCP \
+                 (no TLS). The username/password will be readable on the wire. \
+                 Prefer a localhost broker or a TLS-capable transport.",
+                config.broker_host,
+                config.broker_port
+            );
         }
         // mTLS is intentionally NOT wired here. The plain-TCP path
         // is what the embedded nRF52 gateway needs; an authenticated

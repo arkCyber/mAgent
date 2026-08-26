@@ -50,16 +50,14 @@
 //! * `ingress` (top-level feature on `magent-core`) — pulls in the
 //!   `crate::ingress` module which owns [`crate::ingress::IngressGateway`].
 //!
-//! ## TODO(heapless-signed-message)
+//! ## NOTE (audit-2026-08)
 //!
-//! `IngressGateway::ingest` currently calls
-//! `SignedMessage::to_json() -> alloc::string::String`, which heap-
-//! allocates per frame. On ESP32 the heap is fine for the 72 KiB
-//! budget but a single-byte alloc per frame is wasteful. A future
-//! change should add
-//! `SignedMessage::to_json_into(&mut [u8]) -> Result<usize, Web3ErrorKind>`
-//! so `IngressGateway::build_frame` can write into a stack-resident
-//! `heapless::String<MAX_PAYLOAD>` without touching the allocator.
+//! The `heapless-signed-message` TODO below is **done**: `SignedMessage`
+//! gained `to_json_into(&mut heapless::String<N>)` (in `web3/signature.rs`)
+//! and `IngressGateway::build_frame` writes the envelope into a
+//! stack-resident `heapless::String<MAX_PAYLOAD>` instead of heap-allocating
+//! per frame. The old heap-per-frame path via `SignedMessage::to_json()`
+//! remains only for host convenience.
 
 // BLE implementation lives in its own file; re-export so the public
 // path `magent_core::communication::BleClient` (and the rest of the

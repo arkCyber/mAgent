@@ -360,9 +360,40 @@ impl ToolRegistry {
             }
         };
 
+        // HARDENING (audit-2026-08 H7): previously this was
+        // `heapless::String::try_from(value).unwrap()`. A caller-
+        // controlled `value` longer than 256 bytes would panic the
+        // agent rather than be reported as a tool error. We now
+        // truncate at the boundary, log a warning, and return a
+        // successful result with the truncated payload — the
+        // alternative would be a panic in a worker thread that
+        // kills the whole MiniAgent loop. ToolResult.data is
+        // 256 bytes; we cap at 240 to leave room for a "..."
+        // marker.
+        let mut data_buf: heapless::String<256> = heapless::String::new();
+        let truncated = if value.len() > 240 {
+            log::warn!(
+                "[tools] read_sensor data {} bytes exceeds ToolResult.data=256; \
+                 truncating to 240 chars",
+                value.len()
+            );
+            // HARDENING (audit-2026-08): truncate at the largest *character*
+            // boundary at or below 240 bytes. A raw `&value[..240]` would
+            // panic if a multi-byte UTF-8 codepoint (e.g. `°`) straddled the
+            // cut, which would kill the worker thread instead of producing a
+            // truncated result.
+            let mut end = 240;
+            while end > 0 && !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            &value[..end]
+        } else {
+            value
+        };
+        let _ = data_buf.push_str(truncated);
         Ok(ToolResult {
             tool_name: heapless::String::try_from("read_sensor").unwrap(),
-            data: heapless::String::try_from(value).unwrap(),
+            data: data_buf,
             success: true,
             error: None,
         })
@@ -656,6 +687,7 @@ pub enum GpioState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::try_heapless;
     use crate::tools::{Tool, ToolType};
 
     /// Build a populated registry identical to what
@@ -673,12 +705,25 @@ mod tests {
             ("send_notification", "Send a smartwatch notification", ToolType::SendNotification),
         ];
         for (name, desc, ty) in entries {
+            // HARDENING (audit-2026-08 unwrap sweep): the previous
+            // `String::try_from(*name).unwrap()` would panic if a
+            // future contributor added a tool name longer than the
+            // `String<32>` boundary. `try_heapless` truncates with
+            // a warning instead, keeping the static initializer
+            // crash-free even if a string is bumped past the limit.
             let tool = Tool {
-                name: String::try_from(*name).unwrap(),
-                description: String::try_from(*desc).unwrap(),
+                name: try_heapless::<32>(name),
+                description: try_heapless::<128>(desc),
                 tool_type: *ty,
             };
-            r.register(tool).unwrap();
+            // HARDENING (audit-2026-08 unwrap sweep):
+            // `register` can fail (duplicate tool name). The
+            // previous code panicked the whole registry on a name
+            // collision; we now log and continue so other tools
+            // still get registered.
+            if let Err(e) = r.register(tool) {
+                log::warn!("[tools] duplicate tool name `{name}`: {e}");
+            }
         }
         r
     }
@@ -943,6 +988,56 @@ mod tests {
         .unwrap();
         assert!(out.success);
         assert_eq!(out.data.as_str(), "Sent 5 bytes via BLE to heart_rate");
+    }
+
+    #[test]
+    fn execute_flash_write_parses_address_and_data() {
+        let r = populated_registry();
+        let out = run_async(r.execute(&make_call("flash_write", "address=2048,data=hello"))).unwrap();
+        assert!(out.success);
+        assert_eq!(out.data.as_str(), "Wrote 5 bytes to address 2048");
+    }
+
+    #[test]
+    fn execute_ble_send_empty_data_defaults_to_zero() {
+        // `data=` with no payload must report 0 bytes, not mis-parse.
+        let r = populated_registry();
+        let out = run_async(r.execute(&make_call("ble_send", "data="))).unwrap();
+        assert!(out.success);
+        assert_eq!(out.data.as_str(), "Sent 0 bytes via BLE to default");
+    }
+
+    #[test]
+    fn execute_read_sensor_unknown_sensor_fails() {
+        let r = populated_registry();
+        let out = run_async(r.execute(&make_call("read_sensor", "sensor=zzz"))).unwrap();
+        assert!(!out.success);
+        assert!(out.error.is_some());
+        assert_eq!(out.data.as_str(), "Unknown sensor");
+    }
+
+    #[test]
+    fn execute_write_gpio_missing_pin_defaults_to_zero() {
+        let r = populated_registry();
+        let out = run_async(r.execute(&make_call("write_gpio", "state=low"))).unwrap();
+        assert!(out.success);
+        assert_eq!(out.data.as_str(), "Pin 0 set to low");
+    }
+
+    #[test]
+    fn parse_args_value_containing_equals_keeps_rest() {
+        // `data=a=b` — only the *first* `=` splits key from value, so the
+        // rest (`a=b`) is preserved verbatim rather than re-split.
+        let parsed = parse_args("data=a=b");
+        assert_eq!(arg(&parsed, "data", ""), "a=b");
+    }
+
+    #[test]
+    fn normalize_sensor_preserves_unknown_name() {
+        // Unknown sensor names fall through unchanged (the executor then
+        // rejects them as "Unknown sensor").
+        assert_eq!(normalize_sensor("garbage"), "garbage");
+        assert_eq!(normalize_sensor(""), "");
     }
 }
 

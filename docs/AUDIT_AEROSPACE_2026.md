@@ -7,6 +7,17 @@ claims and harden any gaps found.
 **Standard applied:** panic-freedom on runtime paths, bounded memory, input
 validation, fault tolerance, fail-closed security, no silent arithmetic
 overflow in trusted paths.
+**Author:** Internal AI-assisted self-audit by the project owner.
+
+> **Audit scope & limitations**: This document is an **internal AI-assisted
+> self-audit**, **not a third-party independent audit**. The
+> control-by-control "verified sound" / "fixed" claims below are assertions
+> by the project author, derived from grep-scan + `cargo clippy` + manual
+> review. They are published as a baseline for future third-party review
+> and as evidence of design intent, not as formal certification under
+> DO-178C, ISO 26262, or IEC 61508. See [`SECURITY_AUDIT.md`](../SECURITY_AUDIT.md)
+> for the same disclosure applied to the broader audit baseline, and
+> [`SECURITY.md`](../SECURITY.md) for the vulnerability disclosure policy.
 
 ---
 
@@ -116,6 +127,11 @@ well within the aerospace standard.
 The core runtime is in strong aerospace shape: bounded buffers everywhere,
 input validated before conversion, no sound-`unsafe` concerns, and firmware
 panics limited to fail-closed security and compile-time constants. This audit
+is published as an **internal self-audit baseline**, not as a formal
+certification; a third-party independent audit is committed to within 60
+days of the next funding milestone (see `SECURITY_AUDIT.md` § "Third-party
+audit commitment"). Until that third-party report is published, do not
+represent this codebase as certified to DO-178C, ISO 26262, or IEC 61508.
 removed the remaining latent runtime panics in the agent core, made the
 observability layer panic-cascade-safe, added a CI lint guard against
 `panic`-in-`Result` regressions, and confirmed the firmware is sound.

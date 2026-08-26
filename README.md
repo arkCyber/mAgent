@@ -1,5 +1,18 @@
 # mAgent - Aerospace-Grade Embedded AI Agent
 
+[![CI](https://img.shields.io/github/actions/workflow/status/arkCyber/mAgent/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/arkCyber/mAgent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
+[![Workspace version](https://img.shields.io/badge/workspace-v0.1.0-informational.svg?style=flat-square)](Cargo.toml)
+[![Audit status](https://img.shields.io/badge/audit-internal%20self--audit-orange.svg?style=flat-square)](SECURITY_AUDIT.md)
+
+> **Confidentiality notice**: This repository is the open-source codebase of
+> the **mAgent** project (target commercial brand: **arkChip-mAgent**). The
+> most recent security audit is an **internal AI-assisted self-audit**,
+> not a third-party independent audit; the audit timeline commitment is
+> tracked in [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) and the commercial
+> pitch deck. Do not represent this codebase as certified to DO-178C,
+> ISO 26262, or IEC 61508 unless a third-party report says so.
+
 | Language | Rust |
 |----------|------|
 | Platform | Embedded / Bare-metal |
@@ -64,14 +77,16 @@ below 64 KiB.
 
 ```
 MicroAgent/
-├── Cargo.toml                 # Workspace root
+├── Cargo.toml                 # Workspace root (members, patches, lints)
 ├── README.md                  # This file
 │
-├── magent-core/              # Core AI Agent Library (chip-agnostic)
+├── magent-core/              # Core AI Agent Library (chip-agnostic, no_std)
 │   ├── src/
 │   │   ├── lib.rs           # Module exports, version constants
-│   │   ├── agent.rs         # MiniAgent - ReAct state machine
-│   │   ├── agent_runner.rs  # Full agent runner with LLM integration
+│   │   ├── agent.rs         # MiniAgent — ReAct state machine
+│   │   ├── agent_runner.rs  # Host runner with LLM (Ollama/DeepSeek) integration
+│   │   ├── at.rs            # AT (Hayes / ESP-AT) command parser (no_std)
+│   │   ├── at_validate.rs   # Host-tested AT value validators
 │   │   ├── error.rs         # Error types and handling
 │   │   ├── config.rs        # Agent configuration
 │   │   ├── skills.rs        # Skills manager (flash-based)
@@ -84,6 +99,14 @@ MicroAgent/
 │   │   ├── ollama.rs       # LLM backend interface
 │   │   ├── storage.rs       # Flash storage
 │   │   ├── wear_leveling.rs  # Flash wear leveling
+│   │   ├── ingress.rs       # IngressGateway (link adapters)
+│   │   ├── recovery.rs      # Exponential-backoff retry manager
+│   │   ├── conversation.rs  # Bounded conversation history
+│   │   ├── time_sync.rs     # SNTP time synchronisation (no_std)
+│   │   ├── boot_key.rs      # Boot-key derivation
+│   │   ├── simulator.rs     # Host simulator
+│   │   ├── real_tools.rs    # Host SimulatorExecutor (tool backend)
+│   │   ├── wifi_pass_seal.rs / wifi_pass_seal_v2.rs  # NVS secret sealing (DBO2)
 │   │   │
 │   │   ├── health_sensors.rs    # Health sensor processing
 │   │   ├── sports_coach.rs     # Sports coaching module
@@ -98,9 +121,14 @@ MicroAgent/
 │   │   │   ├── mqtt.rs     # MQTT adapter (host)
 │   │   │   └── manual.rs   # Manual stdin adapter
 │   │   │
-│   │   ├── web3/           # Web3 / blockchain
-│   │   │   └── mod.rs
-│   │   └── web3_app/       # Web3 app integration
+│   │   ├── summary/        # Run-summary store (record schema + CLI helpers)
+│   │   ├── web3/           # Web3 / blockchain (feature-gated)
+│   │   │   ├── mod.rs
+│   │   │   ├── identity.rs / did.rs / signature.rs
+│   │   │   ├── verifiable_credentials.rs
+│   │   │   ├── blockchain/ # Secp256k1, transaction, HTTP client, tools
+│   │   │   └── wallet/     # BIP-39 / BIP-32 + encrypted keystore
+│   │   └── web3_app/       # Signed run-report / prompt envelopes
 │   └── Cargo.toml
 │
 ├── magent-hal/               # Hardware Abstraction Layer
@@ -112,53 +140,38 @@ MicroAgent/
 │
 ├── firmware/                 # Firmware for embedded targets
 │   ├── README.md            # Firmware overview
-│   │
-│   ├── nrf52-app/          # nRF52840 firmware
-│   │   ├── src/
-│   │   │   ├── main.rs     # Application entry point
-│   │   │   ├── ble.rs      # BLE advertising & GATT
-│   │   │   ├── sensors.rs  # Sensor drivers
-│   │   │   ├── power.rs    # Power management
-│   │   │   └── watchdog.rs # Watchdog & error handling
-│   │   ├── Cargo.toml
-│   │   ├── memory.x        # Memory layout
-│   │   ├── build.rs        # Build script
-│   │   ├── .cargo/
-│   │   │   └── config.toml # Build config
-│   │   └── README.md
-│   │
-│   └── esp32-app/          # ESP32-C61 firmware
-│       ├── src/
-│       │   ├── main.rs
-│       │   └── sysenv_stubs.c
-│       ├── Cargo.toml
-│       ├── build.rs
-│       ├── sdkconfig
-│       └── README.md
+│   ├── nrf52-app/          # nRF52840 firmware (Embassy, bare-metal)
+│   │   ├── src/main.rs      # Entry point, tasks
+│   │   ├── src/{ble,sensors,power,watchdog}.rs
+│   │   ├── Cargo.toml · memory.x · build.rs · .cargo/config.toml
+│   ├── esp32-app/          # ESP32-C61 firmware (esp-idf-svc, std)
+│   │   ├── src/main.rs      # Entry point, event loop
+│   │   ├── src/{at_dispatch,ble_at,ble_config,ble_gatt,ble_wallet,
+│   │   │        device_key,link_adapters,llm,local_tools,sntp_sync}.rs
+│   │   ├── Cargo.toml · build.rs · sdkconfig.defaults · .cargo/config.toml
+│   └── integration-test/    # nRF52840 on-device E2E test runner
 │
 ├── host/                     # Host-side tooling
 │   ├── simulator/          # Desktop simulator
 │   ├── nrf52-simulator/    # nRF52840 simulator
-│   ├── email-mcp/          # Email MCP server
+│   ├── email-mcp/          # Email MCP server (IMAP/SMTP)
 │   ├── mqtt-mcp/           # MQTT MCP server
-│   └── mcp-tool-executor/  # MCP tool executor
+│   ├── mcp-tool-executor/  # MCP tool executor
+│   └── magent-man/         # Tauri desktop "Device Manager" app (BLE config)
 │
-├── cli/                     # Command-line interface
-│   └── src/
-│       └── main.rs
+├── cli/                     # `magent` command-line tool
+│   └── src/{main,cli,runner,config,prompt,summary,web3,
+│           web3_blockchain,email_executor,blockchain_executor,
+│           scheduler,doctor,output}.rs
 │
-├── tools/                   # Development tools
-│   └── src/
+├── tools/                   # Development tools (benchmarks / algorithm demos)
+│   └── src/bin/{benchmarks,algorithm-tests,integration-tests,
+│                module-integration-test,config-validation-test,
+│                e2e-agent-test}.rs
 │
-├── docs/                    # Documentation
-│   ├── README.md            # Doc index
-│   ├── NRF52_BUILD_GUIDE.md
-│   ├── NRF52_MEMORY_ANALYSIS.md
-│   ├── ESP32_C61_BUILD.md
-│   ├── ESP32_C61_BUILD_TROUBLESHOOTING.md
-│   └── PLATFORM_COMPARISON.md
+├── examples/                # Example applications (workspace glob)
 │
-└── examples/                # Example applications
+└── docs/                    # Documentation (see index below)
 ```
 
 ## 🔋 Power Management
@@ -328,7 +341,12 @@ verbatim.
 | [AT Command Reference](docs/AT_COMMAND_REFERENCE.md) | AT (Hayes / ESP-AT) provisioning subset |
 | [LLM Backends](docs/LLM_BACKENDS.md) | DeepSeek / Ollama provider wiring |
 | [Summary Store](docs/SUMMARY_STORE.md) | Run-summary schema & CLI |
-| [Aerospace Code Audit](docs/AUDIT_AEROSPACE_2026.md) | Panic-freedom / bounded-memory audit |
+| [Aerospace Code Audit](docs/AUDIT_AEROSPACE_2026.md) | Panic-freedom / bounded-memory audit (internal self-audit — see [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) for scope & limitations) |
+| [Security Policy](SECURITY.md) | Vulnerability disclosure & coordinated disclosure timeline |
+| [Security Audit Baseline](SECURITY_AUDIT.md) | Internal AI-assisted self-audit (NOT a third-party audit) |
+| [Contributing](CONTRIBUTING.md) | How to file issues, open PRs, run the local toolchain |
+| [Code of Conduct](CODE_OF_CONDUCT.md) | Community standards (Contributor Covenant 2.1) |
+| [License](LICENSE) | MIT License |
 
 ## 🧠 Run Summaries
 
@@ -420,7 +438,12 @@ unattended / low-trust environments:
 - **Panic-cascade safety** — the trace-sink and boot-key paths never `panic!`
   inside a `Result`; `#![deny(clippy::panic_in_result_fn)]` is enforced under
   CI to keep it that way.
-- 400+ `magent-core` unit tests pass, 0 failures.
+- **Test coverage** — `magent-core` ships **737 unit tests** plus **365
+  integration tests** (AT parser, web3/blockchain, ingress gateway, time-sync,
+  property tests, nRF52 sim) across all feature flags; the host crates (`magent`
+  CLI, MCP executors, simulators, `magent-tools`) add another ~460. The whole
+  host test suite runs green with 0 failures, and all three firmware targets
+  (nRF52840, nRF52840 integration-test, ESP32-C61) compile cleanly.
 
 ## 🤝 Contributing
 

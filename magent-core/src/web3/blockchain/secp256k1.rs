@@ -92,22 +92,44 @@ impl Secp256k1SecretKey {
     }
 
     /// Compute the public key
+    ///
+    /// Returns an error if the stored bytes are not a valid secp256k1
+    /// scalar (i.e. ≥ the curve group order `n`). The previous
+    /// implementation `.expect("validated at construction")` would panic
+    /// the process on any construction path that bypassed `from_bytes`
+    /// (e.g. a future refactor that adds a `pub fn new_unchecked`, or a
+    /// direct field assignment via `Default`).
+    ///
+    /// HARDENING (audit-2026-08 H10): do not panic on bad-key input.
     #[cfg(feature = "web3")]
-    pub fn public_key(&self) -> Secp256k1PublicKey {
+    pub fn public_key(&self) -> Result<Secp256k1PublicKey, Web3ErrorKind> {
         let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&self.bytes)
-            .expect("validated at construction");
+        let sk = SecretKey::from_slice(&self.bytes).map_err(|e| {
+            Web3ErrorKind::BlockchainError(format!(
+                "stored secp256k1 key is out of range ({} bytes), \
+                 refusing to derive public key",
+                e
+            ))
+        })?;
         let pk = PublicKey::from_secret_key(&secp, &sk);
         let full = pk.serialize_uncompressed();
         let mut uncompressed = [0u8; 64];
         uncompressed.copy_from_slice(&full[1..65]);
-        Secp256k1PublicKey { uncompressed }
+        Ok(Secp256k1PublicKey { uncompressed })
     }
 
     /// Get secp256k1 SecretKey (for internal signing)
+    ///
+    /// HARDENING (audit-2026-08 H10): same fix as `public_key` —
+    /// propagate the error rather than panicking.
     #[cfg(feature = "web3")]
-    pub fn inner(&self) -> SecretKey {
-        SecretKey::from_slice(&self.bytes).expect("validated at construction")
+    pub fn inner(&self) -> Result<SecretKey, Web3ErrorKind> {
+        SecretKey::from_slice(&self.bytes).map_err(|e| {
+            Web3ErrorKind::BlockchainError(format!(
+                "stored secp256k1 key is out of range ({} bytes)",
+                e
+            ))
+        })
     }
 }
 
@@ -229,7 +251,7 @@ impl Secp256k1Keypair {
     #[cfg(feature = "web3")]
     pub fn from_secret_key(bytes: [u8; 32]) -> Result<Self, Web3ErrorKind> {
         let secret = Secp256k1SecretKey::from_bytes(bytes)?;
-        let public = secret.public_key();
+        let public = secret.public_key()?;
         let address = public.to_address();
         Ok(Self { secret, public, address })
     }
@@ -239,7 +261,7 @@ impl Secp256k1Keypair {
         let secret = Secp256k1SecretKey::from_hex(hex)?;
         #[cfg(feature = "web3")]
         {
-            let public = secret.public_key();
+            let public = secret.public_key()?;
             let address = public.to_address();
             Ok(Self { secret, public, address })
         }
@@ -1018,5 +1040,53 @@ mod tests {
         let sig =
             TransactionSigner::sign_typed_data_hash(kp.secret_key(), &digest).unwrap();
         assert!(TransactionSigner::verify(&digest, &sig, kp.address()).unwrap());
+    }
+
+    #[cfg(feature = "web3")]
+    #[test]
+    fn h10_from_bytes_rejects_zero_scalar() {
+        // HARDENING (audit-2026-08 H10): a scalar equal to the
+        // curve group order, or any larger value, must not produce
+        // an invalid secp256k1 key. The constructor `from_bytes`
+        // must reject it via `SecretKey::from_slice`.
+        let bytes = [0u8; 32];
+        let r = Secp256k1SecretKey::from_bytes(bytes);
+        assert!(
+            matches!(r, Err(Web3ErrorKind::BlockchainError(_))),
+            "expected BlockchainError for zero scalar, got {r:?}"
+        );
+    }
+
+    #[cfg(feature = "web3")]
+    #[test]
+    fn h10_from_bytes_rejects_all_ones_scalar() {
+        // 0xFFFF...FF is a valid field element but exceeds the curve
+        // group order, so `SecretKey::from_slice` must reject it.
+        let bytes = [0xFFu8; 32];
+        let r = Secp256k1SecretKey::from_bytes(bytes);
+        assert!(
+            matches!(r, Err(Web3ErrorKind::BlockchainError(_))),
+            "expected BlockchainError for all-ones scalar, got {r:?}"
+        );
+    }
+
+    #[cfg(feature = "web3")]
+    #[test]
+    fn h10_public_key_for_valid_key_succeeds() {
+        // Make sure the post-H10 `Result` return type doesn't break
+        // the happy path: a valid secret key still derives a public
+        // key successfully.
+        let kp = Secp256k1Keypair::generate();
+        let pk = kp.secret_key().public_key().expect("valid key derives pk");
+        assert_eq!(pk.as_bytes().len(), 64);
+    }
+
+    #[cfg(feature = "web3")]
+    #[test]
+    fn h10_inner_for_valid_key_succeeds() {
+        // Mirror of the public_key test for `inner()` — same happy
+        // path, must remain working after the H10 hardening.
+        let kp = Secp256k1Keypair::generate();
+        let _sk = kp.secret_key().inner().expect("valid key returns sk");
     }
 }

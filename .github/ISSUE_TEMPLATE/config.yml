@@ -1,0 +1,11 @@
+# Disable blank-issue and pre-fill the new-issue chooser with bug / feature
+# templates. Sensitive topics (security, funding, commercial roadmap) are
+# explicitly routed to channels listed in SECURITY.md / CONTRIBUTING.md.
+blank_issues_enabled: false
+contact_links:
+  - name: Security disclosure
+    url: https://github.com/arkCyber/mAgent/security/SECURITY.md
+    about: Please do NOT file public issues for suspected vulnerabilities.
+  - name: Contributing guide
+    url: https://github.com/arkCyber/mAgent/blob/main/CONTRIBUTING.md
+    about: How to file issues, open PRs, run the local toolchain, etc.

@@ -43,6 +43,7 @@ use magent_core::at::{
 // directly. We re-export it here so external code can keep using
 // `at_dispatch::AtOutcome::...` references without churn.
 pub use magent_core::at_dispatch_outcome::AtOutcome;
+use magent_core::time_sync::{Source, TZ_KEY, TZ_MAX_MINUTES, TZ_MIN_MINUTES};
 use magent_core::web3::Identity;
 use magent_core::wifi_pass_seal_v2;
 
@@ -113,7 +114,7 @@ pub fn render_outcome(outcome: &AtOutcome, out: &mut ResponseBuf) -> Result<(), 
 // of the main.rs NVS plumbing.
 // ---------------------------------------------------------------------------
 
-fn nvs_load(key: &str, namespace: &str) -> Option<HeaplessString<256>> {
+pub(crate) fn nvs_load(key: &str, namespace: &str) -> Option<HeaplessString<256>> {
     // PATCHED (MicroAgent): share the partition taken once at boot
     // (`main::init_default_nvs`); `EspDefaultNvsPartition::take()` fails
     // after EspWifi holds it, which made every AT read silently empty.
@@ -135,6 +136,25 @@ fn nvs_save(key: &str, value: &str, namespace: &str) -> Result<(), &'static str>
     Ok(())
 }
 
+/// `TZ_KEY` is a namespace-qualified key (`mag_at:timezone_min`, matching
+/// main.rs's `namespace:key` shorthand). Our local `nvs_load`/`nvs_save`
+/// take a bare key + namespace separately, so strip the prefix before use.
+fn tz_bare_key() -> &'static str {
+    TZ_KEY.rsplit_once(':').map(|(_, k)| k).unwrap_or(TZ_KEY)
+}
+
+/// Load the persisted timezone offset from NVS. Returns 0 if the key
+/// is absent / unparseable. The `main` task uses this on boot to
+/// pre-populate `TimeSync::new(tz)` so the operator's `AT+TIMEZONE=`
+/// survives reboots.
+pub fn load_tz_offset_from_nvs() -> i16 {
+    let v = match nvs_load(tz_bare_key(), NS) {
+        Some(s) => s,
+        None => return 0,
+    };
+    v.parse::<i16>().unwrap_or(0).clamp(TZ_MIN_MINUTES, TZ_MAX_MINUTES)
+}
+
 /// Load the device-bound sealing key. The key is the Ed25519 seed stored
 /// under `magent:dev_identity`. Supports BOTH the legacy 64-hex plaintext
 /// and the modern `BTDK1:`-sealed form via
@@ -152,9 +172,26 @@ fn load_device_key() -> Result<[u8; 32], &'static str> {
 // ---------------------------------------------------------------------------
 
 /// Apply one parsed AT command. `now_ms` is the ESP-IDF monotonic ms
-/// clock; `safe_mode` reflects the firmware's crash-loop detector.
-pub fn dispatch<'a>(cmd: &AtCommand<'a>, now_ms: u64, safe_mode: bool) -> AtOutcome {
-    let outcome = dispatch_inner(cmd, now_ms, safe_mode);
+/// clock; `safe_mode` reflects the firmware's crash-loop detector;
+/// `time_sync` is the shared wall-clock handle used by `AT+TIME?`,
+/// `AT+NTPSYNC`, `AT+TIMEZONE`. `force_ntp_sync` lets the dispatcher
+/// trigger an SNTP re-sync (it is called when `AT+NTPSYNC` arrives).
+pub fn dispatch<'a>(
+    cmd: &AtCommand<'a>,
+    now_ms: u64,
+    safe_mode: bool,
+    wifi_status: Option<&crate::WifiStatusHandle>,
+    time_sync: Option<&crate::sntp_sync::TimeSyncHandle>,
+    force_ntp_sync: &mut bool,
+) -> AtOutcome {
+    let outcome = dispatch_inner(
+        cmd,
+        now_ms,
+        safe_mode,
+        wifi_status,
+        time_sync,
+        force_ntp_sync,
+    );
     log::info!(
         "[at] op={} kind={:?} -> {:?} (t={}ms)",
         cmd.op.name(),
@@ -165,7 +202,14 @@ pub fn dispatch<'a>(cmd: &AtCommand<'a>, now_ms: u64, safe_mode: bool) -> AtOutc
     outcome
 }
 
-fn dispatch_inner<'a>(cmd: &AtCommand<'a>, now_ms: u64, safe_mode: bool) -> AtOutcome {
+fn dispatch_inner<'a>(
+    cmd: &AtCommand<'a>,
+    now_ms: u64,
+    safe_mode: bool,
+    wifi_status: Option<&crate::WifiStatusHandle>,
+    time_sync: Option<&crate::sntp_sync::TimeSyncHandle>,
+    force_ntp_sync: &mut bool,
+) -> AtOutcome {
     match cmd.op {
         AtOp::Ping => AtOutcome::NoReply,
         AtOp::SetEcho { on: _ } => AtOutcome::NoReply,
@@ -190,7 +234,7 @@ fn dispatch_inner<'a>(cmd: &AtCommand<'a>, now_ms: u64, safe_mode: bool) -> AtOu
         AtOp::CwHostname => cwhostname_dispatch(cmd),
         AtOp::CwAutoconn => cwautoconn_dispatch(cmd),
         AtOp::CwReconnCfg => cwreconncfg_dispatch(cmd),
-        AtOp::CwState => AtOutcome::ok_line("+CWSTATE:4"),
+        AtOp::CwState => cwstate_line(wifi_status),
         AtOp::CipStaMac => cipstamac_dispatch(cmd),
         AtOp::MacRand => {
             log::warn!("[at] MACRAND: not implemented in v0.2");
@@ -215,8 +259,38 @@ fn dispatch_inner<'a>(cmd: &AtCommand<'a>, now_ms: u64, safe_mode: bool) -> AtOu
         AtOp::WifiPassUpgrade => wifipass_upgrade_dispatch(cmd),
         AtOp::HttpGet => http_get_dispatch(cmd),
         AtOp::LlmCfg => llmcfg_dispatch(cmd),
+        AtOp::Time => time_dispatch(cmd, time_sync, now_ms),
+        AtOp::NtpSync => ntp_sync_dispatch(cmd, time_sync, force_ntp_sync, safe_mode),
+        AtOp::Timezone => timezone_dispatch(cmd, time_sync),
+        AtOp::Ble => ble_dispatch(cmd),
     }
 }
+
+/// Report the real Wi-Fi link state by reading the snapshot published by the
+/// Wi-Fi supervisor thread. Falls back to `4` (disconnected) when no
+/// supervisor is running. The optional IP makes the line self-describing
+/// without needing a separate `AT+CIPSTA` probe.
+fn cwstate_line(wifi_status: Option<&crate::WifiStatusHandle>) -> AtOutcome {
+    let mut line = ReplyLine::new();
+    let res = match wifi_status {
+        Some(h) => match h.lock() {
+            Ok(g) => {
+                if g.ip.is_empty() {
+                    write!(line, "+CWSTATE:{}", g.state)
+                } else {
+                    write!(line, "+CWSTATE:{},{}", g.state, g.ip)
+                }
+            }
+            Err(_) => write!(line, "+CWSTATE:4"),
+        },
+        None => write!(line, "+CWSTATE:4"),
+    };
+    if res.is_err() {
+        return AtOutcome::ok_line("+CWSTATE:4");
+    }
+    AtOutcome::ok_line(&line)
+}
+
 
 // ---------------------------------------------------------------------------
 // Individual command implementations.
@@ -791,12 +865,23 @@ impl Drop for HTTPWorkerGuard {
 /// a short body preview. Used to verify outbound network reachability from
 /// the device (e.g. to well-known Chinese websites).
 ///
+/// The URL is validated by `magent_core::at_validate::validate_httpget_set`
+/// (http/https scheme whitelist, length cap, control-byte rejection) before
+/// any worker thread is spawned.
+///
 /// Runs the actual network call on a separate worker thread and waits for
 /// it with a bounded `recv_timeout`, so a hung TLS handshake can NEVER
 /// block the ingress thread (which would freeze the whole AT console).
 /// If the worker doesn't finish in time it is intentionally leaked (bounded
 /// by the 6s HTTP timeout) and we reply with an error.
 fn http_get_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
+    // Validate the URL up front (scheme whitelist, length cap, control-byte
+    // rejection) before spending any worker / connection budget on it.
+    let validated = match magent_core::at_validate::validate_httpget_set(cmd) {
+        Ok(v) => v,
+        Err(outcome) => return outcome,
+    };
+
     // Bound concurrent workers (see `HTTP_MAX_WORKERS`).
     if HTTP_WORKERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= HTTP_MAX_WORKERS {
         HTTP_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -805,20 +890,20 @@ fn http_get_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
     }
     let _guard = HTTPWorkerGuard;
 
-    let url = match cmd.arg(0) {
-        Some(AtArg::Quoted(b)) | Some(AtArg::Token(b)) => core::str::from_utf8(b).ok(),
-        _ => None,
-    };
-    let url = match url {
-        Some(u) if !u.is_empty() => u,
-        _ => return AtOutcome::error(4),
-    };
-    let url = url.to_string(); // owned for the worker thread
+    let url = validated.url.as_str().to_string(); // owned for the worker thread
 
     let (tx, rx) = std::sync::mpsc::channel::<Result<ReplyLine, u8>>();
-    std::thread::spawn(move || {
-        let _ = tx.send(http_get_worker(&url));
-    });
+    // PATCHED (MicroAgent): the TLS handshake needs a real stack — the default
+    // pthread stack (~4 KiB) overflows during a TLS handshake to
+    // api.deepseek.com and panics the board ("Guru Meditation: Stack protection
+    // fault"). Give the worker 24 KiB like the ingress thread.
+    std::thread::Builder::new()
+        .name("httpget-worker".into())
+        .stack_size(24 * 1024)
+        .spawn(move || {
+            let _ = tx.send(http_get_worker(&url));
+        })
+        .ok();
 
     match rx.recv_timeout(std::time::Duration::from_secs(12)) {
         Ok(Ok(line)) => AtOutcome::Ok { data: line },
@@ -967,6 +1052,10 @@ fn url_host_port(url: &str) -> Option<(String, u16)> {
 /// `AT+LLMCFG?` / `AT+LLMCFG=<model>,<api_key>` — query / set the LLM
 /// backend parameters the agent uses for reasoning. The API key is never
 /// echoed back verbatim on query; it is masked (`sk-abc…def`).
+///
+/// The SET path is validated by `magent_core::at_validate::validate_llmcfg_set`
+/// (length caps, NUL / control-byte / whitespace rejection, UTF-8) before
+/// anything is written to NVS.
 fn llmcfg_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
     match cmd.kind {
         AtCommandKind::Query => {
@@ -977,31 +1066,19 @@ fn llmcfg_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
             AtOutcome::Ok { data: line }
         }
         AtCommandKind::Set => {
-            let model = match cmd.arg(0) {
-                Some(AtArg::Quoted(b)) | Some(AtArg::Token(b)) => {
-                    core::str::from_utf8(b).ok().filter(|s| !s.is_empty())
-                }
-                _ => None,
+            let validated = match magent_core::at_validate::validate_llmcfg_set(cmd) {
+                Ok(v) => v,
+                Err(outcome) => return outcome,
             };
-            let key = match cmd.arg(1) {
-                Some(AtArg::Quoted(b)) | Some(AtArg::Token(b)) => {
-                    core::str::from_utf8(b).ok().filter(|s| !s.is_empty())
-                }
-                _ => None,
-            };
-            let (model, key) = match (model, key) {
-                (Some(m), Some(k)) => (m, k),
-                _ => return AtOutcome::error(4),
-            };
-            if model.len() > 64 || key.len() > 128 {
-                return AtOutcome::error(8);
-            }
             match (
-                nvs_save(NVS_KEY_LLM_MODEL, model, NS),
-                nvs_save(NVS_KEY_LLM_API_KEY, key, NS),
+                nvs_save(NVS_KEY_LLM_MODEL, validated.model.as_str(), NS),
+                nvs_save(NVS_KEY_LLM_API_KEY, validated.api_key.as_str(), NS),
             ) {
                 (Ok(()), Ok(())) => {
-                    log::info!("[at] LLMCFG: model={model} api_key set");
+                    log::info!(
+                        "[at] LLMCFG: model={} api_key set",
+                        validated.model.as_str()
+                    );
                     AtOutcome::NoReply
                 }
                 _ => AtOutcome::error(7),
@@ -1044,6 +1121,146 @@ fn escape_wire(s: &str) -> HeaplessString<128> {
         }
     }
     out
+}
+
+/// `AT+TIME?` — report the current wall-clock time as ISO 8601 UTC
+/// plus the source of the last authoritative sync. Empty / `None`
+/// reply if no sync has happened yet (the firmware treats this as
+/// "device clock unknown" and refuses to lie about the wall-clock).
+fn time_dispatch(
+    cmd: &AtCommand<'_>,
+    time_sync: Option<&crate::sntp_sync::TimeSyncHandle>,
+    now_ms: u64,
+) -> AtOutcome {
+    if !matches!(cmd.kind, AtCommandKind::Query | AtCommandKind::Execute) {
+        return AtOutcome::error(4);
+    }
+    let handle = match time_sync {
+        Some(h) => h,
+        None => return AtOutcome::ok_line("+TIME:UNSYNCED"),
+    };
+    let guard = match handle.lock() {
+        Ok(g) => g,
+        Err(_) => return AtOutcome::error(7),
+    };
+    if guard.source() == Source::None {
+        return AtOutcome::ok_line("+TIME:UNSYNCED");
+    }
+    let mut iso: HeaplessString<32> = HeaplessString::new();
+    if guard.format_iso8601(now_ms, &mut iso).is_err() {
+        return AtOutcome::ok_line("+TIME:ERROR");
+    }
+    let wall = match guard.now_unix(now_ms) {
+        Some(w) => w,
+        None => return AtOutcome::ok_line("+TIME:ERROR"),
+    };
+    let mut line: ReplyLine = ReplyLine::new();
+    let _ = write!(
+        line,
+        "+TIME:{},{},{}",
+        iso.as_str(),
+        wall,
+        guard.source().tag(),
+    );
+    AtOutcome::Ok { data: line }
+}
+
+/// `AT+NTPSYNC` — force an immediate SNTP re-sync. The supervisor
+/// thread is the actual sync owner; we just set a flag the
+/// supervisor polls on its 5-s tick. Returns NoReply so the caller
+/// doesn't have to wait — the operator reads the result via
+/// `AT+TIME?` afterwards.
+fn ntp_sync_dispatch(
+    cmd: &AtCommand<'_>,
+    time_sync: Option<&crate::sntp_sync::TimeSyncHandle>,
+    force_ntp_sync: &mut bool,
+    safe_mode: bool,
+) -> AtOutcome {
+    if !matches!(cmd.kind, AtCommandKind::Execute) {
+        return AtOutcome::error(4);
+    }
+    if safe_mode {
+        log::warn!("[at] NTPSYNC refused: safe mode active");
+        return AtOutcome::error(4);
+    }
+    if time_sync.is_none() {
+        log::warn!("[at] NTPSYNC refused: no SNTP supervisor (wifi feature off?)");
+        return AtOutcome::error(9);
+    }
+    *force_ntp_sync = true;
+    log::info!("[at] NTPSYNC: supervisor will re-sync on next tick");
+    AtOutcome::NoReply
+}
+
+/// `AT+TIMEZONE?` / `AT+TIMEZONE=<minutes>` — query / set the
+/// operator-supplied UTC offset used by future `AT+TIME?` replies
+/// for human-readable display. The canonical wall-clock stays UTC;
+/// only the local-time annotation shifts.
+fn timezone_dispatch(
+    cmd: &AtCommand<'_>,
+    time_sync: Option<&crate::sntp_sync::TimeSyncHandle>,
+) -> AtOutcome {
+    let handle = match time_sync {
+        Some(h) => h,
+        None => return AtOutcome::error(7),
+    };
+    match cmd.kind {
+        AtCommandKind::Query => {
+            let guard = match handle.lock() {
+                Ok(g) => g,
+                Err(_) => return AtOutcome::error(7),
+            };
+            let mut line: ReplyLine = ReplyLine::new();
+            let _ = write!(line, "+TIMEZONE:{}", guard.tz_offset_minutes());
+            AtOutcome::Ok { data: line }
+        }
+        AtCommandKind::Set => {
+            let validated = match magent_core::at_validate::validate_timezone_set(cmd) {
+                Ok(v) => v,
+                Err(outcome) => return outcome,
+            };
+            let mut guard = match handle.lock() {
+                Ok(g) => g,
+                Err(_) => return AtOutcome::error(7),
+            };
+            if guard.set_tz_offset_minutes(validated.offset_minutes).is_err() {
+                return AtOutcome::error(7);
+            }
+            if nvs_save(tz_bare_key(), &validated.offset_minutes.to_string(), NS).is_err() {
+                return AtOutcome::error(7);
+            }
+            log::info!(
+                "[at] TIMEZONE set: offset={} minutes",
+                validated.offset_minutes
+            );
+            AtOutcome::NoReply
+        }
+        _ => AtOutcome::error(4),
+    }
+}
+
+/// `AT+BLE?` / `AT+BLE=<ON|OFF|STATE>` — query / control the BLE
+/// peripheral.
+///
+/// The verb is validated by `magent_core::at_validate::validate_ble_set`
+/// so a malformed `AT+BLE=` line returns a precise `+CMDER:4` / `:7`
+/// instead of falling through.
+///
+/// Routing to [`crate::ble_at::handle_ble_command`] requires a shared
+/// `BleServer` handle, which the dispatcher does not yet hold. Until that
+/// wiring lands (main.rs should pass a `Arc<Mutex<BleServer>>` alongside
+/// `time_sync`), report `+CMDER:9` (unsupported) for a *valid* verb so
+/// the command is never silently swallowed.
+fn ble_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
+    // Validate the verb *before* touching the BLE stack so a malformed
+    // `AT+BLE=` line yields a precise error (`+CMDER:4`/`:7`) rather than
+    // the generic unsupported code. The actual `BleServer` operation is
+    // still gated on the wiring below.
+    if let Err(outcome) = magent_core::at_validate::validate_ble_set(cmd) {
+        return outcome;
+    }
+    log::warn!("[at] BLE control not yet wired to a shared BleServer");
+    AtOutcome::error(9)
 }
 
 // Suppress dead-code warnings for shared NVS keys that exist but are

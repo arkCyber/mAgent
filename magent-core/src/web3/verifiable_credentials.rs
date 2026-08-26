@@ -505,17 +505,33 @@ impl CredentialSchema {
 // Helper Functions
 // ============================================================================
 
-/// Generate a UUID v4 string.
+/// Generate a UUID v4 string backed by the OS RNG.
+///
+/// **Security note (audit-2026-08):** the previous implementation used a
+/// fixed-seed Linear Congruential Generator with a `static mut` state.
+/// That made every issued credential ID *predictable* to an attacker who
+/// knew the seed, and the `static mut` access was also UB if reached
+/// from a multi-threaded context. We now use `getrandom` (which the
+/// `web3` feature already pulls in via the workspace) so that:
+///   * IDs are cryptographically random,
+///   * no global mutable state is touched (UB-free),
+///   * the implementation works on `no_std` as long as the target's
+///     `getrandom` backend is registered (true on macOS/Linux/ESP32).
 fn uuid_v4() -> String {
-    // Simplified UUID v4 generation
-    let bytes: [u8; 16] = [
-        rand_u8(), rand_u8(), rand_u8(), rand_u8(),
-        rand_u8(), rand_u8(),
-        0x40 | (rand_u8() & 0x0f), // Version 4
-        0x80 | (rand_u8() & 0x3f), // Variant
-        rand_u8(), rand_u8(), rand_u8(), rand_u8(),
-        rand_u8(), rand_u8(), rand_u8(), rand_u8(),
-    ];
+    // Pull from the OS RNG. 16 bytes for a UUID v4.
+    let mut bytes = [0u8; 16];
+    // `getrandom` returns `Err` only when no backend is registered or the
+    // backend itself fails. In either case we fall back to a clearly-tagged
+    // dummy UUID rather than panicking; the credential issuer logs the
+    // failure so it remains visible.
+    if getrandom::getrandom(&mut bytes).is_err() {
+        log_random_failure("uuid_v4");
+        // RFC 4122 §4.4 "Nil UUID" — distinctive, easy to grep in logs.
+        bytes = [0u8; 16];
+    }
+    // Set the RFC 4122 v4 version and variant bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
 
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
@@ -527,20 +543,23 @@ fn uuid_v4() -> String {
     )
 }
 
-/// Get a random byte using a simple LCG (Linear Congruential Generator).
-/// This is deterministic and suitable for single-threaded no_std environments.
-fn rand_u8() -> u8 {
-    // Simple LCG with fixed seed for reproducibility
-    // State: x_{n+1} = (a * x_n + c) mod m
-    const A: u64 = 6364136223846793005;
-    const C: u64 = 1442695040888963407;
-    static mut STATE: u64 = 0x123456789ABCDEF0;
+/// Best-effort, side-effect-free logger for RNG failures. In `no_std` /
+/// `defmt` builds we still want a trace; in `std` builds we use the
+/// standard `log` crate.
+#[cfg(feature = "std")]
+fn log_random_failure(where_: &str) {
+    log::error!(
+        "[web3/verifiable_credentials] {}: RNG unavailable; using nil UUID",
+        where_
+    );
+}
 
-    // In single-threaded no_std, this is safe
-    unsafe {
-        STATE = STATE.wrapping_mul(A).wrapping_add(C);
-        (STATE >> 32) as u8
-    }
+#[cfg(not(feature = "std"))]
+fn log_random_failure(where_: &str) {
+    // On `no_std` builds without a logger registered we have no choice but
+    // to drop the message. Callers that need visibility should register a
+    // `defmt` logger.
+    let _ = where_;
 }
 
 /// Get current ISO 8601 timestamp.
@@ -820,5 +839,45 @@ mod tests {
 
         let with_prefix = format!("urn:uuid:{}", bare);
         assert!(with_prefix.starts_with("urn:uuid:"));
+    }
+
+    /// Audit-2026-08 C2: the previous `uuid_v4` used a fixed-seed LCG,
+    /// making every issued credential ID predictable to anyone who
+    /// knew the seed. After the fix we source bytes from the OS RNG,
+    /// so two consecutive UUIDs must differ. We also assert the
+    /// RFC-4122 version-4 and variant-1 bits are set so the IDs are
+    /// still recognised as v4 by standards-compliant parsers.
+    #[test]
+    fn uuid_v4_is_random_and_rfc4122_compliant() {
+        let a = uuid_v4();
+        let b = uuid_v4();
+        let c = uuid_v4();
+
+        // Uniqueness: 3 distinct v4 IDs are vanishingly unlikely to
+        // collide (p < 2^-120). If this assertion fires we either
+        // regressed to the deterministic LCG or the RNG backend is
+        // returning a constant.
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+
+        // RFC 4122 §4.4 — version field is the high nibble of byte 6.
+        // "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
+        //   idx  0  2  4  6  8 10 12 14 16 18 20 22 24 26 28 30 32 34
+        let v4_byte_idx = 14; // position of the version nibble
+        let variant_byte_idx = 19; // position of the variant nibble
+        for id in [&a, &b, &c] {
+            let v4_char = id.as_bytes()[v4_byte_idx];
+            let variant_char = id.as_bytes()[variant_byte_idx];
+            assert_eq!(v4_char, b'4', "expected version-4 in {id}");
+            let variant_top_two_bits = match variant_char {
+                b'8'..=b'b' => true,
+                _ => false,
+            };
+            assert!(
+                variant_top_two_bits,
+                "expected RFC 4122 variant-1 (8/9/a/b) in {id}, got '{variant_char}'"
+            );
+        }
     }
 }

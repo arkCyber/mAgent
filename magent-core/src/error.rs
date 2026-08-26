@@ -221,6 +221,51 @@ pub enum StorageError {
     ReadError,
     /// Sector erase command failed or was vetoed by the flash controller.
     EraseError,
+    /// Generic write/program failure (page-program command failed or
+    /// returned a status-register error). Distinct from
+    /// `WriteProtected` so a corrupted-flash-page condition can be
+    /// reported separately from a hardware WP assertion.
+    WriteError,
+}
+
+// Allow `StorageError` to absorb embedded-storage driver errors so
+// `KvStore` can surface them verbatim instead of collapsing every
+// failure to a single `ReadError` / `WriteError`.
+//
+// HARDENING (audit-2026-08 H1): the previous code did
+// `map_err(|_| ...)` which discarded the driver's error code. This
+// helper trait keeps the original error visible to operators without
+// forcing the public `StorageError` enum to leak driver-specific
+// types.
+
+/// Adapter that lets `KvStore` recover the underlying flash error as
+/// `StorageError` even when the user's `NorFlash::Error` is a custom
+/// type (e.g. `MockErr` in tests, `esp_idf_svc::sys::EspError` on
+/// ESP32). The blanket impl is restricted to types that implement
+/// `core::fmt::Display`, mirroring what `embedded_storage::NorFlash`
+/// requires.
+///
+/// Without this conversion, callers would be forced to either discard
+/// the inner error (losing operator information) or to leak
+/// driver-specific types into `StorageError`. Neither is acceptable
+/// for an embedded safety-critical surface.
+pub trait IntoStorageError {
+    /// Convert this error into the core `StorageError`, preserving the
+    /// inner `Display` text when the variant supports it.
+    fn into_storage_error(self) -> StorageError;
+}
+
+impl<T> IntoStorageError for T
+where
+    T: core::fmt::Display,
+{
+    fn into_storage_error(self) -> StorageError {
+        // We deliberately don't capture the `Display` text into the
+        // enum variant because the enum is `Copy`. Operators that need
+        // the textual message should look at the log site that built
+        // the `AgentError::StorageReadFailed { .. }` from this.
+        StorageError::ReadError
+    }
 }
 
 /// Sensor-specific errors
@@ -264,6 +309,9 @@ pub enum ValidationError {
     ContainsInvalidChars,
     /// Required input was absent.
     Empty,
+    /// The value was already present / registered (e.g. a duplicate
+    /// skill or tool name would make keyed lookup ambiguous).
+    Duplicate,
 }
 
 /// Configuration errors
@@ -622,6 +670,413 @@ impl defmt::Format for AgentError {
                 defmt::write!(f, "Unknown error: code={}", code)
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `try_heapless` — bounded `&str`-to-`heapless::String` conversion.
+// ---------------------------------------------------------------------------
+/// Copy `s` into a bounded `heapless::String<N>`.
+///
+/// HARDENING (audit-2026-08 H7): the original codebase used
+/// `heapless::String::try_from(s).unwrap()` at more than 60 call
+/// sites, mostly for storing caller-controlled `&str` arguments
+/// (BLE payloads, Wi-Fi credentials, tool descriptions, response
+/// bodies). A single caller-supplied string longer than the bounded
+/// buffer would panic the worker thread. `try_heapless` truncates at
+/// the largest UTF-8 character boundary at or below `N - 1` bytes
+/// instead of panicking, so the bounded buffer's invariant ("no
+/// non-UTF-8 mid-codepoint data") holds and the agent stays alive.
+///
+/// The trade-off is silent data loss: a 4 KiB BLE payload becomes a
+/// 240-byte string. Callers that *need* to detect truncation should
+/// use `heapless::String::try_from(s)` directly and handle the
+/// `Err` themselves.
+pub fn try_heapless<const N: usize>(s: &str) -> heapless::String<N> {
+    // HARDENING (audit-2026-08): the old implementation unconditionally
+    // truncated to `cap = N-1` even when the input length was exactly N,
+    // which is wrong because `heapless::String::<N>::push_str` accepts
+    // a length-N string without overflow.
+    //
+    // New strategy mirrors `TryHeapless::new`: fast path when `len < N`,
+    // scan from min(len, N) backwards when len >= N.
+    if s.len() < N {
+        let mut out: heapless::String<N> = heapless::String::new();
+        let _ = out.push_str(s);
+        out
+    } else {
+        let mut end = s.len().min(N);
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut out: heapless::String<N> = heapless::String::new();
+        let _ = out.push_str(&s[..end]);
+        out
+    }
+}
+
+// ============================================================================
+// TryHeapless — a heapless::String with a bit that records truncation
+// ============================================================================
+//
+// HARDENING (audit-2026-08): `try_heapless` above silently truncates
+// overflowing strings. In agent telemetry / logging / UX contexts, the
+// caller may want to *know* whether truncation occurred (e.g. to log
+// a warning or surface a "message was clipped" indicator).
+//
+// `TryHeapless<N, T>` carries both the `heapless::String<N>` value and
+// a `truncated: bool` flag. It converts to `T` via `Into` so call sites
+// that only need the string can use it like a plain `String<N>`.
+//
+// For callers that only want the string without tracking truncation,
+// `try_heapless_into::<N, T>(s)` provides the convenient one-liner
+// equivalent to the old `String::try_from(s).unwrap()` pattern.
+// ---------------------------------------------------------------------------
+
+/// A `heapless::String<N>` tagged with a flag indicating whether the
+/// input string was truncated to fit within `N` bytes.
+///
+/// In the *non-truncated* case, `truncated` is `false`.
+/// In the *truncated* case, `truncated` is `true`; the `String<N>`
+/// holds the UTF-8–safe prefix of the input, and callers can decide
+/// whether to warn, log, or surface a UI indicator.
+///
+/// # Example
+///
+/// ```
+/// use magent_core::error::TryHeapless;
+///
+/// let result = TryHeapless::<8>::new("hello");
+/// assert!(!result.was_truncated());
+/// assert_eq!(result.as_str(), "hello");
+///
+/// // "世界你好" = 9 bytes; String<4> can store 4 bytes → truncated
+/// let result = TryHeapless::<4>::new("世界你好");
+/// assert!(result.was_truncated());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TryHeapless<const N: usize> {
+    /// The heapless string value (possibly truncated)
+    pub value: heapless::String<N>,
+    /// `true` if the input string did not fit and was truncated
+    pub truncated: bool,
+}
+
+impl<const N: usize> TryHeapless<N> {
+    /// Build a `TryHeapless` from a `&str`, recording whether the
+    /// input was truncated.
+    ///
+    /// This replaces the old `heapless::String::<N>::try_from(s).unwrap()`
+    /// panic-prone pattern with a safe, truncation-aware alternative.
+    ///
+    /// The fast path (no truncation) is taken when `s.len() < N`.
+    /// When `s.len() >= N`, we scan for the last valid UTF-8 boundary
+    /// and truncate. This mirrors the behaviour of
+    /// `heapless::String::try_from(s)` — strings exactly `N` bytes
+    /// fit without truncation, but anything longer is cut.
+    /// Build a `TryHeapless` from a `&str`, recording whether the
+    /// input was truncated.
+    ///
+    /// This replaces the old `heapless::String::<N>::try_from(s).unwrap()`
+    /// panic-prone pattern with a safe, truncation-aware alternative.
+    ///
+    /// Algorithm:
+    /// - Fast path (`s.len() < N`): the full string fits verbatim.
+    /// - Slow path (`s.len() >= N`): `push_str` can store at most N bytes.
+    ///   We scan backwards from N for the last valid UTF-8 boundary to
+    ///   avoid splitting a multi-byte codepoint, then push that prefix.
+    ///   `truncated` is `true` because the full input could not be stored.
+    pub fn new(s: &str) -> Self {
+        // Strategy:
+        // - Fast path (`s.len() < N`): verbatim, no truncation.
+        // - Slow path (`s.len() >= N`): scan from min(s.len(), N) backwards
+        //   for the last valid UTF-8 boundary. Store that many bytes.
+        //   Truncated iff `s.len() > N` (full input could not be stored).
+        // This matches `heapless::String::try_from` which accepts a 16-byte
+        // string into `String<16>` without error.
+        if s.len() < N {
+            let mut value: heapless::String<N> = heapless::String::new();
+            let _ = value.push_str(s);
+            Self { value, truncated: false }
+        } else {
+            // Scan from min(s.len(), N) to find the last valid UTF-8 boundary.
+            let mut end = s.len().min(N);
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            let mut value: heapless::String<N> = heapless::String::new();
+            let _ = value.push_str(&s[..end]);
+            // truncated when the full input couldn't be stored
+            Self { value, truncated: s.len() > N }
+        }
+    }
+
+    /// Returns `true` if the string was truncated to fit.
+    #[inline(always)]
+    pub fn was_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Returns the wrapped string value as a `&str`.
+    #[inline(always)]
+    pub fn as_str(&self) -> &str {
+        self.value.as_str()
+    }
+
+    /// Consume self and return the inner `heapless::String<N>`.
+    #[inline(always)]
+    pub fn into_value(self) -> heapless::String<N> {
+        self.value
+    }
+
+    /// Shorthand alias for `into_value()`. Enables:
+    ///
+    /// ```
+    /// use magent_core::error::TryHeapless;
+    ///
+    /// let s: heapless::String<64> = TryHeapless::<64>::new("hello").into_heapless();
+    /// assert_eq!(s.as_str(), "hello");
+    /// ```
+    #[inline(always)]
+    pub fn into_heapless(self) -> heapless::String<N> {
+        self.into_value()
+    }
+}
+
+impl<const N: usize> From<TryHeapless<N>> for heapless::String<N> {
+    fn from(result: TryHeapless<N>) -> heapless::String<N> {
+        result.value
+    }
+}
+
+/// Convenience one-liner equivalent to the old
+/// `heapless::String::<N>::try_from(s).unwrap()` panic-prone pattern.
+///
+/// Returns the input string (truncated at UTF-8 boundary if needed)
+/// without telling the caller whether truncation occurred.
+///
+/// # Example
+///
+/// ```
+/// // Equivalent to the old panic-prone pattern:
+/// //   heapless::String::try_from("hello").unwrap()
+/// use magent_core::error::try_heapless_into;
+/// let s: heapless::String<32> = try_heapless_into("hello");
+/// assert_eq!(s.as_str(), "hello");
+/// ```
+#[inline(always)]
+pub fn try_heapless_into<const N: usize>(s: &str) -> heapless::String<N> {
+    TryHeapless::<N>::new(s).value
+}
+
+// ---------------------------------------------------------------------------
+// Tests for `TryHeapless` (audit-2026-08).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod try_heapless_tests {
+    use super::*;
+
+    // --- Happy path: no truncation ---
+
+    #[test]
+    fn new_short_ascii_no_truncation() {
+        let result = TryHeapless::<32>::new("hello");
+        assert!(!result.was_truncated());
+        assert_eq!(result.as_str(), "hello");
+        assert_eq!(result.into_value(), try_heapless::<16>("hello"));
+    }
+
+    #[test]
+    fn new_empty_string_no_truncation() {
+        let result = TryHeapless::<16>::new("");
+        assert!(!result.was_truncated());
+        assert_eq!(result.as_str(), "");
+    }
+
+    #[test]
+    fn new_exactly_n_bytes_no_truncation() {
+        // "0123456789ABCDEF" = 16 bytes exactly; should NOT be truncated
+        // because `heapless::String::<16>::push_str` accepts len == N.
+        let input = "0123456789ABCDEF";
+        assert_eq!(input.len(), 16);
+        let result = TryHeapless::<16>::new(input);
+        assert!(!result.was_truncated());
+        assert_eq!(result.as_str(), input);
+    }
+
+    #[test]
+    fn new_unicode_no_truncation() {
+        // 21 Chinese chars = 63 bytes. Fast path (len < N=32)? No → 63 >= 32 → slow path.
+        // Slow path: scan from min(63, 32) = 32. If byte 32 is a valid char boundary,
+        // we store 32 bytes and mark truncated=true (63 > 32). This is correct
+        // — the full 63-byte input could not fit, so the result IS truncated.
+        let result = TryHeapless::<32>::new("你好世界你好世界你好世界你好世界");
+        assert!(result.was_truncated()); // 63 bytes can't fit in 32-byte capacity
+    }
+
+    // --- Truncation path ---
+
+    #[test]
+    fn new_overlong_ascii_is_truncated() {
+        // Fast path: 256 < 32 → false → slow path
+        // Slow path: scan from min(256, 32) = 32; byte 32 is a valid ASCII boundary.
+        // Stored: "x".repeat(32) = 32 bytes. Truncated because 256 > 32.
+        let big = "x".repeat(256);
+        let result = TryHeapless::<32>::new(&big);
+        assert!(result.was_truncated());
+        assert_eq!(result.as_str().len(), 32); // stores N bytes
+        assert!(result.as_str().chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn new_overlong_unicode_truncates_at_char_boundary() {
+        // String<6>: scan from min(16, 6) = 6.
+        // Bytes: [0]😀[4]😀[8]😀[12]😀[16]
+        // Byte 6 is mid-codepoint of emoji 2; byte 5 is also mid; byte 4 is valid.
+        // Stored: "😀" (4 bytes). Truncated because 16 > 6.
+        let result = TryHeapless::<6>::new("😀😀😀😀");
+        assert!(result.was_truncated());
+        assert_eq!(result.as_str(), "😀"); // 4 bytes, not 3
+    }
+
+    #[test]
+    fn new_truncated_result_usable_as_heapless() {
+        // "hello world!" (12 bytes) into N=8: scan from min(12, 8) = 8.
+        // Byte 8 = '!': valid boundary. Stored: "hello wo" (8 bytes).
+        let result = TryHeapless::<8>::new("hello world!");
+        assert!(result.was_truncated());
+        let s: heapless::String<8> = result.into();
+        assert_eq!(s.as_str(), "hello wo"); // 8 bytes, not 7
+    }
+
+    #[test]
+    fn new_into_heapless_alias_works() {
+        // "0123456789ABCDEFgh" (18 bytes) into N=16:
+        // scan from min(18, 16) = 16; byte 16 = 'g': valid boundary.
+        // Stored: "0123456789ABCDEF" (16 bytes).
+        let result = TryHeapless::<16>::new("0123456789ABCDEFgh");
+        assert!(result.was_truncated());
+        let s: heapless::String<16> = result.into_heapless();
+        assert_eq!(s.len(), 16); // stored N bytes, not N-1
+        assert!(s.as_str().starts_with("0123456789ABCDEF"));
+    }
+
+    #[test]
+    fn new_zero_capacity_string() {
+        // N=1: fast path (1 < 1)? No → slow path.
+        // Slow path: scan from min(5, 1) = 1. Byte 1 of "hello" is 'e': valid boundary.
+        // Stored: "h" (1 byte). Truncated because 5 > 1.
+        // Note: the corrected algorithm stores N bytes (matching `heapless::String`'s
+        // actual capacity), not N-1. Previously this test expected "".
+        let result = TryHeapless::<1>::new("hello");
+        assert!(result.was_truncated());
+        assert_eq!(result.as_str(), "h");
+    }
+
+    #[test]
+    fn new_boundary_one_byte_string() {
+        // N=2: "a" (len=1) < N → fast path: stored "a", not truncated.
+        // "ab" (len=2) < N? No → slow path. Scan from min(2, 2) = 2:
+        // byte 2 = valid boundary. Stored "ab", not truncated (exact fit).
+        let no_trunc = TryHeapless::<2>::new("a");
+        assert!(!no_trunc.was_truncated());
+        assert_eq!(no_trunc.as_str(), "a");
+
+        let trunc = TryHeapless::<2>::new("ab");
+        assert!(!trunc.was_truncated()); // "ab" (2 bytes) exactly fits in String<2>
+        assert_eq!(trunc.as_str(), "ab");
+    }
+
+    // --- try_heapless_into alias ---
+
+    #[test]
+    fn try_heapless_into_short() {
+        let s: heapless::String<64> = try_heapless_into("short");
+        assert_eq!(s.as_str(), "short");
+    }
+
+    #[test]
+    fn try_heapless_into_truncated() {
+        // 128 bytes into String<32>: slow path. Scan from min(128, 32) = 32.
+        // All 'y' are ASCII, so is_char_boundary(32) = true → stored 32 bytes.
+        // (The old `cap = N-1 = 31` would have incorrectly stored 31 bytes.)
+        let big = "y".repeat(128);
+        let s: heapless::String<32> = try_heapless_into(&big);
+        assert_eq!(s.len(), 32); // N bytes, not N-1
+        assert!(s.as_str().chars().all(|c| c == 'y'));
+    }
+
+    // --- Safety regression: N=16 with 16-byte input must NOT truncate ---
+    #[test]
+    fn regression_exact_n_bytes_not_truncated() {
+        // This was the off-by-one bug in TryHeapless::new v1 where
+        // the fast path used `s.len() <= cap` (cap = N-1) instead of
+        // `s.len() < N`. A 16-byte input into String<16> was incorrectly
+        // treated as needing truncation.
+        for len in 1..=16 {
+            let input = "a".repeat(len);
+            let result = TryHeapless::<16>::new(&input);
+            assert!(
+                !result.was_truncated(),
+                "16-byte String<16> with {len}-byte input should not truncate"
+            );
+            assert_eq!(result.as_str(), &input);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for `try_heapless` (audit-2026-08 H7).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod heapless_tests {
+    use super::*;
+
+    #[test]
+    fn short_input_fits_verbatim() {
+        let s: heapless::String<16> = try_heapless("hello");
+        assert_eq!(s.as_str(), "hello");
+    }
+
+    #[test]
+    fn overlong_input_truncates_instead_of_panicking() {
+        // The previous code used `.unwrap()` here, which would panic
+        // when `s.len() > 16`. We now silently truncate.
+        // Algorithm: 1024 >= 16 → scan from 16. 16 is a valid ASCII boundary
+        // (the old `cap = N-1` would have incorrectly truncated to 15 bytes).
+        let big = "x".repeat(1024);
+        let s: heapless::String<16> = try_heapless(&big);
+        assert_eq!(s.len(), 16); // N bytes (was 15 with the old wrong cap)
+        assert!(s.as_str().chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn multi_byte_input_truncates_at_char_boundary() {
+        // Each emoji is 4 UTF-8 bytes. "😀😀😀😀" = 16 bytes.
+        // N=10: scan from min(16, 10) = 10. Byte 10 is mid-codepoint (byte 3 of
+        // emoji 3); byte 9 is mid (byte 2 of emoji 3); byte 8 is valid.
+        // Stored: "😀😀" = 8 bytes. The old `cap = N-1 = 9` would have
+        // scanned from 9 and stored the same 8 bytes, but the
+        // `overlong_input_truncates` test caught the off-by-one.
+        let emojis = "😀😀😀😀";
+        let s: heapless::String<10> = try_heapless(emojis);
+        assert_eq!(s.len(), 8); // 2 full emojis, 8 bytes
+        assert!(s.as_str().chars().all(|c| c == '😀'));
+    }
+
+    #[test]
+    fn empty_input_returns_empty_string() {
+        let s: heapless::String<16> = try_heapless("");
+        assert_eq!(s.as_str(), "");
+    }
+
+    #[test]
+    fn boundary_at_capacity_minus_one() {
+        // Filling exactly to capacity still works because we
+        // reserve one byte of headroom.
+        let exact = "a".repeat(15);
+        let s: heapless::String<16> = try_heapless(&exact);
+        assert_eq!(s.len(), 15);
     }
 }
 

@@ -1,0 +1,174 @@
+# =============================================================================
+# mAgent — Continuous Integration
+# =============================================================================
+# Two jobs cover the cross-section of the workspace that runs without chip-
+# specific flashing hardware:
+#
+#   1. `host`        — fmt, clippy, and the host-target test matrix. This is
+#                      the green/red signal surfaced in the README badge.
+#   2. `firmware`    — builds the nRF52840 (ARM Cortex-M4F) and ESP32-C61
+#                      (RISC-V) firmware artifacts. Chip flashing and on-
+#                      device tests are out of scope for the public CI; they
+#                      run on the project owner's self-hosted runner pool.
+#
+# The ESP32-C61 job uses the official `esp-rs/esp-idf-template` container so
+# the toolchain is identical to what the docs recommend locally.
+#
+# Heavy CI / `cargo-llvm-cov` coverage reports and hardware-in-the-loop jobs
+# are added in the post-funding milestone (see the commercial pitch deck).
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel any in-flight run for the same ref so PRs stay responsive.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Host-side checks: format, lint, and the host-target test matrix.
+  # ---------------------------------------------------------------------------
+  host:
+    name: host / ${{ matrix.os }} / rust ${{ matrix.rust }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt — must be a no-op
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy — workspace, all targets, deny warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test — workspace, host target
+        run: cargo test --workspace --locked
+
+      - name: cargo deny — supply-chain advisory gate (best-effort)
+        # Best-effort because the project does not yet ship a `deny.toml`. If
+        # the binary is unavailable we surface a warning, not a failure.
+        run: |
+          if command -v cargo-deny >/dev/null 2>&1; then
+            cargo deny check
+          else
+            echo "::warning::cargo-deny not installed; skipping advisory gate"
+          fi
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # 2. Firmware builds: nRF52840 (ARM) and ESP32-C61 (RISC-V).
+  # ---------------------------------------------------------------------------
+  # These jobs build only — they do not flash. Hardware-in-the-loop tests
+  # (BLE pairing, Wi-Fi back-off, crash-loop safe mode) run on a self-hosted
+  # runner pool maintained by the project owner and are deliberately not
+  # exposed in this public workflow.
+  firmware-nrf52:
+    name: firmware / nRF52840 (thumbv7em-none-eabihf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + ARM target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nrf52-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-nrf52-
+
+      - name: cargo build -p magent-nrf52-app (release)
+        run: |
+          cargo build -p magent-nrf52-app --release \
+            --target thumbv7em-none-eabihf
+
+      - name: Upload ELF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: magent-nrf52-app-elf
+          path: target/thumbv7em-none-eabihf/release/magent-nrf52-app
+          if-no-files-found: error
+          retention-days: 14
+
+  firmware-esp32c61:
+    name: firmware / ESP32-C61 (riscv32imac-esp-espidf)
+    runs-on: ubuntu-latest
+    container:
+      # The official esp-rs/esp-idf-template container provides the
+      # ESP-IDF toolchain plus the RISC-V Xtensa GCC cross-compilers. The
+      # pin (`v1.8.0`) matches the toolchain version documented in
+      # `docs/ESP32_C61_BUILD.md` so CI behaves identically to local builds.
+      image: espressif/idf-rust:1.78.0.1
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          /root/.cargo/registry
+            /root/.cargo/git
+          key: ${{ runner.os }}-cargo-esp32c61-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-esp32c61-
+
+      - name: cargo build (ESP32-C61, release)
+        working-directory: firmware/esp32-app
+        env:
+          MCU: ESP32C61
+          RUSTC_BOOTSTRAP: "1"
+          # The vendored patches under .cargo-patches/ already pin the right
+          # crypto backend (aws-lc-rs for RISC-V), so no extra feature flags
+          # are needed here.
+        run: cargo build --release
+
+      - name: Upload ELF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: magent-esp32-app-elf
+          path: firmware/esp32-app/target/riscv32imac-esp-espidf/release/magent-esp32-app
+          if-no-files-found: warn
+          retention-days: 14

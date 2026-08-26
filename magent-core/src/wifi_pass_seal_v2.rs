@@ -144,6 +144,7 @@ pub const DBO2_PREFIX: &str = "DBO2:";
 // Errors
 // ---------------------------------------------------------------------------
 
+/// Errors that can occur while sealing / opening a DBO2-protected secret.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SealError {
     /// Plaintext exceeded `MAX_PLAINTEXT`.
@@ -379,7 +380,7 @@ pub fn open_sealed_v2<'a>(
             // or could be invalid. Validate the trailing MAC
             // portion length.
             if payload.len() < 2 * (NONCE_LEN + MAC_LEN)
-                || (payload.len() - 2 * MAC_LEN) % 2 != 0
+                || !(payload.len() - 2 * MAC_LEN).is_multiple_of(2)
             {
                 return Err(SealError::BadLength);
             }
@@ -458,6 +459,194 @@ pub fn open_sealed_v2<'a>(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Generic secret seal / open (for non-Wi-Fi credentials)
+// ---------------------------------------------------------------------------
+//
+// `seal_str` / `open_sealed_v2` are capped at `MAX_PLAINTEXT` (64 bytes),
+// which is right for a Wi-Fi password but too small for the other secrets
+// this device stores in NVS (the DeepSeek/LLM API key is allowed up to 128
+// bytes by `at_validate::LLM_API_KEY_MAX`, and OAuth tokens are similar).
+// These two functions generalise the exact same HKDF-XOR-HMAC-DBO2
+// construction to a 256-byte plaintext cap. They are **additive**: the
+// Wi-Fi path is untouched, and the wire format + key schedule are identical,
+// so a blob written by `seal_secret` can be opened by `open_secret` and vice
+// versa. The firmware LLM-config path should call these instead of writing
+// the API key to NVS in the clear (see SECURITY_ASSESSMENT_2026_08_25.md).
+
+/// Maximum plaintext size for [`seal_secret`] / [`open_secret`].
+///
+/// Decoupled from the Wi-Fi password cap ([`MAX_PLAINTEXT`] = 64) so long
+/// credentials (LLM API keys ≤128 bytes, OAuth/refresh tokens, MQTT/email
+/// passwords) fit. Bounds the wire format so callers can size their output
+/// buffer once.
+pub const MAX_SECRET_PLAINTEXT: usize = 256;
+
+/// Maximum encoded length for a blob produced by [`seal_secret`]:
+/// `DBO2:`(5) + 2*NONCE_LEN + 2*MAX_SECRET_PLAINTEXT + 2*MAC_LEN.
+pub const MAX_SECRET_ENCODED_LEN: usize =
+    5 + 2 * (NONCE_LEN + MAX_SECRET_PLAINTEXT + MAC_LEN);
+
+/// Outcome of [`open_secret`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum SecretOpenOutcome {
+    /// The stored value was a `DBO2:` blob and opened cleanly.
+    Dbo2Decoded,
+    /// The stored value had no `DBO2:` prefix. Treat it as legacy
+    /// plaintext and use it verbatim — the migration shim for
+    /// entries written before sealing was introduced, so an
+    /// in-the-field device upgrades in place without losing its
+    /// credential.
+    LegacyPlaintext,
+}
+
+/// Seal an arbitrary-size secret `plain` (bytes) with the device-bound
+/// `device_key` + a fresh `nonce`, writing the DBO2 wire format into `out`.
+///
+/// Same construction as [`seal_str`] (HKDF-SHA256 key stretch → XOR stream +
+/// truncated HMAC-SHA256 integrity, constant-time MAC check on open) but
+/// with a 256-byte plaintext cap so long credentials fit. `out` must have
+/// capacity at least [`MAX_SECRET_ENCODED_LEN`].
+pub fn seal_secret(
+    plain: &[u8],
+    device_key: &[u8],
+    nonce: &[u8],
+    out: &mut HeaplessString<MAX_SECRET_ENCODED_LEN>,
+) -> Result<(), SealError> {
+    if device_key.is_empty() {
+        return Err(SealError::EmptyKey);
+    }
+    if nonce.is_empty() {
+        return Err(SealError::EmptyNonce);
+    }
+    if plain.len() > MAX_SECRET_PLAINTEXT {
+        return Err(SealError::PlaintextTooLong);
+    }
+
+    // 1. Stretch the device key with HKDF to derive per-entry
+    //    cipher and MAC keys (same schedule as `seal_str`).
+    let prk = hkdf_extract(nonce, device_key);
+    let mut cipher_key = [0u8; CIPHER_KEY_LEN];
+    hkdf_expand(&prk, HKDF_INFO_CIPHER, &mut cipher_key);
+    let mut mac_key = [0u8; MAC_KEY_LEN];
+    hkdf_expand(&prk, HKDF_INFO_MAC, &mut mac_key);
+
+    // 2. XOR-stream into a bounded cipher buffer.
+    let mut cipher: Vec<u8, MAX_SECRET_PLAINTEXT> = Vec::new();
+    for (i, &b) in plain.iter().enumerate() {
+        let kb = cipher_key[i % cipher_key.len()];
+        let _ = cipher.push(b ^ kb);
+    }
+
+    // 3. Compute the MAC over (nonce || cipher).
+    let mac = mac_bytes(&mac_key, nonce, &cipher);
+
+    // 4. Write the wire format: "DBO2:" + hex(nonce) + hex(cipher) + hex(mac).
+    out.clear();
+    out.push_str(DBO2_PREFIX).map_err(|_| SealError::OutputFull)?;
+    for &b in nonce.iter() {
+        let mut buf = [0u8; 2];
+        hex_encode_byte(&mut buf, b)?;
+        out.push_str(core::str::from_utf8(&buf).expect("hex is ASCII"))
+            .map_err(|_| SealError::OutputFull)?;
+    }
+    for &b in cipher.iter() {
+        let mut buf = [0u8; 2];
+        hex_encode_byte(&mut buf, b)?;
+        out.push_str(core::str::from_utf8(&buf).expect("hex is ASCII"))
+            .map_err(|_| SealError::OutputFull)?;
+    }
+    for &b in mac.iter() {
+        let mut buf = [0u8; 2];
+        hex_encode_byte(&mut buf, b)?;
+        out.push_str(core::str::from_utf8(&buf).expect("hex is ASCII"))
+            .map_err(|_| SealError::OutputFull)?;
+    }
+    Ok(())
+}
+
+
+
+/// Open a secret stored by [`seal_secret`].
+///
+/// * `DBO2:` prefix present → decode, MAC-verify (constant time), decrypt
+///   into `out`, return [`SecretOpenOutcome::Dbo2Decoded`].
+/// * Otherwise → return [`SecretOpenOutcome::LegacyPlaintext`] so the
+///   caller can use the stored value verbatim (entries written before
+///   sealing existed). The caller is expected to re-seal such an entry on
+///   the next successful open, mirroring the Wi-Fi `AT+WIFIPASSUPGRADE`
+///   migration pattern.
+pub fn open_secret<'a>(
+    stored: &'a str,
+    device_key: &[u8],
+    out: &mut Vec<u8, MAX_SECRET_PLAINTEXT>,
+) -> Result<SecretOpenOutcome, SealError> {
+    let Some(payload) = stored.strip_prefix(DBO2_PREFIX) else {
+        return Ok(SecretOpenOutcome::LegacyPlaintext);
+    };
+
+    // Must at least hold nonce + MAC; cipher length must be even (hex).
+    if payload.len() < 2 * (NONCE_LEN + MAC_LEN) || !(payload.len() - 2 * MAC_LEN).is_multiple_of(2) {
+        return Err(SealError::BadLength);
+    }
+
+    // Decode nonce (always NONCE_LEN hex chars).
+    let nonce_hex = &payload.as_bytes()[..2 * NONCE_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    for i in 0..NONCE_LEN {
+        nonce[i] = hex_decode_byte(nonce_hex[i * 2], nonce_hex[i * 2 + 1])
+            .ok_or(SealError::BadHex)?;
+    }
+
+    // Decode MAC (last MAC_LEN hex chars).
+    let mac_hex = &payload.as_bytes()[payload.len() - 2 * MAC_LEN..];
+    let mut stored_mac = [0u8; MAC_LEN];
+    for i in 0..MAC_LEN {
+        stored_mac[i] = hex_decode_byte(mac_hex[i * 2], mac_hex[i * 2 + 1])
+            .ok_or(SealError::BadHex)?;
+    }
+
+    // Decode cipher (middle portion).
+    let cipher_hex = &payload.as_bytes()[2 * NONCE_LEN..payload.len() - 2 * MAC_LEN];
+    if cipher_hex.len() % 2 != 0 {
+        return Err(SealError::BadHex);
+    }
+    let cipher_len = cipher_hex.len() / 2;
+    if cipher_len > MAX_SECRET_PLAINTEXT {
+        return Err(SealError::PlaintextTooLong);
+    }
+    let mut cipher: Vec<u8, MAX_SECRET_PLAINTEXT> = Vec::new();
+    for i in 0..cipher_len {
+        let b = hex_decode_byte(cipher_hex[i * 2], cipher_hex[i * 2 + 1])
+            .ok_or(SealError::BadHex)?;
+        cipher.push(b).map_err(|_| SealError::OutputFull)?;
+    }
+
+    // Re-derive keys and check the MAC (constant-time compare).
+    let prk = hkdf_extract(&nonce, device_key);
+    let mut mac_key = [0u8; MAC_KEY_LEN];
+    hkdf_expand(&prk, HKDF_INFO_MAC, &mut mac_key);
+    let computed = mac_bytes(&mac_key, &nonce, &cipher);
+    let mut diff: u8 = 0;
+    for i in 0..MAC_LEN {
+        diff |= computed[i] ^ stored_mac[i];
+    }
+    if diff != 0 {
+        return Err(SealError::BadMac);
+    }
+
+    // MAC OK — decrypt.
+    let mut cipher_key = [0u8; CIPHER_KEY_LEN];
+    hkdf_expand(&prk, HKDF_INFO_CIPHER, &mut cipher_key);
+    out.clear();
+    for (i, &b) in cipher.iter().enumerate() {
+        out.push(b ^ cipher_key[i % cipher_key.len()])
+            .map_err(|_| SealError::OutputFull)?;
+    }
+    Ok(SecretOpenOutcome::Dbo2Decoded)
+}
+
 
 // ---------------------------------------------------------------------------
 // Algorithm introspection
@@ -770,6 +959,106 @@ mod tests {
         // values that the caller already knows are non-empty.
         // Document the empty-string behaviour as a degenerate case.
         assert!(is_legacy(""));
+    }
+
+    // ------------------------------------------------------------------
+    // Generic secret seal / open (seal_secret / open_secret)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn secret_round_trips_with_long_plaintext() {
+        // A 128-byte secret (the max LLM API-key length) must survive
+        // a seal -> open round trip — this is the case the Wi-Fi-only
+        // `seal_str` (cap 64) cannot handle.
+        let secret: [u8; 128] = {
+            let mut s = [0u8; 128];
+            for (i, b) in s.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+            }
+            s
+        };
+        let nonce = test_nonce();
+        let mut blob: HeaplessString<MAX_SECRET_ENCODED_LEN> = HeaplessString::new();
+        seal_secret(&secret, TEST_KEY, &nonce, &mut blob).unwrap();
+        assert!(blob.starts_with(DBO2_PREFIX));
+
+        let mut out: Vec<u8, MAX_SECRET_PLAINTEXT> = Vec::new();
+        let outcome = open_secret(&blob, TEST_KEY, &mut out).unwrap();
+        assert_eq!(outcome, SecretOpenOutcome::Dbo2Decoded);
+        assert_eq!(&out[..], &secret[..]);
+    }
+
+    #[test]
+    fn secret_tamper_is_detected() {
+        let nonce = test_nonce();
+        let mut blob: HeaplessString<MAX_SECRET_ENCODED_LEN> = HeaplessString::new();
+        seal_secret(b"sk-abcdefghijklmnopqrstuvwxyz", TEST_KEY, &nonce, &mut blob).unwrap();
+        // Flip one hex character in the middle of the blob by rebuilding
+        // it with a single nibble changed.
+        let mid = blob.len() / 2;
+        let bytes = blob.as_bytes();
+        let mut tampered: HeaplessString<MAX_SECRET_ENCODED_LEN> = HeaplessString::new();
+        for (i, &b) in bytes.iter().enumerate() {
+            let c = if i == mid {
+                match b {
+                    b'a' => b'b',
+                    b'f' => b'e',
+                    other => other ^ 0x01,
+                }
+            } else {
+                b
+            };
+            let _ = tampered.push(c as char);
+        }
+        let mut out: Vec<u8, MAX_SECRET_PLAINTEXT> = Vec::new();
+        let err = open_secret(&tampered, TEST_KEY, &mut out).unwrap_err();
+        assert_eq!(err, SealError::BadMac);
+    }
+
+    #[test]
+    fn secret_wrong_key_fails_mac() {
+        let nonce = test_nonce();
+        let mut blob: HeaplessString<MAX_SECRET_ENCODED_LEN> = HeaplessString::new();
+        seal_secret(b"sk-secret-token-value", TEST_KEY, &nonce, &mut blob).unwrap();
+        let wrong = [0xabu8; 32];
+        let mut out: Vec<u8, MAX_SECRET_PLAINTEXT> = Vec::new();
+        let err = open_secret(&blob, &wrong, &mut out).unwrap_err();
+        assert_eq!(err, SealError::BadMac);
+    }
+
+    #[test]
+    fn secret_legacy_plaintext_is_reported_not_opened() {
+        // A value with no DBO2: prefix must surface as legacy
+        // plaintext so the caller can use it verbatim (migration shim).
+        let mut out: Vec<u8, MAX_SECRET_PLAINTEXT> = Vec::new();
+        let outcome = open_secret("sk-legacy-key", TEST_KEY, &mut out).unwrap();
+        assert_eq!(outcome, SecretOpenOutcome::LegacyPlaintext);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn secret_rejects_empty_key_and_nonce() {
+        let nonce = test_nonce();
+        let mut blob: HeaplessString<MAX_SECRET_ENCODED_LEN> = HeaplessString::new();
+        assert_eq!(
+            seal_secret(b"x", &[], &nonce, &mut blob),
+            Err(SealError::EmptyKey)
+        );
+        assert_eq!(
+            seal_secret(b"x", TEST_KEY, &[], &mut blob),
+            Err(SealError::EmptyNonce)
+        );
+    }
+
+    #[test]
+    fn secret_rejects_oversized_plaintext() {
+        let big = [0x55u8; MAX_SECRET_PLAINTEXT + 1];
+        let nonce = test_nonce();
+        let mut blob: HeaplessString<MAX_SECRET_ENCODED_LEN> = HeaplessString::new();
+        assert_eq!(
+            seal_secret(&big, TEST_KEY, &nonce, &mut blob),
+            Err(SealError::PlaintextTooLong)
+        );
     }
 
     // Reference the symbols so a future contributor who removes

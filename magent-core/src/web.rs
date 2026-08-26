@@ -519,7 +519,7 @@ fn wmo_description(code: i64) -> &'static str {
         66 | 67 => "Freezing rain",
         71 | 73 | 75 => "Snow",
         77 => "Snow grains",
-        80 | 81 | 82 => "Rain showers",
+        80..=82 => "Rain showers",
         85 | 86 => "Snow showers",
         95 => "Thunderstorm",
         96 | 99 => "Thunderstorm with hail",
@@ -559,11 +559,11 @@ pub fn get_weather(args: &str) -> std::result::Result<String, String> {
         .ok_or_else(|| format!("get_weather: no results for city '{city}'"))?;
     let lat = result
         .get("latitude")
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .ok_or_else(|| "get_weather: geocode missing latitude".to_string())?;
     let lon = result
         .get("longitude")
-        .and_then(|v| v.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .ok_or_else(|| "get_weather: geocode missing longitude".to_string())?;
     let resolved_name = result
         .get("name")
@@ -590,7 +590,7 @@ pub fn get_weather(args: &str) -> std::result::Result<String, String> {
 
     let current = fc.get("current").cloned().unwrap_or_else(|| serde_json::json!({}));
     let daily = fc.get("daily").cloned().unwrap_or_else(|| serde_json::json!({}));
-    let current_code = current.get("weather_code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let current_code = current.get("weather_code").and_then(serde_json::Value::as_i64).unwrap_or(-1);
 
     // Build a compact, labelled daily summary so the LLM doesn't have to
     // interpret raw WMO codes.
@@ -603,11 +603,11 @@ pub fn get_weather(args: &str) -> std::result::Result<String, String> {
     let forecast: Vec<serde_json::Value> = (0..days.len().min(3))
         .map(|i| {
             serde_json::json!({
-                "date": days.get(i).cloned().unwrap_or_else(|| serde_json::Value::Null),
-                "condition": wmo_description(codes.get(i).and_then(|v| v.as_i64()).unwrap_or(-1)),
-                "max_c": maxs.get(i).cloned().unwrap_or_else(|| serde_json::Value::Null),
-                "min_c": mins.get(i).cloned().unwrap_or_else(|| serde_json::Value::Null),
-                "precip_prob_pct": preps.get(i).cloned().unwrap_or_else(|| serde_json::Value::Null),
+                "date": days.get(i).cloned().unwrap_or(serde_json::Value::Null),
+                "condition": wmo_description(codes.get(i).and_then(serde_json::Value::as_i64).unwrap_or(-1)),
+                "max_c": maxs.get(i).cloned().unwrap_or(serde_json::Value::Null),
+                "min_c": mins.get(i).cloned().unwrap_or(serde_json::Value::Null),
+                "precip_prob_pct": preps.get(i).cloned().unwrap_or(serde_json::Value::Null),
             })
         })
         .collect();

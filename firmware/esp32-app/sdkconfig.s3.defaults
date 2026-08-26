@@ -1,0 +1,74 @@
+# =============================================================================
+# mAgent firmware — sdkconfig for ESP32-S3-WROOM-1-N8R8
+#
+# Compile-time S3 board profile. Use with:
+#   SDKCONFIG_DEFAULTS=firmware/esp32-app/sdkconfig.s3.defaults \
+#   cargo build -p magent-esp32-app --target xtensa-esp32s3-espidf \
+#       --features board-s3 --release
+#
+# NOTE: this profile is a starting point for the ESP32-S3 port. The S3 has
+# 512KB internal SRAM and 8MB octal PSRAM, so WiFi + BLE + the agent can
+# coexist (unlike the RAM-limited C61). It should be validated on real S3
+# hardware before production.
+# =============================================================================
+
+# ---- Target: ESP32-S3 ----
+CONFIG_IDF_TARGET_ESP32S3=y
+
+# ---- Flash: 8MB ----
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# ---- PSRAM: 8MB octal, used for the main heap (std::alloc) ----
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# ---- Wi-Fi (needed for DeepSeek LLM RPC) ----
+CONFIG_ESP_WIFI_ENABLED=y
+# Shrunk buffers (same rationale as the C61 profile) to keep internal DRAM
+# headroom for worker-thread stacks.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
+
+# ---- Network / TLS (mbedTLS, allow HTTP for local test) ----
+CONFIG_ESP_TLS_USING_MBEDTLS=y
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_ESP_HTTP_CLIENT_ALLOW_HTTP_FOR_TESTS=y
+CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
+CONFIG_OTA_ALLOW_HTTP=y
+
+# ---- lwIP (small TCP windows — device only makes small LLM requests) ----
+CONFIG_LWIP_IPV6=n
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
+CONFIG_LWIP_WND_SCALE=0
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=6
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
+CONFIG_LWIP_TCP_MSS=1200
+CONFIG_LWIP_MAX_SOCKETS=6
+
+# ---- FreeRTOS / watchdogs (mirror the C61 profile) ----
+CONFIG_FREERTOS_HZ=1000
+CONFIG_BOOTLOADER_WDT_ENABLE=n
+CONFIG_ESP_TASK_WDT_EN=n
+CONFIG_ESP_INT_WDT=n
+CONFIG_ESP_SYSTEM_PANIC="PrintAndReboot"
+
+# ---- C library: picolibc (matches esp-idf-svc bindings) ----
+CONFIG_LIBC_PICOLIBC=y
+CONFIG_LIBC_NEWLIB=n
+
+# ---- Partition table (4MB factory app partition to fit the full build) ----
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="firmware/esp32-app/partitions.csv"
+
+# ---- BLE stability: this is a peripheral that never scans ----
+# Skip the Bluedroid adv-report queue allocation to free internal DRAM and
+# avoid the btm_ble_init assert seen on the RAM-limited C61.
+CONFIG_BT_BLE_42_SCAN_EN=n

@@ -9,7 +9,7 @@
 //! This module handles all audio output and user notifications,
 //! including voice coaching during exercise and health alerts.
 
-use crate::error::Result;
+use crate::error::{try_heapless, Result};
 use core::fmt::Write;
 use heapless::{String, Vec};
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,11 @@ impl VoiceMessage {
     pub fn new(id: u32, text: &str, priority: u8, category: VoiceCategory, timestamp: u32) -> Self {
         Self {
             id,
-            text: String::try_from(text).unwrap(),
+            // HARDENING (audit-2026-08 unwrap sweep): TTS input from the
+            // agent or sensor rules can be arbitrarily long. Truncating at
+            // the 512-char boundary preserves partial speech rather than
+            // crashing the notification pipeline during a health alert.
+            text: try_heapless::<256>(text),
             priority,
             category,
             timestamp,
@@ -149,8 +153,11 @@ impl Notification {
     ) -> Self {
         Self {
             id,
-            title: String::try_from(title).unwrap(),
-            body: String::try_from(body).unwrap(),
+            // HARDENING (audit-2026-08 unwrap sweep): notification title/body
+            // are typically short, but external sources could provide long
+            // content. `try_heapless` keeps the notification pipeline alive.
+            title: try_heapless::<64>(title),
+            body: try_heapless::<256>(body),
             notification_type,
             priority,
             category,
@@ -184,7 +191,7 @@ impl Default for TtsConfig {
             speech_rate: 1.0,
             pitch: 1.0,
             volume: 0.8,
-            language: String::try_from("zh-CN").unwrap(),
+            language: try_heapless::<8>("zh-CN"),
             voice_id: None,
             enable_ssml: false,
         }
@@ -294,12 +301,14 @@ impl VoiceNotificationManager {
             return false;
         }
 
-        if self.dnd_start_hour < self.dnd_end_hour {
-            // DND spans midnight (e.g., 22:00 - 07:00)
-            current_hour >= self.dnd_start_hour || current_hour < self.dnd_end_hour
-        } else {
-            // DND within same day
+        if self.dnd_start_hour <= self.dnd_end_hour {
+            // Same-day window (e.g. 09:00 – 17:00): inside iff
+            // `start <= hour < end`.
             current_hour >= self.dnd_start_hour && current_hour < self.dnd_end_hour
+        } else {
+            // Spans midnight (e.g. 22:00 – 07:00): inside iff
+            // `hour >= start` (late night) or `hour < end` (early morning).
+            current_hour >= self.dnd_start_hour || current_hour < self.dnd_end_hour
         }
     }
 
@@ -375,8 +384,11 @@ impl VoiceNotificationManager {
             return None;
         }
 
-        // Get highest priority message
-        if let Some(mut msg) = self.voice_queue.pop() {
+        // Get highest priority message. The queue is ordered highest-first
+        // (index 0 = highest), so we remove from the front — `pop()` would
+        // wrongly serve the *lowest*-priority message.
+        if !self.voice_queue.is_empty() {
+            let mut msg = self.voice_queue.remove(0);
             // Mark as spoken
             msg.spoken = true;
             self.last_speech_ms = current_time_ms;
@@ -418,8 +430,8 @@ impl VoiceNotificationManager {
 
         let notification = Notification {
             id: self.next_message_id,
-            title: String::try_from(title).unwrap(),
-            body: String::try_from(body).unwrap(),
+            title: try_heapless::<64>(title),
+            body: try_heapless::<256>(body),
             notification_type,
             priority,
             category,
@@ -674,8 +686,11 @@ impl EmergencyAlert {
         notify_all_contacts: bool,
         timestamp: u32,
     ) -> Self {
+        // HARDENING (audit-2026-08 unwrap sweep): emergency alert messages
+        // come from LLM responses or sensor rules — not bounded at compile
+        // time. `try_heapless` prevents panic in the critical alert path.
         Self {
-            message: String::try_from(message).unwrap(),
+            message: try_heapless::<256>(message),
             call_emergency,
             notify_all_contacts,
             timestamp,
@@ -690,5 +705,219 @@ impl EmergencyAlert {
         let _ = writeln!(body, "时间：{}", self.timestamp);
         let _ = write!(body, "请立即联系用户或呼叫急救。");
         body
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_category_priority_and_names() {
+        assert_eq!(VoiceCategory::Alert.priority_multiplier(), 10);
+        assert_eq!(VoiceCategory::Warning.priority_multiplier(), 9);
+        assert_eq!(VoiceCategory::Breathing.priority_multiplier(), 8);
+        assert_eq!(VoiceCategory::Meditation.priority_multiplier(), 7);
+        assert_eq!(VoiceCategory::Coaching.priority_multiplier(), 5);
+        assert_eq!(VoiceCategory::Encouragement.priority_multiplier(), 3);
+        assert_eq!(VoiceCategory::System.priority_multiplier(), 2);
+        // All have a non-empty Chinese display name.
+        for c in [
+            VoiceCategory::Alert,
+            VoiceCategory::Warning,
+            VoiceCategory::Breathing,
+            VoiceCategory::Meditation,
+            VoiceCategory::Coaching,
+            VoiceCategory::Encouragement,
+            VoiceCategory::System,
+        ] {
+            assert!(!c.name().is_empty());
+        }
+    }
+
+    #[test]
+    fn notification_new_truncates_long_fields() {
+        let long_body = "x".repeat(400);
+        let n = Notification::new(1, "t", &long_body, NotificationType::Screen, 5, VoiceCategory::System, 0);
+        assert_eq!(n.title.as_str(), "t");
+        assert_eq!(n.body.len(), 256); // truncated to the bounded buffer
+        assert!(!n.delivered && !n.acknowledged);
+    }
+
+    #[test]
+    fn tts_config_defaults_and_clamps() {
+        let cfg = TtsConfig::default();
+        assert_eq!(cfg.speech_rate, 1.0);
+        assert_eq!(cfg.volume, 0.8);
+        assert_eq!(cfg.volume_percent(), 80);
+
+        let mut c = cfg;
+        c.set_speech_rate(5.0); // clamp to 2.0
+        assert_eq!(c.speech_rate, 2.0);
+        c.set_speech_rate(0.1); // clamp to 0.5
+        assert_eq!(c.speech_rate, 0.5);
+        c.set_volume(3.0); // clamp to 1.0
+        assert_eq!(c.volume, 1.0);
+        assert_eq!(c.volume_percent(), 100);
+    }
+
+    #[test]
+    fn dnd_period_logic_same_day_and_midnight() {
+        let mut mgr = VoiceNotificationManager::new();
+        // Default DND 22:00 → 07:00 spans midnight.
+        mgr.set_dnd(true, 22, 7);
+        assert!(!mgr.is_in_dnd_period(12)); // noon, outside
+        assert!(mgr.is_in_dnd_period(23)); // 23:00, inside
+        assert!(mgr.is_in_dnd_period(2)); // 02:00, inside
+        assert!(mgr.is_in_dnd_period(6)); // 06:00, inside
+        assert!(!mgr.is_in_dnd_period(7)); // 07:00 boundary, outside
+
+        // Same-day DND 9:00 → 17:00.
+        mgr.set_dnd(true, 9, 17);
+        assert!(!mgr.is_in_dnd_period(8));
+        assert!(mgr.is_in_dnd_period(10));
+        assert!(!mgr.is_in_dnd_period(17));
+
+        // Disabled → always false.
+        mgr.set_dnd(false, 22, 7);
+        assert!(!mgr.is_in_dnd_period(2));
+    }
+
+    #[test]
+    fn queue_voice_orders_highest_priority_first() {
+        let mut mgr = VoiceNotificationManager::new();
+        mgr.queue_voice("low", 3, VoiceCategory::Encouragement, 0).unwrap();
+        mgr.queue_voice("high", 9, VoiceCategory::Warning, 0).unwrap();
+        mgr.queue_voice("mid", 5, VoiceCategory::Coaching, 0).unwrap();
+        let q = mgr.pending_voices();
+        // Highest priority should be at the front (index 0).
+        assert_eq!(q[0].priority, 9, "highest priority must be first, got {}", q[0].priority);
+        assert_eq!(q[1].priority, 5);
+        assert_eq!(q[2].priority, 3);
+    }
+
+    #[test]
+    fn get_next_voice_speaks_highest_priority_first() {
+        let mut mgr = VoiceNotificationManager::new();
+        mgr.queue_voice("low", 3, VoiceCategory::Encouragement, 0).unwrap();
+        mgr.queue_voice("high", 9, VoiceCategory::Warning, 0).unwrap();
+        // Bypass the 2s min-interval by using a large timestamp.
+        let first = mgr.get_next_voice(100_000).expect("first message");
+        assert_eq!(first.text.as_str(), "high");
+        assert!(first.spoken);
+        // The second one is the next-highest.
+        let second = mgr.get_next_voice(102_000).expect("second message");
+        assert_eq!(second.text.as_str(), "low");
+    }
+
+    #[test]
+    fn get_next_voice_respects_min_interval() {
+        let mut mgr = VoiceNotificationManager::new();
+        mgr.queue_voice("a", 5, VoiceCategory::Coaching, 0).unwrap();
+        // First call at t=100000 speaks it and records last_speech_ms.
+        let first = mgr.get_next_voice(100_000);
+        assert!(first.is_some());
+        // A call too soon after (1s < 2s) returns None (cooldown).
+        assert!(mgr.get_next_voice(101_000).is_none());
+        // After the interval elapses, the next message is served.
+        mgr.queue_voice("b", 4, VoiceCategory::Coaching, 0).unwrap();
+        let next = mgr.get_next_voice(103_000);
+        assert_eq!(next.unwrap().text.as_str(), "b");
+    }
+
+    #[test]
+    fn voice_disabled_queues_nothing() {
+        let mut mgr = VoiceNotificationManager::new();
+        mgr.set_voice_enabled(false);
+        mgr.queue_voice("nope", 5, VoiceCategory::Coaching, 0).unwrap();
+        assert_eq!(mgr.voice_queue_size(), 0);
+        assert!(mgr.get_next_voice(100_000).is_none());
+    }
+
+    #[test]
+    fn send_notification_drops_during_dnd_low_priority() {
+        let mut mgr = VoiceNotificationManager::new();
+        mgr.set_dnd(true, 22, 7);
+        // Hour 2 (inside DND) + priority 3 < 7 → silently dropped.
+        mgr.send_notification("t", "b", NotificationType::Screen, 3, VoiceCategory::System, 2 * 3_600_000)
+            .unwrap();
+        assert_eq!(mgr.notification_history().len(), 0, "low-priority DND message must be dropped");
+        // High priority (>= 7) is delivered even in DND.
+        mgr.send_notification("t", "b", NotificationType::Screen, 9, VoiceCategory::Alert, 2 * 3_600_000)
+            .unwrap();
+        assert_eq!(mgr.notification_history().len(), 1);
+    }
+
+    #[test]
+    fn send_health_alert_channels_by_severity() {
+        let mut mgr = VoiceNotificationManager::new();
+        // Severity 8+ → voice queue + notification (multiple channels).
+        mgr.send_health_alert("心率异常", 8, "心动过速", "请休息", 12 * 3_600_000).unwrap();
+        assert!(mgr.voice_queue_size() >= 1);
+        assert!(!mgr.notification_history().is_empty());
+
+        let mut mgr2 = VoiceNotificationManager::new();
+        // Severity 3 → screen-only (no voice queued).
+        mgr2.send_health_alert("提醒", 3, "检测到低活动", "起来活动", 12 * 3_600_000).unwrap();
+        assert_eq!(mgr2.voice_queue_size(), 0);
+        assert_eq!(mgr2.notification_history().len(), 1);
+    }
+
+    #[test]
+    fn mark_delivered_and_acknowledge() {
+        let mut mgr = VoiceNotificationManager::new();
+        mgr.send_notification("t", "b", NotificationType::Screen, 5, VoiceCategory::System, 0)
+            .unwrap();
+        let id = mgr.notification_history()[0].id;
+        // Unknown id → false.
+        assert!(!mgr.mark_delivered(9999));
+        assert!(!mgr.acknowledge(9999));
+        // Known id → true, and unacknowledged() reflects the state.
+        assert!(mgr.mark_delivered(id));
+        assert_eq!(mgr.unacknowledged().len(), 1);
+        assert!(mgr.acknowledge(id));
+        assert_eq!(mgr.unacknowledged().len(), 0);
+    }
+
+    #[test]
+    fn recent_notifications_returns_newest_first() {
+        let mut mgr = VoiceNotificationManager::new();
+        for i in 0..5 {
+            mgr.send_notification(&format!("t{}", i), "b", NotificationType::Screen, 5, VoiceCategory::System, i)
+                .unwrap();
+        }
+        let recent = mgr.recent_notifications(3);
+        assert_eq!(recent.len(), 3);
+        // Newest first: ids are 1..=5 (next_message_id starts at 1).
+        assert_eq!(recent[0].title.as_str(), "t4");
+        assert_eq!(recent[2].title.as_str(), "t2");
+    }
+
+    #[test]
+    fn prepare_for_tts_adds_rate_dependent_pauses() {
+        // Normal rate → ". " between sentences.
+        let normal = TtsConfig::default(); // speech_rate 1.0
+        assert_eq!(prepare_for_tts("a。b。c", &normal).as_str(), "a. b. c");
+
+        // Slow rate → ", " pauses.
+        let mut slow = normal.clone();
+        slow.set_speech_rate(0.5);
+        assert_eq!(prepare_for_tts("a。b。c", &slow).as_str(), "a, b, c");
+
+        // Fast rate → no pauses.
+        let mut fast = normal.clone();
+        fast.set_speech_rate(1.5);
+        assert_eq!(prepare_for_tts("a。b。c", &fast).as_str(), "abc");
+    }
+
+    #[test]
+    fn emergency_alert_sms_body_contains_message() {
+        let alert = EmergencyAlert::new("检测到跌倒，请确认", true, true, 1_700_000_000);
+        let body = alert.sms_body();
+        assert!(body.as_str().contains("检测到跌倒，请确认"));
+        assert!(body.as_str().contains("紧急健康预警"));
+        // Long messages are truncated to the bounded buffer, never panic.
+        let long = EmergencyAlert::new(&"x".repeat(1000), false, false, 1);
+        assert!(long.sms_body().len() > 0);
     }
 }

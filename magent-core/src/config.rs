@@ -3,7 +3,7 @@
 //! Provides configuration loading, validation, and management
 //! with aerospace-grade safety checks.
 
-use crate::error::{AgentError, ConfigError, Result};
+use crate::error::{try_heapless, AgentError, ConfigError, Result};
 use heapless::{String, Vec};
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +43,10 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            name: heapless::String::try_from("mAgent").unwrap(),
+            // HARDENING (audit-2026-08 unwrap sweep): use `try_heapless` so a
+            // future rename of the default agent name cannot introduce
+            // a panic on platforms with tight < 7-byte string limits.
+            name: try_heapless::<64>("mAgent"),
             max_iterations: crate::MAX_ITERATION_BUDGET as u16,
             max_memory: crate::MAX_MEMORY_BUDGET as u32,
             watchdog_timeout_secs: crate::WATCHDOG_TIMEOUT_SECS as u16,

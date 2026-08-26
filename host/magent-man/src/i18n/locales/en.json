@@ -1,0 +1,330 @@
+{
+  "app": {
+    "title": "mAgent-Man",
+    "subtitle": "Device Manager"
+  },
+  "nav": {
+    "config": "Configuration",
+    "status": "Status",
+    "chat": "Chat",
+    "channels": "Channels",
+    "advanced": "Advanced",
+    "menu": "Menu",
+    "collapse": "Collapse sidebar"
+  },
+  "status": {
+    "connected": "Connected to {name}",
+    "connecting": "Connecting...",
+    "disconnected": "Disconnected",
+    "error": "Connection Error",
+    "disconnect": "Disconnect"
+  },
+  "usb": {
+    "scanning": "Scanning USB…",
+    "connecting": "Connecting USB…",
+    "connected": "USB: {path}",
+    "noDevice": "No USB device",
+    "failed": "USB unavailable",
+    "autoConnected": "Auto-connected USB: {path}",
+    "start": "Start",
+    "retry": "Retry",
+    "continue": "Continue",
+    "scanAgain": "Scan again",
+    "dialogScanning": "Scanning USB ports…",
+    "dialogScanningHint": "Looking for the C61 serial bridge…",
+    "dialogConnecting": "Connecting…",
+    "dialogConnectingHint": "Opening {path}",
+    "dialogConnected": "Connection Successful",
+    "dialogConnectedHint": "Connected to {path}. You can start chatting now.",
+    "dialogFailed": "Connection Failed",
+    "dialogNoDevice": "No USB Device Found",
+    "dialogNoDeviceHint": "Plug in the device and try again."
+  },
+  "devices": {
+    "title": "BLE Devices",
+    "scan": "Scan",
+    "scanning": "Scanning...",
+    "noDevices": "No devices found",
+    "searchHint": "Click Scan to search for BLE devices",
+    "unknownDevice": "Unknown Device"
+  },
+  "config": {
+    "title": "Configuration",
+    "reload": "Reload",
+    "notConnected": "Not Connected",
+    "notConnectedHint": "Connect to a device to configure it",
+    "currentConfig": "Current:",
+    "wifi": {
+      "title": "WiFi Settings",
+      "ssid": "Network Name (SSID)",
+      "ssidPlaceholder": "Enter WiFi network name",
+      "password": "Password",
+      "passwordPlaceholder": "Enter WiFi password",
+      "save": "Save WiFi",
+      "saving": "Saving...",
+      "saved": "Saved!",
+      "ssidRequired": "SSID is required"
+    },
+    "llm": {
+      "title": "LLM Settings",
+      "model": "Model",
+      "modelPlaceholder": "e.g., deepseek-chat",
+      "modelHint": "Enter the LLM model identifier",
+      "apiKey": "API Key",
+      "apiKeyPlaceholder": "Enter API key",
+      "apiKeyHint": "Your API key is stored securely",
+      "save": "Save LLM",
+      "saving": "Saving...",
+      "saved": "Saved!",
+      "modelRequired": "Model is required",
+      "apiKeyRequired": "API key is required"
+    },
+    "hostname": {
+      "title": "Hostname",
+      "label": "Device Hostname",
+      "placeholder": "e.g., mAgent-001",
+      "hint": "Unique identifier for the device on the network",
+      "save": "Save Hostname",
+      "saving": "Saving...",
+      "saved": "Saved!",
+      "required": "Hostname is required"
+    },
+    "saved": "Configuration saved",
+    "saveFailed": "Failed to save configuration"
+  },
+  "monitor": {
+    "title": "System Status",
+    "refresh": "Refresh",
+    "lastUpdate": "Updated {time}",
+    "notConnected": "Not Connected",
+    "notConnectedHint": "Connect to a device to view status",
+    "device": {
+      "title": "Device Information",
+      "version": "Version",
+      "chip": "Chip",
+      "uptime": "Uptime",
+      "memory": "Memory",
+      "heapUsage": "Heap Usage",
+      "free": "free"
+    },
+    "wifi": {
+      "title": "WiFi Status",
+      "network": "Network",
+      "ipAddress": "IP Address",
+      "signal": "Signal Strength",
+      "notConnected": "Not connected",
+      "state": {
+        "idle": "Idle",
+        "connecting": "Connecting",
+        "associated": "Associated",
+        "disconnected": "Disconnected",
+        "connected": "Connected"
+      }
+    },
+    "actions": {
+      "refresh": "Refresh",
+      "logs": "Logs",
+      "diagnostics": "Diagnostics"
+    },
+    "reboot": {
+      "button": "Reboot Device",
+      "confirm": "Are you sure you want to reboot the device?",
+      "success": "Reboot command sent successfully"
+    },
+    "logs": {
+      "title": "Device Logs"
+    },
+    "diagnostics": {
+      "title": "Diagnostics Report"
+    }
+  },
+  "common": {
+    "close": "Close"
+  },
+  "quit": {
+    "title": "Quit mAgent-Man?",
+    "message": "Any in-progress work will be lost. Are you sure you want to exit?",
+    "confirm": "Quit",
+    "cancel": "Cancel"
+  },
+  "wifiScan": {
+    "title": "WiFi Scanner",
+    "scan": "Scan Networks",
+    "scanning": "Scanning...",
+    "notConnected": "Connect to a device first",
+    "hint": "Click Scan to search for nearby WiFi networks",
+    "found": "Found {count} networks",
+    "started": "Network scan started. Results will appear on the device.",
+    "selected": "Selected network {ssid}. Set the password in Configuration and save.",
+    "failed": "Network scan failed",
+    "error": "Failed to scan for networks",
+    "hidden": "Hidden Network",
+    "excellent": "Excellent",
+    "good": "Good",
+    "fair": "Fair",
+    "weak": "Weak",
+    "connect": "Connect"
+  },
+  "safeMode": {
+    "title": "Safe Mode",
+    "label": "Safe Mode",
+    "description": "Enable safe mode for troubleshooting",
+    "toggle": "Toggle safe mode",
+    "notConnected": "Connect to a device first",
+    "enabled": "Safe mode enabled",
+    "disabled": "Safe mode disabled",
+    "activeWarning": "Safe mode is active. Some features may be limited.",
+    "error": "Failed to toggle safe mode"
+  },
+  "identity": {
+    "title": "Identity",
+    "publicKey": "Public Key",
+    "address": "Address",
+    "chainId": "Chain ID",
+    "rotatedAt": "Last Rotated",
+    "rotate": "Rotate Identity",
+    "rotateHint": "Generate a new identity key pair",
+    "rotating": "Rotating...",
+    "notConnected": "Connect to a device first",
+    "loadError": "Failed to load identity",
+    "rotateError": "Failed to rotate identity",
+    "rotated": "Identity rotated successfully",
+    "notFound": "Identity not found",
+    "retry": "Retry",
+    "copied": "Copied to clipboard",
+    "copy": "Copy",
+    "never": "Never"
+  },
+  "configImport": {
+    "title": "Import/Export",
+    "export": "Export Configuration",
+    "exportDesc": "Download device configuration as JSON",
+    "import": "Import Configuration",
+    "importDesc": "Load configuration from JSON file",
+    "preview": "Show preview",
+    "success": "Operation completed",
+    "error": "Operation failed",
+    "exportSuccess": "Configuration exported successfully",
+    "exportFailed": "Failed to export configuration",
+    "importSuccess": "Configuration imported successfully",
+    "importFailed": "Failed to import configuration",
+    "notConnected": "Connect to a device first"
+  },
+  "toast": {
+    "scanComplete": "Scan completed",
+    "connectionLost": "Connection lost",
+    "connectionRestored": "Connection restored",
+    "reconnecting": "Reconnecting..."
+  },
+  "errors": {
+    "scanFailed": "Scan failed",
+    "connectionFailed": "Connection failed",
+    "bluetoothOff": "Bluetooth is off",
+    "deviceNotFound": "Device not found",
+    "networkScanFailed": "Network scan failed",
+    "saveFailed": "Failed to save",
+    "loadFailed": "Failed to load"
+  },
+  "webhook": {
+    "title": "Webhook Settings",
+    "url": "Webhook URL",
+    "urlPlaceholder": "https://example.com/webhook",
+    "secret": "Secret",
+    "secretPlaceholder": "Webhook secret key",
+    "events": "Events",
+    "save": "Save Webhook",
+    "test": "Test",
+    "testing": "Testing...",
+    "testSuccess": "Webhook test successful",
+    "testFailed": "Webhook test failed"
+  },
+  "mqtt": {
+    "title": "MQTT Settings",
+    "broker": "Broker URL",
+    "brokerPlaceholder": "mqtt://broker.example.com:1883",
+    "username": "Username",
+    "password": "Password",
+    "topic": "Topic",
+    "topicPlaceholder": "devices/+/events",
+    "save": "Save MQTT",
+    "test": "Test Connection",
+    "connected": "Connected",
+    "disconnected": "Disconnected"
+  },
+  "footer": {
+    "devicesFound": "devices",
+    "lastScan": "Last scan",
+    "neverScanned": "Never scanned",
+    "ago": "ago",
+    "connected": "Connected"
+  },
+  "settings": {
+    "theme": "Theme",
+    "lightMode": "Light",
+    "darkMode": "Dark",
+    "warmMode": "Warm",
+    "coffeeMode": "Coffee",
+    "language": "Language"
+  },
+  "chat": {
+    "title": "Chat with Agent",
+    "notConnected": "Not Connected",
+    "notConnectedHint": "Connect to a device to chat with its agent",
+    "welcome": "Hello! I'm the mAgent assistant. Connect to a device and start chatting!",
+    "placeholder": "Type your message...",
+    "hint": "Press Enter to send, Shift+Enter for new line",
+    "you": "You",
+    "agent": "Agent",
+    "system": "System",
+    "clear": "Clear chat",
+    "responseReceived": "Response received",
+    "error": "Failed to send message",
+    "sending": "Sending...",
+    "connectedTo": "Connected to",
+    "device": "Device",
+    "demoMode": "Demo Mode · No device connected"
+  },
+  "channels": {
+    "title": "Communication Channels",
+    "notConnected": "Not Connected",
+    "notConnectedHint": "Connect to a device to view channels",
+    "activeChannels": "Active",
+    "totalMessages": "Messages",
+    "totalChannels": "Channels",
+    "messages": "msgs",
+    "lastActivity": "Last activity",
+    "never": "Never",
+    "ago": "ago",
+    "type": "Type",
+    "description": "Description",
+    "close": "Close",
+    "status": {
+      "active": "Active",
+      "inactive": "Inactive",
+      "error": "Error"
+    },
+    "filter": {
+      "all": "All",
+      "active": "Active",
+      "inactive": "Inactive"
+    },
+    "local": {
+      "description": "Local BLE connection to the device"
+    },
+    "uart": {
+      "description": "UART serial port communication"
+    },
+    "manual": {
+      "description": "Manual input via button or CLI"
+    },
+    "mqtt": {
+      "description": "MQTT broker for remote communication"
+    },
+    "webhook": {
+      "description": "HTTP webhook integration"
+    },
+    "web3": {
+      "description": "Blockchain/Web3 communication"
+    }
+  }
+}

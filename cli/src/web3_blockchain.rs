@@ -552,15 +552,24 @@ mod tests {
         let _j = Output::new(OutputKind::Json, true);
     }
 
-    /// Confirm we can read at least one byte from stdin (the
-    /// tests run interactively with stdin closed, but the read
-    /// API itself should be invokable without panic).
+    /// Confirm we can read from stdin without panicking on EOF.
+    ///
+    /// Under an interactive `cargo test`, stdin is the terminal, so a
+    /// plain `read` would block forever waiting for input. That would
+    /// hang the whole test suite. We guard with `is_terminal()`: when
+    /// stdin is a TTY we skip the actual read (a terminal never hits
+    /// EOF anyway, so it's not the case the historical panic covered).
+    /// When stdin is piped/closed (CI, `< /dev/null`), we perform the
+    /// read to exercise the EOF path that used to panic.
     #[test]
     fn stdin_read_does_not_panic_on_eof() {
+        use std::io::{IsTerminal, Read};
+        if std::io::stdin().is_terminal() {
+            return;
+        }
         let mut buf = [0u8; 16];
-        let res = std::io::stdin().read(&mut buf);
         // We don't care what the result is, only that the API
-        // is callable from tests.
-        let _ = res;
+        // is callable from tests without panicking.
+        let _ = std::io::stdin().read(&mut buf);
     }
 }

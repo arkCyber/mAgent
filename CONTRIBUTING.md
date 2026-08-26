@@ -1,347 +1,291 @@
 # Contributing to mAgent
 
-Thank you for your interest in contributing to mAgent! This document provides guidelines for contributing to the project.
+Thank you for your interest in contributing to **mAgent** — the aerospace-grade
+embedded AI agent platform targeting nRF52840 and ESP32-C61. This document
+covers how to file issues, submit code, and what to expect from the review
+process.
+
+> **Disclosure reminder**: This repository is the open-source codebase of the
+> **mAgent** project (target commercial brand: **arkChip-mAgent**). Any
+> contribution you submit will be released under the project's MIT License and
+> become part of the open codebase. Please do not submit proprietary
+> information, customer data, or unreleased product roadmaps through this
+> channel.
+
+---
+
+## Table of contents
+
+1. [Code of Conduct](#code-of-conduct)
+2. [Reporting issues](#reporting-issues)
+3. [Pull requests](#pull-requests)
+4. [Development environment](#development-environment)
+5. [Building &amp; testing](#building--testing)
+6. [Coding style](#coding-style)
+7. [Aerospace-grade lint policy](#aerospace-grade-lint-policy)
+8. [Commit messages](#commit-messages)
+9. [Security disclosure](#security-disclosure)
+
+---
 
 ## Code of Conduct
 
-- Be respectful and inclusive
-- Provide constructive feedback
-- Focus on what is best for the community
-- Show empathy towards other community members
+By participating, you agree to abide by the [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+Project maintainers enforce it; reports may be sent to **[conduct@arkchip.example]**.
 
-## Development Setup
+---
 
-### Prerequisites
+## Reporting issues
 
-- Rust 1.70 or higher
-- arm-none-eabi toolchain
-- nRF52840 Development Kit (optional)
-- probe-rs for flashing (optional)
+Before opening an issue:
 
-### Installation
+1. **Search existing issues** (open and closed) — your problem may already be
+   triaged.
+2. **Try the latest `main`** — the bug may already be fixed.
+3. **Reproduce on the closest possible environment**:
+   * For `magent-core` agent-runtime logic: the host simulator (`cargo run -p
+     magent-simulator`) or the nRF52840 simulator (`cargo run -p
+     magent-nrf52-simulator`) is usually enough.
+   * For chip-specific bugs (BLE, GPIO, Wi-Fi): we strongly prefer
+     hardware-in-the-loop reproductions on the real device. If you do not have
+     the hardware, file the issue with the closest available logs from the
+     host simulator and a clear description of the expected vs. observed
+     behavior.
+
+When opening an issue, please include:
+
+- **Component**: `magent-core` / `magent-hal` / `firmware/nrf52-app` /
+  `firmware/esp32-app` / `host/*` / `cli` / `tools` / `examples/*`
+- **Target**: `host` / `nrf52840` / `esp32-c61`
+- **Toolchain**: `rustc --version`, `cargo --version`, ESP-IDF version (if
+  relevant), `probe-rs --version` (if relevant)
+- **Repro command**: the exact `cargo build` / `cargo run` invocation
+- **Expected vs. observed**: with log output (please redact any API keys or
+  seed material; see "Security disclosure" below)
+- **For crashes**: a `panic-probe` / `defmt` backtrace if available
+
+For issues **only relevant to the project owner / commercial roadmap** (e.g.
+funding, partnership, branded-chip delivery schedule), do **not** open a public
+GitHub issue — see the project website for a contact channel.
+
+---
+
+## Pull requests
+
+We follow a **fork + feature branch** workflow:
+
+1. Fork the repository.
+2. Create a topic branch from `main`: `git checkout -b fix/<short-slug>` or
+   `feat/<short-slug>` or `audit/<short-slug>`.
+3. Make your changes. Keep them focused — one logical change per PR. If your
+   PR touches both an agent-runtime semantic and a chip-specific HAL path,
+   please split it.
+4. Make sure your branch is up to date with `main` and **rebased** (no merge
+   commits in your branch — we rebase-merge in the GitHub UI).
+5. Run the local checks listed in [Building &amp; testing](#building--testing).
+   At minimum:
+   * `cargo fmt --all -- --check`
+   * `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+   * `cargo test --workspace`
+6. Push the branch and open a PR. Fill in the PR template. If your change
+   affects the **agent-runtime contract** (public API, JSON tool-call format,
+   security-sensitive behavior), please call this out explicitly in the PR
+   description — those get a maintainer review before merge.
+
+### What we look for in review
+
+- **Correctness**: tests cover the happy path **and** the failure path.
+- **Bounded resources**: any new `Vec`, `String`, or buffer must be
+  `heapless`-typed with an explicit capacity, unless it lives on the host
+  (CLI / simulator) side and you have a written reason.
+- **No panics in production code**: see [Aerospace-grade lint policy](#aerospace-grade-lint-policy).
+- **No new direct calls to `unsafe`** outside the HAL boundary. If you
+  genuinely need one, add a `// SAFETY:` comment and a unit test.
+- **Traceability**: if the change addresses a `TRACE: REQ-…` requirement
+  declared in the codebase, mention the requirement ID in the PR description.
+
+### Out-of-scope for community PRs
+
+- Changes to the in-tree vendored patches under `.cargo-patches/` — these
+  mirror upstream crate sources with our local fixes and are updated through
+  a separate process.
+- Changes to brand assets, trademark references, or the commercial naming
+  (mAgent vs. arkChip-mAgent) — coordinate via the project owner before
+  opening a PR.
+
+---
+
+## Development environment
+
+The workspace is a Rust `cargo` workspace with members spanning `no_std`
+embedded targets and host-side tooling. Minimum toolchain:
+
+| Component | Version | Notes |
+|---|---|---|
+| `rustup` | latest stable | |
+| `rustc` | 1.70+ (host), 1.97+ (ESP32) | toolchain pinning lives in `rust-toolchain.toml` if present |
+| `cargo` | bundled with `rustup` | |
+| `rustfmt` + `clippy` | `rustup component add rustfmt clippy` | |
+| `probe-rs` | latest | for nRF52840 flash / debug |
+| `espflash` | latest | for ESP32 flash |
+| `cargo-binutils` | latest | for `cargo size`, `cargo objcopy` |
+| `cargo-llvm-cov` | latest | for coverage reports |
+
+Embedded targets to install:
 
 ```bash
-# Install Rust target
-rustup target add thumbv7em-none-eabihf
-
-# Install cargo-binutils
-cargo install cargo-binutils
-
-# Install probe-rs (for hardware flashing)
-cargo install probe-rs
-
-# Clone repository
-git clone https://github.com/arksong/magent.git
-cd magent
-
-# Build
-cargo build --release
+rustup target add thumbv7em-none-eabihf        # nRF52840 (ARM Cortex-M4F)
+rustup target add riscv32imac-esp-espidf      # ESP32-C61 (RISC-V)
 ```
 
-## Coding Standards
+ESP32 builds additionally require the ESP-IDF toolchain; see
+[`docs/ESP32_C61_BUILD.md`](docs/ESP32_C61_BUILD.md) for the full setup.
 
-### Rust Guidelines
+---
 
-- Follow [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
-- Use `cargo clippy` for linting
-- Use `cargo fmt` for formatting
-- Document all public APIs
-- Write unit tests for all modules
+## Building &amp; testing
 
-### Aerospace-Grade Standards
-
-- **No Panics**: All functions must return `Result<T>`
-- **Memory Safety**: Use heapless data structures
-- **Input Validation**: Validate all external inputs
-- **Error Handling**: Use comprehensive error types
-- **Resource Limits**: Enforce memory and iteration budgets
-- **Documentation**: Document safety-critical code
-
-### Code Style
-
-```rust
-// Good: Returns Result
-pub fn safe_function(input: &str) -> Result<String> {
-    if input.len() > MAX_LENGTH {
-        return Err(AgentError::InputValidationFailed { ... });
-    }
-    Ok(String::from(input))
-}
-
-// Bad: Uses unwrap
-pub fn unsafe_function(input: &str) -> String {
-    String::from(input).unwrap()  // DON'T DO THIS
-}
-```
-
-## Testing
-
-### Unit Tests
+The project is a workspace; from the repo root:
 
 ```bash
-# Run all tests
-cargo test
+# Format + lint (host-only, fast feedback)
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 
-# Run specific test
-cargo test test_budget_enforcer
+# Unit + integration tests (host)
+cargo test --workspace
 
-# Run with output
-cargo test -- --nocapture
+# Build the nRF52840 firmware (requires target above)
+cargo build -p magent-nrf52-app --release \
+  --target thumbv7em-none-eabihf
+
+# Build the ESP32-C61 firmware (run from the firmware dir)
+cd firmware/esp32-app
+MCU=ESP32C61 cargo build --release
+
+# Run the host simulator (no hardware required)
+cargo run -p magent-simulator -- --task "read the temperature"
 ```
 
-### Integration Tests
+CI runs the same matrix on every PR. Pull requests are blocked from merge if
+any of the following fail:
 
-```bash
-# Run integration tests (requires hardware)
-cargo test --features integration
-```
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace` on the host target
+- the nRF52840 and ESP32-C61 build jobs (artifact-only — full flash tests are
+  hardware-in-the-loop and run on a self-hosted runner pool)
 
-### Memory Analysis
+---
 
-```bash
-# Check binary size
-cargo size --release
+## Coding style
 
-# Analyze stack usage
-cargo stack-sizes
-```
+- **`rustfmt` defaults** — do not fight the formatter; if you must, justify in
+  the PR.
+- **Naming**: `snake_case` for functions / variables; `PascalCase` for types
+  and `SCREAMING_SNAKE_CASE` for constants. Module-private helpers that are
+  only used inside one module: no `pub`.
+- **Error handling**: every fallible operation returns `Result<T, AgentError>`.
+  Do not introduce `unwrap()` / `expect()` in `magent-core` or in any firmware
+  path; the workspace lints will reject your PR.
+- **Heapless by default**: if you reach for `alloc::vec::Vec` or
+  `alloc::string::String` inside `magent-core` or firmware, you almost
+  certainly want `heapless::Vec<T, N>` instead. The host tooling
+  (`host/*`, `cli`, `tools`) is allowed to use `alloc`.
+- **Documentation**: every public item has at least a one-line `///` doc
+  comment; the workspace warns on `missing_docs`.
 
-## Pull Request Process
+---
 
-### Before Submitting
+## Aerospace-grade lint policy
 
-1. Update documentation
-2. Add/update tests
-3. Run `cargo clippy`
-4. Run `cargo fmt`
-5. Ensure all tests pass
-6. Update CHANGELOG.md
+The workspace enforces a small, deliberate set of `deny` lints under
+[`Cargo.toml`](Cargo.toml) `[workspace.lints]`. These are non-negotiable for
+code under `magent-core` and the firmware crates:
 
-### Pull Request Template
+- `unsafe_op_in_unsafe_fn = "deny"` — every `unsafe` block inside an `unsafe
+  fn` must be justified with a `// SAFETY:` comment.
+- `panic_in_result_fn = "deny"` — no panic-from-a-`Result` paths.
+- `mutex_atomic = "deny"` — no accidental `Mutex` where an `AtomicXxx` will
+  do.
 
-```markdown
-## Description
-Brief description of changes
+Style lints are at `warn`, not `deny`, so CI still builds but review surface
+is preserved. **Demote a lint to `allow` only with a `TRACE: REQ-…`
+comment** explaining why.
 
-## Type of Change
-- [ ] Bug fix
-- [ ] New feature
-- [ ] Breaking change
-- [ ] Documentation update
+---
 
-## Testing
-- [ ] Unit tests added/updated
-- [ ] Integration tests added/updated
-- [ ] Manual testing performed
+## Commit messages
 
-## Checklist
-- [ ] Code follows project style guidelines
-- [ ] Self-review of code completed
-- [ ] Comments added for complex logic
-- [ ] Documentation updated
-- [ ] No new warnings generated
-- [ ] Tests added/updated
-- [ ] All tests passing
-```
-
-## Project Structure
+We follow a lightweight Conventional Commits flavor:
 
 ```
-magent/
-├── magent-core/          # Core library
-│   ├── src/
-│   │   ├── agent.rs     # ReAct state machine
-│   │   ├── error.rs     # Error handling
-│   │   ├── safety.rs    # Safety mechanisms
-│   │   ├── skills.rs    # Skills system
-│   │   ├── tools.rs     # Tool registry
-│   │   ├── storage.rs   # Flash storage
-│   │   ├── communication.rs  # BLE/Thread
-│   │   └── config.rs    # Configuration
-│   └── Cargo.toml
-├── magent-app/          # Application
-│   ├── src/
-│   │   └── main.rs      # Entry point
-│   └── Cargo.toml
-├── docs/                # Documentation
-│   ├── ARCHITECTURE.md
-│   ├── API.md
-│   ├── HARDWARE.md
-│   └── SAFETY.md
-├── tests/               # Integration tests
-├── Cargo.toml           # Workspace config
-├── memory.x             # Linker script
-└── README.md
+<type>(<scope>): <subject>
+
+<body>
+
+<footer>
 ```
 
-## Adding New Features
+Where `<type>` is one of:
 
-### 1. Design Phase
+- `feat` — user-visible functionality
+- `fix` — bug fix
+- `audit` — security / safety hardening (no behavior change)
+- `docs` — documentation only
+- `refactor` — code change with no behavior change
+- `test` — test additions or corrections
+- `chore` — tooling, CI, dependencies
 
-- Create an issue describing the feature
-- Discuss implementation approach
-- Consider memory and performance impact
-- Plan testing strategy
+`<scope>` is optional and names the affected crate or area
+(`agent`, `tools`, `skills`, `wallet`, `ci`, etc.).
 
-### 2. Implementation Phase
+The subject is **imperative** ("add", not "added"), **lowercase**, **no
+period at the end**, and **≤ 72 characters**.
 
-- Add feature to appropriate module
-- Follow aerospace-grade standards
-- Add comprehensive error handling
-- Write unit tests
+Example:
 
-### 3. Documentation Phase
+```
+feat(tools): add parse_args() helper to fix substring bleed
 
-- Update API documentation
-- Add usage examples
-- Update architecture docs
-- Add to CHANGELOG.md
+The previous args.contains("…") heuristics mis-parsed inputs in two
+realistic ways:
+ * order coupling (hrv matched heart_rate first)
+ * substring bleed ("10" matched state=high)
 
-### 4. Review Phase
-
-- Self-review code
-- Request peer review
-- Address feedback
-- Update tests/docs
-
-## Bug Reports
-
-### Bug Report Template
-
-```markdown
-## Description
-Clear description of the bug
-
-## Steps to Reproduce
-1. Step 1
-2. Step 2
-3. Step 3
-
-## Expected Behavior
-What should happen
-
-## Actual Behavior
-What actually happens
-
-## Environment
-- Hardware: nRF52840 DK
-- Rust version: 1.70.0
-- mAgent version: 0.1.0
-
-## Additional Context
-Logs, screenshots, etc.
+parse_args() is now the single source of truth for argument parsing
+across all execute_* methods.
 ```
 
-## Feature Requests
+---
 
-### Feature Request Template
+## Security disclosure
 
-```markdown
-## Problem Description
-What problem does this solve?
+**Do not** open public GitHub issues for suspected vulnerabilities.
 
-## Proposed Solution
-How should this be implemented?
+Send a private report to **[security@arkchip.example]** (PGP key on request)
+with:
 
-## Alternatives Considered
-What other approaches were considered?
+- A description of the issue and its impact
+- A reproducer (firmware image, host command, or PoC code)
+- The affected commit SHA / version
 
-## Additional Context
-Any other relevant information
-```
+We aim to acknowledge within **3 business days** and to coordinate disclosure
+on a 90-day clock (adjustable for legitimate complexity reasons). Security
+fixes are tagged `audit/…` and shipped via the next patch release; critical
+issues may fast-track an out-of-band release.
 
-## Documentation
+See [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) for the most recent internal
+self-audit summary. *(Note: this is an internal AI-assisted self-audit; a
+third-party audit is on the post-funding roadmap. See the commercial pitch
+deck for the public timing commitment.)*
 
-### Writing Documentation
-
-- Use clear, concise language
-- Provide code examples
-- Include diagrams where helpful
-- Keep documentation up to date
-
-### API Documentation
-
-```rust
-/// Brief description of what this does
-///
-/// More detailed explanation...
-///
-/// # Arguments
-///
-/// * `arg1` - Description of arg1
-/// * `arg2` - Description of arg2
-///
-/// # Returns
-///
-/// * `Result<T>` - Description of return value
-///
-/// # Errors
-///
-/// * `AgentError::MemoryAllocationFailed` - When...
-///
-/// # Examples
-///
-/// ```
-/// let result = function(arg1, arg2)?;
-/// ```
-pub fn function(arg1: Type1, arg2: Type2) -> Result<ReturnType> {
-    // Implementation
-}
-```
-
-## Release Process
-
-### Version Bumping
-
-1. Update version in Cargo.toml
-2. Update CHANGELOG.md
-3. Create git tag
-4. Push to repository
-5. Create GitHub release
-
-### Changelog Format
-
-```markdown
-## [0.2.0] - 2026-XX-XX
-
-### Added
-- New feature 1
-- New feature 2
-
-### Changed
-- Changed behavior 1
-- Changed behavior 2
-
-### Fixed
-- Bug fix 1
-- Bug fix 2
-
-### Removed
-- Deprecated feature 1
-```
-
-## Security
-
-### Reporting Security Issues
-
-- Do not create public issues
-- Email security contact
-- Provide detailed description
-- Wait for confirmation before disclosure
-
-### Security Guidelines
-
-- Validate all inputs
-- Use secure communication
-- Follow aerospace standards
-- Regular security audits
+---
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the MIT License.
-
-## Questions?
-
-- Open an issue for questions
-- Join discussions in issues
-- Contact maintainers directly
+By contributing, you agree that your contributions will be licensed under the
+MIT License (see [`LICENSE`](LICENSE)). The project owner retains the right to
+relicense the codebase as a whole for the commercial `arkChip-mAgent`
+product line; your contributions remain under MIT for the open-source
+distribution.

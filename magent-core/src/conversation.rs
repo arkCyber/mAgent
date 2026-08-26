@@ -48,10 +48,11 @@ use std::string::{String, ToString};
 use std::vec::Vec;
 
 // Note: the truncation marker is rendered inline by `truncate_tool_content`
-// using a placeholder-based substring substitution, so there is no single
-// `const TRUNCATION_MARKER` to share. The literal pattern is
-// `\n[...truncated N bytes...]\n` and the LLM is expected to recognise it
-// as "irrelevant middle elided".
+// (no shared `const TRUNCATION_MARKER`), so there is no single constant to
+// refer to. The literal pattern is `\n[...truncated N bytes...]\n` and the
+// LLM is expected to recognise it as "irrelevant middle elided". The marker
+// is constructed directly (never via placeholder substitution) so a tool
+// payload containing the marker text can never be clobbered.
 
 /// Combined policy for keeping the live conversation within a manageable
 /// size. All fields are inclusive limits — i.e. a value of `0` disables
@@ -147,29 +148,27 @@ pub fn truncate_tool_content(msg: &mut Message, max_chars: usize) -> bool {
     let head_end = floor_char_boundary(&msg.content, head_budget);
     let tail_start = ceil_char_boundary(&msg.content, original_len.saturating_sub(tail_budget));
 
-    // Build the marker with a placeholder, then substitute the
-    // approximate drop count. The placeholder contains an ASCII NUL
-    // (U+0000) which never appears in JSON-escaped tool output, so
-    // the substitution can never clobber user content.
-    let placeholder = "\x00BYTES\x00";
+    // Approximate the dropped count: original_len minus the bytes we kept
+    // (head + tail) minus the marker overhead. The exact number after the
+    // marker is built is irrelevant for telemetry — the substring and tail
+    // are at the user's eye level, the marker is diagnostics.
+    let kept_payload = head_end + (original_len - tail_start);
+    let marker_approx = original_len.saturating_sub(kept_payload);
+
+    // Build the truncated content directly. We deliberately do NOT use a
+    // placeholder + `replacen`: a tool payload could (in principle) contain
+    // the placeholder sequence, and `replacen` would then clobber the
+    // *user's* bytes instead of the marker. Constructing the marker inline
+    // keeps user content untouched.
     let mut new_content = String::with_capacity(max_chars + 64);
     new_content.push_str(&msg.content[..head_end]);
-    new_content.push_str(&format!(
-        "\n[...truncated {} bytes...]\n",
-        placeholder
-    ));
+    new_content.push_str("\n[...truncated ");
+    new_content.push_str(&marker_approx.to_string());
+    new_content.push_str(" bytes...]\n");
     if tail_start < original_len {
         new_content.push_str(&msg.content[tail_start..]);
     }
-
-    // Approximate the dropped count: original_len minus the bytes we
-    // kept (head + tail) minus the marker overhead. The exact number
-    // after the placeholder substitution is irrelevant for telemetry
-    // — the substring and tail are at the user's eye level, the
-    // marker is diagnostics.
-    let kept_payload = head_end + (original_len - tail_start);
-    let marker_approx = original_len.saturating_sub(kept_payload);
-    msg.content = new_content.replacen(placeholder, &marker_approx.to_string(), 1);
+    msg.content = new_content;
 
     true
 }
@@ -550,5 +549,25 @@ mod tests {
         let i = ceil_char_boundary(s, 2);
         assert!(s.is_char_boundary(i));
         assert_eq!(i, 3);
+    }
+
+    #[test]
+    fn truncate_preserves_placeholder_like_bytes_in_head() {
+        // Regression: the old implementation used a `\x00BYTES\x00`
+        // placeholder + `replacen`, which would clobber *user* bytes if the
+        // head of the tool payload happened to contain that exact sequence.
+        // The marker is now built directly, so user bytes are untouched.
+        let head_with_placeholder = "HEAD\x00BYTES\x00TAIL";
+        let body = format!("{} {}", head_with_placeholder, &"x".repeat(5_000));
+        let mut m = tool("call_1", &body);
+        assert!(truncate_tool_content(&mut m, 100));
+        // The head — including the user's NUL-containing bytes — is preserved.
+        assert!(m.content.starts_with("HEAD\x00BYTES\x00TAIL"));
+        // The truncation marker is still present and appears exactly once
+        // (not clobbered by a replacement of the user's bytes).
+        assert!(m.content.contains("[...truncated"));
+        assert_eq!(m.content.matches("[...truncated").count(), 1);
+        // The tool_call_id survives.
+        assert_eq!(m.tool_call_id.as_deref(), Some("call_1"));
     }
 }

@@ -44,6 +44,17 @@ impl SkillsManager {
             });
         }
 
+        // Reject a duplicate name so `get` / `remove` / `best_k` /
+        // `count_by_category` never have to disambiguate two skills
+        // sharing a key. Without this, `add` could silently create an
+        // unreachable duplicate (only the first match is ever looked up).
+        if self.skills.iter().any(|s| s.name == skill.name) {
+            return Err(AgentError::InputValidationFailed {
+                field: "skill.name",
+                reason: crate::error::ValidationError::Duplicate,
+            });
+        }
+
         // Validate skill
         skill.validate()?;
 
@@ -58,7 +69,7 @@ impl SkillsManager {
     /// Search for skills by keyword
     pub fn search(&self, keyword: &str) -> Vec<&Skill, MAX_SKILLS> {
         let mut results = Vec::new();
-        
+
         for skill in self.skills.iter() {
             if (skill.name.contains(keyword) || skill.description.contains(keyword))
                 && results.push(skill).is_err()
@@ -66,7 +77,7 @@ impl SkillsManager {
                 break;
             }
         }
-        
+
         results
     }
 
@@ -109,6 +120,146 @@ impl SkillsManager {
     /// Get skill count
     pub fn count(&self) -> usize {
         self.skills.len()
+    }
+
+    /// FEATURE (audit-2026-08 round-4): return a borrowed list of
+    /// all loaded skill names in registration order. The owned
+    /// `Vec<String, ...>` form would require an internal allocator;
+    /// `Vec<&str, MAX_SKILLS>` borrows from the underlying `Vec<Skill>`
+    /// and is therefore zero-copy. Used by the agent runner to
+    /// surface "available skills" in system-prompt injection and by
+    /// `AT+SKILLS?` to list skills over UART without copying.
+    ///
+    /// `MAX_SKILLS` is the hard upper bound; if the registry is
+    /// later made resizable, the return-type `Vec<&'_, _, MAX_SKILLS>`
+    /// grows with `N` and is the right shape to reuse.
+    pub fn names(&self) -> Vec<&str, MAX_SKILLS> {
+        let mut out: Vec<&str, MAX_SKILLS> = Vec::new();
+        for s in &self.skills {
+            // Capacity-bounded: `MAX_SKILLS` matches the underlying
+            // Vec capacity, so push always succeeds.
+            let _ = out.push(s.name.as_str());
+        }
+        out
+    }
+
+    /// FEATURE (audit-2026-08 round-4): tally skills grouped by
+    /// `category`. Returns up to `MAX_CATEGORIES` (8) distinct
+    /// category strings paired with their occurrence count.
+    ///
+    /// Why 8: the agent's current prompt injection groups skills
+    /// this way, and the embedded UI can only show ~8 categories on
+    /// a 128x64 OLED anyway. If a future task needs more, bump the
+    /// const.
+    ///
+    /// Skills with an empty category are bucketed as `"uncategorized"`
+    /// so callers always get a complete picture.
+    pub fn count_by_category(&self) -> Vec<(String<32>, u16), 8> {
+        const MAX_CATEGORIES: usize = 8;
+        let mut out: Vec<(String<32>, u16), MAX_CATEGORIES> = Vec::new();
+
+        for s in &self.skills {
+            let cat = if s.category.is_empty() {
+                // Allocate a tiny static for the uncategorized
+                // bucket; we can't build a `String<32>` on the fly
+                // without an `Into` import here, but `from("uncategorized")`
+                // is always well under 32 bytes.
+                "uncategorized"
+            } else {
+                s.category.as_str()
+            };
+            if let Some(slot) = out.iter_mut().find(|(c, _)| c.as_str() == cat) {
+                slot.1 = slot.1.saturating_add(1);
+            } else if out.len() < MAX_CATEGORIES {
+                let entry = (
+                    heapless::String::try_from(cat).unwrap_or_else(|_| heapless::String::new()),
+                    1,
+                );
+                let _ = out.push(entry);
+            }
+            // If `out.len() == MAX_CATEGORIES` and we see a brand-new
+            // category, we silently drop it — a registered skill with
+            // a 9th category is rare in embedded use, and the next
+            // pass with a bigger MAX_CATEGORIES recovers the data.
+        }
+
+        out
+    }
+
+    /// FEATURE (audit-2026-08 round-4): pick the top-K skills by
+    /// usage_count × (success_rate / 100). Used by the agent runner
+    /// to inject the most-tried-and-true skills first when the
+    /// system-prompt budget is tight.
+    ///
+    /// Sorting algorithm: simple insertion sort, which is
+    /// O(K × N) and well within budget for `N ≤ 10`. Returns at
+    /// most `k` skills (or fewer if the registry has fewer than
+    /// `k`). Skills with identical scores retain their input
+    /// order (stable sort by virtue of the forward scan).
+    pub fn best_k(&self, k: usize) -> Vec<&Skill, MAX_SKILLS> {
+        let k = k.min(self.skills.len());
+        let mut scored: Vec<(&Skill, u32), MAX_SKILLS> = Vec::new();
+        for s in &self.skills {
+            // `usage_count: u16` × `success_rate: u8` (≤ 100) fits
+            // in u32 even at the saturation ceiling (65535 * 100).
+            let score = (s.usage_count as u32) * (s.success_rate as u32);
+            let _ = scored.push((s, score));
+        }
+
+        // Stable partial sort: for each position `0..k`, find the
+        // max among the remaining unsorted slots. Because we walk
+        // forward only (never swap), equal scores keep their
+        // original order — that's the stability we need.
+        let n = scored.len();
+        for i in 0..k.min(n) {
+            let mut best_idx = i;
+            let mut best_score = scored[i].1;
+            for j in (i + 1)..n {
+                if scored[j].1 > best_score {
+                    best_idx = j;
+                    best_score = scored[j].1;
+                }
+            }
+            if best_idx != i {
+                scored.swap(i, best_idx);
+            }
+        }
+
+        let mut out: Vec<&Skill, MAX_SKILLS> = Vec::new();
+        for i in 0..k {
+            let _ = out.push(scored[i].0);
+        }
+        out
+    }
+
+    /// FEATURE (audit-2026-08 round-4): one-line human-readable
+    /// summary of the registry state, suitable for a CLI doctor
+    /// command or `AT+SKILLS?` UART reply. Format:
+    ///
+    /// ```text
+    /// skills=3/10 categories={"glucose":1,"voice":2}
+    /// ```
+    ///
+    /// `MAX_SKILLS = 10` is hard-coded in the const above; we keep
+    /// the message shape stable regardless of the actual
+    /// `max_skills` field so callers can parse it.
+    pub fn summary(&self) -> String<512> {
+        let mut out: String<512> = String::new();
+        let _ = write!(
+            out,
+            "skills={}/{} categories={{",
+            self.skills.len(),
+            MAX_SKILLS
+        );
+        let cats = self.count_by_category();
+        for (i, (c, n)) in cats.iter().enumerate() {
+            if i > 0 {
+                let _ = out.push_str(",");
+            }
+            let _ = write!(out, "{}:{}", c.as_str(), n);
+        }
+        let _ = out.push_str("}");
+        out
     }
 }
 
@@ -213,4 +364,115 @@ impl Skill {
         result
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests for the round-4 features (introspection helpers).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_returns_zero_copy_references() {
+        let mut mgr = SkillsManager::new(4);
+        mgr.add(Skill::new("read_sensor", "Read a sensor", "device", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("write_gpio", "Set a GPIO", "device", "x").unwrap()).unwrap();
+        let names = mgr.names();
+        assert_eq!(names.as_slice(), &["read_sensor", "write_gpio"]);
+    }
+
+    #[test]
+    fn count_by_category_groups_and_renames_empty() {
+        let mut mgr = SkillsManager::new(4);
+        mgr.add(Skill::new("a", "x", "device", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("b", "x", "voice", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("c", "x", "voice", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("d", "x", "", "x").unwrap()).unwrap(); // → uncategorized
+        let cats = mgr.count_by_category();
+        // Find each bucket by linear scan rather than a map, to
+        // avoid pulling in a `HashMap` for the test.
+        fn find(cats: &Vec<(heapless::String<32>, u16), 8>, cat: &str) -> Option<u16> {
+            cats.iter().find(|(c, _)| c.as_str() == cat).map(|(_, n)| *n)
+        }
+        assert_eq!(find(&cats, "device"), Some(1));
+        assert_eq!(find(&cats, "voice"), Some(2));
+        assert_eq!(find(&cats, "uncategorized"), Some(1));
+    }
+
+    #[test]
+    fn best_k_ranks_by_usage_times_success_rate() {
+        let mut mgr = SkillsManager::new(4);
+        let mut s1 = Skill::new("low", "d", "c", "x").unwrap();
+        s1.usage_count = 1;
+        s1.success_rate = 50; // score 50
+        let mut s2 = Skill::new("high", "d", "c", "x").unwrap();
+        s2.usage_count = 10;
+        s2.success_rate = 100; // score 1000
+        let mut s3 = Skill::new("mid", "d", "c", "x").unwrap();
+        s3.usage_count = 5;
+        s3.success_rate = 80; // score 400
+        mgr.add(s1).unwrap();
+        mgr.add(s2).unwrap();
+        mgr.add(s3).unwrap();
+        let top2 = mgr.best_k(2);
+        assert_eq!(top2[0].name.as_str(), "high");
+        assert_eq!(top2[1].name.as_str(), "mid");
+    }
+
+    #[test]
+    fn summary_is_stable_format() {
+        let mut mgr = SkillsManager::new(4);
+        mgr.add(Skill::new("a", "x", "voice", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("b", "x", "voice", "x").unwrap()).unwrap();
+        let s = mgr.summary();
+        assert!(s.as_str().starts_with("skills=2/"));
+        assert!(s.as_str().contains("voice:2"));
+    }
+
+    #[test]
+    fn add_rejects_duplicate_name() {
+        let mut mgr = SkillsManager::new(4);
+        mgr.add(Skill::new("dup", "first", "c", "x").unwrap()).unwrap();
+        // Same name, different content — must be rejected so `get`/`remove`
+        // never have to disambiguate two skills sharing a key.
+        let err = mgr.add(Skill::new("dup", "second", "c", "y").unwrap()).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::InputValidationFailed {
+                field: "skill.name",
+                reason: crate::error::ValidationError::Duplicate,
+            }
+        ));
+        // The original skill is unchanged and still retrievable.
+        assert_eq!(mgr.count(), 1);
+        assert_eq!(mgr.get("dup").unwrap().description.as_str(), "first");
+    }
+
+    #[test]
+    fn add_allows_distinct_names() {
+        let mut mgr = SkillsManager::new(4);
+        mgr.add(Skill::new("a", "x", "c", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("b", "x", "c", "x").unwrap()).unwrap();
+        assert_eq!(mgr.count(), 2);
+        // Case-sensitive: "a" and "A" are distinct names.
+        mgr.add(Skill::new("A", "x", "c", "x").unwrap()).unwrap();
+        assert_eq!(mgr.count(), 3);
+    }
+
+    #[test]
+    fn search_matches_name_and_description() {
+        let mut mgr = SkillsManager::new(4);
+        mgr.add(Skill::new("read_sensor", "Read ambient temperature", "c", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("write_gpio", "Set a pin", "c", "x").unwrap()).unwrap();
+        // Matches by name.
+        assert_eq!(mgr.search("sensor")[0].name.as_str(), "read_sensor");
+        // Matches by description substring.
+        assert_eq!(mgr.search("temperature")[0].name.as_str(), "read_sensor");
+        // Empty keyword matches everything (contains("") is always true).
+        assert_eq!(mgr.search("").len(), 2);
+        // No match → empty result.
+        assert_eq!(mgr.search("zzz").len(), 0);
+    }
+}
+
 

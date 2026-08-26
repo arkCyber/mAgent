@@ -143,10 +143,13 @@ version = "1.7"
 default-features = false
 package = "rustls-pki-types"
 
+[dependencies.ring]
+version = "0.17"
+optional = true
+default-features = false
+
 [dependencies.untrusted]
 version = "0.9"
-
-# PATCHED (MicroAgent): Removed optional ring dependency - use aws-lc-rs only
 
 [dev-dependencies.base64]
 version = "0.22"
@@ -174,15 +177,15 @@ version = "1.0"
 
 [features]
 alloc = [
-    "aws-lc-rs?/alloc",
+    "ring?/alloc",
     "pki-types/alloc",
 ]
 aws_lc_rs = ["dep:aws-lc-rs"]
-# PATCHED (MicroAgent): Removed ring feature - use aws_lc_rs only
 default = [
     "std",
     "aws_lc_rs",
 ]
+ring = ["dep:ring"]
 std = [
     "alloc",
     "pki-types/std",

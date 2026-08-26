@@ -544,8 +544,50 @@ pub fn save(record: ConfigRecord) -> Result<PathBuf, ConfigError> {
         path: path.clone(),
         source,
     })?;
-    fs::write(&path, json)?;
+    // Write with owner-only permissions so the config (which can carry
+    // credential-related settings) isn't world-readable.
+    write_config_file(&path, &json)?;
     Ok(path)
+}
+
+/// Write the config file with owner-only permissions (0600 on Unix).
+///
+/// The config can carry provider endpoints and credential-related settings,
+/// so it must not be left world-readable (the default `fs::write` mode of
+/// 0644 would expose it to any other local user). On non-Unix platforms we
+/// fall back to `fs::write` (there is no POSIX mode bit to set).
+fn write_config_file(path: &Path, contents: &str) -> Result<(), ConfigError> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|source| ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        f.write_all(contents.as_bytes()).map_err(|source| ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        f.flush().map_err(|source| ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, contents).map_err(|source| ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
 }
 
 /// Delete the config file. Returns `Ok(true)` if a file was removed,
@@ -2265,6 +2307,26 @@ mod tests {
             "{:?}",
             issues
         );
+    }
+
+    #[test]
+    fn save_writes_owner_only_permissions_on_unix() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempConfig::new("perm");
+        let r = ConfigRecord::with_defaults();
+        let path = save(r).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "config file must be owner-only (0600), got {:#o}",
+                mode & 0o777
+            );
+        }
+        let _ = tmp;
     }
 
     #[test]

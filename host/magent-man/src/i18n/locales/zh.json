@@ -1,0 +1,330 @@
+{
+  "app": {
+    "title": "mAgent-Man",
+    "subtitle": "设备管理器"
+  },
+  "nav": {
+    "config": "配置",
+    "status": "状态",
+    "chat": "对话",
+    "channels": "渠道",
+    "advanced": "高级",
+    "menu": "菜单",
+    "collapse": "收起侧边栏"
+  },
+  "status": {
+    "connected": "已连接到 {name}",
+    "connecting": "连接中...",
+    "disconnected": "未连接",
+    "error": "连接错误",
+    "disconnect": "断开连接"
+  },
+  "usb": {
+    "scanning": "USB 扫描中…",
+    "connecting": "USB 连接中…",
+    "connected": "USB: {path}",
+    "noDevice": "无 USB 设备",
+    "failed": "USB 不可用",
+    "autoConnected": "已自动连接 USB: {path}",
+    "start": "开始",
+    "retry": "重试",
+    "continue": "继续",
+    "scanAgain": "重新扫描",
+    "dialogScanning": "正在扫描 USB 端口…",
+    "dialogScanningHint": "正在查找 C61 串口桥接器…",
+    "dialogConnecting": "正在连接…",
+    "dialogConnectingHint": "正在打开 {path}",
+    "dialogConnected": "连接成功",
+    "dialogConnectedHint": "已连接到 {path}，现在可以开始对话。",
+    "dialogFailed": "连接失败",
+    "dialogNoDevice": "未找到 USB 设备",
+    "dialogNoDeviceHint": "请插入设备后重试。"
+  },
+  "devices": {
+    "title": "蓝牙设备",
+    "scan": "扫描",
+    "scanning": "扫描中...",
+    "noDevices": "未找到设备",
+    "searchHint": "点击扫描以搜索蓝牙设备",
+    "unknownDevice": "未知设备"
+  },
+  "config": {
+    "title": "配置",
+    "reload": "刷新",
+    "notConnected": "未连接",
+    "notConnectedHint": "连接设备后进行配置",
+    "currentConfig": "当前:",
+    "wifi": {
+      "title": "WiFi 设置",
+      "ssid": "网络名称 (SSID)",
+      "ssidPlaceholder": "输入 WiFi 网络名称",
+      "password": "密码",
+      "passwordPlaceholder": "输入 WiFi 密码",
+      "save": "保存 WiFi",
+      "saving": "保存中...",
+      "saved": "已保存!",
+      "ssidRequired": "请输入 SSID"
+    },
+    "llm": {
+      "title": "LLM 设置",
+      "model": "模型",
+      "modelPlaceholder": "例如: deepseek-chat",
+      "modelHint": "输入 LLM 模型标识符",
+      "apiKey": "API 密钥",
+      "apiKeyPlaceholder": "输入 API 密钥",
+      "apiKeyHint": "您的 API 密钥将安全存储",
+      "save": "保存 LLM",
+      "saving": "保存中...",
+      "saved": "已保存!",
+      "modelRequired": "请输入模型名称",
+      "apiKeyRequired": "请输入 API 密钥"
+    },
+    "hostname": {
+      "title": "主机名",
+      "label": "设备主机名",
+      "placeholder": "例如: mAgent-001",
+      "hint": "设备在网络上的唯一标识符",
+      "save": "保存主机名",
+      "saving": "保存中...",
+      "saved": "已保存!",
+      "required": "请输入主机名"
+    },
+    "saved": "配置已保存",
+    "saveFailed": "配置保存失败"
+  },
+  "monitor": {
+    "title": "系统状态",
+    "refresh": "刷新",
+    "lastUpdate": "更新于 {time}",
+    "notConnected": "未连接",
+    "notConnectedHint": "连接设备后查看状态",
+    "device": {
+      "title": "设备信息",
+      "version": "版本",
+      "chip": "芯片",
+      "uptime": "运行时间",
+      "memory": "内存",
+      "heapUsage": "堆内存使用",
+      "free": "可用"
+    },
+    "wifi": {
+      "title": "WiFi 状态",
+      "network": "网络",
+      "ipAddress": "IP 地址",
+      "signal": "信号强度",
+      "notConnected": "未连接",
+      "state": {
+        "idle": "空闲",
+        "connecting": "连接中",
+        "associated": "已关联",
+        "disconnected": "已断开",
+        "connected": "已连接"
+      }
+    },
+    "actions": {
+      "refresh": "刷新",
+      "logs": "日志",
+      "diagnostics": "诊断"
+    },
+    "reboot": {
+      "button": "重启设备",
+      "confirm": "确定要重启设备吗？",
+      "success": "重启命令已发送"
+    },
+    "logs": {
+      "title": "设备日志"
+    },
+    "diagnostics": {
+      "title": "诊断报告"
+    }
+  },
+  "common": {
+    "close": "关闭"
+  },
+  "quit": {
+    "title": "退出 mAgent-Man？",
+    "message": "正在进行的操作将丢失。确定要退出吗？",
+    "confirm": "退出",
+    "cancel": "取消"
+  },
+  "wifiScan": {
+    "title": "WiFi 扫描器",
+    "scan": "扫描网络",
+    "scanning": "扫描中...",
+    "notConnected": "请先连接设备",
+    "hint": "点击扫描以搜索附近的 WiFi 网络",
+    "found": "找到 {count} 个网络",
+    "started": "扫描已开始，结果将显示在设备上。",
+    "selected": "已选择网络 {ssid}，请在配置页设置密码并保存。",
+    "failed": "网络扫描失败",
+    "error": "扫描网络失败",
+    "hidden": "隐藏网络",
+    "excellent": "极好",
+    "good": "良好",
+    "fair": "一般",
+    "weak": "较弱",
+    "connect": "连接"
+  },
+  "safeMode": {
+    "title": "安全模式",
+    "label": "安全模式",
+    "description": "启用安全模式以进行故障排除",
+    "toggle": "切换安全模式",
+    "notConnected": "请先连接设备",
+    "enabled": "安全模式已启用",
+    "disabled": "安全模式已禁用",
+    "activeWarning": "安全模式已启用，部分功能可能受限。",
+    "error": "切换安全模式失败"
+  },
+  "identity": {
+    "title": "身份标识",
+    "publicKey": "公钥",
+    "address": "地址",
+    "chainId": "链 ID",
+    "rotatedAt": "上次轮换",
+    "rotate": "轮换身份",
+    "rotateHint": "生成新的身份密钥对",
+    "rotating": "轮换中...",
+    "notConnected": "请先连接设备",
+    "loadError": "加载身份失败",
+    "rotateError": "轮换身份失败",
+    "rotated": "身份轮换成功",
+    "notFound": "未找到身份",
+    "retry": "重试",
+    "copied": "已复制到剪贴板",
+    "copy": "复制",
+    "never": "从未"
+  },
+  "configImport": {
+    "title": "导入/导出",
+    "export": "导出配置",
+    "exportDesc": "将设备配置下载为 JSON",
+    "import": "导入配置",
+    "importDesc": "从 JSON 文件加载配置",
+    "preview": "显示预览",
+    "success": "操作完成",
+    "error": "操作失败",
+    "exportSuccess": "配置导出成功",
+    "exportFailed": "配置导出失败",
+    "importSuccess": "配置导入成功",
+    "importFailed": "配置导入失败",
+    "notConnected": "请先连接设备"
+  },
+  "toast": {
+    "scanComplete": "扫描完成",
+    "connectionLost": "连接丢失",
+    "connectionRestored": "连接已恢复",
+    "reconnecting": "正在重连..."
+  },
+  "errors": {
+    "scanFailed": "扫描失败",
+    "connectionFailed": "连接失败",
+    "bluetoothOff": "蓝牙已关闭",
+    "deviceNotFound": "设备未找到",
+    "networkScanFailed": "网络扫描失败",
+    "saveFailed": "保存失败",
+    "loadFailed": "加载失败"
+  },
+  "webhook": {
+    "title": "Webhook 设置",
+    "url": "Webhook URL",
+    "urlPlaceholder": "https://example.com/webhook",
+    "secret": "密钥",
+    "secretPlaceholder": "Webhook 密钥",
+    "events": "事件",
+    "save": "保存 Webhook",
+    "test": "测试",
+    "testing": "测试中...",
+    "testSuccess": "Webhook 测试成功",
+    "testFailed": "Webhook 测试失败"
+  },
+  "mqtt": {
+    "title": "MQTT 设置",
+    "broker": "Broker URL",
+    "brokerPlaceholder": "mqtt://broker.example.com:1883",
+    "username": "用户名",
+    "password": "密码",
+    "topic": "主题",
+    "topicPlaceholder": "devices/+/events",
+    "save": "保存 MQTT",
+    "test": "测试连接",
+    "connected": "已连接",
+    "disconnected": "未连接"
+  },
+  "footer": {
+    "devicesFound": "个设备",
+    "lastScan": "上次扫描",
+    "neverScanned": "从未扫描",
+    "ago": "前",
+    "connected": "已连接"
+  },
+  "settings": {
+    "theme": "主题",
+    "lightMode": "浅色",
+    "darkMode": "深色",
+    "warmMode": "暖色",
+    "coffeeMode": "咖啡",
+    "language": "语言"
+  },
+  "chat": {
+    "title": "与智能体对话",
+    "notConnected": "未连接",
+    "notConnectedHint": "连接设备后与智能体对话",
+    "welcome": "你好！我是 mAgent 智能助手。连接设备后即可开始对话！",
+    "placeholder": "输入消息...",
+    "hint": "按 Enter 发送，Shift+Enter 换行",
+    "you": "你",
+    "agent": "智能体",
+    "system": "系统",
+    "clear": "清空对话",
+    "responseReceived": "已收到响应",
+    "error": "发送消息失败",
+    "sending": "发送中...",
+    "connectedTo": "已连接 ·",
+    "device": "设备",
+    "demoMode": "演示模式 · 未连接设备"
+  },
+  "channels": {
+    "title": "通信渠道",
+    "notConnected": "未连接",
+    "notConnectedHint": "连接设备后查看渠道",
+    "activeChannels": "活跃",
+    "totalMessages": "消息",
+    "totalChannels": "渠道",
+    "messages": "条",
+    "lastActivity": "最近活动",
+    "never": "从未",
+    "ago": "前",
+    "type": "类型",
+    "description": "描述",
+    "close": "关闭",
+    "status": {
+      "active": "活跃",
+      "inactive": "未激活",
+      "error": "错误"
+    },
+    "filter": {
+      "all": "全部",
+      "active": "活跃",
+      "inactive": "未激活"
+    },
+    "local": {
+      "description": "本地 BLE 连接到设备"
+    },
+    "uart": {
+      "description": "UART 串口通信"
+    },
+    "manual": {
+      "description": "按钮或 CLI 手动输入"
+    },
+    "mqtt": {
+      "description": "MQTT broker 远程通信"
+    },
+    "webhook": {
+      "description": "HTTP webhook 集成"
+    },
+    "web3": {
+      "description": "区块链/Web3 通信"
+    }
+  }
+}

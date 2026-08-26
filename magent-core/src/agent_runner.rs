@@ -329,7 +329,9 @@ impl SharedTraceSink {
     /// trace/logging path. The guarded data is still valid — only the poison
     /// flag is set — so recover the guard and keep going.
     fn lock_sinks(&self) -> std::sync::MutexGuard<'_, Vec<BoxedTraceSink>> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        // HARDENING (clippy/redundant_closure_for_method_calls):
+        // `PoisonError::into_inner` is available directly on the error.
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Append `sink` to the list. Subsequent events are delivered

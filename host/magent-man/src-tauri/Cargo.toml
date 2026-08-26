@@ -1,0 +1,39 @@
+[package]
+name = "magent-man"
+version = "0.2.0"
+edition = "2021"
+description = "mAgent Device Manager - BLE Configuration Tool"
+authors = ["MicroAgent Team"]
+license = "MIT"
+
+[lib]
+name = "magent_man"
+path = "src/lib.rs"
+
+[[bin]]
+name = "magent-man"
+path = "src/main.rs"
+
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+chrono = "0.4"
+# USB-serial transport for talking to the C61 over its UART0 console port
+# (used instead of BLE, see src/usb.rs).
+serialport = "4"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

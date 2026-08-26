@@ -242,6 +242,15 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["st
 argon2 = { version = "0.5", default-features = false, features = ["std", "password-hash", "alloc"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
+# ---------------------------------------------------------------------------
+# Digital Wallet (BIP-39, BIP-32, BIP-44)
+# ---------------------------------------------------------------------------
+# Pure-Rust BIP-39 implementation with no_std support.
+# - bip39core: core wordlist + entropy conversion
+# - hmac and sha2: already in workspace, reused here
+# Note: For embedded targets, we use a minimal subset of bip39 functionality
+# to minimize code size. Full wordlist (2048 words) is embedded as static data.
+
 # Build
 [profile.dev]
 opt-level = "s"
@@ -307,6 +316,12 @@ esp-idf-sys = { path = ".cargo-patches/esp-idf-sys-0.37.2" }
 # PATCHED (MicroAgent): Use aws_lc_rs instead of ring for RISC-V support.
 # Ring doesn't support 32-bit RISC-V architecture (needed for ESP32-C6/C61).
 # Note: Patching multiple 0.23.x versions since different deps need different versions.
+# The 0.23.39 patch is intentionally NOT applied because the vendored copy
+# has stale `webpki` type references that no longer match the patched
+# `rustls-webpki` 0.102.8 it pins. Falling back to the upstream 0.23.39
+# from crates.io fixes the host-side compile (only reqwest 0.12.28 pulls
+# 0.23.39, and upstream 0.23.39 + rustls-webpki 0.102.8 are compatible).
+# PATCH fix is tracked separately under PATCH-RUSTLS-039.
 rustls = { path = ".cargo-patches/rustls-0.23.43" }
 rustls_0_23_42 = { path = ".cargo-patches/rustls-0.23.42", package = "rustls" }
 rustls_0_23_41 = { path = ".cargo-patches/rustls-0.23.41", package = "rustls" }

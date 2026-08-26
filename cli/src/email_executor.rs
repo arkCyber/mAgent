@@ -355,6 +355,13 @@ mod tests {
         {
             let with_email = CompositeExecutor::new(Some("true"));
             let s = format!("{:?}", with_email);
+            // When the `web3` feature is also enabled, `new(Some(_))`
+            // auto-wires a blockchain backend and returns the `Full`
+            // variant; otherwise it returns `WithEmailTools`. Assert on
+            // whichever variant the active feature set actually produces.
+            #[cfg(feature = "web3")]
+            assert!(s.contains("Full"), "got: {s}");
+            #[cfg(not(feature = "web3"))]
             assert!(s.contains("WithEmailTools"), "got: {s}");
         }
     }

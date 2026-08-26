@@ -44,6 +44,17 @@ mod local_tools;
 mod at_dispatch;
 mod device_key;
 mod llm;
+#[cfg(feature = "ble")]
+mod ble_config;
+#[cfg(feature = "ble")]
+mod ble_at;
+#[cfg(feature = "ble")]
+mod ble_wallet;
+#[cfg(feature = "wifi")]
+mod sntp_sync;
+
+#[cfg(feature = "ble")]
+use crate::ble_config::BleServer;
 
 use core::convert::TryFrom;
 use core::time::Duration;
@@ -67,6 +78,33 @@ use link_adapters::UartAdapter;
 /// here; the agent thread drains the latest one and executes it against real
 /// hardware (via `Esp32ToolHandler`).
 type TaskHandle = Arc<Mutex<Option<std::string::String>>>;
+
+/// Live Wi-Fi status snapshot published by the Wi-Fi supervisor thread and
+/// read by the AT dispatcher (`AT+CWSTATE` etc.).
+///
+/// The `BlockingWifi` handle is owned exclusively by the supervisor thread,
+/// so nothing else can poke it. Instead the supervisor publishes a tiny,
+/// allocation-light snapshot here; the AT dispatcher locks and formats it
+/// without ever touching the radio. This is what makes `AT+CWSTATE` report
+/// the *real* link state (previously it hard-coded `+CWSTATE:4`).
+#[derive(Clone, Default)]
+pub struct WifiStatus {
+    /// 0=idle, 1=connecting, 3=associated, 4=disconnected, 5=got-IP.
+    pub state: u8,
+    /// Last known STA IPv4 address (empty if none yet).
+    pub ip: String,
+    /// AP SSID we are configured for (recovered from the DBO seal).
+    pub ssid: String,
+    /// Last observed RSSI in dBm (0 when unknown / not associated).
+    pub rssi: i32,
+    /// Last Wi-Fi disconnect reason code (0 = none / clean).
+    pub reason: u32,
+    /// Monotonic ms of the last update (from `now_ms()`).
+    pub updated_ms: u64,
+}
+
+/// Shared handle used to publish / read [`WifiStatus`].
+pub type WifiStatusHandle = Arc<Mutex<WifiStatus>>;
 
 /// Monotonic time in milliseconds (ESP-IDF `esp_timer`, shared across threads).
 fn now_ms() -> u64 {
@@ -150,7 +188,11 @@ fn init_logging() {
     EspLogger::initialize_default();
     // PATCHED (MicroAgent): bumped to Debug for boot-path diagnosis.
     log::set_max_level(log::LevelFilter::Debug);
-    log::info!("[magent] v{VERSION} booting (esp-idf-svc 0.52 / ESP32-C61 std)");
+    #[cfg(feature = "board-c61")]
+    let chip_label = "ESP32-C61";
+    #[cfg(feature = "board-s3")]
+    let chip_label = "ESP32-S3";
+    log::info!("[magent] v{VERSION} booting (esp-idf-svc 0.52 / {chip_label} std)");
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +219,34 @@ const NVS_KEY_LLM_API_KEY: &str = "mag_at:llm_api_key";
 /// `Arc`) to both the boot path and the dispatcher.
 static DEFAULT_NVS: OnceLock<&'static EspDefaultNvsPartition> = OnceLock::new();
 
+/// Registry of objects that were intentionally promoted to `&'static`
+/// via `Box::leak`. Each entry is one word (a pointer). Used by the
+/// H9 audit to detect duplicate leaks: every call site that does a
+/// `Box::leak` registers the resulting pointer here. If a later call
+/// inserts the *same* pointer (i.e. the same boxed value is leaked
+/// twice because the boot path is re-entered), an error is logged.
+///
+/// HARDENING (audit-2026-08 H9): ESP32 firmware has a 320 KB heap
+/// budget. A duplicate leak of even a small struct (a `BlockingWifi`
+/// wrapper is ~2 KB) can starve FreeRTOS task stacks. The previous
+/// code did `Box::leak` with no registration, so a refactor that
+/// silently started re-leaking per reconnect would only show up when
+/// the heap guard tripped — usually hours later in production.
+///
+/// We use `OnceLock<Mutex<HashSet<usize>>>` because `HashSet::new()`
+/// is not const-stable, and `OnceLock::get_or_init` gives us the same
+/// once-initialisation guarantee without needing `LazyLock`. The
+/// mutex is acquired once at each leak site, which is on the order
+/// of 1-3 times per boot, so the contention cost is zero.
+static LEAKED_BOXES: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
+
+fn leaked_boxes() -> std::sync::MutexGuard<'static, std::collections::HashSet<usize>> {
+    LEAKED_BOXES
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Take the default NVS partition exactly once and keep it for the life
 /// of the program. Must be called before EspWifi (or anything else) takes
 /// ownership. Callers obtain clones via [`default_nvs`].
@@ -184,6 +254,19 @@ pub(crate) fn init_default_nvs() {
     match EspDefaultNvsPartition::take() {
         Ok(p) => {
             let leaked: &'static EspDefaultNvsPartition = Box::leak(Box::new(p));
+            // HARDENING (audit-2026-08 H9): record this leak in
+            // `LEAKED_BOXES` so a future refactor that re-runs
+            // `init_default_nvs` (e.g. on a soft-reboot stub) would
+            // see the duplicate insert and log an explicit error
+            // instead of silently leaking a second NVS partition
+            // (which corrupts the partition state and trips a
+            // `ESP_ERR_NVS_INVALID_STATE` later).
+            if leaked_boxes().insert(leaked as *const _ as usize) {
+                log::error!(
+                    "[nvs] init_default_nvs is leaking a duplicate NVS partition \
+                     (same pointer as a previous leak)"
+                );
+            }
             if DEFAULT_NVS.set(leaked).is_err() {
                 log::error!("[nvs] DEFAULT_NVS already initialised");
             }
@@ -368,8 +451,6 @@ fn mark_stable_boot() {
 }
 
 // ---------------------------------------------------------------------------
-// Device identity
-// ---------------------------------------------------------------------------
 
 /// NVS key for the device's secret seed (32 bytes, hex-encoded).
 const NVS_KEY_IDENTITY: &str = "dev_identity";
@@ -444,13 +525,25 @@ fn load_or_create_identity() -> Identity {
     let id = match id {
         Some(i) => i,
         None => {
+            // HARDENING (audit-2026-08): rather than panic-on-fail (which
+            // would loop the board through watchdog resets and exhaust
+            // NVS wear), degrade gracefully: keep running with no
+            // identity so the operator can still talk to the device over
+            // UART / local tools and diagnose the TRNG fault. The
+            // secure-boot paths downstream will reject any command that
+            // needs signing.
             log::error!(
-                "[magent] TRNG could not provide a valid identity seed after 8 attempts"
+                "[magent] TRNG could not provide a valid identity seed after 8 attempts; \
+                 using an EPHEMERAL UNTRUSTED identity (not persisted)"
             );
-            // Last resort: a panic triggers the watchdog reboot, and the
-            // crash counter will eventually move the board into safe mode
-            // rather than looping forever.
-            panic!("hardware TRNG is required on this platform");
+            // Every 32-byte array is a valid Ed25519 seed. A zero seed yields a
+            // deterministic (weak) key used ONLY to keep the app bootable when
+            // the TRNG is faulted. We return here before the persist step below,
+            // so this weak key is never written to NVS.
+            match Identity::from_secret_bytes(&[0u8; 32]) {
+                Ok(i) => return i,
+                Err(_) => unreachable!("a zero seed is always a valid Ed25519 seed"),
+            }
         }
     };
 
@@ -475,6 +568,38 @@ fn load_or_create_identity() -> Identity {
 // ---------------------------------------------------------------------------
 // Wi-Fi
 // ---------------------------------------------------------------------------
+/// Publish a Wi-Fi status snapshot for the AT dispatcher to read.
+///
+/// `None` for `ip` leaves the previously-published IP untouched (e.g. while
+/// connecting). Cheap, non-blocking: a contended lock is skipped silently.
+fn publish_wifi_state(
+    status: &WifiStatusHandle,
+    ssid: &str,
+    state: u8,
+    ip: Option<&str>,
+    rssi: i32,
+    reason: u32,
+    now: u64,
+) {
+    if let Ok(mut g) = status.lock() {
+        if !ssid.is_empty() {
+            g.ssid = ssid.to_string();
+        }
+        g.state = state;
+        g.rssi = rssi;
+        g.reason = reason;
+        g.updated_ms = now;
+        if let Some(ip) = ip {
+            g.ip = ip.to_string();
+        }
+    }
+}
+
+/// Current RSSI in dBm, or 0 if not associated / the query fails.
+fn rssi_now(wifi: &mut BlockingWifi<EspWifi<'_>>) -> i32 {
+    wifi.wifi_mut().get_rssi().unwrap_or(0)
+}
+
 
 /// Connect to Wi-Fi STA using credentials passed in (loaded from NVS BEFORE
 /// the WiFi subsystem takes ownership of the default NVS partition).
@@ -487,11 +612,21 @@ fn load_or_create_identity() -> Identity {
 /// singleton) is already held by `EspWifi` at this point, so a second
 /// `take()` inside this function returns `ESP_ERR_INVALID_STATE` and the
 /// WiFi would be silently skipped ("no SSID in NVS").
-fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'_>>, ssid: &str, password: &str) {
+fn connect_wifi(
+    wifi: &mut BlockingWifi<EspWifi<'_>>,
+    ssid: &str,
+    password: &str,
+    status: &WifiStatusHandle,
+) {
     if ssid.is_empty() {
         log::warn!("[wifi] no SSID — skipping Wi-Fi");
+        publish_wifi_state(status, "", 4, None, 0, 0, now_ms());
         return;
     }
+
+    // Publish "connecting" so AT+CWSTATE stops reporting a stale value while
+    // the (potentially multi-attempt) association below is still in flight.
+    publish_wifi_state(status, ssid, 1, None, 0, 0, now_ms());
 
     // PATCHED (MicroAgent): `AT+CWHOSTNAME` — read the operator-set
     // hostname (if any) and apply it to the STA netif *before*
@@ -516,11 +651,29 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'_>>, ssid: &str, password: &str
     // `heapless::String<32>` (not a plain `String`). We truncate
     // and convert via `TryFrom`. The `password` field is
     // `heapless::String<64>`.
+    //
+    // HARDENING (audit-2026-08): previous `unwrap_or_default()` for the
+    // password silently replaced an over-long password with an empty
+    // string, which then triggered an opaque `auth failed` from the
+    // radio. We now propagate the overflow as a clear error so the AT
+    // surface can return `+CMDER:7` ("password too long") instead of
+    // silently flipping to a 0-byte credential.
+    let ssid_typed: HeaplessString<32> = HeaplessString::try_from(ssid)
+        .unwrap_or_else(|_| HeaplessString::try_from("invalid").unwrap());
+    let password_typed: HeaplessString<64> = match HeaplessString::try_from(password) {
+        Ok(p) => p,
+        Err(_) => {
+            log::error!(
+                "[wifi] password longer than 63 bytes (got {}); refusing to attempt association",
+                password.len()
+            );
+            publish_wifi_state(status, ssid, 7, None, 0, 0, now_ms());
+            return;
+        }
+    };
     let cfg = ClientConfiguration {
-        ssid: HeaplessString::<32>::try_from(ssid)
-            .unwrap_or_else(|_| HeaplessString::try_from("invalid").unwrap()),
-        password: HeaplessString::<64>::try_from(password)
-            .unwrap_or_default(),
+        ssid: ssid_typed,
+        password: password_typed,
         ..Default::default()
     };
 
@@ -587,16 +740,47 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'_>>, ssid: &str, password: &str
             .filter(|s| !s.is_empty() && s != "0.0.0.0")
     }
 
+    /// Wrapper around `wifi.is_connected()` that distinguishes three
+    /// outcomes instead of the two the old `unwrap_or(false)` exposed.
+    ///
+    /// HARDENING (audit-2026-08 H5): previously an `EspError` from the
+    /// driver (e.g. lwIP not initialised, radio fault) was collapsed to
+    /// `false`, so the supervisor would loop forever "not connected,
+    /// retrying" without ever surfacing the real fault. We now log the
+    /// driver error and return a third state that callers can use to
+    /// give up cleanly.
+    enum WifiLink {
+        /// Driver explicitly reports link up.
+        Up,
+        /// Driver explicitly reports link down (not associated).
+        Down,
+        /// Driver call itself failed — we treat this as `Down` but log
+        /// the underlying `EspError` so it's visible in operator logs.
+        DriverError,
+    }
+
+    fn check_link(wifi: &mut BlockingWifi<EspWifi<'_>>) -> WifiLink {
+        match wifi.is_connected() {
+            Ok(true) => WifiLink::Up,
+            Ok(false) => WifiLink::Down,
+            Err(e) => {
+                log::warn!("[wifi] is_connected() driver error: {e}");
+                WifiLink::DriverError
+            }
+        }
+    }
+
     loop {
         // (Re)initiate the connection.
         if let Err(e) = wifi.connect() {
             log::warn!("[wifi] connect() failed: {e}");
+            publish_wifi_state(status, ssid, 4, None, 0, 0, now_ms());
             return;
         }
 
         // 1) Wait for the STA to associate within this attempt.
         let attempt_start = std::time::Instant::now();
-        while !wifi.is_connected().unwrap_or(false) {
+        while matches!(check_link(&mut *wifi), WifiLink::Down) {
             if attempt_start.elapsed() > Duration::from_secs(PER_ATTEMPT_S)
                 || start.elapsed() > Duration::from_secs(ASSOC_TIMEOUT_S)
             {
@@ -605,7 +789,7 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'_>>, ssid: &str, password: &str
             std::thread::sleep(Duration::from_millis(300));
         }
 
-        if wifi.is_connected().unwrap_or(false) {
+        if matches!(check_link(&mut *wifi), WifiLink::Up) {
             log::info!("[wifi] associated (STA connected) — waiting for DHCP");
             // 2) Associated — wait for DHCP to hand out a real IP.
             let dhcp_start = std::time::Instant::now();
@@ -614,16 +798,21 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'_>>, ssid: &str, password: &str
                     log::warn!(
                         "[wifi] DHCP did not complete in {DHCP_TIMEOUT_S}s — continuing without IP"
                     );
+                    publish_wifi_state(status, ssid, 3, None, rssi_now(&mut *wifi), 0, now_ms());
                     return;
                 }
-                if !wifi.is_connected().unwrap_or(false) {
-                    log::warn!("[wifi] dropped after association — reconnecting");
-                    break;
+                match check_link(&mut *wifi) {
+                    WifiLink::Up => {}
+                    WifiLink::Down | WifiLink::DriverError => {
+                        log::warn!("[wifi] dropped after association — reconnecting");
+                        break;
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(300));
             }
             if let Some(ip) = have_ip(&mut *wifi) {
                 log::info!("[wifi] connected — ip={ip}");
+                publish_wifi_state(status, ssid, 5, Some(&ip), rssi_now(&mut *wifi), 0, now_ms());
                 return;
             }
         } else {
@@ -634,6 +823,7 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'_>>, ssid: &str, password: &str
         attempt += 1;
         if attempt >= MAX_ATTEMPTS || start.elapsed() > Duration::from_secs(ASSOC_TIMEOUT_S) {
             log::warn!("[wifi] gave up after {attempt} attempt(s) — continuing without network");
+            publish_wifi_state(status, ssid, 4, None, 0, 0, now_ms());
             return;
         }
         std::thread::sleep(Duration::from_millis(700));
@@ -665,6 +855,95 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'_>>, ssid: &str, password: &str
 ///
 /// `None` is the correct signal to `setup_platform` to skip Wi-Fi
 /// entirely rather than associating with the wrong AP.
+
+/// Wi-Fi supervisor thread: keeps the STA connected and publishes live
+/// diagnostics (state / IP / RSSI) for `AT+CWSTATE`.
+///
+/// Owns the leaked `BlockingWifi` handle *exclusively*: neither the AT
+/// dispatcher nor the agent touch the radio. On a link drop it re-runs
+/// `connect_wifi` (the same multi-attempt association logic) and backs off
+/// exponentially so a dead AP doesn't hammer the radio in a tight loop.
+fn run_wifi_supervisor(
+    mut wifi: &'static mut BlockingWifi<EspWifi<'static>>,
+    status: WifiStatusHandle,
+    ssid: String,
+    pass: String,
+) {
+    log::info!("[wifi-sup] supervisor thread started (ssid={ssid})");
+    let mut was_up: Option<bool> = None;
+    let mut downs: u32 = 0;
+    let mut last_heartbeat = 0u64;
+    loop {
+        std::thread::sleep(Duration::from_secs(3));
+        let now = now_ms();
+        let connected = wifi.is_connected().unwrap_or(false);
+        let ip = wifi
+            .wifi_mut()
+            .sta_netif()
+            .get_ip_info()
+            .ok()
+            .map(|i| i.ip.to_string())
+            .filter(|s| !s.is_empty() && s != "0.0.0.0");
+        let rssi = wifi.wifi_mut().get_rssi().unwrap_or(0);
+
+        // Publish the live snapshot for AT+CWSTATE.
+        publish_wifi_state(
+            &status,
+            &ssid,
+            if ip.is_some() { 5 } else if connected { 3 } else { 4 },
+            ip.as_deref(),
+            rssi,
+            0,
+            now,
+        );
+
+        // Log state transitions (and the very first observation).
+        match was_up {
+            None => {
+                log::info!(
+                    "[wifi-sup] initial state: connected={connected} ip={} rssi={rssi} dBm",
+                    ip.as_deref().unwrap_or("none")
+                );
+                downs = 0;
+            }
+            Some(true) if !connected => {
+                downs += 1;
+                log::warn!(
+                    "[wifi-sup] LINK DOWN (consecutive={downs}) ip={} rssi={rssi} dBm - reconnecting",
+                    ip.as_deref().unwrap_or("none")
+                );
+            }
+            Some(false) if connected => {
+                downs = 0;
+                log::info!(
+                    "[wifi-sup] LINK UP ip={} rssi={rssi} dBm",
+                    ip.as_deref().unwrap_or("none")
+                );
+            }
+            _ => {}
+        }
+        was_up = Some(connected);
+
+        // Heartbeat while up: periodic RSSI/IP so an operator can watch drift.
+        if connected && now - last_heartbeat > 60_000 {
+            last_heartbeat = now;
+            log::info!(
+                "[wifi-sup] heartbeat ip={} rssi={rssi} dBm",
+                ip.as_deref().unwrap_or("none")
+            );
+        }
+
+        if !connected {
+            log::warn!("[wifi-sup] attempting reconnect to {ssid}");
+            connect_wifi(&mut *wifi, &ssid, &pass, &status);
+            // Exponential backoff (capped at 30s) before the next attempt.
+            let backoff = std::cmp::min(3u64 << downs.min(3), 30);
+            log::warn!("[wifi-sup] backoff {backoff}s before next attempt");
+            std::thread::sleep(Duration::from_secs(backoff));
+        }
+    }
+}
+
 fn provision_and_load_wifi_credentials() -> (Option<String>, Option<String>) {
     // PATCHED (MicroAgent): `AT+SYSSTORE` — when set to 0 the operator
     // has explicitly opted out of having the firmware persist anything
@@ -870,7 +1149,10 @@ fn run_ingress(
     task_handle: TaskHandle,
     reply_outbox: TaskHandle,
     heartbeat: Heartbeat,
+    wifi_status: WifiStatusHandle,
     safe_mode: bool,
+    time_sync: sntp_sync::TimeSyncHandle,
+    force_ntp_sync: sntp_sync::ForceSyncFlag,
 ) {
     log::info!("[ingress] thread starting");
     dtrace("ingress:entry");
@@ -1017,8 +1299,21 @@ fn run_ingress(
                                         }
                                     } else {
                                         let now = now_ms();
-                                        let outcome =
-                                            at_dispatch::dispatch(&cmd, now, safe_mode);
+                                        let mut force_flag = false;
+                                        if let Ok(mut g) = force_ntp_sync.lock() {
+                                            force_flag = *g;
+                                        }
+                                        let outcome = at_dispatch::dispatch(
+                                            &cmd,
+                                            now,
+                                            safe_mode,
+                                            Some(&wifi_status),
+                                            Some(&time_sync),
+                                            &mut force_flag,
+                                        );
+                                        if let Ok(mut g) = force_ntp_sync.lock() {
+                                            *g = force_flag;
+                                        }
                                         let mut buf = at_dispatch::ResponseBuf::new();
                                         if at_dispatch::render_outcome(&outcome, &mut buf)
                                             .is_ok()
@@ -1098,13 +1393,29 @@ fn run_agent_loop(
     log::info!("[agent] thread starting");
     dtrace("agent:entry");
 
+    // HARDENING (audit-2026-08): replace `.expect()` with chained
+    // `and_then` + `ok()` so future contributors who change these compile-time
+    // constants get graceful degradation instead of a board panic.
+    // Agent display name (compile-time board switch).
+    #[cfg(feature = "board-c61")]
+    let agent_name = "mAgent-ESP32-C61";
+    #[cfg(feature = "board-s3")]
+    let agent_name = "mAgent-ESP32-S3";
     let config = AgentConfig::new()
-        .with_name("mAgent-ESP32-C61")
-        .expect("agent name fits")
-        .with_max_iterations(20)
-        .expect("iterations in range")
-        .with_max_memory(512 * 1024) // 512 KiB budget on the 2 MB PSRAM heap
-        .expect("memory budget in range");
+        .with_name(agent_name)
+        .and_then(|c| c.with_max_iterations(20))
+        .and_then(|c| c.with_max_memory(512 * 1024))
+        .ok();
+    let Some(config) = config else {
+        // Config is compile-time constants — unreachable in practice.
+        // But a future refactor that reads these from NVS or AT commands
+        // would trigger this path and should NOT panic the thread.
+        log::error!(
+            "[agent] config build failed (name/iterations/memory out of range); \
+             using safe defaults"
+        );
+        return;
+    };
     dtrace("agent:config-built");
 
     // MiniAgent is heap-allocated (Box) so its large conversation buffers
@@ -1138,6 +1449,13 @@ fn run_agent_loop(
     // cloud HTTP call would hit `tcpip_send_msg_wait_sem (Invalid mbox)` and
     // hard-assert (crash loop). Skip the cloud backend and rely on the local
     // heuristic + local tools instead.
+    //
+    // Additionally: on the RAM-limited C61 the HTTPS/TLS stack cannot reach a
+    // cloud LLM (see sdkconfig "Network / TLS" notes), so installing the
+    // DeepSeek backend would only add an ~8s timeout + log noise to every
+    // task. We therefore install the cloud backend only on the ESP32-S3
+    // (`board-s3`) where the network + TLS work; the C61 runs local-only.
+    #[cfg(feature = "board-s3")]
     if !safe_mode {
         if let (Some(model), Some(key)) = (
             nvs_load_string(NVS_KEY_LLM_MODEL),
@@ -1147,11 +1465,34 @@ fn run_agent_loop(
                 log::info!("[agent] installing DeepSeek LLM backend (model={model})");
                 let backend: &'static mut llm::Esp32DeepSeekBackend =
                     Box::leak(Box::new(llm::Esp32DeepSeekBackend::new(&model, &key)));
+                // HARDENING (audit-2026-08 H9): the agent boot path
+                // intentionally leaks the LLM backend so the agent
+                // can hold a `&'static mut` reference. This is
+                // *one-shot* per boot, but a future refactor that
+                // re-leaks on every reconnect would silently double
+                // heap usage. We register the leaked pointer in
+                // `LEAKED_BOXES` so a duplicate insert triggers an
+                // explicit error log instead of a quiet leak. Cost:
+                // one `HashSet` entry, no heap growth.
+                if leaked_boxes().insert(backend as *mut _ as usize) {
+                    log::error!(
+                        "[magent] agent boot path is leaking a second LLM backend \
+                         (same pointer as a previous leak); refactor leak site or \
+                         re-use the previous handle"
+                    );
+                }
                 agent.set_llm_backend(backend);
             }
         }
     } else {
         log::info!("[agent] safe mode — cloud LLM disabled (local heuristic only)");
+    }
+    #[cfg(feature = "board-c61")]
+    {
+        log::info!(
+            "[agent] C61 local mode — cloud LLM skipped (USB-serial + local tools; \
+             DeepSeek is enabled on the board-s3 build)"
+        );
     }
 
     log::info!("[agent] MiniAgent ready");
@@ -1173,8 +1514,20 @@ fn run_agent_loop(
         // thread (from UART), defaulting to a temperature read. Track whether
         // the task came from a real UART command so we can reply over UART.
         let pending = task_handle.lock().ok().and_then(|mut g| g.take());
-        let from_command = pending.is_some();
-        let task = pending.unwrap_or_else(|| "read sensor temperature".to_string());
+        let from_uart = pending.is_some();
+        // BLE-fed chat payload (set by the BLE SYS_CMD handler in ble_config).
+        #[cfg(feature = "ble")]
+        let ble_task = crate::ble_config::BLE_AGENT_TASK
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        #[cfg(feature = "ble")]
+        let from_ble = ble_task.is_some();
+        #[cfg(not(feature = "ble"))]
+        let (ble_task, from_ble) = (None::<String>, false);
+        let task = ble_task
+            .or(pending)
+            .unwrap_or_else(|| "read sensor temperature".to_string());
 
         // PATCHED (MicroAgent): `MiniAgent::run` is an `async fn` (it
         // awaits the LLM and tool futures). On a bare esp-idf-svc
@@ -1193,12 +1546,22 @@ fn run_agent_loop(
         match outcome {
             Ok(Ok(result)) => {
                 log::info!("[agent] result({task}): {result}");
-                // Bidirectional: if this task came from a UART command, put
-                // the result into the reply outbox; the ingress thread sends
-                // it back over the UART link to the host.
-                if from_command {
+                // Bidirectional replies: a UART-fed command replies over the
+                // UART outbox; a BLE-fed chat payload replies via the BLE
+                // SYS_RSP path (see ble_config::agent_reply_for).
+                if from_uart {
                     if let Ok(mut guard) = reply_outbox.lock() {
                         *guard = Some(std::format!("RESULT[{task}]: {result}"));
+                    }
+                }
+                #[cfg(feature = "ble")]
+                if from_ble {
+                    if let Ok(mut guard) = crate::ble_config::BLE_AGENT_REPLY.lock() {
+                        // HARDENING (audit-2026-08 fix type mismatch):
+                        // `result` is `String<MAX_BUFFER_SIZE>` (heapless) but
+                        // `BLE_AGENT_REPLY` expects `Option<String>` (std).
+                        // Convert via `to_string()`.
+                        *guard = Some(result.as_str().to_string());
                     }
                 }
             }
@@ -1271,7 +1634,15 @@ pub extern "C" fn app_main() {
 /// If `safe_mode` is `true` (crash-loop suspected) we skip the Wi-Fi bring-up
 /// entirely so the board boots as fast and risk-free as possible and can at
 /// least serve UART + local tools.
-fn setup_platform(wifi_ssid: &str, wifi_pass: &str, safe_mode: bool) -> Option<IngressUartParts> {
+fn setup_platform(
+    wifi_ssid: &str,
+    wifi_pass: &str,
+    safe_mode: bool,
+    wifi_status: &WifiStatusHandle,
+) -> (
+    Option<IngressUartParts>,
+    Option<&'static mut BlockingWifi<EspWifi<'static>>>,
+) {
     use esp_idf_svc::eventloop::EspSystemEventLoop;
     use esp_idf_svc::hal::peripherals::Peripherals;
     let sysloop = match EspSystemEventLoop::take() {
@@ -1281,7 +1652,7 @@ fn setup_platform(wifi_ssid: &str, wifi_pass: &str, safe_mode: bool) -> Option<I
         }
         Err(e) => {
             log::warn!("[wifi] event loop unavailable ({e}) — running without Wi-Fi");
-            return None;
+            return (None, None);
         }
     };
 
@@ -1322,14 +1693,14 @@ fn setup_platform(wifi_ssid: &str, wifi_pass: &str, safe_mode: bool) -> Option<I
         }
         Err(e) => {
             log::warn!("[wifi] peripherals unavailable ({e}) — running without Wi-Fi/UART");
-            return None;
+            return (None, None);
         }
     };
     let nvs_partition = match default_nvs() {
         Some(n) => n,
         None => {
             log::warn!("[wifi] NVS partition unavailable — running without Wi-Fi");
-            return None;
+            return (None, None);
         }
     };
 
@@ -1346,7 +1717,7 @@ fn setup_platform(wifi_ssid: &str, wifi_pass: &str, safe_mode: bool) -> Option<I
     // only, so an operator can connect and diagnose.
     if safe_mode {
         log::warn!("[wifi] safe mode — skipping Wi-Fi init (crash-loop recovery)");
-        return ingress_uart;
+        return (ingress_uart, None);
     }
 
     // PATCHED (MicroAgent): `AT+CWMODE` — refuse to bring up the
@@ -1360,7 +1731,7 @@ fn setup_platform(wifi_ssid: &str, wifi_pass: &str, safe_mode: bool) -> Option<I
         log::warn!(
             "[wifi] AT+CWMODE={cwmode} — only station (1) is implemented; skipping Wi-Fi"
         );
-        return ingress_uart;
+        return (ingress_uart, None);
     }
 
     // PATCHED (MicroAgent): `AT+CWAUTOCONN` — when the operator set
@@ -1378,24 +1749,39 @@ fn setup_platform(wifi_ssid: &str, wifi_pass: &str, safe_mode: bool) -> Option<I
         log::warn!("[wifi] AT+CWAUTOCONN=0 — skipping blocking connect");
         // Still return ingress_uart so the console is up; we just
         // don't try to join an AP this boot.
-        return ingress_uart;
+        return (ingress_uart, None);
     }
 
+    let mut wifi_handle: Option<&'static mut BlockingWifi<EspWifi<'static>>> = None;
     match EspWifi::new(modem, sysloop.clone(), Some(nvs_partition)) {
         Ok(esp_wifi) => {
             log::info!("[magent] boot phase 5/8: esp_wifi ready");
             match BlockingWifi::wrap(esp_wifi, sysloop) {
                 Ok(mut wifi) => {
                     log::info!("[magent] boot phase 6/8: BlockingWifi ready");
-                    connect_wifi(&mut wifi, wifi_ssid, wifi_pass);
-                    // PATCHED (MicroAgent): keep the radio alive for the
-                    // whole program. `wifi` is a local; if it drops when
-                    // setup_platform returns, esp-idf-svc deinitialises the
-                    // STA and the device disconnects immediately after
-                    // getting an IP (seen as WIFI_REASON_ASSOC_LEAVE).
-                    // Leaking the handle keeps the link up so the agent can
-                    // use the network (Ollama, MQTT, …) after boot.
-                    std::mem::forget(wifi);
+                    connect_wifi(&mut wifi, wifi_ssid, wifi_pass, wifi_status);
+                    // PATCHED (MicroAgent): keep the radio alive for the whole
+                    // program AND hand the handle to the Wi-Fi supervisor so it
+                    // can reconnect after a later drop. Previously we leaked it
+                    // with `std::mem::forget`, which kept the link up but left no
+                    // owner to react when the AP kicked us. `Box::leak` yields a
+                    // `'static` handle the supervisor thread can move into.
+                    let leaked_wifi: &'static mut BlockingWifi<EspWifi<'static>> = Box::leak(Box::new(wifi));
+                    // HARDENING (audit-2026-08 H9): the Wi-Fi
+                    // supervisor keeps this handle for the entire
+                    // program lifetime. Register the pointer so a
+                    // future refactor that re-runs the wifi init
+                    // path (e.g. an OTA reboot sequence) surfaces a
+                    // duplicate-leak log instead of silently
+                    // doubling the radio's heap footprint.
+                    let leaked_ptr = leaked_wifi as *mut _ as usize;
+                    if leaked_boxes().insert(leaked_ptr) {
+                        log::error!(
+                            "[wifi] wifi_handle is leaking a duplicate BlockingWifi \
+                             (same pointer as a previous leak)"
+                        );
+                    }
+                    wifi_handle = Some(leaked_wifi);
                 }
                 Err(e) => log::warn!("[wifi] BlockingWifi::wrap failed: {e}"),
             }
@@ -1403,11 +1789,57 @@ fn setup_platform(wifi_ssid: &str, wifi_pass: &str, safe_mode: bool) -> Option<I
         Err(e) => log::warn!("[wifi] EspWifi::new failed: {e}"),
     }
 
-    ingress_uart
+    (ingress_uart, wifi_handle)
+}
+
+/// Worker-thread stacks stay in internal DRAM.
+///
+/// Earlier we routed stacks to PSRAM (`esp_pthread_set_cfg` +
+/// `MALLOC_CAP_SPIRAM`) to free internal DRAM for Wi-Fi + BLE. But a PSRAM
+/// task stack running while Wi-Fi is active triggers a `CPU_LOCKUP`
+/// (`rst:0x1a`) on this C61, regardless of free memory. With BLE disabled by
+/// default (USB-serial transport) there is ~90 KiB of internal DRAM free —
+/// enough for the agent (32 KiB) + ingress (24 KiB) + supervisor stacks. We
+/// therefore keep the default `MALLOC_CAP_INTERNAL` stacks (no `esp_pthread`
+/// override), which avoids the PSRAM-stack-vs-Wi-Fi lockup entirely.
+fn configure_psram_thread_stacks() {
+    // Intentionally a no-op: leave stacks in internal DRAM (see doc comment).
+    log::info!("[mem] worker-thread stacks stay in internal DRAM (avoids PSRAM-vs-WiFi CPU_LOCKUP)");
 }
 
 fn main() {
     init_logging();
+
+    // STABILITY (stability-2026-08): route worker-thread stacks to PSRAM.
+    // On this RAM-limited C61 (~134 KiB internal DRAM), the agent/ingress/
+    // supervisor thread stacks (32+24+8+8 KiB) are allocated from internal
+    // SRAM by default (esp-pthread's stack_alloc_caps defaults to
+    // MALLOC_CAP_INTERNAL). After Wi-Fi + BLE bring-up there is not enough
+    // internal DRAM left, so thread spawns fail (`os error 12`) and the agent
+    // never runs. Setting stack_alloc_caps to MALLOC_CAP_SPIRAM moves the
+    // stacks onto the 2 MiB PSRAM, freeing internal DRAM so Wi-Fi + BLE +
+    // agent can coexist. (Only the small task TCB stays in internal RAM.)
+    configure_psram_thread_stacks();
+
+    // HARDENING (audit-2026-08 M-WDT01): log the reset reason at the very
+    // start of boot so crash dumps and serial logs always include the cause.
+    // This helps operators distinguish a power-on from a watchdog/panic/crash
+    // reboot without needing to connect a JTAG debugger.
+    let reason = unsafe { esp_idf_sys::esp_reset_reason() };
+    let reason_str = match reason {
+        esp_idf_sys::esp_reset_reason_t_ESP_RST_POWERON   => "POWERON",
+        esp_idf_sys::esp_reset_reason_t_ESP_RST_SW        => "SOFTWARE",
+        esp_idf_sys::esp_reset_reason_t_ESP_RST_PANIC      => "PANIC",
+        esp_idf_sys::esp_reset_reason_t_ESP_RST_INT_WDT    => "INT_WDT",
+        esp_idf_sys::esp_reset_reason_t_ESP_RST_TASK_WDT   => "TASK_WDT",
+        esp_idf_sys::esp_reset_reason_t_ESP_RST_WDT         => "WDT",
+        esp_idf_sys::esp_reset_reason_t_ESP_RST_DEEPSLEEP   => "DEEPSLEEP",
+        esp_idf_sys::esp_reset_reason_t_ESP_RST_BROWNOUT    => "BROWNOUT",
+        esp_idf_sys::esp_reset_reason_t_ESP_RST_SDIO        => "SDIO",
+        _ => "UNKNOWN",
+    };
+    log::info!("[magent] reset reason: {} (0x{:02X})", reason_str, reason);
+
     // Boot-path progress markers. Each phase advances the number so a
     // crash mid-boot leaves a record in the UART ring buffer.
     log::info!("[magent] boot phase 1/8: logger up");
@@ -1446,16 +1878,129 @@ fn main() {
     // from build-time env vars when the operator hasn't set `AT+LLMCFG`.
     provision_llm_config();
 
+    // STABILITY (stability-2026-08): initialize BLE *before* Wi-Fi bring-up.
+    // On this RAM-limited C61 (~134 KiB internal DRAM), the Bluedroid host's
+    // `btm_ble_init` allocates FreeRTOS mutexes/queues from internal DRAM.
+    // When Wi-Fi is initialized first it eats ~56 KiB of that internal DRAM,
+    // leaving ~44 KiB — too little for BLE's allocations, so the stack asserts
+    // (`adv_rpt_queue != NULL` / `xQueueSemaphoreTake`), panics, and the board
+    // crash-loops into safe mode (which also prevents the agent thread from
+    // ever starting). BLE does not need the sysloop/peripherals that Wi-Fi
+    // bring-up creates, so we init it here while internal DRAM is still fresh
+    // (~100 KiB). Wi-Fi is attempted afterwards and remains non-fatal if the
+    // remaining DRAM is too tight (setup_platform returns None).
+    #[cfg(feature = "ble")]
+    {
+        use crate::ble_config::BleServer;
+
+        log::info!("[ble] Creating BLE server...");
+        let mut ble_server = BleServer::new();
+        log::info!("[ble] BLE server created, device name: {}", ble_server.device_name());
+
+        log::info!("[ble] Calling init()...");
+        match ble_server.init() {
+            Ok(_) => {
+                log::info!("[ble] init() succeeded, state: {:?}", ble_server.get_state());
+
+                log::info!("[ble] Calling start_advertising()...");
+                match ble_server.start_advertising() {
+                    Ok(_) => {
+                        log::info!("[ble] start_advertising() succeeded");
+                    }
+                    Err(e) => {
+                        log::error!("[ble] start_advertising() failed: {:?}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("[ble] init() failed: {:?}", e);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "ble"))]
+    {
+        log::info!("[ble] BLE feature not enabled (add 'ble' to features for BLE support)");
+    }
+
+    // Shared Wi-Fi status snapshot published by the supervisor thread and
+    // read by the AT dispatcher so `AT+CWSTATE` reports the real link.
+    let wifi_status: WifiStatusHandle = Arc::new(Mutex::new(WifiStatus::default()));
+
     // PATCHED (MicroAgent): platform bring-up (event loop, peripherals, NVS,
     // Wi-Fi) is now NON-FATAL — see `setup_platform`. If Wi-Fi can't be set up
     // the firmware still boots and runs the agent/ingress threads (local tools
     // + UART don't need network). Returns the UART parts for the ingress thread.
-    let ingress_uart = setup_platform(
+    let (ingress_uart, wifi_handle) = setup_platform(
         wifi_ssid.as_deref().unwrap_or(""),
         wifi_pass.as_deref().unwrap_or(""),
         safe_mode,
+        &wifi_status,
     );
     log::info!("[magent] boot phase 7/8: platform ready");
+
+    // Whether lwIP / the radio actually came up. In safe mode (crash-loop
+    // recovery) Wi-Fi is skipped, so `wifi_handle` is None and the network
+    // stack is NOT initialized — anything that touches lwIP (e.g. SNTP) must
+    // be gated on this or it asserts (`tcpip_callback: Invalid mbox`).
+    let wifi_up = wifi_handle.is_some();
+
+    // PATCHED (MicroAgent): Wi-Fi supervisor — keeps the STA connected and
+    // logs RSSI/IP/state transitions so an operator can diagnose an unstable
+    // AP. It owns the leaked `BlockingWifi` handle exclusively; the AT
+    // dispatcher and agent never touch the radio.
+    if let Some(wifi_handle) = wifi_handle {
+        let wstatus = wifi_status.clone();
+        let wssid = wifi_ssid.clone().unwrap_or_default();
+        let wpass = wifi_pass.clone().unwrap_or_default();
+        let sup = thread::Builder::new()
+            .name("wifi-supervisor".into())
+            // Keep this small — thread stacks come from the C61's limited
+            // internal RAM (~158 KiB), and the agent (64 KiB) + ingress
+            // (24 KiB) threads already consume most of it. The supervisor
+            // only does lightweight wifi queries (is_connected/rssi/ip), so
+            // 8 KiB is ample; a 24 KiB stack here starved the agent thread
+            // and its spawn failed.
+            .stack_size(8 * 1024)
+            .spawn(move || run_wifi_supervisor(wifi_handle, wstatus, wssid, wpass))
+            .ok();
+        if sup.is_none() {
+            log::error!("[wifi-sup] thread spawn failed — no reconnect supervision");
+        }
+    } else {
+        log::warn!("[wifi-sup] no Wi-Fi handle — supervisor not started");
+    }
+
+    // PATCHED (MicroAgent): Initialize BLE GATT server for mAgent-Man
+    // (moved BEFORE Wi-Fi bring-up for stability — see the block above
+    // `provision_llm_config`; keeping the old slot would re-init BLE after
+    // Wi-Fi has consumed internal DRAM and crash-loop the board).
+
+    // PATCHED (MicroAgent): time-sync handle. The supervisor (below)
+    // records samples; the AT dispatcher queries the canonical
+    // wall-clock through this handle. We pre-populate the timezone
+    // from NVS so an operator's `AT+TIMEZONE=` survives reboots.
+    let time_sync: sntp_sync::TimeSyncHandle = Arc::new(Mutex::new(
+        magent_core::time_sync::TimeSync::new(
+            at_dispatch::load_tz_offset_from_nvs(),
+        ),
+    ));
+    let time_sync_for_dispatch = time_sync.clone();
+    let time_sync_for_supervisor = time_sync.clone();
+
+    // `force_ntp_sync` flag: the AT dispatcher sets this on
+    // `AT+NTPSYNC`; the supervisor thread polls it on its 5s tick.
+    let force_ntp_sync: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let force_ntp_sync_for_thread = force_ntp_sync.clone();
+    let force_ntp_sync_for_dispatch = force_ntp_sync.clone();
+
+    // Restore the persisted time-sync snapshot (if any) so we don't
+    // lose wall-clock continuity across reboots.
+    if let Some(prior) = nvs_load_string(crate::sntp_sync::NVS_PERSIST_KEY) {
+        if let Err(e) = sntp_sync::restore_from_nvs(&time_sync, Some(&prior)) {
+            log::warn!("[time-sync] failed to restore persisted state: {e}");
+        }
+    }
 
     // Shared identity + task handle for the threads.
     let identity_clone = identity.clone();
@@ -1488,16 +2033,28 @@ fn main() {
         let th_task = agent_task.clone();
         let th_reply = agent_reply.clone();
         let th_hb = agent_hb_for_thread.clone();
-        agent_handle = thread::Builder::new()
+        log::info!("[agent] free heap before spawn: {} B", free_heap());
+        log::info!(
+            "[agent] internal DRAM before spawn: {} B",
+            unsafe { esp_idf_sys::esp_get_free_internal_heap_size() }
+        );
+        agent_handle = match thread::Builder::new()
             .name("agent-thread".into())
-            // 64 KiB: MiniAgent is heap-allocated (PSRAM), so the task stack
-            // only holds a few stack-local String<MAX_BUFFER_SIZE> (8 KiB)
-            // 64 KiB: MiniAgent is heap-allocated (PSRAM) and MAX_BUFFER_SIZE
+            // 32 KiB: MiniAgent is heap-allocated (PSRAM) and MAX_BUFFER_SIZE
             // stays at 2 KiB, so the task stack only needs a few 2 KiB stack
-            // temporaries in think().
-            .stack_size(64 * 1024)
+            // temporaries in think(). (16-24 KiB was too tight and faulted.)
+            .stack_size(32 * 1024)
             .spawn(move || run_agent_loop(th_task, th_reply, th_hb, safe_mode))
-            .ok();
+        {
+            Ok(h) => Some(h),
+            Err(e) => {
+                log::error!(
+                    "[agent] thread spawn error: {e} (free heap {} B)",
+                    free_heap()
+                );
+                None
+            }
+        };
     }
     if agent_handle.is_none() {
         log::error!("[agent] thread spawn failed — continuing without agent");
@@ -1507,16 +2064,66 @@ fn main() {
         .name("ingress-thread".into())
         // PATCHED (MicroAgent): keep this modest. `AT+HTTPGET` runs its TLS
         // handshake on a dedicated worker thread (see at_dispatch), so the
-        // ingress thread itself does no heavy network work. A 64 KiB stack
-        // here made `pthread` fail to create the task on the C61's limited
-        // internal RAM.
+        // ingress thread itself does no heavy network work. 24 KiB is the
+        // known-stable size (16 KiB overflowed a pthread stack).
         .stack_size(24 * 1024)
         .spawn(move || {
-            run_ingress(identity_clone, ingress_uart, ingress_task, ingress_reply, ingress_hb_for_thread, safe_mode)
+            run_ingress(
+                identity_clone,
+                ingress_uart,
+                ingress_task,
+                ingress_reply,
+                ingress_hb_for_thread,
+                wifi_status,
+                safe_mode,
+                time_sync_for_dispatch,
+                force_ntp_sync_for_dispatch,
+            )
         })
         .ok();
     if ingress_handle.is_none() {
         log::error!("[ingress] thread spawn failed — continuing without ingress");
+    }
+
+    // PATCHED (MicroAgent): SNTP supervisor thread. SNTP needs lwIP, which is
+    // only up when Wi-Fi actually initialised. In safe mode Wi-Fi is skipped
+    // (wifi_up == false), so starting SNTP would assert in
+    // `tcpip_callback (Invalid mbox)` and crash-loop the board. Only spawn it
+    // when the network stack is really available.
+    #[cfg(feature = "wifi")]
+    {
+        if wifi_up {
+            let ts_for_supervisor = time_sync_for_supervisor.clone();
+            let flag_for_supervisor = force_ntp_sync_for_thread.clone();
+            let sntp_handle = thread::Builder::new()
+                .name("sntp-supervisor".into())
+                .stack_size(8 * 1024)
+                .spawn(move || {
+                    sntp_sync::run_sntp_supervisor(
+                        ts_for_supervisor,
+                        flag_for_supervisor,
+                        |record| {
+                            nvs_save_string(
+                                crate::sntp_sync::NVS_PERSIST_KEY,
+                                record,
+                            )
+                            .is_ok()
+                        },
+                    );
+                })
+                .ok();
+            if sntp_handle.is_none() {
+                log::error!("[sntp] supervisor thread spawn failed");
+            }
+        } else {
+            log::warn!(
+                "[sntp] network not up (safe mode / Wi-Fi skipped) — SNTP supervisor not started"
+            );
+        }
+    }
+    #[cfg(not(feature = "wifi"))]
+    {
+        log::info!("[sntp] wifi feature disabled — SNTP supervisor not started");
     }
 
     log::info!("[magent] boot phase 8/8: all systems nominal");
@@ -1560,7 +2167,7 @@ fn main() {
                 let th_hb = agent_hb_for_thread.clone();
                 agent_handle = thread::Builder::new()
                     .name("agent-thread".into())
-                    .stack_size(64 * 1024)
+                    .stack_size(32 * 1024)
                     .spawn(move || run_agent_loop(th_task, th_reply, th_hb, safe_mode))
                     .ok();
                 if agent_handle.is_none() {

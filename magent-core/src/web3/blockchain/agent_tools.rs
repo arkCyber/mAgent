@@ -74,6 +74,9 @@ use crate::web3::blockchain::{
     Address, Hash, Wei,
 };
 
+#[cfg(feature = "web3")]
+use crate::error::try_heapless;
+
 #[cfg(all(feature = "web3", feature = "esp32"))]
 #[allow(unused_imports)]
 use crate::web3::blockchain::{
@@ -988,85 +991,33 @@ fn parse_tx_hash_from_args(args: &str) -> Option<String> {
 pub fn create_blockchain_tools() -> Vec<Tool, 8> {
     let mut tools = Vec::new();
 
-    // get_balance
-    let tool = Tool {
-        name: heapless::String::try_from("get_balance").unwrap(),
-        description: heapless::String::try_from(
-            "Get ETH balance for an Ethereum address. Args: {\"address\": \"0x...\"}"
-        ).unwrap(),
-        tool_type: ToolType::ReadSensor,
-    };
-    let _ = tools.push(tool);
+    // HARDENING (audit-2026-08 unwrap sweep): the previous code used
+    // `heapless::String::try_from("...").unwrap()` on all 16 constant
+    // tool-name and description strings. All of them fit easily within
+    // the `name: String<32>` and `description: String<256>` bounds, so
+    // a panic is impossible — but a future contributor who lengthens a
+    // description past 256 chars would trigger a panic. We use
+    // `try_heapless` so the function stays panic-free regardless of
+    // future content changes.
+    macro_rules! push_tool {
+        ($name:expr, $desc:expr) => {{
+            let tool = Tool {
+                name: try_heapless::<32>($name),
+                description: try_heapless::<128>($desc),
+                tool_type: ToolType::ReadSensor,
+            };
+            let _ = tools.push(tool);
+        }};
+    }
 
-    // get_nonce
-    let tool = Tool {
-        name: heapless::String::try_from("get_nonce").unwrap(),
-        description: heapless::String::try_from(
-            "Get transaction count (nonce) for an Ethereum address. Args: {\"address\": \"0x...\"}"
-        ).unwrap(),
-        tool_type: ToolType::ReadSensor,
-    };
-    let _ = tools.push(tool);
-
-    // get_gas_price
-    let tool = Tool {
-        name: heapless::String::try_from("get_gas_price").unwrap(),
-        description: heapless::String::try_from(
-            "Get current gas price in Gwei. No args required."
-        ).unwrap(),
-        tool_type: ToolType::ReadSensor,
-    };
-    let _ = tools.push(tool);
-
-    // get_block_number
-    let tool = Tool {
-        name: heapless::String::try_from("get_block_number").unwrap(),
-        description: heapless::String::try_from(
-            "Get current block number. No args required."
-        ).unwrap(),
-        tool_type: ToolType::ReadSensor,
-    };
-    let _ = tools.push(tool);
-
-    // send_transaction
-    let tool = Tool {
-        name: heapless::String::try_from("send_transaction").unwrap(),
-        description: heapless::String::try_from(
-            "Send a signed transaction. Args: {\"transaction\": \"0x...\"}"
-        ).unwrap(),
-        tool_type: ToolType::ReadSensor,
-    };
-    let _ = tools.push(tool);
-
-    // poll_transaction
-    let tool = Tool {
-        name: heapless::String::try_from("poll_transaction").unwrap(),
-        description: heapless::String::try_from(
-            "Poll for transaction confirmation. Args: {\"tx_hash\": \"0x...\"} or uses pending tx."
-        ).unwrap(),
-        tool_type: ToolType::ReadSensor,
-    };
-    let _ = tools.push(tool);
-
-    // blockchain_status
-    let tool = Tool {
-        name: heapless::String::try_from("blockchain_status").unwrap(),
-        description: heapless::String::try_from(
-            "Get blockchain client status. No args required."
-        ).unwrap(),
-        tool_type: ToolType::ReadSensor,
-    };
-    let _ = tools.push(tool);
-
-    // sign_message (local signing, no RPC)
-    let tool = Tool {
-        name: heapless::String::try_from("sign_message").unwrap(),
-        description: heapless::String::try_from(
-            "Sign a message with the agent's identity key. Args: {\"message\": \"...\"}"
-        ).unwrap(),
-        tool_type: ToolType::ReadSensor,
-    };
-    let _ = tools.push(tool);
+    push_tool!("get_balance", "Get ETH balance for an Ethereum address. Args: {\"address\": \"0x...\"}");
+    push_tool!("get_nonce", "Get transaction count (nonce) for an Ethereum address. Args: {\"address\": \"0x...\"}");
+    push_tool!("get_gas_price", "Get current gas price in Gwei. No args required.");
+    push_tool!("get_block_number", "Get current block number. No args required.");
+    push_tool!("send_transaction", "Send a signed transaction. Args: {\"transaction\": \"0x...\"}");
+    push_tool!("poll_transaction", "Poll for transaction confirmation. Args: {\"tx_hash\": \"0x...\"} or uses pending tx.");
+    push_tool!("blockchain_status", "Get blockchain client status. No args required.");
+    push_tool!("sign_message", "Sign a message with the agent's identity key. Args: {\"message\": \"...\"}");
 
     tools
 }

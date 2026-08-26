@@ -1,0 +1,330 @@
+{
+  "app": {
+    "title": "mAgent-Man",
+    "subtitle": "裝置管理器"
+  },
+  "nav": {
+    "config": "設定",
+    "status": "狀態",
+    "chat": "對話",
+    "channels": "頻道",
+    "advanced": "進階",
+    "menu": "選單",
+    "collapse": "收合側邊欄"
+  },
+  "status": {
+    "connected": "已連線到 {name}",
+    "connecting": "連線中...",
+    "disconnected": "已中斷連線",
+    "error": "連線錯誤",
+    "disconnect": "中斷連線"
+  },
+  "usb": {
+    "scanning": "USB 掃描中…",
+    "connecting": "USB 連線中…",
+    "connected": "USB: {path}",
+    "noDevice": "無 USB 裝置",
+    "failed": "USB 無法使用",
+    "autoConnected": "已自動連線 USB: {path}",
+    "start": "開始",
+    "retry": "重試",
+    "continue": "繼續",
+    "scanAgain": "重新掃描",
+    "dialogScanning": "正在掃描 USB 連接埠…",
+    "dialogScanningHint": "正在查找 C61 串口橋接器…",
+    "dialogConnecting": "正在連線…",
+    "dialogConnectingHint": "正在開啟 {path}",
+    "dialogConnected": "連線成功",
+    "dialogConnectedHint": "已連線到 {path}，現在可以開始對話。",
+    "dialogFailed": "連線失敗",
+    "dialogNoDevice": "找不到 USB 裝置",
+    "dialogNoDeviceHint": "請插入裝置後重試。"
+  },
+  "devices": {
+    "title": "藍牙裝置",
+    "scan": "掃描",
+    "scanning": "掃描中...",
+    "noDevices": "找不到裝置",
+    "searchHint": "點擊掃描以搜尋藍牙裝置",
+    "unknownDevice": "未知裝置"
+  },
+  "config": {
+    "title": "設定",
+    "reload": "重新整理",
+    "notConnected": "未連線",
+    "notConnectedHint": "連線裝置後即可進行設定",
+    "currentConfig": "目前:",
+    "wifi": {
+      "title": "WiFi 設定",
+      "ssid": "網路名稱 (SSID)",
+      "ssidPlaceholder": "輸入 WiFi 網路名稱",
+      "password": "密碼",
+      "passwordPlaceholder": "輸入 WiFi 密碼",
+      "save": "儲存 WiFi",
+      "saving": "儲存中...",
+      "saved": "已儲存!",
+      "ssidRequired": "請輸入 SSID"
+    },
+    "llm": {
+      "title": "LLM 設定",
+      "model": "模型",
+      "modelPlaceholder": "例如: deepseek-chat",
+      "modelHint": "輸入 LLM 模型識別碼",
+      "apiKey": "API 金鑰",
+      "apiKeyPlaceholder": "輸入 API 金鑰",
+      "apiKeyHint": "您的 API 金鑰將安全儲存",
+      "save": "儲存 LLM",
+      "saving": "儲存中...",
+      "saved": "已儲存!",
+      "modelRequired": "請輸入模型名稱",
+      "apiKeyRequired": "請輸入 API 金鑰"
+    },
+    "hostname": {
+      "title": "主機名",
+      "label": "裝置主機名",
+      "placeholder": "例如: mAgent-001",
+      "hint": "裝置在網路上的唯一識別符",
+      "save": "儲存主機名",
+      "saving": "儲存中...",
+      "saved": "已儲存!",
+      "required": "請輸入主機名"
+    },
+    "saved": "設定已儲存",
+    "saveFailed": "設定儲存失敗"
+  },
+  "common": {
+    "close": "關閉"
+  },
+  "quit": {
+    "title": "結束 mAgent-Man？",
+    "message": "正在進行的操作將遺失。確定要結束嗎？",
+    "confirm": "結束",
+    "cancel": "取消"
+  },
+  "monitor": {
+    "title": "系統狀態",
+    "refresh": "重新整理",
+    "lastUpdate": "更新於 {time}",
+    "notConnected": "未連線",
+    "notConnectedHint": "連線裝置後即可檢視狀態",
+    "device": {
+      "title": "裝置資訊",
+      "version": "版本",
+      "chip": "晶片",
+      "uptime": "運行時間",
+      "memory": "記憶體",
+      "heapUsage": "堆積記憶體使用",
+      "free": "可用"
+    },
+    "wifi": {
+      "title": "WiFi 狀態",
+      "network": "網路",
+      "ipAddress": "IP 位址",
+      "signal": "訊號強度",
+      "notConnected": "未連線",
+      "state": {
+        "idle": "閒置",
+        "connecting": "連線中",
+        "associated": "已關聯",
+        "disconnected": "已中斷",
+        "connected": "已連線"
+      }
+    },
+    "actions": {
+      "refresh": "重新整理",
+      "logs": "日誌",
+      "diagnostics": "診斷"
+    },
+    "reboot": {
+      "button": "重新啟動裝置",
+      "confirm": "確定要重新啟動裝置嗎？",
+      "success": "重新啟動指令已送出"
+    },
+    "logs": {
+      "title": "裝置日誌"
+    },
+    "diagnostics": {
+      "title": "診斷報告"
+    }
+  },
+  "errors": {
+    "scanFailed": "掃描失敗",
+    "connectionFailed": "連線失敗",
+    "bluetoothOff": "藍牙已關閉",
+    "deviceNotFound": "找不到裝置",
+    "networkScanFailed": "網路掃描失敗",
+    "saveFailed": "儲存失敗",
+    "loadFailed": "載入失敗"
+  },
+  "wifiScan": {
+    "title": "WiFi 掃描器",
+    "scan": "掃描網路",
+    "scanning": "掃描中...",
+    "notConnected": "請先連線裝置",
+    "hint": "點擊掃描以搜尋附近的 WiFi 網路",
+    "found": "找到 {count} 個網路",
+    "started": "掃描已開始，結果將顯示在裝置上。",
+    "selected": "已選擇網路 {ssid}，請在設定頁設定密碼並儲存。",
+    "failed": "網路掃描失敗",
+    "error": "掃描網路失敗",
+    "hidden": "隱藏網路",
+    "excellent": "極佳",
+    "good": "良好",
+    "fair": "普通",
+    "weak": "較弱",
+    "connect": "連線"
+  },
+  "safeMode": {
+    "title": "安全模式",
+    "label": "安全模式",
+    "description": "啟用安全模式以進行疑難排解",
+    "toggle": "切換安全模式",
+    "notConnected": "請先連線裝置",
+    "enabled": "安全模式已啟用",
+    "disabled": "安全模式已停用",
+    "activeWarning": "安全模式已啟用，部分功能可能受限。",
+    "error": "切換安全模式失敗"
+  },
+  "identity": {
+    "title": "身分識別",
+    "publicKey": "公鑰",
+    "address": "地址",
+    "chainId": "鏈 ID",
+    "rotatedAt": "上次輪換",
+    "rotate": "輪換身分",
+    "rotateHint": "產生新的身分金鑰對",
+    "rotating": "輪換中...",
+    "notConnected": "請先連線裝置",
+    "loadError": "載入身分失敗",
+    "rotateError": "輪換身分失敗",
+    "rotated": "身分輪換成功",
+    "notFound": "找不到身分",
+    "retry": "重試",
+    "copied": "已複製到剪貼簿",
+    "copy": "複製",
+    "never": "從未"
+  },
+  "configImport": {
+    "title": "匯入/匯出",
+    "export": "匯出設定",
+    "exportDesc": "將裝置設定下載為 JSON",
+    "import": "匯入設定",
+    "importDesc": "從 JSON 檔案載入設定",
+    "preview": "顯示預覽",
+    "success": "操作完成",
+    "error": "操作失敗",
+    "exportSuccess": "設定匯出成功",
+    "exportFailed": "設定匯出失敗",
+    "importSuccess": "設定匯入成功",
+    "importFailed": "設定匯入失敗",
+    "notConnected": "請先連線裝置"
+  },
+  "toast": {
+    "scanComplete": "掃描完成",
+    "connectionLost": "連線中斷",
+    "connectionRestored": "連線已恢復",
+    "reconnecting": "正在重新連線..."
+  },
+  "webhook": {
+    "title": "Webhook 設定",
+    "url": "Webhook URL",
+    "urlPlaceholder": "https://example.com/webhook",
+    "secret": "密鑰",
+    "secretPlaceholder": "Webhook 密鑰",
+    "events": "事件",
+    "save": "儲存 Webhook",
+    "test": "測試",
+    "testing": "測試中...",
+    "testSuccess": "Webhook 測試成功",
+    "testFailed": "Webhook 測試失敗"
+  },
+  "mqtt": {
+    "title": "MQTT 設定",
+    "broker": "Broker URL",
+    "brokerPlaceholder": "mqtt://broker.example.com:1883",
+    "username": "使用者名稱",
+    "password": "密碼",
+    "topic": "主題",
+    "topicPlaceholder": "devices/+/events",
+    "save": "儲存 MQTT",
+    "test": "測試連線",
+    "connected": "已連線",
+    "disconnected": "未連線"
+  },
+  "footer": {
+    "devicesFound": "個裝置",
+    "lastScan": "上次掃描",
+    "neverScanned": "從未掃描",
+    "ago": "前",
+    "connected": "已連線"
+  },
+  "settings": {
+    "theme": "主題",
+    "lightMode": "淺色",
+    "darkMode": "深色",
+    "warmMode": "暖色",
+    "coffeeMode": "咖啡",
+    "language": "語言"
+  },
+  "chat": {
+    "title": "與智慧體對話",
+    "notConnected": "未連線",
+    "notConnectedHint": "連線裝置後與智慧體對話",
+    "welcome": "你好！我是 mAgent 智慧助手。連線裝置後即可開始對話！",
+    "placeholder": "輸入訊息...",
+    "hint": "按 Enter 傳送，Shift+Enter 換行",
+    "you": "你",
+    "agent": "智慧體",
+    "system": "系統",
+    "clear": "清空對話",
+    "responseReceived": "已收到回應",
+    "error": "傳送訊息失敗",
+    "sending": "傳送中...",
+    "connectedTo": "已連線 ·",
+    "device": "裝置",
+    "demoMode": "演示模式 · 未連線裝置"
+  },
+  "channels": {
+    "title": "通訊頻道",
+    "notConnected": "未連線",
+    "notConnectedHint": "連線裝置後檢視頻道",
+    "activeChannels": "活躍",
+    "totalMessages": "訊息",
+    "totalChannels": "頻道",
+    "messages": "筆",
+    "lastActivity": "最近活動",
+    "never": "從未",
+    "ago": "前",
+    "type": "類型",
+    "description": "描述",
+    "close": "關閉",
+    "status": {
+      "active": "活躍",
+      "inactive": "未啟動",
+      "error": "錯誤"
+    },
+    "filter": {
+      "all": "全部",
+      "active": "活躍",
+      "inactive": "未啟動"
+    },
+    "local": {
+      "description": "本地 BLE 連線至裝置"
+    },
+    "uart": {
+      "description": "UART 序列埠通訊"
+    },
+    "manual": {
+      "description": "按鈕或 CLI 手動輸入"
+    },
+    "mqtt": {
+      "description": "MQTT broker 遠端通訊"
+    },
+    "webhook": {
+      "description": "HTTP webhook 整合"
+    },
+    "web3": {
+      "description": "區塊鏈/Web3 通訊"
+    }
+  }
+}

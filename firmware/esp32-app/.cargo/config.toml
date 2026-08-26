@@ -59,6 +59,25 @@ rustflags = [
     # that ESP-IDF's link wrapper expects.
 ]
 
+# ---------------------------------------------------------------------------
+# ESP32-S3 (Xtensa) target — compile-time board switch (`board-s3`)
+# ---------------------------------------------------------------------------
+# To build the S3 profile, override the default RISC-V target and point the
+# build at the Xtensa toolchain + S3 sdkconfig (this config's `[build] target`
+# and `[env]` are C61-specific and can't be switched by a Cargo feature):
+#
+#   MCU=ESP32S3 \
+#   ESP_IDF_SDKCONFIG_DEFAULTS=/Users/arksong/MicroAgent/firmware/esp32-app/sdkconfig.s3.defaults \
+#   cargo build -p magent-esp32-app --target xtensa-esp32s3-espidf \
+#       --features board-s3 --release
+#
+# The Xtensa linker path below is the standard esp-rs location. Install the
+# ESP32-S3 toolchain (xtensa-esp32s3-elf-gcc) first, e.g. via:
+#   cargo install espup && espup install
+# TRACE: REQ-FW-001.
+[target.xtensa-esp32s3-espidf]
+linker = "/Users/arksong/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+
 [unstable]
 # `riscv32imac-esp-espidf` is a Tier 3 target with no pre-built
 # std. `build-std` rebuilds std from the rust source tree using

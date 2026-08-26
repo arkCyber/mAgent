@@ -64,6 +64,24 @@ sha2 = { version = "0.10", optional = true, default-features = false }
 secp256k1 = { version = "0.29", optional = true, default-features = false, features = ["alloc", "recovery", "rand"] }
 
 # ---------------------------------------------------------------------------
+# Digital Wallet crypto
+# ---------------------------------------------------------------------------
+# ChaCha20-Poly1305 AEAD for keystore encryption
+chacha20poly1305 = { workspace = true, optional = true }
+# Argon2id for passphrase-to-key derivation
+argon2 = { version = "0.5", optional = true }
+# Base64 encoding for keystore JSON
+base64 = { workspace = true, optional = true }
+# AES-GCM for keystore encryption
+aes-gcm = { version = "0.10", optional = true, default-features = false, features = ["aes", "getrandom"] }
+# AES block cipher (needed by aes-gcm)
+aes = { version = "0.8", optional = true, default-features = false }
+# serde-json-core for embedded keystore serialization (heapless support)
+serde-json-core = { version = "0.5", optional = true, default-features = false, features = ["heapless"] }
+# Getrandom for RNG
+getrandom = { version = "0.2", optional = true }
+
+# ---------------------------------------------------------------------------
 # Optional: architecture-level crates (chip-agnostic)
 # ---------------------------------------------------------------------------
 # These provide the CPU startup code, critical-section impls, and
@@ -320,7 +338,7 @@ ingress = [
 #
 # To enable:
 #   cargo build -p magent-core --features verifiable_credentials,web3,std
-verifiable_credentials = ["serde_json/std", "dep:ed25519-dalek", "dep:bs58", "dep:rand_core", "std", "web3"]
+verifiable_credentials = ["serde_json/std", "dep:ed25519-dalek", "dep:bs58", "dep:rand_core", "dep:getrandom", "std", "web3"]
 
 # ---------------------------------------------------------------------------
 # Web3 identity & asymmetric cryptography
@@ -362,6 +380,30 @@ web3_app = [
 ]
 
 # ---------------------------------------------------------------------------
+# Digital Wallet (BIP-39 + Keystore)
+# ---------------------------------------------------------------------------
+# Provides:
+# - BIP-39 mnemonic generation and validation (12/24 word phrases)
+# - BIP-32 HD key derivation for secp256k1
+# - Encrypted keystore (AES-256-GCM + Argon2id)
+# - Wallet management with address derivation
+wallet = [
+    "dep:chacha20poly1305",
+    "dep:argon2",
+    "dep:base64",
+    "dep:aes-gcm",
+    "dep:aes",
+    "dep:serde-json-core",
+    "dep:getrandom",
+    "web3",
+]
+
+# ESP32 NVS wallet storage (`web3::wallet::esp32_nvs`). Only meaningful in
+# the ESP32 firmware build, where `esp_idf_svc` is available; enabling it
+# without that dependency is a host-only compile error by design.
+esp32_nvs = []
+
+# ---------------------------------------------------------------------------
 # Blockchain Integration
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -390,6 +432,7 @@ embedded = ["nrf52"]
 serde_json = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 futures = "0.3"
+proptest = "1.5"
 
 # ---------------------------------------------------------------------------
 # Test targets
@@ -414,6 +457,14 @@ required-features = ["std"]
 name = "comprehensive_agent_tests"
 path = "tests/comprehensive_agent_tests.rs"
 required-features = ["std"]
+
+[[test]]
+name = "property_tests"
+path = "tests/property_tests.rs"
+# Uses `web3::wallet::Keystore`, so it needs the `wallet` feature (which
+# pulls in `web3` + `std`) in addition to `web3` itself. Without `wallet`
+# the test target fails to compile with `could not find 'wallet' in 'web3'`.
+required-features = ["std", "web3", "wallet"]
 
 # ---------------------------------------------------------------------------
 # Lints
@@ -508,3 +559,14 @@ required-features = ["web3"]
 name = "ingress_tests"
 path = "tests/ingress_tests.rs"
 required-features = ["ingress", "mqtt", "web3"]
+
+# Time-synchronisation integration tests. The tests are pure logic and
+# written without `format!` / `std::string` so that they compile against
+# the bare library (no `required-features`). This deliberately sidesteps
+# the workspace rustls patch problem (which only triggers through
+# `reqwest`, a dev-dep on the host side). The `time_sync` module is
+# `no_std + alloc`, so the tests stay `no_std + alloc` too — they map
+# 1:1 to what the ESP32 / nRF52 firmwares run.
+[[test]]
+name = "time_sync_tests"
+path = "tests/time_sync_tests.rs"

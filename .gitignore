@@ -29,6 +29,13 @@ Thumbs.db
 *.log
 *.dSYM/
 
+# Node / frontend build output (e.g. host/magent-man) — regenerable
+node_modules/
+dist/
+
+# Swift build cache (host/magent-man/ble-helper) — regenerable
+.build/
+
 # Environment
 .env
 .env.local

@@ -435,4 +435,66 @@ mod tests {
         let via_display = alloc::format!("{}", did);
         assert_eq!(via_display, did.as_str());
     }
+
+    /// Security-boundary robustness: `from_string` parses untrusted
+    /// `did:key:` strings, so it must never panic. We also check an
+    /// invariant: every string that parses successfully must round-trip
+    /// through `as_str()` and parse again identically.
+    #[test]
+    fn from_string_never_panics_and_round_trips_on_success() {
+        // A structurally-valid did that we use to seed round-trip checks.
+        let valid = DidKey::from_ed25519_public_key(&[7u8; ED25519_PUB_LEN]).unwrap();
+        let valid_str = valid.as_str().to_string();
+
+        let mut cases: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+        // Structural edge cases.
+        cases.push("".into());
+        cases.push("did".into());
+        cases.push("did:".into());
+        cases.push("did:key".into());
+        cases.push("did:key:".into());
+        cases.push("did:key:z".into());
+        cases.push("did:key:x".into());
+        cases.push("did:key:z!".into());
+        cases.push(valid_str.clone());
+        // Base58 alphabet bounds + non-alphabet chars appended/prepended.
+        for c in ['0', 'O', 'I', 'l', '!', ' ', '\n', '\0', '1', 'z'] {
+            cases.push(format!("did:key:z{c}"));
+            cases.push(format!("did:key:z{}", c.to_string().repeat(40)));
+            cases.push(format!("did:key:z{c}{}", valid.as_str()));
+            cases.push(format!("did:key:z{}c", valid.as_str()));
+        }
+        // Truncated / extended versions of a valid DID.
+        for cut in 0..valid_str.len() {
+            cases.push(valid_str[..cut].to_string());
+        }
+        cases.push(format!("{valid_str}{valid_str}"));
+        cases.push(format!("did:key:z{}", "A".repeat(200)));
+        // Deterministic pseudo-random bytes (LCG) as base58 payloads.
+        let mut acc: u32 = 0xDEADBEEF;
+        for len in 1..=128usize {
+            let mut v = String::with_capacity(len);
+            for _ in 0..len {
+                acc = acc.wrapping_mul(1664525).wrapping_add(1013904223);
+                // Map into the base58 alphabet range roughly.
+                let b = ((acc >> 24) % 122) as u8 + 33; // printable ASCII
+                v.push(b as char);
+            }
+            cases.push(format!("did:key:z{v}"));
+        }
+
+        for c in &cases {
+            // Must never panic.
+            match DidKey::from_string(c) {
+                Ok(did) => {
+                    // Invariant: a successfully-parsed DID round-trips.
+                    let s = did.as_str();
+                    let reparsed = DidKey::from_string(&s)
+                        .expect("as_str() output must re-parse");
+                    assert_eq!(did.as_str(), reparsed.as_str());
+                }
+                Err(_) => {} // rejections are fine; the point is no panic
+            }
+        }
+    }
 }

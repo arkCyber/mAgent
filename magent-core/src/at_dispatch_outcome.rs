@@ -22,9 +22,15 @@ pub enum AtOutcome {
     /// Send only `OK\r\n`.
     NoReply,
     /// Send `data\r\n` (a single line) followed by `OK\r\n`.
-    Ok { data: HeaplessString<REPLY_LINE_MAX> },
+    Ok {
+        /// The reply line payload, capped at `REPLY_LINE_MAX` bytes.
+        data: HeaplessString<REPLY_LINE_MAX>,
+    },
     /// Send `+CMDER:<code>\r\nERROR\r\n`.
-    Error { code: u8 },
+    Error {
+        /// The numeric `+CMDER:<n>` error code to emit.
+        code: u8,
+    },
 }
 
 impl AtOutcome {

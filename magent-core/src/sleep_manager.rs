@@ -9,7 +9,7 @@
 //! This module monitors the user's autonomic nervous system state
 //! and provides timely interventions to reduce stress and improve sleep quality.
 
-use crate::error::Result;
+use crate::error::{try_heapless, Result};
 use crate::health_sensors::StressLevel;
 use core::fmt::Write;
 use heapless::{String, Vec};
@@ -115,7 +115,12 @@ impl CircadianPhase {
 pub struct SleepQuality {
     /// Total sleep duration in minutes
     pub duration_min: u32,
-    /// Sleep efficiency (percentage in bed actually sleeping)
+    /// Sleep efficiency (percentage of time in bed actually sleeping).
+    ///
+    /// **Convention:** this is a 0.0–100.0 percentage (e.g. `95.0` for 95%),
+    /// **not** a 0–1 fraction. The score formula is `efficiency * 0.25`, so a
+    /// fractional value like `0.95` would silently contribute almost nothing
+    /// to the overall score.
     pub efficiency: f32,
     /// Deep sleep minutes (estimated)
     pub deep_sleep_min: u16,
@@ -563,23 +568,28 @@ impl SleepManager {
         }
 
         // Based on recent sleep quality
-        if let Some(avg_score) = self.average_sleep_score(5) {
+        // HARDENING (audit-2026-08 unwrap sweep): the four `String::try_from`
+            // calls below operate on compile-time Chinese literals that
+            // are well within the 128-byte capacity, but using
+            // `try_heapless` keeps the recommendation pipeline panic-free
+            // if a future contributor translates/extends the strings.
+            if let Some(avg_score) = self.average_sleep_score(5) {
             if avg_score < 60.0 {
                 let _ = recommendations
-                    .push(String::try_from("最近睡眠质量较差，建议睡前减少屏幕使用").unwrap());
+                    .push(try_heapless::<128>("最近睡眠质量较差，建议睡前减少屏幕使用"));
             }
         }
 
         // Based on circadian phase
         match self.circadian_phase {
             CircadianPhase::WindDown => {
-                let _ = recommendations.push(
-                    String::try_from("现在是睡眠准备阶段，建议调暗灯光，进行放松活动").unwrap(),
-                );
+                let _ = recommendations.push(try_heapless::<128>(
+                    "现在是睡眠准备阶段，建议调暗灯光，进行放松活动",
+                ));
             }
             CircadianPhase::AlertPhase => {
                 let _ = recommendations
-                    .push(String::try_from("现在是警觉期，适合处理复杂任务").unwrap());
+                    .push(try_heapless::<128>("现在是警觉期，适合处理复杂任务"));
             }
             _ => {}
         }
@@ -587,7 +597,7 @@ impl SleepManager {
         // Default recommendations
         if recommendations.is_empty() {
             let _ = recommendations
-                .push(String::try_from("保持良好的睡眠习惯：固定作息，适度运动").unwrap());
+                .push(try_heapless::<128>("保持良好的睡眠习惯：固定作息，适度运动"));
         }
 
         recommendations
@@ -650,4 +660,241 @@ pub enum InterventionType {
     LightExposure,
     /// Emergency calm (HRV spike)
     EmergencyCalm,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::health_sensors::StressLevel;
+
+    /// Build a `SleepRecord` with the given quality params and a fixed
+    /// overnight window (23:00 → 06:30, 450 min).
+    fn record(score: u8, duration_min: u32) -> SleepRecord {
+        SleepRecord {
+            day_index: 0,
+            sleep_start_min: 23 * 60,
+            wake_time_min: 6 * 60 + 30,
+            quality: SleepQuality {
+                duration_min,
+                // `efficiency` is a 0-100 percentage (see `SleepQuality` docs).
+                efficiency: 90.0,
+                deep_sleep_min: 90,
+                rem_sleep_min: 90,
+                wake_count: 1,
+                onset_latency_min: 10,
+                score,
+            },
+            sleep_hrv: 55.0,
+            sleep_hr: 60,
+            hrv_trend: 0,
+        }
+    }
+
+    /// Build a record from a 23:00 sleep start and a caller-chosen wake
+    /// time (minutes from midnight), so the *derived* duration can be
+    /// controlled (used by the debt / capacity tests).
+    fn make_record(day_index: u32, wake_min: u16) -> SleepRecord {
+        SleepRecord {
+            day_index,
+            sleep_start_min: 23 * 60,
+            wake_time_min: wake_min,
+            quality: SleepQuality::new(80, 90.0, 90, 90, 1, 10),
+            sleep_hrv: 55.0,
+            sleep_hr: 60,
+            hrv_trend: 0,
+        }
+    }
+
+    #[test]
+    fn time_of_day_maps_hours() {
+        assert_eq!(TimeOfDay::from_hour(0), TimeOfDay::Night);
+        assert_eq!(TimeOfDay::from_hour(4), TimeOfDay::Night);
+        assert_eq!(TimeOfDay::from_hour(5), TimeOfDay::EarlyMorning);
+        assert_eq!(TimeOfDay::from_hour(6), TimeOfDay::EarlyMorning);
+        assert_eq!(TimeOfDay::from_hour(7), TimeOfDay::Morning);
+        assert_eq!(TimeOfDay::from_hour(11), TimeOfDay::Morning);
+        assert_eq!(TimeOfDay::from_hour(12), TimeOfDay::Afternoon);
+        assert_eq!(TimeOfDay::from_hour(16), TimeOfDay::Afternoon);
+        assert_eq!(TimeOfDay::from_hour(17), TimeOfDay::Evening);
+        assert_eq!(TimeOfDay::from_hour(20), TimeOfDay::Evening);
+        assert_eq!(TimeOfDay::from_hour(21), TimeOfDay::Night);
+        assert_eq!(TimeOfDay::from_hour(23), TimeOfDay::Night);
+        // Names / activity suggestions are non-empty for every phase.
+        for h in 0u8..24 {
+            let tod = TimeOfDay::from_hour(h);
+            assert!(!tod.name().is_empty());
+            assert!(!tod.ideal_activity().is_empty());
+        }
+    }
+
+    #[test]
+    fn sleep_quality_scores_and_rates() {
+        // A good night (8h, 95% efficiency, plenty of deep+REM, fast onset,
+        // no wake-ups) should score high. `efficiency` is a 0-100 percentage.
+        let good = SleepQuality::new(480, 95.0, 90, 90, 0, 10);
+        assert!(good.score >= 80, "good night scored {}", good.score);
+        assert_eq!(good.rating(), "Excellent");
+
+        // A poor night scores low.
+        let poor = SleepQuality::new(300, 50.0, 30, 20, 5, 45);
+        assert!(poor.score <= 40, "poor night scored {}", poor.score);
+        assert_eq!(poor.rating(), "Poor");
+
+        // Score is clamped to [0, 100].
+        let extreme = SleepQuality::new(10, 10.0, 0, 0, 20, 120);
+        assert_eq!(extreme.score, 0);
+    }
+
+    #[test]
+    fn sleep_record_duration_handles_midnight_crossing() {
+        // Same-day window: 10:00 → 15:00 = 300 min.
+        let within_day = SleepRecord {
+            day_index: 1,
+            sleep_start_min: 10 * 60,
+            wake_time_min: 15 * 60,
+            quality: SleepQuality::new(480, 90.0, 90, 90, 1, 10),
+            sleep_hrv: 55.0,
+            sleep_hr: 60,
+            hrv_trend: 0,
+        };
+        assert_eq!(within_day.duration_minutes(), 300);
+
+        // Overnight: 23:00 → 06:30 crosses midnight → (1440-1380)+390 = 450.
+        let overnight = record(80, 450);
+        assert_eq!(overnight.duration_minutes(), 450);
+    }
+
+    #[test]
+    fn meditation_session_tracks_stress_reduction() {
+        let mut s = MeditationSession::new(MeditationType::QuickBreath, 2, 80);
+        assert!(!s.completed);
+        assert_eq!(s.stress_reduction(), 0);
+        s.complete(45);
+        assert!(s.completed);
+        assert_eq!(s.stress_after, 45);
+        assert_eq!(s.stress_reduction(), 35); // 80 - 45
+    }
+
+    #[test]
+    fn recommended_meditation_maps_stress_level() {
+        assert_eq!(MeditationType::recommended_for_stress(StressLevel::Low), MeditationType::QuickBreath);
+        assert_eq!(MeditationType::recommended_for_stress(StressLevel::Moderate), MeditationType::BodyScan);
+        assert_eq!(MeditationType::recommended_for_stress(StressLevel::High), MeditationType::GuidedRelaxation);
+        assert_eq!(MeditationType::recommended_for_stress(StressLevel::VeryHigh), MeditationType::EmergencyCalm);
+    }
+
+    #[test]
+    fn meditation_scripts_are_non_empty_for_all_types() {
+        use MeditationType::*;
+        for t in [QuickBreath, BodyScan, GuidedRelaxation, DeepMeditation, SleepPrep, EmergencyCalm] {
+            assert!(!SleepManager::get_meditation_script(t).is_empty());
+            assert!(!t.name().is_empty());
+            assert!(!t.description().is_empty());
+        }
+    }
+
+    #[test]
+    fn average_sleep_score_uses_last_n() {
+        let mut m = SleepManager::new();
+        for s in [80u8, 90, 100] {
+            m.add_sleep_record(record(s, 450)).unwrap();
+        }
+        // Last 2 average: (90 + 100) / 2 = 95.
+        let avg2 = m.average_sleep_score(2).unwrap();
+        assert!((avg2 - 95.0).abs() < 0.01);
+        // Requesting more nights than available returns the full average.
+        let avg_all = m.average_sleep_score(10).unwrap();
+        assert!((avg_all - 90.0).abs() < 0.01);
+        // No records → None.
+        assert!(SleepManager::new().average_sleep_score(3).is_none());
+    }
+
+    #[test]
+    fn sleep_debt_is_zero_with_enough_sleep_and_positive_when_short() {
+        // No records → full target is treated as debt (conservative: no
+        // data = worst case), i.e. 8h × 7 days.
+        assert_eq!(SleepManager::new().calculate_sleep_debt(7), 56.0);
+        // Two 6-hour nights (wake 05:00 from 23:00) vs 8h target → 4h debt.
+        let mut m = SleepManager::new();
+        m.add_sleep_record(make_record(0, 5 * 60)).unwrap(); // 360 min
+        m.add_sleep_record(make_record(1, 5 * 60)).unwrap(); // 360 min
+        let debt = m.calculate_sleep_debt(2);
+        assert!((debt - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn circadian_phase_updates_by_hour() {
+        let mut m = SleepManager::new();
+        m.update_circadian(0); // 00:00
+        assert_eq!(m.circadian_phase(), CircadianPhase::SleepPhase);
+        m.update_circadian(6 * 60); // 06:00
+        assert_eq!(m.circadian_phase(), CircadianPhase::WakeTransition);
+        m.update_circadian(10 * 60); // 10:00
+        assert_eq!(m.circadian_phase(), CircadianPhase::AlertPhase);
+        m.update_circadian(18 * 60); // 18:00
+        assert_eq!(m.circadian_phase(), CircadianPhase::PeakAlertness);
+        m.update_circadian(21 * 60 + 30); // 21:30
+        assert_eq!(m.circadian_phase(), CircadianPhase::WindDown);
+    }
+
+    #[test]
+    fn stress_intervention_triggers_and_obeys_cooldown() {
+        let mut m = SleepManager::new();
+        // Low stress (hrv 80, hr 70) → no intervention.
+        assert!(m.check_stress_intervention(80.0, 70, 1_000_000).is_none());
+
+        // Very high stress + elevated HR → score ≥ threshold → intervention.
+        // hrv 10 → hrv_score 43; hr 160 → +35 → 78 ≥ 70. Use a timestamp
+        // well past the initial 15-min cooldown so the first offer fires.
+        let rec = m
+            .check_stress_intervention(10.0, 160, 1_000_000)
+            .expect("intervention");
+        assert_eq!(rec.intervention_type, InterventionType::MeditationOffer);
+        assert_eq!(rec.session_type, MeditationType::EmergencyCalm);
+        assert_eq!(rec.priority, 7); // 71..=85 band
+        assert!(rec.stress_score >= 70);
+
+        // A second check 1s later — well within the 15-min cooldown — is
+        // suppressed (no duplicate nagging).
+        assert!(m.check_stress_intervention(10.0, 160, 1_001_000).is_none());
+    }
+
+    #[test]
+    fn meditation_progress_tracks_and_resets() {
+        let mut m = SleepManager::new();
+        assert_eq!(m.today_meditation_progress(), (0, 10));
+        m.record_meditation(MeditationSession::new(MeditationType::QuickBreath, 2, 50))
+            .unwrap();
+        m.record_meditation(MeditationSession::new(MeditationType::BodyScan, 5, 50))
+            .unwrap();
+        assert_eq!(m.today_meditation_progress(), (7, 10));
+        m.reset_daily();
+        assert_eq!(m.today_meditation_progress(), (0, 10));
+    }
+
+    #[test]
+    fn sleep_history_caps_at_max_entries() {
+        let mut m = SleepManager::new();
+        for i in 0..(MAX_SLEEP_HISTORY + 5) {
+            m.add_sleep_record(make_record(i as u32, 6 * 60 + 30)).unwrap();
+        }
+        assert_eq!(m.sleep_history().len(), MAX_SLEEP_HISTORY);
+        // The oldest 5 entries were evicted.
+        assert_eq!(m.sleep_history()[0].day_index, 5);
+        assert_eq!(m.latest_sleep().unwrap().day_index as usize, MAX_SLEEP_HISTORY + 4);
+    }
+
+    #[test]
+    fn stress_threshold_is_clamped() {
+        // Setting a threshold above 100 must clamp to 100 (never wrap or
+        // store an out-of-range value). A 78-score stress is therefore
+        // *below* the clamped threshold and must NOT fire...
+        let mut clamped = SleepManager::new();
+        clamped.set_stress_threshold(200);
+        assert!(clamped.check_stress_intervention(10.0, 160, 1_000_000).is_none());
+
+        // ...whereas the same input fires under the default threshold of 70.
+        let mut default = SleepManager::new();
+        assert!(default.check_stress_intervention(10.0, 160, 1_000_000).is_some());
+    }
 }
