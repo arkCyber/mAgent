@@ -2118,4 +2118,11 @@ cd firmware/esp32-app && ./build-s3.sh   # 固件 S3 交叉编译通过，SSID �
 - **H13：`AT+CWJAP=` 实时连接（无需重启）**。此前改 WiFi 凭据后要重启才生效。新增模块级静态信号 `WIFI_RECONNECT_REQUESTED: AtomicBool`：`AT+CWJAP=` 成功写 NVS 后置位；WiFi supervisor 每 tick `swap(false)` 消费该信号，重载 NVS 凭据并**立即强制重连**（即使当前已关联也能切换 AP）。无需改 `dispatch` 签名。
 - **H14：web_admin 暴露断开原因**。`/api/status` 新增 `wifi_reason` 字段；HTML 仪表盘新增 "wifi reason" 行（含可读标签，如 201=no-ap-found、202=auth-fail、204=handshake-timeout）。复用 H12 的 `WifiStatus.reason`（由 STA 断开事件回调维护），方便诊断不稳定热点。
 
+### 35.8 功能补全（H15，2026-08-27）
+
+补齐其余被 deferred 的 AT 命令（S3+C61 构建通过、S3 实机启动验证）：
+- **`AT+IFCONFIG`**：不再返回硬编码 `+IFCONFIG: deferred`，改为从 `WifiStatus` 快照报告实时 STA IP（无链接时为空）。
+- **`AT+SIGN="<payload>"`**：用设备 Ed25519 身份对负载签名，返回规范 signed-message JSON（signer DID + payload_hex + signature_hex），与 ingress 信封同格式可验证。负载限 1..=64 字节以保证回复在 256B 行内。无需 IngressGateway 上下文。
+- **热点缺失提示**（WiFi supervisor）：持续 NO_AP_FOUND ≥2 分钟时打印用户可读提示（建议开启手机热点 2.4GHz「最大兼容性」），每 ~2 分钟重复一次。实机验证 138s 出现。
+
 ---
