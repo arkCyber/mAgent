@@ -2095,4 +2095,22 @@ cd firmware/esp32-app && ./build-s3.sh   # 固件 S3 交叉编译通过，SSID �
 - **H10：修正 `LEAKED_BOXES` 重复泄漏检测逻辑反转**。`HashSet::insert` 对首次插入返回 `true`、已存在返回 `false`；原代码 `if insert(ptr) { log::error!(duplicate) }` 在每次正常启动（首次泄漏）都误报 "duplicate"，而对真正的重复泄漏静默。已改为 `if !insert(ptr)`，三处调用点（NVS / LLM backend / Wi-Fi handle）统一修复。**实机验证**：重启后 `leaking a duplicate` 日志从 1 → 0。
 - **H11：web_admin SSID/IP 未转义**。`render_status`（JSON）/`render_index`（HTML）直接拼接运营商可控的 `ssid`/`ip`，恶意 SSID 可破坏 JSON 或注入 HTML/JS（XSS）。新增 `magent-core::escape::{json,html}`（no_std+alloc、宿主测试 6 条含 JSON 往返），web_admin 与 llm.rs 复用；llm.rs 本地 `escape_json` 去重为共享实现。
 
+### 35.6 WiFi 热点不稳定容错（H12，2026-08-27，实机验证）
+
+针对用户反馈「热点不稳定」新增两类容错：
+
+1. **WiFi supervisor 按断开原因自适应退避（main.rs）**。新增共享 `net_up: Arc<AtomicBool>` 链路标志 + `WifiStatus.reason` 由 STA 断开事件回调维护（连上置 0、断开写实际码）。`publish_wifi_state` 改为只在传入非零 reason 时才覆盖（避免每 3s 快照把事件原因清成 0）。`!connected` 分支按 reason 分类：
+   - **AUTH_FAIL=202**（密码错误）：`CREDENTIAL_BACKOFF_S=600s`，**完全跳过重连**（重试无意义）。
+   - **NO_AP_FOUND=201**（热点下线/2.4GHz 不可见）：`3s << downs` 指数退避，封顶 `AP_ABSENT_MAX_BACKOFF_S=60s`，避免紧扫描。
+   - 其它瞬时断开：原退避，封顶 30s。
+
+2. **SNTP 按链路门控（sntp_sync.rs）**。`run_sntp_supervisor` 新增 `network_up` 参数；无链路时**跳过首同步等待**并记录 `deferring first sync`，循环内重同步也加 `network_up` 守卫——不再在死链路上空轮询 NTP。
+
+**实机验证**（热点不可见、reason=201）：
+```
+[sntp] no network link yet — deferring first sync (will retry on link-up)
+[wifi-sup] attempting reconnect to arkSong@iPhone (last reason=201)
+[wifi-sup] backoff 3s before next attempt
+```
+
 ---
