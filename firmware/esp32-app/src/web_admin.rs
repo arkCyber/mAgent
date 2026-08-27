@@ -63,5 +63,5 @@ fn render_index(wifi_status: &WifiStatusHandle) -> String {
 
 fn render_status(wifi_status: &WifiStatusHandle) -> String {
     let s = wifi_status.lock().unwrap_or_else(|p| p.into_inner());
-    format!("{{\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"free_heap_b\":{},\"uptime_ms\":{}}}", s.state, s.ip, s.ssid, s.rssi, free_heap(), now_ms())
+    format!("{{\"version\":\"{}\",\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"free_heap_b\":{},\"uptime_ms\":{}}}", env!("CARGO_PKG_VERSION"), s.state, s.ip, s.ssid, s.rssi, free_heap(), now_ms())
 }

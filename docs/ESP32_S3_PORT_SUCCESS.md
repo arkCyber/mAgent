@@ -25,3 +25,21 @@ cd firmware/esp32-app && ./build-s3.sh              # 构建 S3（sdkconfig.defa
 
 ## 四、待后续验证（非阻塞）
 WiFi 联机 + BLE + DeepSeek 端到端、PSRAM 识别、web_admin 网页（http://<ip>/）、fetch_web 出站抓取。
+
+## 五、S3 vs C61 功能审计矩阵（2026-08-27）
+
+| 功能 | C61 | S3 | 说明 |
+|---|---|---|---|
+| 启动 + agent/ingress 线程 | ✅ | ✅ | S3 实机已验证 |
+| 本地工具（write_gpio / read_sensor 温度） | ✅ | ✅ | S3 实测 temperature=38.6 C |
+| UART 命令 / AT / 双向回传 | ✅ | ✅ | 共享源码 |
+| WiFi STA | ✅ | ✅ | 已构建，联机待测 |
+| DeepSeek 云 LLM | ❌ 仅本地 | ✅ | S3 专属（cfg board-s3） |
+| web_admin HTTP 状态页 | ✅ | ✅ | S3 实机已启动 Httpd（:80） |
+| fetch_web 出站抓取 | ✅ | ✅ | 共享 |
+| PSRAM | ✅ 2MB | ✅ quad | 实测该 4MB 板为 quad PSRAM（octal 报 not connected） |
+| 安全模式 / 崩溃检测 / 健康心跳 | ✅ | ✅ | 共享，实机心跳正常 |
+| Web3 钱包 / BLE 管理器 | ✅ | ✅ | magent-core 共享特性 |
+| OTA | ✅ 8MB 双 OTA | 精简（4MB 硬件约束，暂不考虑） | 用户确认 OTA 暂缓 |
+
+> 结论：除 OTA（4MB flash 硬件约束，暂不考虑）外，S3 已实现与 C61 同等甚至更全的功能。
