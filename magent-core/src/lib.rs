@@ -82,6 +82,11 @@ pub mod at;
 /// return it without dragging in firmware-side dependencies.
 pub mod at_dispatch_outcome;
 
+/// Minimal JSON / HTML escaping helpers for rendering untrusted
+/// operator-controlled strings (SSID, IP, model names, …) into output
+/// consumed by another component. `no_std` + `alloc`, host-tested.
+pub mod escape;
+
 /// Pure-logic decision helpers for AT command validation. Lives
 /// in the core (not firmware) so the security-sensitive rules
 /// (length caps, NUL rejection, encoding checks, mode

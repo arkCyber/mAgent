@@ -13,6 +13,7 @@ use embedded_svc::io::Write as _;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
 use magent_core::agent::LlmBackend;
 use magent_core::error::AgentError;
+use magent_core::escape::json as escape_json;
 
 /// DeepSeek's public OpenAI-compatible endpoint.
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
@@ -114,20 +115,4 @@ fn llm_err(_e: impl std::fmt::Debug) -> AgentError {
         operation: "deepseek",
         duration_ms: 8000,
     }
-}
-
-/// Escape a string for safe embedding inside a JSON string literal.
-fn escape_json(s: &str) -> String {
-    let mut out = String::new();
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other => out.push(other),
-        }
-    }
-    out
 }

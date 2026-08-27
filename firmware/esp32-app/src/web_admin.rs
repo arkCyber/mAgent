@@ -13,6 +13,7 @@ use embedded_svc::http::Method;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 
 use crate::{WifiStatusHandle, free_heap, now_ms};
+use magent_core::escape::{html as html_escape, json as json_escape};
 
 pub fn run_web_admin(wifi_status: WifiStatusHandle) {
     let config = Configuration {
@@ -58,10 +59,14 @@ pub fn run_web_admin(wifi_status: WifiStatusHandle) {
 
 fn render_index(wifi_status: &WifiStatusHandle) -> String {
     let s = wifi_status.lock().unwrap_or_else(|p| p.into_inner());
-    format!("<!DOCTYPE html><html><head><title>mAgent v{0}</title></head><body><h1>mAgent v{0}</h1><table><tr><td>version</td><td>{0}</td></tr><tr><td>state</td><td>{1}</td></tr><tr><td>ip</td><td>{2}</td></tr><tr><td>ssid</td><td>{3}</td></tr><tr><td>rssi</td><td>{4} dBm</td></tr><tr><td>heap</td><td>{5} B</td></tr><tr><td>uptime</td><td>{6} ms</td></tr></table><p><a href=/api/status>JSON status</a></p></body></html>", env!("CARGO_PKG_VERSION"), s.state, s.ip, s.ssid, s.rssi, free_heap(), now_ms())
+    let ip = html_escape(&s.ip);
+    let ssid = html_escape(&s.ssid);
+    format!("<!DOCTYPE html><html><head><title>mAgent v{0}</title></head><body><h1>mAgent v{0}</h1><table><tr><td>version</td><td>{0}</td></tr><tr><td>state</td><td>{1}</td></tr><tr><td>ip</td><td>{2}</td></tr><tr><td>ssid</td><td>{3}</td></tr><tr><td>rssi</td><td>{4} dBm</td></tr><tr><td>heap</td><td>{5} B</td></tr><tr><td>uptime</td><td>{6} ms</td></tr></table><p><a href=/api/status>JSON status</a></p></body></html>", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, free_heap(), now_ms())
 }
 
 fn render_status(wifi_status: &WifiStatusHandle) -> String {
     let s = wifi_status.lock().unwrap_or_else(|p| p.into_inner());
-    format!("{{\"version\":\"{}\",\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"free_heap_b\":{},\"uptime_ms\":{}}}", env!("CARGO_PKG_VERSION"), s.state, s.ip, s.ssid, s.rssi, free_heap(), now_ms())
+    let ip = json_escape(&s.ip);
+    let ssid = json_escape(&s.ssid);
+    format!("{{\"version\":\"{}\",\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"free_heap_b\":{},\"uptime_ms\":{}}}", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, free_heap(), now_ms())
 }
