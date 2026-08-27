@@ -104,7 +104,7 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 | `AT+CWJAP="ssid","pwd"` | `OK` | Persist credentials to NVS **and reconnect live** (no reboot) — the supervisor reloads them and re-associates immediately. | **Refused in `safe mode`** `+CMDER:4`. Validates SSID ≤32, pass ≤64, no NUL. Sealed with DBO2. |
 | `AT+CWJAP` | `OK` | Re-issue connect with last credentials. | Still deferred to next boot (use `AT+CWJAP=...` for a live connect). |
 | `AT+CWQAP` | `OK` | Disconnect. | Deferred to next boot in v0.2. |
-| `AT+CWLAP` | `+CWLAP:scan-started` `OK` | List available APs. | Background scan in v0.2; explicit table output ships in v0.3. |
+| `AT+CWLAP` | `+CWLAP:(<ssid>,<rssi>)...` `OK` | List APs from the supervisor's most recent scan (cached when the STA is disconnected). | Cached scan (2026-08-27); falls back to `+CWLAP:scan-started` if no scan has run yet. |
 | `AT+CWSTATE?` | `+CWSTATE:<state>[,<ip>]` `OK` | Real Wi-Fi state + IP from the supervisor's live snapshot. | Codes: 0 idle, 1 connecting, 3 associated, 4 disconnected, 5 got-IP. (Previously hard-coded 4.) |
 | `AT+CWHOSTNAME?` / `="name"` | `+CWHOSTNAME:"…"` `OK` | Read/write hostname. | NVS `mag_at:hostname`. Max 32 bytes. |
 | `AT+CWAUTOCONN?` / `=0/1` | `+CWAUTOCONN:<0/1>` `OK` | Auto-connect at boot. | NVS `mag_at:autoconn`. |
@@ -446,7 +446,7 @@ that makes the in-place migration safe.
 |---|---|---|
 | Basic commands | ✅ | ✅ |
 | `AT+CWJAP=` full semantics | ✅ live connect (no reboot) | — |
-| `AT+CWLAP` results | placeholder | full table |
+| `AT+CWLAP` results | ✅ cached scan list | full table |
 | `AT+CWSTATE?` | ✅ live snapshot | — |
 | `AT+CIPSTAMAC?` | ✅ real MAC | — |
 | `AT+CIPSTAMAC` set | refused | live cycle |
