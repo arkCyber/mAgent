@@ -49,6 +49,7 @@ const SNTP_SERVER_NUM: usize = {
     1
 };
 use esp_idf_svc::sys::EspError;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use magent_core::time_sync::{Source, TimeSync, DEFAULT_RESYNC_INTERVAL_S};
@@ -268,6 +269,7 @@ pub fn record_sample(
 pub fn run_sntp_supervisor<F>(
     handle: TimeSyncHandle,
     force_flag: ForceSyncFlag,
+    network_up: Arc<AtomicBool>,
     mut save_fn: F,
 ) where
     F: FnMut(&str) -> bool + Send + 'static,
@@ -286,8 +288,13 @@ pub fn run_sntp_supervisor<F>(
 
     // Initial wait for first sync (best-effort; we keep running
     // either way so the agent can serve commands even if SNTP is
-    // unreachable).
-    if wait_for_first_sync(&sntp, FIRST_SYNC_TIMEOUT_MS) {
+    // unreachable). FAULT-TOLERANCE (2026-08-27): if the STA has no IP
+    // yet (unstable hotspot / still associating), skip the wait entirely —
+    // the loop below re-checks `network_up` every tick and syncs the moment
+    // a link appears.
+    if !network_up.load(Ordering::Relaxed) {
+        log::warn!("[sntp] no network link yet — deferring first sync (will retry on link-up)");
+    } else if wait_for_first_sync(&sntp, FIRST_SYNC_TIMEOUT_MS) {
         if let Ok(Some(wall)) = read_rtc_unix() {
             let now = monotonic_ms();
             if record_sample(&handle, wall, 0, now).is_ok() {
@@ -348,10 +355,16 @@ pub fn run_sntp_supervisor<F>(
         }
 
         // Re-sync if (a) the resync interval has elapsed, OR
-        // (b) SNTP has reported a new sync status.
+        // (b) SNTP has reported a new sync status. FAULT-TOLERANCE
+        // (2026-08-27): only attempt when the STA actually has a link —
+        // reading a stale `Completed` status / polling NTP on a dead link
+        // is wasted work.
         let status = sntp.get_sync_status();
         let elapsed_since_sync = now.saturating_sub(last_sync_ms);
-        if status == SyncStatus::Completed && elapsed_since_sync >= RESYNC_INTERVAL_S * 1000 {
+        if network_up.load(Ordering::Relaxed)
+            && status == SyncStatus::Completed
+            && elapsed_since_sync >= RESYNC_INTERVAL_S * 1000
+        {
             if let Ok(Some(wall)) = read_rtc_unix() {
                 if record_sample(&handle, wall, 0, now).is_ok() {
                     log::info!(

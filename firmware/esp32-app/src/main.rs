@@ -59,6 +59,7 @@ use crate::ble_config::BleServer;
 
 use core::convert::TryFrom;
 use core::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
@@ -596,7 +597,14 @@ fn publish_wifi_state(
         }
         g.state = state;
         g.rssi = rssi;
-        g.reason = reason;
+        // FAULT-TOLERANCE (2026-08-27): only overwrite `reason` with a
+        // non-zero value. The STA-disconnect event subscription is the sole
+        // owner of `reason` (it sets the real code on drop and resets to 0 on
+        // connect); every periodic publish passes 0 and would otherwise clobber
+        // the code the reconnect backoff needs to classify the failure.
+        if reason != 0 {
+            g.reason = reason;
+        }
         g.updated_ms = now;
         if let Some(ip) = ip {
             g.ip = ip.to_string();
@@ -872,11 +880,19 @@ fn connect_wifi(
 /// dispatcher nor the agent touch the radio. On a link drop it re-runs
 /// `connect_wifi` (the same multi-attempt association logic) and backs off
 /// exponentially so a dead AP doesn't hammer the radio in a tight loop.
+///
+/// FAULT-TOLERANCE (2026-08-27): the backoff is *reason-adaptive* — a wrong
+/// password (AUTH_FAIL=202) is backed off for minutes (retrying can never
+/// succeed), while an absent AP (NO_AP_FOUND=201, the classic unstable-hotspot
+/// case) uses a growing backoff so we don't scan in a tight loop. The shared
+/// `net_up` flag also feeds the SNTP supervisor so it stops polling while
+/// there is no link.
 fn run_wifi_supervisor(
     wifi: &'static mut BlockingWifi<EspWifi<'static>>,
     status: WifiStatusHandle,
     ssid: String,
     pass: String,
+    net_up: Arc<AtomicBool>,
 ) {
     log::info!("[wifi-sup] supervisor thread started (ssid={ssid})");
     let mut was_up: Option<bool> = None;
@@ -894,6 +910,11 @@ fn run_wifi_supervisor(
             .map(|i| i.ip.to_string())
             .filter(|s| !s.is_empty() && s != "0.0.0.0");
         let rssi = wifi.wifi_mut().get_rssi().unwrap_or(0);
+
+        // FAULT-TOLERANCE: publish the link-up bit for the SNTP supervisor.
+        // Having a non-loopback IP means DHCP completed, so outbound UDP
+        // (NTP) is genuinely possible.
+        net_up.store(ip.is_some(), Ordering::Relaxed);
 
         // Publish the live snapshot for AT+CWSTATE.
         publish_wifi_state(
@@ -943,15 +964,58 @@ fn run_wifi_supervisor(
         }
 
         if !connected {
-            log::warn!("[wifi-sup] attempting reconnect to {ssid}");
-            connect_wifi(&mut *wifi, &ssid, &pass, &status);
-            // Exponential backoff (capped at 30s) before the next attempt.
-            let backoff = std::cmp::min(3u64 << downs.min(3), 30);
+            // FAULT-TOLERANCE (2026-08-27): classify the last drop reason so a
+            // wrong-password AUTH_FAIL isn't hammered (it can never succeed),
+            // an absent AP backs off harder, and transient drops retry normally.
+            let reason = status.lock().unwrap_or_else(|e| e.into_inner()).reason;
+            let cred_error = reason == WIFI_REASON_AUTH_FAIL;
+            let backoff: u64 = if cred_error {
+                // Wrong credentials: don't burn the radio re-associating.
+                CREDENTIAL_BACKOFF_S
+            } else if reason == WIFI_REASON_NO_AP_FOUND {
+                // Hotspot offline/out of 2.4GHz range: grow the gap.
+                std::cmp::min(3u64 << downs.min(4), AP_ABSENT_MAX_BACKOFF_S)
+            } else {
+                std::cmp::min(3u64 << downs.min(3), TRANSIENT_MAX_BACKOFF_S)
+            };
+
+            if cred_error {
+                log::warn!(
+                    "[wifi-sup] credential error (reason={reason}, AUTH_FAIL) — \
+                     verify the password; suppressing reconnect for {backoff}s"
+                );
+            } else {
+                log::warn!("[wifi-sup] attempting reconnect to {ssid} (last reason={reason})");
+                connect_wifi(&mut *wifi, &ssid, &pass, &status);
+            }
             log::warn!("[wifi-sup] backoff {backoff}s before next attempt");
             std::thread::sleep(Duration::from_secs(backoff));
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wi-Fi reconnect backoff tuning (FAULT-TOLERANCE 2026-08-27).
+//
+// ESP-IDF `WIFI_REASON_*` codes used to classify why the STA last dropped:
+//   201 NO_AP_FOUND  — the classic unstable-hotspot case (no 2.4 GHz beacon)
+//   202 AUTH_FAIL    — wrong password; re-associating can never succeed
+//   204 HANDSHAKE_TIMEOUT — transient; normal retry is fine
+// ---------------------------------------------------------------------------
+const WIFI_REASON_NO_AP_FOUND: u32 = 201;
+const WIFI_REASON_AUTH_FAIL: u32 = 202;
+
+/// How long (seconds) to suppress reconnect after an AUTH_FAIL (wrong
+/// password). Retrying faster is pointless and wastes radio power.
+const CREDENTIAL_BACKOFF_S: u64 = 600;
+
+/// Max gap (seconds) between reconnect attempts when the AP is absent. Grows
+/// as `3s << downs`, capped here so we still retry periodically once the
+/// hotspot comes back (a fixed huge sleep would delay recovery forever).
+const AP_ABSENT_MAX_BACKOFF_S: u64 = 60;
+
+/// Max gap (seconds) between reconnect attempts for transient failures.
+const TRANSIENT_MAX_BACKOFF_S: u64 = 30;
 
 fn provision_and_load_wifi_credentials() -> (Option<String>, Option<String>) {
     // PATCHED (MicroAgent): `AT+SYSSTORE` — when set to 0 the operator
@@ -1674,10 +1738,24 @@ fn setup_platform(
     // subscription must be created before `BlockingWifi::wrap` consumes
     // `sysloop`; it stays alive (via an internal Arc) through the
     // 30s connect_wifi poll below.
-    match sysloop.subscribe::<esp_idf_svc::wifi::WifiEvent, _>(|event| {
+    //
+    // FAULT-TOLERANCE (2026-08-27): we also record the reason code into the
+    // shared `WifiStatus` so the supervisor can pick an adaptive reconnect
+    // backoff (e.g. a wrong-password AUTH_FAIL is pointless to hammer).
+    let wifi_status_for_events = wifi_status.clone();
+    match sysloop.subscribe::<esp_idf_svc::wifi::WifiEvent, _>(move |event| {
         use esp_idf_svc::wifi::WifiEvent;
         match event {
-            WifiEvent::StaConnected(_) => log::info!("[wifi] EVENT STA CONNECTED"),
+            WifiEvent::StaConnected(_) => {
+                log::info!("[wifi] EVENT STA CONNECTED");
+                // FAULT-TOLERANCE: a successful (re)association clears the
+                // last-drop reason so the supervisor's backoff classifier sees
+                // reason 0 once we're up.
+                if let Ok(mut g) = wifi_status_for_events.lock() {
+                    g.reason = 0;
+                    g.updated_ms = now_ms();
+                }
+            }
             WifiEvent::StaDisconnected(r) => {
                 log::warn!(
                     "[wifi] EVENT STA DISCONNECTED reason={} ssid={:?} rssi={}",
@@ -1685,6 +1763,10 @@ fn setup_platform(
                     r.ssid(),
                     r.rssi()
                 );
+                if let Ok(mut g) = wifi_status_for_events.lock() {
+                    g.reason = r.reason() as u32;
+                    g.updated_ms = now_ms();
+                }
             }
             WifiEvent::StaAuthmodeChanged => log::warn!("[wifi] EVENT STA AUTHMODE CHANGED"),
             WifiEvent::ScanDone(_) => log::info!("[wifi] EVENT SCAN DONE"),
@@ -1962,10 +2044,16 @@ fn main() {
     // logs RSSI/IP/state transitions so an operator can diagnose an unstable
     // AP. It owns the leaked `BlockingWifi` handle exclusively; the AT
     // dispatcher and agent never touch the radio.
+    //
+    // FAULT-TOLERANCE (2026-08-27): `net_up` is a shared link-up flag the
+    // supervisor sets and the SNTP supervisor reads, so SNTP stops polling
+    // while there is no IP (avoids wasting NTP attempts on a dead link).
+    let net_up = Arc::new(AtomicBool::new(false));
     if let Some(wifi_handle) = wifi_handle {
         let wstatus = wifi_status.clone();
         let wssid = wifi_ssid.clone().unwrap_or_default();
         let wpass = wifi_pass.clone().unwrap_or_default();
+        let net_up_for_sup = net_up.clone();
         let sup = thread::Builder::new()
             .name("wifi-supervisor".into())
             // Keep this small — thread stacks come from the C61's limited
@@ -1975,7 +2063,7 @@ fn main() {
             // 8 KiB is ample; a 24 KiB stack here starved the agent thread
             // and its spawn failed.
             .stack_size(8 * 1024)
-            .spawn(move || run_wifi_supervisor(wifi_handle, wstatus, wssid, wpass))
+            .spawn(move || run_wifi_supervisor(wifi_handle, wstatus, wssid, wpass, net_up_for_sup))
             .ok();
         if sup.is_none() {
             log::error!("[wifi-sup] thread spawn failed — no reconnect supervision");
@@ -2122,6 +2210,7 @@ fn main() {
         if wifi_up {
             let ts_for_supervisor = time_sync_for_supervisor.clone();
             let flag_for_supervisor = force_ntp_sync_for_thread.clone();
+            let net_up_for_sntp = net_up.clone();
             let sntp_handle = thread::Builder::new()
                 .name("sntp-supervisor".into())
                 .stack_size(8 * 1024)
@@ -2129,6 +2218,7 @@ fn main() {
                     sntp_sync::run_sntp_supervisor(
                         ts_for_supervisor,
                         flag_for_supervisor,
+                        net_up_for_sntp,
                         |record| {
                             nvs_save_string(
                                 crate::sntp_sync::NVS_PERSIST_KEY,
