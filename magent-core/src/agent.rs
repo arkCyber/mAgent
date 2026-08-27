@@ -19,9 +19,9 @@ use crate::tools::{Tool, ToolRegistry, ToolType};
 use crate::MAX_BUFFER_SIZE;
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 use crate::MAX_CONVERSATION_MESSAGES;
+use heapless::String;
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 use heapless::Vec;
-use heapless::String;
 use serde::{Deserialize, Serialize};
 
 /// FEATURE (audit-2026-08 round-4): pack an `AgentError` into a
@@ -249,6 +249,11 @@ impl<'a> TokenSink for BoundedTokenSink<'a> {
 /// the offline back-off so a dead backend doesn't cost a network timeout on
 /// every task; we retry the LLM after `LLM_SKIP_CALLS` so it re-arms the
 /// moment the network comes back.
+///
+/// Only used on embedded targets (nRF52 / ESP32 / generic embedded) where the
+/// agent has a real LLM backend; gated identically to its single call site so
+/// the constant isn't flagged as dead under the host `std`-only feature set.
+#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 const LLM_SKIP_CALLS: u8 = 5;
 
 /// FEATURE (audit-2026-08 round-4): self-healing telemetry for the
@@ -424,7 +429,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
              pressure, light, heart_rate, hrv, glucose, ecg, stress, battery)",
             ToolType::ReadSensor,
         ),
-        ("write_gpio", "Drive a GPIO pin high or low", ToolType::WriteGpio),
+        (
+            "write_gpio",
+            "Drive a GPIO pin high or low",
+            ToolType::WriteGpio,
+        ),
         (
             "flash_read",
             "Read bytes from internal flash storage",
@@ -600,7 +609,6 @@ impl MiniAgent {
     /// The actual ReAct body of [`Self::run`]; telemetry counters
     /// (`runs_total`/`runs_err`) are managed by the wrapper.
     async fn run_inner(&mut self, task: &str) -> Result<String<MAX_BUFFER_SIZE>> {
-
         // Validate task length
         if task.len() > MAX_BUFFER_SIZE {
             return Err(AgentError::InputValidationFailed {
@@ -609,7 +617,8 @@ impl MiniAgent {
             });
         }
 
-        self.current_task = heapless::String::try_from(task).unwrap_or_else(|_| heapless::String::new());
+        self.current_task =
+            heapless::String::try_from(task).unwrap_or_else(|_| heapless::String::new());
         self.budget.reset_iteration();
         self.budget.reset_memory();
         self.conversation.clear();
@@ -708,17 +717,16 @@ impl MiniAgent {
             // between `self.skills.all()` and `self.add_message()`.
             // We cap at 4 injected skills to keep the conversation buffer
             // from filling up before the loop has a chance to run.
-            let mut to_inject: heapless::Vec<heapless::String<512>, 4> =
-                heapless::Vec::new();
+            let mut to_inject: heapless::Vec<heapless::String<512>, 4> = heapless::Vec::new();
             for skill in self.skills.all() {
                 if to_inject.is_full() {
                     break;
                 }
                 let name = skill.name.as_str();
                 let desc = skill.description.as_str();
-                let matched = task_buf.split_whitespace().any(|word| {
-                    word.len() > 2 && (name.contains(word) || desc.contains(word))
-                });
+                let matched = task_buf
+                    .split_whitespace()
+                    .any(|word| word.len() > 2 && (name.contains(word) || desc.contains(word)));
                 if matched {
                     let content = skill.to_injection_string();
                     let _ = to_inject.push(content);
@@ -816,14 +824,12 @@ impl MiniAgent {
                     // "off" / "0" → low), because pick_tool only checks for
                     // "off" and would mis-route "set gpio 7 low".
                     let lower = task.to_ascii_lowercase();
-                    let state = if lower.contains("low")
-                        || lower.contains("off")
-                        || lower.contains("=0")
-                    {
-                        "low"
-                    } else {
-                        "high"
-                    };
+                    let state =
+                        if lower.contains("low") || lower.contains("off") || lower.contains("=0") {
+                            "low"
+                        } else {
+                            "high"
+                        };
                     let mut a = heapless::String::<128>::new();
                     use core::fmt::Write as _;
                     let _ = write!(a, "pin={pin},state={state}");
@@ -893,9 +899,16 @@ impl MiniAgent {
             ("read_sensor", "sensor=heart_rate")
         } else if lower.contains("hrv") || lower.contains("心率变异") {
             ("read_sensor", "sensor=hrv")
-        } else if lower.contains("glucose") || lower.contains("blood sugar") || lower.contains("血糖") {
+        } else if lower.contains("glucose")
+            || lower.contains("blood sugar")
+            || lower.contains("血糖")
+        {
             ("read_sensor", "sensor=glucose")
-        } else if lower.contains("ecg") || lower.contains("ekg") || lower.contains("心电图") || lower.contains("心电") {
+        } else if lower.contains("ecg")
+            || lower.contains("ekg")
+            || lower.contains("心电图")
+            || lower.contains("心电")
+        {
             ("read_sensor", "sensor=ecg")
         } else if lower.contains("stress")
             || lower.contains("精神压力")
@@ -903,7 +916,8 @@ impl MiniAgent {
             || lower.contains("压力大")
         {
             ("read_sensor", "sensor=stress")
-        } else if lower.contains("humidity") || lower.contains("humid") || lower.contains("湿度") {
+        } else if lower.contains("humidity") || lower.contains("humid") || lower.contains("湿度")
+        {
             ("read_sensor", "sensor=humidity")
         } else if lower.contains("pressure")
             || lower.contains("baro")
@@ -913,7 +927,12 @@ impl MiniAgent {
             || lower.contains("高度")
         {
             ("read_sensor", "sensor=pressure")
-        } else if lower.contains("light") || lower.contains("lux") || lower.contains("光照") || lower.contains("亮度") || lower.contains("光线") {
+        } else if lower.contains("light")
+            || lower.contains("lux")
+            || lower.contains("光照")
+            || lower.contains("亮度")
+            || lower.contains("光线")
+        {
             ("read_sensor", "sensor=light")
         } else if lower.contains("accelerometer")
             || lower.contains("accel")
@@ -923,7 +942,11 @@ impl MiniAgent {
             || lower.contains("计步")
         {
             ("read_sensor", "sensor=accelerometer")
-        } else if lower.contains("battery") || lower.contains("batt") || lower.contains("电池") || lower.contains("电量") {
+        } else if lower.contains("battery")
+            || lower.contains("batt")
+            || lower.contains("电池")
+            || lower.contains("电量")
+        {
             ("read_sensor", "sensor=battery")
         } else if lower.contains("memory")
             || lower.contains("free_heap")
@@ -960,10 +983,22 @@ impl MiniAgent {
             } else {
                 ("flash_read", "address=0,length=16")
             }
-        } else if lower.contains("voice") || lower.contains("speak") || lower.contains("tts") || lower.contains("语音") || lower.contains("说话") {
+        } else if lower.contains("voice")
+            || lower.contains("speak")
+            || lower.contains("tts")
+            || lower.contains("语音")
+            || lower.contains("说话")
+        {
             ("voice_output", "text=Hello from mAgent")
-        } else if lower.contains("notif") || lower.contains("alert") || lower.contains("通知") || lower.contains("提醒") {
-            ("send_notification", "text=Notification from mAgent,priority=normal")
+        } else if lower.contains("notif")
+            || lower.contains("alert")
+            || lower.contains("通知")
+            || lower.contains("提醒")
+        {
+            (
+                "send_notification",
+                "text=Notification from mAgent,priority=normal",
+            )
         } else if lower.contains("ble") || lower.contains("bluetooth") || lower.contains("蓝牙") {
             ("ble_send", "data=hello,characteristic=default")
         } else {
@@ -985,12 +1020,10 @@ impl MiniAgent {
         self.telemetry.last_err_code = err.discriminant_byte();
         match phase {
             AgentState::Thinking => {
-                self.telemetry.think_errors =
-                    self.telemetry.think_errors.saturating_add(1);
+                self.telemetry.think_errors = self.telemetry.think_errors.saturating_add(1);
             }
             AgentState::Executing => {
-                self.telemetry.execute_errors =
-                    self.telemetry.execute_errors.saturating_add(1);
+                self.telemetry.execute_errors = self.telemetry.execute_errors.saturating_add(1);
             }
             // Observing / Finished errors are rare; we don't track
             // a dedicated counter for them, but the outer
@@ -1003,8 +1036,7 @@ impl MiniAgent {
         // it out so the supervisor can show "agent timed out"
         // rather than the generic "agent failed".
         if matches!(err, AgentError::OperationTimeout { .. }) {
-            self.telemetry.watchdog_trips =
-                self.telemetry.watchdog_trips.saturating_add(1);
+            self.telemetry.watchdog_trips = self.telemetry.watchdog_trips.saturating_add(1);
         }
         // LLM-backend failures look like network errors from the
         // agent's POV — the cloud LLM is a remote endpoint. We
@@ -1015,8 +1047,7 @@ impl MiniAgent {
             err,
             AgentError::NetworkConnectionFailed { .. } | AgentError::NetworkTimeout { .. }
         ) {
-            self.telemetry.llm_failures =
-                self.telemetry.llm_failures.saturating_add(1);
+            self.telemetry.llm_failures = self.telemetry.llm_failures.saturating_add(1);
         }
     }
 
@@ -1038,10 +1069,13 @@ impl MiniAgent {
         // Pull the pending call that `think` queued. If there isn't one
         // we treat that as a logic bug and surface a configuration
         // error instead of silently dropping the iteration.
-        let tool_call = self.pending_tool.take().ok_or(AgentError::ConfigurationError {
-            field: "agent",
-            reason: crate::error::ConfigError::MissingField,
-        })?;
+        let tool_call = self
+            .pending_tool
+            .take()
+            .ok_or(AgentError::ConfigurationError {
+                field: "agent",
+                reason: crate::error::ConfigError::MissingField,
+            })?;
 
         // Execute via the tool registry.
         let result = self.tools.execute(&tool_call).await?;
@@ -1090,11 +1124,7 @@ impl MiniAgent {
         // recorded the result. Without a real LLM there is no point in
         // iterating further; the final assistant reply will summarise
         // what was done.
-        if self
-            .conversation
-            .iter()
-            .any(|m| m.role.as_str() == "tool")
-        {
+        if self.conversation.iter().any(|m| m.role.as_str() == "tool") {
             // PATCHED (MicroAgent): build the final reply from the last tool
             // result (which now carries the real data), so the caller sees
             // e.g. "Task: Tool result: temperature=35.2 C" rather than a
@@ -1135,13 +1165,16 @@ impl MiniAgent {
 
         let message = Message {
             role: heapless::String::try_from(role).unwrap_or_else(|_| heapless::String::new()),
-            content: heapless::String::try_from(content).unwrap_or_else(|_| heapless::String::new()),
+            content: heapless::String::try_from(content)
+                .unwrap_or_else(|_| heapless::String::new()),
         };
 
-        self.conversation.push(message).map_err(|_| AgentError::BufferOverflow {
-            capacity: MAX_CONVERSATION_MESSAGES,
-            attempted: self.conversation.len() + 1,
-        })?;
+        self.conversation
+            .push(message)
+            .map_err(|_| AgentError::BufferOverflow {
+                capacity: MAX_CONVERSATION_MESSAGES,
+                attempted: self.conversation.len() + 1,
+            })?;
 
         Ok(())
     }
@@ -1245,7 +1278,6 @@ impl MiniAgent {
         }
         None
     }
-
 }
 
 /// Parse an LLM tool-call directive `{"tool":"<name>","args":"<kv>"}`.
@@ -1562,7 +1594,10 @@ mod tests {
         assert_eq!(agent.pick_tool("write config to flash").0, "flash_write");
         assert_eq!(agent.pick_tool("read from flash").0, "flash_read");
         assert_eq!(agent.pick_tool("speak the result").0, "voice_output");
-        assert_eq!(agent.pick_tool("send a notification").0, "send_notification");
+        assert_eq!(
+            agent.pick_tool("send a notification").0,
+            "send_notification"
+        );
         assert_eq!(agent.pick_tool("send over ble").0, "ble_send");
     }
 
@@ -1589,7 +1624,10 @@ mod tests {
             assert_eq!(name, "read_sensor");
             let parsed = parse_args(args);
             let sensor = arg(&parsed, "sensor", "");
-            assert_eq!(sensor, expect, "task {task:?} should select sensor {expect:?}, got {sensor:?}");
+            assert_eq!(
+                sensor, expect,
+                "task {task:?} should select sensor {expect:?}, got {sensor:?}"
+            );
         }
     }
 
@@ -1624,9 +1662,15 @@ mod tests {
     fn run_routes_voice_and_led_actions() {
         let mut agent = MiniAgent::new(make_cfg()).expect("agent");
         let out = futures::executor::block_on(agent.run("speak the answer")).unwrap();
-        assert!(out.contains("Voice queued"), "expected voice reply, got: {out}");
+        assert!(
+            out.contains("Voice queued"),
+            "expected voice reply, got: {out}"
+        );
         let out2 = futures::executor::block_on(agent.run("turn on the led")).unwrap();
-        assert!(out2.contains("set to high"), "expected gpio reply, got: {out2}");
+        assert!(
+            out2.contains("set to high"),
+            "expected gpio reply, got: {out2}"
+        );
     }
 
     #[test]
@@ -1643,7 +1687,10 @@ mod tests {
         // We assert instead that no *user* tools are present by
         // snapping the names and checking the snapshot below.
         let names: Vec<&'static str, 16> = BUILTIN_TOOL_NAMES.iter().copied().collect();
-        assert!(!names.is_empty(), "embedded test should see non-empty builtin list");
+        assert!(
+            !names.is_empty(),
+            "embedded test should see non-empty builtin list"
+        );
     }
 
     #[test]
@@ -1767,7 +1814,8 @@ mod tests {
 
     #[test]
     fn skill_to_injection_string_returns_markdown() {
-        let skill = Skill::new("ReadHR", "Read heart rate", "sensors", "shell content").expect("skill");
+        let skill =
+            Skill::new("ReadHR", "Read heart rate", "sensors", "shell content").expect("skill");
         let s = skill.to_injection_string();
         assert!(s.contains("ReadHR"));
         assert!(s.contains("shell content"));

@@ -426,7 +426,9 @@ impl TimeSync {
         monotonic_ms: u64,
         out: &mut String<MAX_ISO_LEN>,
     ) -> Result<(), TimeSyncError> {
-        let (s, ns) = self.now_unix_with_ns(monotonic_ms).ok_or(TimeSyncError::Overflow)?;
+        let (s, ns) = self
+            .now_unix_with_ns(monotonic_ms)
+            .ok_or(TimeSyncError::Overflow)?;
         let (y, mo, d, h, mi, sec) = unix_to_calendar(s).ok_or(TimeSyncError::Overflow)?;
         out.clear();
         // `YYYY-MM-DDTHH:MM:SSZ` — 20 chars; MAX_ISO_LEN is 32.
@@ -527,7 +529,9 @@ impl Source {
 /// the 200-ppm regime we operate in).
 fn apply_drift(wall_s: i64, elapsed_ms: u64, drift_ppm: i32) -> Result<i64, TimeSyncError> {
     let elapsed_s = (elapsed_ms / 1000) as i64;
-    let raw = wall_s.checked_add(elapsed_s).ok_or(TimeSyncError::Overflow)?;
+    let raw = wall_s
+        .checked_add(elapsed_s)
+        .ok_or(TimeSyncError::Overflow)?;
     if drift_ppm == 0 {
         return Ok(raw);
     }
@@ -628,7 +632,11 @@ pub fn unix_to_calendar(unix_s: i64) -> Option<(i32, u32, u32, u32, u32, u32)> {
     //   m = mp + (mp < 10 ? 3 : -9)                [1..12]
     //   y = y + (m <= 2 ? 1 : 0)
     let z = days + 719_468;
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = (z - era * 146_097) as u64; // [0..146_096]
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y_long = yoe as i64 + era * 400;
@@ -709,7 +717,9 @@ pub fn format_iso8601_for_test(
     let ns = wall_unix_ns.saturating_add(extra_ns);
     let carry = ns / 1_000_000_000;
     let ns = ns % 1_000_000_000;
-    let s = corrected.checked_add(carry as i64).ok_or(TimeSyncError::Overflow)?;
+    let s = corrected
+        .checked_add(carry as i64)
+        .ok_or(TimeSyncError::Overflow)?;
     let (y, mo, d, h, mi, sec) = unix_to_calendar(s).ok_or(TimeSyncError::Overflow)?;
     out.clear();
     write!(
@@ -759,7 +769,7 @@ mod tests {
         assert_eq!(ts_at(&t, 1000), Some(1_700_000_000));
         assert_eq!(ts_at(&t, 2000), Some(1_700_000_001));
         assert_eq!(ts_at(&t, 60_000), Some(1_700_000_059));
-        assert_eq!(ts_at(&t, 3661_000), Some(1_700_003_660));
+        assert_eq!(ts_at(&t, 3_661_000), Some(1_700_003_660));
     }
 
     #[test]
@@ -863,8 +873,10 @@ mod tests {
         // The wire record carries wall + nano + mono + drift + source;
         // TZ lives in a separate NVS key (see `TZ_KEY`) and so is
         // not part of the round-trip.
-        assert_eq!(buf.as_str().contains("1700000000"), true,
-            "serialised buf missing wall-clock field: {buf}");
+        assert!(
+            buf.as_str().contains("1700000000"),
+            "serialised buf missing wall-clock field: {buf}"
+        );
         assert_eq!(recovered.source(), Source::Sntp);
         // now_unix uses the *recovered* monotonic-anchored value.
         assert_eq!(recovered.now_unix(42_000), Some(1_700_000_000));
@@ -886,11 +898,7 @@ mod tests {
     #[test]
     fn load_rejects_drift_out_of_range() {
         let mut s: heapless::String<96> = heapless::String::new();
-        let _ = core::write!(
-            s,
-            "TIM1:1:2:3:{}:NONE",
-            MAX_DRIFT_PPM + 1
-        );
+        let _ = core::write!(s, "TIM1:1:2:3:{}:NONE", MAX_DRIFT_PPM + 1);
         let r = TimeSync::load(&s, 1000);
         assert!(matches!(r, Err(TimeSyncError::DriftOutOfRange)));
     }
@@ -990,12 +998,8 @@ mod tests {
         let mut t = TimeSync::default();
         assert!(t.set_tz_offset_minutes(TZ_MIN_MINUTES).is_ok());
         assert!(t.set_tz_offset_minutes(TZ_MAX_MINUTES).is_ok());
-        assert!(t
-            .set_tz_offset_minutes(TZ_MIN_MINUTES - 1)
-            .is_err());
-        assert!(t
-            .set_tz_offset_minutes(TZ_MAX_MINUTES + 1)
-            .is_err());
+        assert!(t.set_tz_offset_minutes(TZ_MIN_MINUTES - 1).is_err());
+        assert!(t.set_tz_offset_minutes(TZ_MAX_MINUTES + 1).is_err());
     }
 
     #[test]
@@ -1057,7 +1061,8 @@ mod tests {
     #[test]
     fn now_unix_with_ns_carries_subsecond() {
         let mut t = TimeSync::default();
-        t.record(1_700_000_000, 500_000_000, 0, Source::Sntp).unwrap();
+        t.record(1_700_000_000, 500_000_000, 0, Source::Sntp)
+            .unwrap();
         let (s, ns) = t.now_unix_with_ns(0).unwrap();
         assert_eq!(s, 1_700_000_000);
         assert_eq!(ns, 500_000_000);

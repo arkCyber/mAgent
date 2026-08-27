@@ -17,6 +17,14 @@ use heapless::String as HeaplessString;
 pub const REPLY_LINE_MAX: usize = 256;
 
 /// What we did with a command. Drives the reply machinery.
+///
+/// `#[allow(clippy::large_enum_variant)]`: the `Ok { data }` variant carries a
+/// 256-byte reply buffer. Boxing it would save ~248 bytes of stack per value
+/// but would add a heap allocation on the hot AT dispatch path (and the S3/C61
+/// already heap-allocate the reply line in most handlers). The enum is
+/// returned by value one-at-a-time and never stored in a Vec, so the 256-byte
+/// variant is acceptable — boxing is a deliberate trade-off we have not made.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum AtOutcome {
     /// Send only `OK\r\n`.

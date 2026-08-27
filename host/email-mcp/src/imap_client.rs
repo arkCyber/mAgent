@@ -137,7 +137,11 @@ impl ImapSession {
         wanted.sort_unstable();
         let start = total.saturating_sub(limit as usize);
         let slice = &wanted[start..];
-        let sequence_set: String = slice.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let sequence_set: String = slice
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
 
         let query = "UID FLAGS ENVELOPE";
         let mut stream = self.client.fetch::<_, _>(sequence_set, query).await?;
@@ -173,7 +177,11 @@ impl ImapSession {
     /// Search INBOX for messages whose subject OR from-header
     /// contains `query` (case-insensitive). Returns up to `limit`
     /// summaries, newest first.
-    pub async fn search_emails(&mut self, query: &str, limit: u32) -> Result<Vec<MessageSummary>, anyhow::Error> {
+    pub async fn search_emails(
+        &mut self,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<MessageSummary>, anyhow::Error> {
         let q = escape_imap_string(query);
         let criteria = format!("OR SUBJECT \"{q}\" FROM \"{q}\"");
         let seqs: std::collections::HashSet<u32> = self.client.search(&criteria).await?;
@@ -185,9 +193,16 @@ impl ImapSession {
         wanted.sort_unstable();
         let start = total.saturating_sub(limit as usize);
         let slice = &wanted[start..];
-        let sequence_set: String = slice.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let sequence_set: String = slice
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
 
-        let mut stream = self.client.fetch::<_, _>(sequence_set, "UID FLAGS ENVELOPE").await?;
+        let mut stream = self
+            .client
+            .fetch::<_, _>(sequence_set, "UID FLAGS ENVELOPE")
+            .await?;
         let mut out = Vec::new();
         while let Some(msg) = stream.next().await {
             let msg = msg?;
@@ -199,7 +214,10 @@ impl ImapSession {
 
     /// Mark a message as seen (set `\Seen` flag) by UID.
     pub async fn mark_read(&mut self, uid: u32) -> Result<(), anyhow::Error> {
-        let mut stream = self.client.uid_store(uid.to_string(), "+FLAGS (\\Seen)").await?;
+        let mut stream = self
+            .client
+            .uid_store(uid.to_string(), "+FLAGS (\\Seen)")
+            .await?;
         // Drain the response stream so the server actually
         // processes the STORE. Without this, the warning
         // "unused implementer of Stream" fires and the
@@ -210,7 +228,7 @@ impl ImapSession {
 
     /// Render a list of [`MessageSummary`] as a JSON array.
     pub fn summaries_to_json(summaries: &[MessageSummary]) -> serde_json::Value {
-        serde_json::Value::Array(summaries.iter().map(|s| s.to_json()).collect())
+        serde_json::Value::Array(summaries.iter().map(MessageSummary::to_json).collect())
     }
 
     /// Render a [`FullMessage`] as JSON.
@@ -245,7 +263,7 @@ fn summarize_fetch(msg: &Fetch) -> Result<MessageSummary, anyhow::Error> {
 /// Decode a `Cow<[u8]>` to `String`, returning `None` if it isn't
 /// valid UTF-8.
 fn cow_to_string(cow: Option<&Cow<'_, [u8]>>) -> Option<String> {
-    cow.and_then(|c| std::str::from_utf8(c).ok().map(|s| s.to_string()))
+    cow.and_then(|c| std::str::from_utf8(c).ok().map(ToString::to_string))
 }
 
 /// Extract a human-readable `Name <addr@host>` string from the

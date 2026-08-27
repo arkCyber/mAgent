@@ -122,16 +122,15 @@ pub struct ScratchBuffer {
 impl ScratchBuffer {
     /// Create a zeroed scratch buffer for reuse across AT lines.
     pub const fn new() -> Self {
-        Self { bytes: [0; MAX_LINE] }
+        Self {
+            bytes: [0; MAX_LINE],
+        }
     }
 
     /// Copy `line` into this buffer (truncating past `MAX_LINE`) and
     /// parse it. Returns `Ok(AtCommand<'_>)` with borrows tied to this
     /// scratch buffer.
-    pub fn copy_and_parse<'a>(
-        &'a mut self,
-        line: &[u8],
-    ) -> Result<AtCommand<'a>, AtParseError> {
+    pub fn copy_and_parse<'a>(&'a mut self, line: &[u8]) -> Result<AtCommand<'a>, AtParseError> {
         let n = line.len().min(MAX_LINE);
         self.bytes[..n].copy_from_slice(&line[..n]);
         let stored = &self.bytes[..n];
@@ -140,7 +139,9 @@ impl ScratchBuffer {
 }
 
 impl Default for ScratchBuffer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// What kind of payload the parser saw.
@@ -499,10 +500,7 @@ pub fn is_at_line(line: &[u8]) -> bool {
     let c = rest[0];
     // Next char must be one of: '+', 'E'/'e', '?', '=', whitespace,
     // or end-of-line (we already trimmed those).
-    matches!(
-        c,
-        b'+' | b'E' | b'e' | b'?' | b'=' | b' ' | b'\t'
-    )
+    matches!(c, b'+' | b'E' | b'e' | b'?' | b'=' | b' ' | b'\t')
 }
 
 /// Parse one line into an [`AtCommand`].
@@ -528,7 +526,12 @@ pub fn parse_line(line: &[u8]) -> Result<AtCommand<'_>, AtParseError> {
     p.expect_at()?;
     let verb = p.scan_verb()?;
     let (op, kind, args) = p.parse_op(verb)?;
-    Ok(AtCommand { op, kind, args, verb })
+    Ok(AtCommand {
+        op,
+        kind,
+        args,
+        verb,
+    })
 }
 
 /// Trim `\r`, `\n`, `\r\n` from the end of `line`. Used by
@@ -556,7 +559,11 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     const fn new(line: &'a [u8]) -> Self {
-        Self { line, pos: 0, args: Vec::new() }
+        Self {
+            line,
+            pos: 0,
+            args: Vec::new(),
+        }
     }
 
     /// Skip leading whitespace.
@@ -575,11 +582,17 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let at: &[u8] = self.line.get(self.pos..self.pos + 2).unwrap_or(&[]);
         if at.len() != 2 {
-            return Err(AtParseError::new(AtParseErrorKind::NotAnAtCommand, self.pos));
+            return Err(AtParseError::new(
+                AtParseErrorKind::NotAnAtCommand,
+                self.pos,
+            ));
         }
         let at_lo = [at[0].to_ascii_lowercase(), at[1].to_ascii_lowercase()];
         if at_lo != *b"at" {
-            return Err(AtParseError::new(AtParseErrorKind::NotAnAtCommand, self.pos));
+            return Err(AtParseError::new(
+                AtParseErrorKind::NotAnAtCommand,
+                self.pos,
+            ));
         }
         self.pos += 2;
         Ok(())
@@ -606,11 +619,17 @@ impl<'a> Parser<'a> {
                 match n {
                     b'0' => Ok(AtVerb::SetEcho(false)),
                     b'1' => Ok(AtVerb::SetEcho(true)),
-                    _ => Err(AtParseError::new(AtParseErrorKind::InvalidArgument, self.pos)),
+                    _ => Err(AtParseError::new(
+                        AtParseErrorKind::InvalidArgument,
+                        self.pos,
+                    )),
                 }
             }
             b'?' | b'=' => Ok(AtVerb::Execute),
-            _ => Err(AtParseError::new(AtParseErrorKind::NotAnAtCommand, self.pos)),
+            _ => Err(AtParseError::new(
+                AtParseErrorKind::NotAnAtCommand,
+                self.pos,
+            )),
         }
     }
 
@@ -623,11 +642,7 @@ impl<'a> Parser<'a> {
             return Ok((AtOp::Ping, AtCommandKind::Control, Vec::new()));
         }
         if let AtVerb::SetEcho(on) = verb {
-            return Ok((
-                AtOp::SetEcho { on },
-                AtCommandKind::Control,
-                Vec::new(),
-            ));
+            return Ok((AtOp::SetEcho { on }, AtCommandKind::Control, Vec::new()));
         }
         // We're in `AT+...` territory. Scan the op keyword.
         let start = self.pos;
@@ -651,10 +666,7 @@ impl<'a> Parser<'a> {
                 AtCommandKind::Set
             }
             Some(_) => {
-                return Err(AtParseError::new(
-                    AtParseErrorKind::InvalidArgument,
-                    kw_end,
-                ));
+                return Err(AtParseError::new(AtParseErrorKind::InvalidArgument, kw_end));
             }
         };
         Ok((op, kind, core::mem::take(&mut self.args)))
@@ -767,7 +779,10 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                 }
             }
-            return Err(AtParseError::new(AtParseErrorKind::UnterminatedString, start));
+            return Err(AtParseError::new(
+                AtParseErrorKind::UnterminatedString,
+                start,
+            ));
         }
         // Unquoted: read until comma or EOF.
         let start = self.pos;
@@ -862,7 +877,11 @@ pub fn parse_i32(bytes: &[u8]) -> Option<i32> {
     if bytes.is_empty() {
         return None;
     }
-    let (sign, rest) = if bytes[0] == b'-' { (-1_i32, &bytes[1..]) } else { (1_i32, bytes) };
+    let (sign, rest) = if bytes[0] == b'-' {
+        (-1_i32, &bytes[1..])
+    } else {
+        (1_i32, bytes)
+    };
     if rest.is_empty() {
         return None; // bare `-` is not a number
     }
@@ -875,7 +894,11 @@ pub fn parse_i32(bytes: &[u8]) -> Option<i32> {
         v = v.checked_mul(10)?.checked_add((c - b'0') as u64)?;
     }
     // Bound-check before re-applying the sign.
-    let limit: u64 = if sign < 0 { (i32::MAX as u64) + 1 } else { i32::MAX as u64 };
+    let limit: u64 = if sign < 0 {
+        (i32::MAX as u64) + 1
+    } else {
+        i32::MAX as u64
+    };
     if v > limit {
         return None;
     }
@@ -1010,10 +1033,10 @@ fn hex_digit(c: u8) -> Option<u8> {
 /// `data_lines` is the list of `+CMD:...` lines that should appear
 /// before the terminating `OK`/`ERROR`. `term` decides the trailer.
 #[allow(clippy::result_unit_err)] // `()` is an intentional marker: the caller maps it to its own error code.
-pub fn build_response<'a>(
+pub fn build_response(
     data_lines: &[&[u8]],
     kind: AtResponseKind,
-    out: &'a mut Vec<u8, MAX_RESPONSE>,
+    out: &mut Vec<u8, MAX_RESPONSE>,
 ) -> Result<(), ()> {
     for line in data_lines {
         if out.len() + line.len() + 2 > out.capacity() {
@@ -1141,10 +1164,8 @@ mod tests {
         let cmd = parse_line(b"AT+CWJAP=\"MyHome\",\"secret123\"").unwrap();
         assert_eq!(cmd.op, AtOp::CwJap);
         assert_eq!(cmd.kind, AtCommandKind::Set);
-        // Inspect what was parsed
-        for (i, a) in cmd.args.iter().enumerate() {
-            eprintln!("arg[{i}] = {a:?}");
-        }
+        // `eprintln!` is std-only and magent-core is no_std by default, so we
+        // do not print the parsed args here (the assertions below verify them).
         match cmd.arg(0) {
             Some(AtArg::Quoted(s)) => assert_eq!(*s, b"MyHome"),
             _ => panic!("expected quoted SSID, got {:?}", cmd.args),
@@ -1369,15 +1390,15 @@ mod tests {
     fn validate_ssid_len() {
         assert!(validate_ssid(b"").is_err());
         assert!(validate_ssid(b"home").is_ok());
-        assert!(validate_ssid(&vec![b'x'; 33]).is_err());
-        assert!(validate_ssid(&vec![b'x'; 32]).is_ok());
+        assert!(validate_ssid(&[b'x'; 33]).is_err());
+        assert!(validate_ssid(&[b'x'; 32]).is_ok());
     }
 
     #[test]
     fn validate_passphrase_len() {
         assert!(validate_passphrase(b"").is_ok());
         assert!(validate_passphrase(b"hunter2").is_ok());
-        assert!(validate_passphrase(&vec![b'p'; 65]).is_err());
+        assert!(validate_passphrase(&[b'p'; 65]).is_err());
     }
 
     #[test]
@@ -1386,8 +1407,14 @@ mod tests {
             validate_mac(b"aa:bb:cc:dd:ee:ff"),
             Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
         );
-        assert_eq!(validate_mac(b"AA:BB:CC:DD:EE:FF"), Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
-        assert_eq!(validate_mac(b"aa-bb-cc-dd-ee-ff"), Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        assert_eq!(
+            validate_mac(b"AA:BB:CC:DD:EE:FF"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
+        assert_eq!(
+            validate_mac(b"aa-bb-cc-dd-ee-ff"),
+            Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+        );
         assert!(validate_mac(b"aa:bb").is_none());
         assert!(validate_mac(b"zz:bb:cc:dd:ee:ff").is_none());
     }
@@ -1436,7 +1463,7 @@ mod tests {
         // Wrong total length (the gate is exactly 17 bytes).
         assert_eq!(validate_mac(b"aa:bb:cc:dd:ee:f"), None); // 15
         assert_eq!(validate_mac(b"aa:bb:cc:dd:ee:fff"), None); // 18
-        // Length-17 inputs that fail on part *count* (7 parts).
+                                                               // Length-17 inputs that fail on part *count* (7 parts).
         assert_eq!(validate_mac(b"aa:bb:cc:dd:ee:f:"), None);
         // Length-17 inputs that fail on part *length* (1- and 3-char parts).
         assert_eq!(validate_mac(b"a:bb:cc:dd:ee:fff"), None);
@@ -1509,7 +1536,11 @@ mod tests {
             (b"IFCONFIG", AtOp::Ifconfig, AtCommandKind::Query),
             (b"PING", AtOp::Ping6, AtCommandKind::Set),
             (b"AGENT", AtOp::Agent, AtCommandKind::Set),
-            (b"WIFIPASSUPGRADE", AtOp::WifiPassUpgrade, AtCommandKind::Set),
+            (
+                b"WIFIPASSUPGRADE",
+                AtOp::WifiPassUpgrade,
+                AtCommandKind::Set,
+            ),
             (b"HTTPGET", AtOp::HttpGet, AtCommandKind::Set),
             (b"LLMCFG", AtOp::LlmCfg, AtCommandKind::Set),
             (b"TIME", AtOp::Time, AtCommandKind::Query),
@@ -1582,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-fn rejects_max_arguments() {
+    fn rejects_max_arguments() {
         // Build a command that explicitly takes too many args.
         // We'll do it by abusing AT+SYSSTORE which has no fixed-arg
         // max, then assert the parser stays bounded.
@@ -1600,7 +1631,9 @@ fn rejects_max_arguments() {
     #[test]
     fn scratch_buffer_routes_quoted() {
         let mut s = ScratchBuffer::new();
-        let cmd = s.copy_and_parse(b"AT+CWJAP=\"foo\",\"bar\"").expect("CWJAP");
+        let cmd = s
+            .copy_and_parse(b"AT+CWJAP=\"foo\",\"bar\"")
+            .expect("CWJAP");
         assert_eq!(cmd.op, AtOp::CwJap);
         match cmd.arg(0) {
             Some(AtArg::Quoted(p)) => assert_eq!(*p, b"foo"),
@@ -1708,7 +1741,7 @@ fn rejects_max_arguments() {
         }
         // Build a deliberately-too-long input: AT+GMR + 400 x's.
         let mut input = b"AT+GMR".to_vec();
-        input.extend(core::iter::repeat(b'x').take(400));
+        input.extend(core::iter::repeat_n(b'x', 400));
         // Should parse without panic; the truncation should not
         // cause issues — we just expect the parser to at least
         // handle the prefix.
@@ -1754,7 +1787,7 @@ fn rejects_max_arguments() {
             cases.push((0..n as u8).collect()); // 0,1,2,..,255
             cases.push(b"AT".repeat(n / 2 + 1)); // repeated `AT`
             cases.push(b"AT+CWJAP=\"\x00\xFF\x80".repeat(n / 16 + 1)); // embedded control
-            // Deterministic pseudo-random bytes (LCG, no external RNG).
+                                                                       // Deterministic pseudo-random bytes (LCG, no external RNG).
             let mut acc: u32 = 0x12345678;
             let mut v = alloc::vec::Vec::with_capacity(n);
             for _ in 0..n {

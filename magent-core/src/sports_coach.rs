@@ -115,14 +115,14 @@ impl ExerciseGoal {
 
     /// Add an adjustment reason
     // HARDENING (audit-2026-08 unwrap sweep): use `try_heapless` to
-        // prevent panic when a reason string exceeds the capacity.
-        pub fn add_adjustment(&mut self, reason: &str) {
-            let truncated = try_heapless::<64>(reason);
-            if self.adjustments.push(truncated).is_err() {
-                let _ = self.adjustments.remove(0);
-                let _ = self.adjustments.push(try_heapless::<64>(reason));
-            }
+    // prevent panic when a reason string exceeds the capacity.
+    pub fn add_adjustment(&mut self, reason: &str) {
+        let truncated = try_heapless::<64>(reason);
+        if self.adjustments.push(truncated).is_err() {
+            let _ = self.adjustments.remove(0);
+            let _ = self.adjustments.push(try_heapless::<64>(reason));
         }
+    }
 
     /// Format goal as readable string
     pub fn format_summary(&self) -> String<256> {
@@ -550,8 +550,7 @@ impl SportsCoach {
                 BreathingPattern::Recovery => "立即降低强度，深呼吸放松。",
                 _ => "放松呼吸，放慢速度。",
             };
-            let msg =
-                CoachingMessage::new(CoachingMessageType::BreathingCorrection, correction, 8);
+            let msg = CoachingMessage::new(CoachingMessageType::BreathingCorrection, correction, 8);
             let _ = self.messages.push(msg);
         }
 
@@ -662,7 +661,10 @@ mod tests {
         assert_eq!(goal.target_intensity, 0.70);
         assert!(goal.distance_m.is_none());
         assert!(goal.adjustments.is_empty());
-        assert!(goal.format_summary().as_str().contains("Running for 30 minutes"));
+        assert!(goal
+            .format_summary()
+            .as_str()
+            .contains("Running for 30 minutes"));
     }
 
     #[test]
@@ -674,19 +676,40 @@ mod tests {
         // Capacity is 8; the two oldest are evicted.
         assert_eq!(goal.adjustments.len(), 8);
         assert!(goal.adjustments[7].contains("adj 9"));
-        assert!(!goal.adjustments.iter().any(|a| a.contains("adj 0") || a.contains("adj 1")));
+        assert!(!goal
+            .adjustments
+            .iter()
+            .any(|a| a.contains("adj 0") || a.contains("adj 1")));
         // Long reasons are truncated, never panic.
         goal.add_adjustment(&"x".repeat(200));
     }
 
     #[test]
     fn breathing_pattern_for_zone() {
-        assert_eq!(BreathingPattern::for_zone(HeartRateZone::Rest), BreathingPattern::BoxBreathing);
-        assert_eq!(BreathingPattern::for_zone(HeartRateZone::WarmUp), BreathingPattern::Relaxed);
-        assert_eq!(BreathingPattern::for_zone(HeartRateZone::FatBurn), BreathingPattern::AerobicInhale);
-        assert_eq!(BreathingPattern::for_zone(HeartRateZone::Cardio), BreathingPattern::RunningSync);
-        assert_eq!(BreathingPattern::for_zone(HeartRateZone::Peak), BreathingPattern::Recovery);
-        assert_eq!(BreathingPattern::for_zone(HeartRateZone::Danger), BreathingPattern::Recovery);
+        assert_eq!(
+            BreathingPattern::for_zone(HeartRateZone::Rest),
+            BreathingPattern::BoxBreathing
+        );
+        assert_eq!(
+            BreathingPattern::for_zone(HeartRateZone::WarmUp),
+            BreathingPattern::Relaxed
+        );
+        assert_eq!(
+            BreathingPattern::for_zone(HeartRateZone::FatBurn),
+            BreathingPattern::AerobicInhale
+        );
+        assert_eq!(
+            BreathingPattern::for_zone(HeartRateZone::Cardio),
+            BreathingPattern::RunningSync
+        );
+        assert_eq!(
+            BreathingPattern::for_zone(HeartRateZone::Peak),
+            BreathingPattern::Recovery
+        );
+        assert_eq!(
+            BreathingPattern::for_zone(HeartRateZone::Danger),
+            BreathingPattern::Recovery
+        );
         for p in [
             BreathingPattern::BoxBreathing,
             BreathingPattern::Relaxed,
@@ -757,7 +780,10 @@ mod tests {
         let health = HealthSensorManager::default();
         let before = coach.goal().target_intensity;
         coach.adjust_goal_for_conditions(&health, 35.0);
-        assert!(coach.goal().target_intensity < before, "hot weather must cut intensity");
+        assert!(
+            coach.goal().target_intensity < before,
+            "hot weather must cut intensity"
+        );
         assert!(coach.goal().adjustments.iter().any(|a| a.contains("Hot")));
     }
 
@@ -773,13 +799,37 @@ mod tests {
 
     #[test]
     fn calculate_adaptive_goal_increases_when_recovering_well() {
-        let mut coach = SportsCoach::new();
+        let coach = SportsCoach::new();
         let health = HealthSensorManager::default();
         // avg_rpe = 5 < 6 and days_active = 5 > 3 → +10% duration.
         let history = vec![
-            FitnessHistoryEntry { exercise_type: ExerciseType::Running, duration_min: 30, avg_hr: 140, calories: 250, rating: 4, rpe: 5, timestamp: 0 },
-            FitnessHistoryEntry { exercise_type: ExerciseType::Running, duration_min: 40, avg_hr: 145, calories: 300, rating: 4, rpe: 5, timestamp: 1 },
-            FitnessHistoryEntry { exercise_type: ExerciseType::Running, duration_min: 35, avg_hr: 138, calories: 270, rating: 4, rpe: 5, timestamp: 2 },
+            FitnessHistoryEntry {
+                exercise_type: ExerciseType::Running,
+                duration_min: 30,
+                avg_hr: 140,
+                calories: 250,
+                rating: 4,
+                rpe: 5,
+                timestamp: 0,
+            },
+            FitnessHistoryEntry {
+                exercise_type: ExerciseType::Running,
+                duration_min: 40,
+                avg_hr: 145,
+                calories: 300,
+                rating: 4,
+                rpe: 5,
+                timestamp: 1,
+            },
+            FitnessHistoryEntry {
+                exercise_type: ExerciseType::Running,
+                duration_min: 35,
+                avg_hr: 138,
+                calories: 270,
+                rating: 4,
+                rpe: 5,
+                timestamp: 2,
+            },
         ];
         let goal = coach.calculate_adaptive_goal(&history, &health, 5);
         // avg_duration = 35 → 35 * 1.1 = 38.5 → 38.
@@ -789,12 +839,28 @@ mod tests {
 
     #[test]
     fn calculate_adaptive_goal_reduces_when_fatigued() {
-        let mut coach = SportsCoach::new();
+        let coach = SportsCoach::new();
         let health = HealthSensorManager::default();
         // avg_rpe = 9 > 8 → -15% duration.
         let history = vec![
-            FitnessHistoryEntry { exercise_type: ExerciseType::Running, duration_min: 30, avg_hr: 170, calories: 300, rating: 3, rpe: 9, timestamp: 0 },
-            FitnessHistoryEntry { exercise_type: ExerciseType::Running, duration_min: 30, avg_hr: 172, calories: 300, rating: 3, rpe: 9, timestamp: 1 },
+            FitnessHistoryEntry {
+                exercise_type: ExerciseType::Running,
+                duration_min: 30,
+                avg_hr: 170,
+                calories: 300,
+                rating: 3,
+                rpe: 9,
+                timestamp: 0,
+            },
+            FitnessHistoryEntry {
+                exercise_type: ExerciseType::Running,
+                duration_min: 30,
+                avg_hr: 172,
+                calories: 300,
+                rating: 3,
+                rpe: 9,
+                timestamp: 1,
+            },
         ];
         let goal = coach.calculate_adaptive_goal(&history, &health, 1);
         // avg_duration = 30 → 30 * 0.85 = 25.5 → 25.
@@ -804,7 +870,7 @@ mod tests {
 
     #[test]
     fn calculate_adaptive_goal_defaults_for_new_user() {
-        let mut coach = SportsCoach::new();
+        let coach = SportsCoach::new();
         let health = HealthSensorManager::default();
         let goal = coach.calculate_adaptive_goal(&[], &health, 0);
         // Empty history → defaults (Running, 30 min).
@@ -816,7 +882,7 @@ mod tests {
     fn update_transitions_through_session_states() {
         let mut coach = SportsCoach::new();
         coach.start_session(); // WarmUp
-        // 400 s > 300 s warm-up → Active.
+                               // 400 s > 300 s warm-up → Active.
         coach.update(&hr_data(120, 0), None, 400);
         assert_eq!(coach.state(), ExerciseState::Active);
         // Goal is 30 min = 1800 s; push past it → CoolDown.
@@ -833,7 +899,9 @@ mod tests {
         // hr 190 → Danger zone (age 30).
         coach.update(&hr_data(190, 0), None, 10);
         let msgs = coach.get_messages();
-        assert!(msgs.iter().any(|m| m.msg_type == CoachingMessageType::Warning));
+        assert!(msgs
+            .iter()
+            .any(|m| m.msg_type == CoachingMessageType::Warning));
     }
 
     #[test]
@@ -843,7 +911,9 @@ mod tests {
         let temp = TemperatureData::new(38.5, 0); // > 37.5 → fever
         coach.update(&hr_data(120, 0), Some(&temp), 10);
         let msgs = coach.get_messages();
-        assert!(msgs.iter().any(|m| m.msg_type == CoachingMessageType::Warning));
+        assert!(msgs
+            .iter()
+            .any(|m| m.msg_type == CoachingMessageType::Warning));
     }
 
     #[test]

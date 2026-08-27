@@ -55,7 +55,7 @@ impl SmtpSession {
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| s.parse::<Mailbox>())
+            .map(str::parse::<Mailbox>)
             .collect::<Result<_, _>>()
             .map_err(|e| anyhow::anyhow!("invalid `to` address: {e}"))?;
 

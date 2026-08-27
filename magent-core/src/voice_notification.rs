@@ -644,9 +644,9 @@ pub fn prepare_for_tts(text: &str, config: &TtsConfig) -> String<512> {
     };
 
     // Split into sentences and add pauses. We use a heapless::Vec so this
-// code path works in both std and no_std builds; the sentence count is
-// bounded by the text length so 64 entries is more than enough for any
-// realistic TTS input.
+    // code path works in both std and no_std builds; the sentence count is
+    // bounded by the text length so 64 entries is more than enough for any
+    // realistic TTS input.
     let mut sentences: Vec<&str, 64> = Vec::new();
     for s in text.split(['。', '！', '？', ',', '.']) {
         if !s.is_empty() {
@@ -738,7 +738,15 @@ mod tests {
     #[test]
     fn notification_new_truncates_long_fields() {
         let long_body = "x".repeat(400);
-        let n = Notification::new(1, "t", &long_body, NotificationType::Screen, 5, VoiceCategory::System, 0);
+        let n = Notification::new(
+            1,
+            "t",
+            &long_body,
+            NotificationType::Screen,
+            5,
+            VoiceCategory::System,
+            0,
+        );
         assert_eq!(n.title.as_str(), "t");
         assert_eq!(n.body.len(), 256); // truncated to the bounded buffer
         assert!(!n.delivered && !n.acknowledged);
@@ -786,12 +794,19 @@ mod tests {
     #[test]
     fn queue_voice_orders_highest_priority_first() {
         let mut mgr = VoiceNotificationManager::new();
-        mgr.queue_voice("low", 3, VoiceCategory::Encouragement, 0).unwrap();
-        mgr.queue_voice("high", 9, VoiceCategory::Warning, 0).unwrap();
-        mgr.queue_voice("mid", 5, VoiceCategory::Coaching, 0).unwrap();
+        mgr.queue_voice("low", 3, VoiceCategory::Encouragement, 0)
+            .unwrap();
+        mgr.queue_voice("high", 9, VoiceCategory::Warning, 0)
+            .unwrap();
+        mgr.queue_voice("mid", 5, VoiceCategory::Coaching, 0)
+            .unwrap();
         let q = mgr.pending_voices();
         // Highest priority should be at the front (index 0).
-        assert_eq!(q[0].priority, 9, "highest priority must be first, got {}", q[0].priority);
+        assert_eq!(
+            q[0].priority, 9,
+            "highest priority must be first, got {}",
+            q[0].priority
+        );
         assert_eq!(q[1].priority, 5);
         assert_eq!(q[2].priority, 3);
     }
@@ -799,8 +814,10 @@ mod tests {
     #[test]
     fn get_next_voice_speaks_highest_priority_first() {
         let mut mgr = VoiceNotificationManager::new();
-        mgr.queue_voice("low", 3, VoiceCategory::Encouragement, 0).unwrap();
-        mgr.queue_voice("high", 9, VoiceCategory::Warning, 0).unwrap();
+        mgr.queue_voice("low", 3, VoiceCategory::Encouragement, 0)
+            .unwrap();
+        mgr.queue_voice("high", 9, VoiceCategory::Warning, 0)
+            .unwrap();
         // Bypass the 2s min-interval by using a large timestamp.
         let first = mgr.get_next_voice(100_000).expect("first message");
         assert_eq!(first.text.as_str(), "high");
@@ -829,7 +846,8 @@ mod tests {
     fn voice_disabled_queues_nothing() {
         let mut mgr = VoiceNotificationManager::new();
         mgr.set_voice_enabled(false);
-        mgr.queue_voice("nope", 5, VoiceCategory::Coaching, 0).unwrap();
+        mgr.queue_voice("nope", 5, VoiceCategory::Coaching, 0)
+            .unwrap();
         assert_eq!(mgr.voice_queue_size(), 0);
         assert!(mgr.get_next_voice(100_000).is_none());
     }
@@ -839,12 +857,30 @@ mod tests {
         let mut mgr = VoiceNotificationManager::new();
         mgr.set_dnd(true, 22, 7);
         // Hour 2 (inside DND) + priority 3 < 7 → silently dropped.
-        mgr.send_notification("t", "b", NotificationType::Screen, 3, VoiceCategory::System, 2 * 3_600_000)
-            .unwrap();
-        assert_eq!(mgr.notification_history().len(), 0, "low-priority DND message must be dropped");
+        mgr.send_notification(
+            "t",
+            "b",
+            NotificationType::Screen,
+            3,
+            VoiceCategory::System,
+            2 * 3_600_000,
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.notification_history().len(),
+            0,
+            "low-priority DND message must be dropped"
+        );
         // High priority (>= 7) is delivered even in DND.
-        mgr.send_notification("t", "b", NotificationType::Screen, 9, VoiceCategory::Alert, 2 * 3_600_000)
-            .unwrap();
+        mgr.send_notification(
+            "t",
+            "b",
+            NotificationType::Screen,
+            9,
+            VoiceCategory::Alert,
+            2 * 3_600_000,
+        )
+        .unwrap();
         assert_eq!(mgr.notification_history().len(), 1);
     }
 
@@ -852,13 +888,15 @@ mod tests {
     fn send_health_alert_channels_by_severity() {
         let mut mgr = VoiceNotificationManager::new();
         // Severity 8+ → voice queue + notification (multiple channels).
-        mgr.send_health_alert("心率异常", 8, "心动过速", "请休息", 12 * 3_600_000).unwrap();
+        mgr.send_health_alert("心率异常", 8, "心动过速", "请休息", 12 * 3_600_000)
+            .unwrap();
         assert!(mgr.voice_queue_size() >= 1);
         assert!(!mgr.notification_history().is_empty());
 
         let mut mgr2 = VoiceNotificationManager::new();
         // Severity 3 → screen-only (no voice queued).
-        mgr2.send_health_alert("提醒", 3, "检测到低活动", "起来活动", 12 * 3_600_000).unwrap();
+        mgr2.send_health_alert("提醒", 3, "检测到低活动", "起来活动", 12 * 3_600_000)
+            .unwrap();
         assert_eq!(mgr2.voice_queue_size(), 0);
         assert_eq!(mgr2.notification_history().len(), 1);
     }
@@ -866,8 +904,15 @@ mod tests {
     #[test]
     fn mark_delivered_and_acknowledge() {
         let mut mgr = VoiceNotificationManager::new();
-        mgr.send_notification("t", "b", NotificationType::Screen, 5, VoiceCategory::System, 0)
-            .unwrap();
+        mgr.send_notification(
+            "t",
+            "b",
+            NotificationType::Screen,
+            5,
+            VoiceCategory::System,
+            0,
+        )
+        .unwrap();
         let id = mgr.notification_history()[0].id;
         // Unknown id → false.
         assert!(!mgr.mark_delivered(9999));
@@ -883,8 +928,15 @@ mod tests {
     fn recent_notifications_returns_newest_first() {
         let mut mgr = VoiceNotificationManager::new();
         for i in 0..5 {
-            mgr.send_notification(&format!("t{}", i), "b", NotificationType::Screen, 5, VoiceCategory::System, i)
-                .unwrap();
+            mgr.send_notification(
+                &format!("t{}", i),
+                "b",
+                NotificationType::Screen,
+                5,
+                VoiceCategory::System,
+                i,
+            )
+            .unwrap();
         }
         let recent = mgr.recent_notifications(3);
         assert_eq!(recent.len(), 3);
@@ -918,6 +970,6 @@ mod tests {
         assert!(body.as_str().contains("紧急健康预警"));
         // Long messages are truncated to the bounded buffer, never panic.
         let long = EmergencyAlert::new(&"x".repeat(1000), false, false, 1);
-        assert!(long.sms_body().len() > 0);
+        assert!(!long.sms_body().is_empty());
     }
 }

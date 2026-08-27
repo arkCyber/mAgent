@@ -169,9 +169,7 @@ pub fn validate_cwjap_set(cmd: &AtCommand<'_>) -> Result<CwjapValidated, AtOutco
 
     // Password: optional (empty => OPEN network).
     let pass_src_opt: Option<&[u8]> = match cmd.args.get(1) {
-        Some(arg) => {
-            Some(arg_bytes_decoded(arg, &mut pass_dec).map_err(|_| AtOutcome::error(8))?)
-        }
+        Some(arg) => Some(arg_bytes_decoded(arg, &mut pass_dec).map_err(|_| AtOutcome::error(8))?),
         None => None,
     };
     if let Some(src) = pass_src_opt {
@@ -219,7 +217,9 @@ pub fn validate_cwhostname_set(cmd: &AtCommand<'_>) -> Result<HostnameValidated,
     }
     let hostname_str = core::str::from_utf8(src).map_err(|_| AtOutcome::error(4))?;
     let mut hostname: heapless::String<HOSTNAME_MAX> = heapless::String::new();
-    hostname.push_str(hostname_str).map_err(|_| AtOutcome::error(8))?;
+    hostname
+        .push_str(hostname_str)
+        .map_err(|_| AtOutcome::error(8))?;
     Ok(HostnameValidated { hostname })
 }
 
@@ -540,8 +540,8 @@ pub fn validate_httpget_set(cmd: &AtCommand<'_>) -> Result<HttpgetValidated, AtO
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heapless::Vec;
     use crate::at::{AtArg, AtCommand, AtCommandKind, AtOp, AtVerb};
+    use heapless::Vec;
 
     /// Build a `AtCommand` from raw byte args (all Token). Uses
     /// the fact that `b"..."` literals are `'static` so we never
@@ -735,15 +735,15 @@ mod tests {
 
     #[test]
     fn cwmode_set_accepts_known_modes() {
-        // Build static byte arrays so the slice references are 'static.
-        static M1: [u8; 1] = [b'1'];
-        static M2: [u8; 1] = [b'2'];
-        static M3: [u8; 1] = [b'3'];
+        // Build static byte slices so the references are 'static.
+        static M1: &[u8] = b"1";
+        static M2: &[u8] = b"2";
+        static M3: &[u8] = b"3";
         for (i, m) in CWMODE_VALID.iter().enumerate() {
             let c = match i {
-                0 => cmd_token(AtOp::CwMode, &[&M1]),
-                1 => cmd_token(AtOp::CwMode, &[&M2]),
-                _ => cmd_token(AtOp::CwMode, &[&M3]),
+                0 => cmd_token(AtOp::CwMode, &[M1]),
+                1 => cmd_token(AtOp::CwMode, &[M2]),
+                _ => cmd_token(AtOp::CwMode, &[M3]),
             };
             let v = validate_cwmode_set(&c).expect("ok");
             assert_eq!(v.mode, *m);
@@ -983,7 +983,10 @@ mod tests {
     fn ble_set_rejects_named_arg() {
         // `AT+BLE=action=ON` — key=val is not a legal form.
         let mut v: Vec<AtArg<'static>, { crate::at::MAX_ARGUMENTS }> = Vec::new();
-        let _ = v.push(AtArg::Named { key: b"action", val: b"ON" });
+        let _ = v.push(AtArg::Named {
+            key: b"action",
+            val: b"ON",
+        });
         let c = AtCommand {
             op: AtOp::Ble,
             kind: AtCommandKind::Set,
@@ -1131,7 +1134,10 @@ mod tests {
     #[test]
     fn llmcfg_set_rejects_named_arg() {
         let mut v: Vec<AtArg<'static>, { crate::at::MAX_ARGUMENTS }> = Vec::new();
-        let _ = v.push(AtArg::Named { key: b"model", val: b"deepseek" });
+        let _ = v.push(AtArg::Named {
+            key: b"model",
+            val: b"deepseek",
+        });
         let c = AtCommand {
             op: AtOp::LlmCfg,
             kind: AtCommandKind::Set,
@@ -1226,8 +1232,9 @@ mod tests {
     #[test]
     fn httpget_set_rejects_control_in_url() {
         // 0x0a (newline) — CRLF injection into HTTP request / logs.
-        static URL: [u8; 12] =
-            [b'h', b't', b't', b'p', b':', b'/', b'/', b'a', b'b', b'c', 0x0a, b'x'];
+        static URL: [u8; 12] = [
+            b'h', b't', b't', b'p', b':', b'/', b'/', b'a', b'b', b'c', 0x0a, b'x',
+        ];
         let c = cmd_token(AtOp::HttpGet, &[&URL]);
         let err = validate_httpget_set(&c).unwrap_err();
         assert!(matches!(err, AtOutcome::Error { code: 4 }));
@@ -1257,9 +1264,9 @@ mod tests {
     fn validators_never_panic_on_parsed_adversarial_commands() {
         // Deterministic pseudo-random byte generator (LCG).
         let mut acc: u32 = 0x13579BDF;
-        let mut gen = |acc: &mut u32| {
+        let gen = |acc: &mut u32| {
             *acc = acc.wrapping_mul(1664525).wrapping_add(1013904223);
-            ((*acc >> 24) as u8)
+            (*acc >> 24) as u8
         };
 
         // Sweep structured inputs across a range of lengths and op prefixes.
@@ -1280,7 +1287,7 @@ mod tests {
                 for _ in 0..len {
                     input.push(gen(&mut acc));
                 }
-                let mut run_through_validators = |input: &[u8]| {
+                let run_through_validators = |input: &[u8]| {
                     if let Ok(cmd) = crate::at::parse_line(input) {
                         match cmd.op {
                             AtOp::CwJap => {

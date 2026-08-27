@@ -60,51 +60,48 @@ impl RecoveryManager {
             // Network errors: retry with backoff
             AgentError::NetworkConnectionFailed { .. } => RecoveryStrategy::RetryWithBackoff,
             AgentError::NetworkTimeout { .. } => RecoveryStrategy::RetryWithBackoff,
-            
+
             // Storage errors: retry, then fallback
-            AgentError::StorageReadFailed { reason, .. } => {
-                match reason {
-                    crate::error::StorageError::ReadError => RecoveryStrategy::Retry,
-                    crate::error::StorageError::CorruptedData => RecoveryStrategy::Fallback,
-                    _ => RecoveryStrategy::Abort,
-                }
-            }
-            AgentError::StorageWriteFailed { reason, .. } => {
-                match reason {
-                    crate::error::StorageError::WriteProtected => RecoveryStrategy::Reset,
-                    crate::error::StorageError::OutOfSpace => RecoveryStrategy::Fallback,
-                    _ => RecoveryStrategy::Retry,
-                }
-            }
-            
+            AgentError::StorageReadFailed { reason, .. } => match reason {
+                crate::error::StorageError::ReadError => RecoveryStrategy::Retry,
+                crate::error::StorageError::CorruptedData => RecoveryStrategy::Fallback,
+                _ => RecoveryStrategy::Abort,
+            },
+            AgentError::StorageWriteFailed { reason, .. } => match reason {
+                crate::error::StorageError::WriteProtected => RecoveryStrategy::Reset,
+                crate::error::StorageError::OutOfSpace => RecoveryStrategy::Fallback,
+                _ => RecoveryStrategy::Retry,
+            },
+
             // Sensor errors: retry, then fallback
-            AgentError::SensorReadFailed { reason, .. } => {
-                match reason {
-                    crate::error::SensorError::Timeout => RecoveryStrategy::RetryWithBackoff,
-                    crate::error::SensorError::NotInitialized => RecoveryStrategy::Reset,
-                    _ => RecoveryStrategy::Fallback,
-                }
-            }
-            
+            AgentError::SensorReadFailed { reason, .. } => match reason {
+                crate::error::SensorError::Timeout => RecoveryStrategy::RetryWithBackoff,
+                crate::error::SensorError::NotInitialized => RecoveryStrategy::Reset,
+                _ => RecoveryStrategy::Fallback,
+            },
+
             // Memory errors: abort
             AgentError::MemoryAllocationFailed { .. } => RecoveryStrategy::Abort,
             AgentError::MemoryBudgetExhausted { .. } => RecoveryStrategy::Abort,
-            
+
             // Budget errors: skip
             AgentError::IterationBudgetExhausted { .. } => RecoveryStrategy::Skip,
-            
+
             // Validation errors: abort
             AgentError::InputValidationFailed { .. } => RecoveryStrategy::Abort,
-            
+
             // Configuration errors: reset
             AgentError::ConfigurationError { .. } => RecoveryStrategy::Reset,
-            
+
             // GPIO errors: retry
             AgentError::GpioOperationFailed { .. } => RecoveryStrategy::Retry,
 
             // Operation timeout: retry with backoff, except the special
             // "security" timeout which is treated as fatal.
-            AgentError::OperationTimeout { operation: "security", .. } => RecoveryStrategy::Abort,
+            AgentError::OperationTimeout {
+                operation: "security",
+                ..
+            } => RecoveryStrategy::Abort,
             AgentError::OperationTimeout { .. } => RecoveryStrategy::RetryWithBackoff,
 
             // Corrupt / overflow state: abort (cannot be recovered by retry).
@@ -124,10 +121,10 @@ impl RecoveryManager {
         if retry_count == 0 {
             return 0;
         }
-        
+
         // Exponential backoff: base * 2^(retry_count - 1)
         let delay = self.backoff_base_ms * (1 << (retry_count - 1));
-        
+
         // Cap at 5 seconds
         delay.min(5000)
     }
@@ -137,7 +134,7 @@ impl RecoveryManager {
         if retry_count >= self.max_retries {
             return false;
         }
-        
+
         matches!(
             self.get_strategy(error),
             RecoveryStrategy::Retry | RecoveryStrategy::RetryWithBackoff
@@ -145,22 +142,19 @@ impl RecoveryManager {
     }
 
     /// Execute operation with retry logic
-    pub async fn execute_with_retry<F, Fut, T>(
-        &self,
-        operation: F,
-    ) -> Result<T>
+    pub async fn execute_with_retry<F, Fut, T>(&self, operation: F) -> Result<T>
     where
         F: Fn() -> Fut,
         Fut: core::future::Future<Output = Result<T>>,
     {
         let mut retry_count = 0;
-        
+
         loop {
             match operation().await {
                 Ok(result) => return Ok(result),
                 Err(error) => {
                     let strategy = self.get_strategy(&error);
-                    
+
                     match strategy {
                         RecoveryStrategy::Retry | RecoveryStrategy::RetryWithBackoff => {
                             if retry_count >= self.max_retries {
@@ -211,9 +205,9 @@ impl Default for RecoveryManager {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // FallbackProvider/etc. live below the test module on purpose.
 mod tests {
     use super::*;
-    use std::boxed::Box;
 
     #[test]
     fn backoff_is_exponential_and_capped() {
@@ -222,12 +216,17 @@ mod tests {
         assert_eq!(r.calculate_backoff(1), 100); // 100 * 2^0
         assert_eq!(r.calculate_backoff(2), 200); // 100 * 2^1
         assert_eq!(r.calculate_backoff(3), 400); // 100 * 2^2
-        // Capped at 5000ms.
+                                                 // Capped at 5000ms.
         assert_eq!(r.calculate_backoff(10), 5000);
     }
 
+    // Uses std-only types (Arc, AtomicU32, futures::block_on) so it is gated
+    // on the `std` feature — keeps `cargo test` compiling under the default
+    // no_std feature set (matches the CI host job).
     #[test]
+    #[cfg(feature = "std")]
     fn retry_with_backoff_applies_delay_hook() {
+        use std::boxed::Box;
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
 
@@ -251,7 +250,10 @@ mod tests {
             async move {
                 let n = a2.fetch_add(1, Ordering::SeqCst);
                 if n < 3 {
-                    Err(AgentError::NetworkTimeout { operation: "test", duration_ms: 1 })
+                    Err(AgentError::NetworkTimeout {
+                        operation: "test",
+                        duration_ms: 1,
+                    })
                 } else {
                     Ok::<u8, AgentError>(42)
                 }
@@ -263,7 +265,6 @@ mod tests {
         assert_eq!(total.load(Ordering::SeqCst), 700);
     }
 }
-
 
 /// Fallback value provider
 pub trait FallbackProvider<T> {

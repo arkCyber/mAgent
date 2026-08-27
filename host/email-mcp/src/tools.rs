@@ -148,7 +148,7 @@ impl ToolRegistry {
 
     /// Snapshot of the catalogue for `tools/list`.
     pub fn tool_descriptors(&self) -> Vec<Value> {
-        self.catalogue.iter().map(|t| t.to_json()).collect()
+        self.catalogue.iter().map(ToolDescriptor::to_json).collect()
     }
 
     /// Dispatch a tool call by name. Returns the tool's output as
@@ -173,7 +173,9 @@ impl ToolRegistry {
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as u32;
         self.state.ensure_imap().await?;
         let mut guard = self.state.imap.lock().await;
-        let session = guard.as_mut().ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
         let summaries = session.list_inbox(limit).await?;
         let json = ImapSession::summaries_to_json(&summaries);
         Ok(serde_json::to_string_pretty(&json)?)
@@ -183,11 +185,12 @@ impl ToolRegistry {
         let uid = args
             .get("uid")
             .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("missing `uid`"))?
-            as u32;
+            .ok_or_else(|| anyhow::anyhow!("missing `uid`"))? as u32;
         self.state.ensure_imap().await?;
         let mut guard = self.state.imap.lock().await;
-        let session = guard.as_mut().ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
         let msg = session.get_email(uid).await?;
         let json = ImapSession::full_to_json(&msg);
         Ok(serde_json::to_string_pretty(&json)?)
@@ -201,7 +204,9 @@ impl ToolRegistry {
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as u32;
         self.state.ensure_imap().await?;
         let mut guard = self.state.imap.lock().await;
-        let session = guard.as_mut().ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
         let summaries = session.search_emails(query, limit).await?;
         let json = ImapSession::summaries_to_json(&summaries);
         Ok(serde_json::to_string_pretty(&json)?)
@@ -222,7 +227,9 @@ impl ToolRegistry {
             .ok_or_else(|| anyhow::anyhow!("missing `body`"))?;
         self.state.ensure_smtp().await?;
         let guard = self.state.smtp.lock().await;
-        let session = guard.as_ref().ok_or_else(|| anyhow::anyhow!("smtp not connected"))?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("smtp not connected"))?;
         let response = session.send(to, subject, body).await?;
         Ok(json!({ "status": "sent", "server_response": response }).to_string())
     }
@@ -231,11 +238,12 @@ impl ToolRegistry {
         let uid = args
             .get("uid")
             .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("missing `uid`"))?
-            as u32;
+            .ok_or_else(|| anyhow::anyhow!("missing `uid`"))? as u32;
         self.state.ensure_imap().await?;
         let mut guard = self.state.imap.lock().await;
-        let session = guard.as_mut().ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
         session.mark_read(uid).await?;
         Ok(json!({ "status": "marked_read", "uid": uid }).to_string())
     }
