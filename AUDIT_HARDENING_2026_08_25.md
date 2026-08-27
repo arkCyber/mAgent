@@ -2090,4 +2090,9 @@ cd firmware/esp32-app && ./build-s3.sh   # 固件 S3 交叉编译通过，SSID �
 
 **第十轮修改文件**：`agent.rs`、`at.rs`、`time_sync.rs`、`web3/signature.rs`、`web3/verifiable_credentials.rs`。
 
+### 35.5 ESP32 固件加固（实机验证）
+
+- **H10：修正 `LEAKED_BOXES` 重复泄漏检测逻辑反转**。`HashSet::insert` 对首次插入返回 `true`、已存在返回 `false`；原代码 `if insert(ptr) { log::error!(duplicate) }` 在每次正常启动（首次泄漏）都误报 "duplicate"，而对真正的重复泄漏静默。已改为 `if !insert(ptr)`，三处调用点（NVS / LLM backend / Wi-Fi handle）统一修复。**实机验证**：重启后 `leaking a duplicate` 日志从 1 → 0。
+- **H11：web_admin SSID/IP 未转义**。`render_status`（JSON）/`render_index`（HTML）直接拼接运营商可控的 `ssid`/`ip`，恶意 SSID 可破坏 JSON 或注入 HTML/JS（XSS）。新增 `magent-core::escape::{json,html}`（no_std+alloc、宿主测试 6 条含 JSON 往返），web_admin 与 llm.rs 复用；llm.rs 本地 `escape_json` 去重为共享实现。
+
 ---
