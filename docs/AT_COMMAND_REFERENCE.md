@@ -61,13 +61,16 @@ OK
 $ printf 'AT+CWMODE=1\r\n' > /dev/cu.usbserial-10  # station mode
 OK
 $ printf 'AT+CWJAP="ssid","pass"\r\n' > /dev/cu.usbserial-10
-OK                                            # credentials persisted
-$ printf 'AT+RST\r\n' > /dev/cu.usbserial-10   # reboot (deferred in v0.2)
+OK                                            # credentials persisted + live reconnect
+$ printf 'AT+CWSTATE?\r\n' > /dev/cu.usbserial-10
++CWSTATE:5,172.20.10.4                         # associated with an IP — no reboot needed
+$ printf 'AT+RST\r\n' > /dev/cu.usbserial-10   # optional cold reboot (live esp_restart)
 OK
 ```
 
-After reboot, `setup_platform` reads the new credentials and the
-device comes up connected.
+Since 2026-08-27, `AT+CWJAP=` reconnects live (the supervisor reloads the
+credentials and re-associates immediately), so a reboot is no longer required
+to switch networks.
 
 ---
 
@@ -83,7 +86,7 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 | `AT` | `OK` | Handshake. | No-op; used by scripts to verify the UART is alive. |
 | `ATE0` / `ATE1` | `OK` | Toggle local echo of received commands. State kept by the dispatcher. | We accept but the current firmware doesn't drive the UART echo register (the host already sees its own bytes). |
 | `AT+GMR` | `+GMR:…` `OK` | Reports firmware version, AT version, chip. | No IO. |
-| `AT+RST` | `OK` | Soft reset (deferred in v0.2; takes effect on next boot). | Wi-Fi changes need a reboot to take effect; we keep `AT+RST` semantically honest by logging a deferred marker. |
+| `AT+RST` | `OK` | **Live soft reset** — replies `OK`, then reboots via `esp_restart()` after ~200ms so the reply flushes. | Implemented 2026-08-27 (previously deferred). |
 | `AT+SYSRAM?` | `+SYSRAM:<bytes>` `OK` | Reports free heap (bytes). | `esp_get_free_heap_size()`. |
 | `AT+SYSLOG?` | `+SYSLOG:<0..5>` `OK` | Current log level. | `log::LevelFilter`. |
 | `AT+SYSLOG=<0..5>` | `OK` | Set log level at runtime. | `log::set_max_level`. |
@@ -98,11 +101,11 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 | `AT+CWMODE?` | `+CWMODE:<0..3>` `OK` | Wi-Fi mode. | Default 1 (Station). |
 | `AT+CWMODE=<0..3>` | `OK` | Persist mode to `mag_at:wifi_mode`. | Wi-Fi re-applied at next boot. |
 | `AT+CWJAP?` | `+CWJAP:"<ssid>",,0,0` `OK` | Currently-joined SSID (BSSID/RSSI/ch are placeholders until v0.3 reads `esp_wifi_sta_get_state()`). | Read-only. |
-| `AT+CWJAP="ssid","pwd"` | `OK` | Persist Wi-Fi credentials to `magent:wifi_ssid` / `magent:wifi_pass`. | **Refused in `safe mode`** with `+CMDER:4`. Validates SSID ≤32 bytes, pass ≤64, no NUL bytes. |
-| `AT+CWJAP` | `OK` | Re-issue connect with last credentials. | Deferred to next boot in v0.2. |
+| `AT+CWJAP="ssid","pwd"` | `OK` | Persist credentials to NVS **and reconnect live** (no reboot) — the supervisor reloads them and re-associates immediately. | **Refused in `safe mode`** `+CMDER:4`. Validates SSID ≤32, pass ≤64, no NUL. Sealed with DBO2. |
+| `AT+CWJAP` | `OK` | Re-issue connect with last credentials. | Still deferred to next boot (use `AT+CWJAP=...` for a live connect). |
 | `AT+CWQAP` | `OK` | Disconnect. | Deferred to next boot in v0.2. |
 | `AT+CWLAP` | `+CWLAP:scan-started` `OK` | List available APs. | Background scan in v0.2; explicit table output ships in v0.3. |
-| `AT+CWSTATE?` | `+CWSTATE:4` `OK` | Current Wi-Fi state. | ESP-AT codes: 0 uninit, 1 connected no IP, 2 IP, 3 connecting, 4 disconnected. We always answer 4 in v0.2. |
+| `AT+CWSTATE?` | `+CWSTATE:<state>[,<ip>]` `OK` | Real Wi-Fi state + IP from the supervisor's live snapshot. | Codes: 0 idle, 1 connecting, 3 associated, 4 disconnected, 5 got-IP. (Previously hard-coded 4.) |
 | `AT+CWHOSTNAME?` / `="name"` | `+CWHOSTNAME:"…"` `OK` | Read/write hostname. | NVS `mag_at:hostname`. Max 32 bytes. |
 | `AT+CWAUTOCONN?` / `=0/1` | `+CWAUTOCONN:<0/1>` `OK` | Auto-connect at boot. | NVS `mag_at:autoconn`. |
 | `AT+CWRECONNCFG?` / `=<int>,<repeat>[,<now>]` | `+CWRECONNCFG:<int>,<repeat>` `OK` | Reconnection policy. ESP-AT bounds: interval ≤7200s, repeat ≤1000. | NVS `mag_at:reconn_int` + `mag_at:reconn_rep`. |
@@ -114,8 +117,8 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
-| `AT+CIPSTAMAC?` | `+CIPSTAMAC:"…"` `OK` | Read station MAC. (Currently returns the placeholder in v0.2; real driver call ships in v0.3.) | — |
-| `AT+CIPSTAMAC="aa:bb:cc:dd:ee:ff"` | `+CMDER:4` `ERROR` | Set station MAC. | Requires Wi-Fi cycle; deferred to v0.3. |
+| `AT+CIPSTAMAC?` | `+CIPSTAMAC:"aa:bb:cc:dd:ee:ff"` `OK` | Read the **real** station MAC via `esp_wifi_get_mac`. | Implemented 2026-08-27 (previously a hard-coded placeholder). |
+| `AT+CIPSTAMAC="aa:bb:cc:dd:ee:ff"` | `+CMDER:4` `ERROR` | Set station MAC. | Requires stopping the radio first; runtime MAC change not supported. |
 | `AT+MACRAND?` / `=0/1` | `+CMDER:9` `ERROR` | Toggle MAC randomisation. | Deferred to v0.3. |
 | `AT+IDENT?` | `+IDENT:<hex-pubkey>` `OK` | Ed25519 public key (did:key material) in hex. Returns `+IDENT:NO_IDENTITY` if absent. | Read-only; the firmware regenerates identity from hardware TRNG on first boot. |
 | `AT+IDENTROT` | `+IDENTROT:<hex-pubkey>` `OK` | Generate new Ed25519 seed from TRNG and overwrite NVS. | **Refused in `safe mode`**. Atomically persists hex-encoded 32-byte seed to `magent:dev_identity`. |
@@ -132,7 +135,7 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
-| `AT+IFCONFIG?` | `+IFCONFIG: deferred` `OK` | Report IP / Mask / GW. | Awaiting a clean interface in v0.3. |
+| `AT+IFCONFIG?` | `+IFCONFIG:"<ip>"` `OK` | Report the current STA IP (from the supervisor snapshot). Empty when the STA has no link. | Implemented 2026-08-27 (previously `+IFCONFIG: deferred`). Netmask/gateway still deferred. |
 | `AT+PING="host"` | `+CMDER:4` `ERROR` | ICMP ping. | Awaiting an ICMP stack module. |
 
 ### 3.6 Restore / agent passthrough
@@ -140,7 +143,7 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
 | `AT+RESTORE` | `+CMDER:4` `ERROR` | Factory reset (wipe NVS). | **Not implemented in v0.2** to avoid accidental data loss. Track in v0.3 with explicit `AT+RESTORECONFIRM` follow-up. |
-| `AT+SIGN="text"` | `+CMDER:4` `ERROR` | Sign with current identity. | Defer until v0.3 has unified signer context. |
+| `AT+SIGN="text"` | `<signed-message JSON>` `OK` | Sign the payload with the device Ed25519 identity; returns canonical signed-message JSON (signer DID + payload_hex + signature_hex). | Implemented 2026-08-27 (previously `+CMDER:4`). Payload 1..=64 bytes so the reply fits the 256-byte line. |
 | `AT+AGENT="<text>"` | `OK` | Escape hatch: hand the rest of the line to the agent's ReAct loop. | Useful when you want to script via AT but ask the LLM. |
 
 ---
@@ -442,13 +445,15 @@ that makes the in-place migration safe.
 | Surface | v0.2 (this doc) | v0.3 (planned) |
 |---|---|---|
 | Basic commands | ✅ | ✅ |
-| `AT+CWJAP=` full semantics | ✅ (NVS only) | + live connect |
+| `AT+CWJAP=` full semantics | ✅ live connect (no reboot) | — |
 | `AT+CWLAP` results | placeholder | full table |
-| `AT+CWSTATE?` | sentinel (4) | live `esp_wifi_sta_get_state()` |
+| `AT+CWSTATE?` | ✅ live snapshot | — |
+| `AT+CIPSTAMAC?` | ✅ real MAC | — |
 | `AT+CIPSTAMAC` set | refused | live cycle |
-| `AT+SIGN` / `AT+RESTORE` | refused | implemented |
+| `AT+SIGN` | ✅ implemented | — |
+| `AT+RESTORE` | refused (safe NVS wipe pending) | implemented |
 | `AT+PING` | refused | needs ICMP |
-| `AT+IFCONFIG` | placeholder | lwip netif dump |
+| `AT+IFCONFIG` | ✅ live IP (mask/gw pending) | lwip netif dump |
 | `AT+MACRAND` | refused | needs driver restart |
 | **DBO1 password seal** | ✅ | ✅ (kept for read-back compat) |
 | **DBO2 password seal** | ✅ (default for new writes) | ✅ |
