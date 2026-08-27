@@ -24,24 +24,27 @@ cd firmware/esp32-app && ./build-s3.sh              # 构建 S3（sdkconfig.defa
 ```
 
 ## 四、待后续验证（非阻塞）
-- ✅ **WiFi 联机**（2026-08-27）：SSID 大小写修正为 `arkSong@iPhone` 后，实机连上热点并拿到 IP `172.20.10.4`（rssi -31 dBm）。注：iPhone 热点需开启「最大兼容性」（2.4GHz）且热点会间歇性变不可见，属热点侧问题。
+- ✅ **WiFi 联机**（2026-08-27）：SSID 大小写修正为 `arkSong@iPhone` 后，实机连上热点并拿到 IP `172.20.10.4`（rssi -31 dBm，稳定运行 70+ 分钟）。注：iPhone 热点需开启「最大兼容性」（2.4GHz）且热点会间歇性变不可见，属热点侧问题。
 - ✅ **PSRAM quad**（2026-08-27）：free_heap ~2.18MB，4MB quad PSRAM 确认生效。
-- ⬜ BLE + DeepSeek 端到端、web_admin 网页（http://<ip>/，受热点客户端隔离影响无法从同网段主机直连）、fetch_web 出站抓取。
+- ✅ **web_admin 主机访问**（2026-08-27）：从同网段主机**直连** `http://172.20.10.4/` 与 `/api/status` 验证成功（HTML 仪表盘 + JSON 均正常；此前 curl 空是 SOCKS5 代理干扰，直连正常）。
+- ⬜ **DeepSeek / fetch_web / SNTP 时间同步**：固件就绪（SNTP 已修复为链路恢复后自动轮询），但 iPhone 热点**未提供互联网出口**（Mac 经热点出站也超时）——需热点启用蜂窝数据后才能端到端验证。
 
 ## 五、S3 vs C61 功能审计矩阵（2026-08-27）
 
 | 功能 | C61 | S3 | 说明 |
 |---|---|---|---|
 | 启动 + agent/ingress 线程 | ✅ | ✅ | S3 实机已验证 |
-| 本地工具（write_gpio / read_sensor 温度） | ✅ | ✅ | S3 实测 temperature=38.6 C |
+| 本地工具（write_gpio / read_sensor 温度） | ✅ | ✅ | S3 实测 temperature≈37-41 C |
 | UART 命令 / AT / 双向回传 | ✅ | ✅ | 共享源码 |
-| WiFi STA | ✅ | ✅ | 已构建，联机待测 |
+| WiFi STA | ✅ | ✅ | **S3 实机联机已验证**（IP + LINK UP） |
 | DeepSeek 云 LLM | ❌ 仅本地 | ✅ | S3 专属（cfg board-s3） |
-| web_admin HTTP 状态页 | ✅ | ✅ | S3 实机已启动 Httpd（:80） |
+| web_admin HTTP 状态页 | ✅ | ✅ | **S3 实机主机直连访问验证成功**（含 wifi_reason 字段） |
 | fetch_web 出站抓取 | ✅ | ✅ | 共享 |
 | PSRAM | ✅ 2MB | ✅ quad | 实测该 4MB 板为 quad PSRAM（octal 报 not connected） |
 | 安全模式 / 崩溃检测 / 健康心跳 | ✅ | ✅ | 共享，实机心跳正常 |
 | Web3 钱包 / BLE 管理器 | ✅ | ✅ | magent-core 共享特性 |
+| 热点容错（原因自适应退避 + SNTP 门控 + 提示） | ✅ | ✅ | 实机验证（reason=201 处理、链路恢复重连、2min 提示） |
+| AT 补全（RST/CIPSTAMAC/CWJAP实时/IFCONFIG/SIGN） | ✅ | ✅ | 共享源码，S3+C61 均构建通过 |
 | OTA | ✅ 8MB 双 OTA | 精简（4MB 硬件约束，暂不考虑） | 用户确认 OTA 暂缓 |
 
 > 结论：除 OTA（4MB flash 硬件约束，暂不考虑）外，S3 已实现与 C61 同等甚至更全的功能。
