@@ -28,6 +28,9 @@ export BINDGEN_EXTRA_CLANG_ARGS="-target xtensa-esp32s3-none-elf"
 # S3 is Xtensa; force C crates (secp256k1_sys etc.) to build for Xtensa, not
 # the RISC-V CC set in .cargo/config.toml (else EM:RISCV objects fail to link).
 export CC="/Users/arksong/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+# WiFi provisioning (baked into NVS on first boot if unset)
+export MAGENT_WIFI_SSID="arkSong@iPhone"
+export MAGENT_WIFI_PASS="Ark314159"
 export CXX="/Users/arksong/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-g++"
 
 RUSTC_BOOTSTRAP=1 cargo +esp build --target "${TARGET}" --no-default-features --features board-s3,wifi,uart --"${PROFILE}"
