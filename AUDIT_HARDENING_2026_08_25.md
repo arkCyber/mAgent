@@ -609,9 +609,10 @@ pub fn derive_btdk() -> Result<[u8; 32], &str> {
 **风险**：3 处 `Box::leak`（NVS / Wi-Fi handle / LLM backend）目前都是一次性启动期泄漏，但如果未来重构引入 OTA 重启或 supervisor 重连路径，会从一次性泄漏变成 per-reconnect 泄漏，悄无声息地烧穿 320 KB ESP32 堆预算。
 
 **修复**：新增 `OnceLock<Mutex<HashSet<usize>>>` 注册表 `LEAKED_BOXES`，每次 `leaked_boxes().insert(ptr)`：
-- 首次插入：返回 `false`，静默通过；
-- 重复插入（同一指针再次泄漏）：返回 `true`，立刻 `log::error!` 重复路径；
-- 跨指针插入（连续启动多实例）：返回 `false`，正常通过。
+- 首次插入：返回 `true`，静默通过；
+- 重复插入（同一指针再次泄漏）：返回 `false`，用 `!insert(...)` 立刻 `log::error!` 重复路径。
+
+> **2026-08-27 修正（第十轮）**：原实现把 `HashSet::insert` 语义写反了——`insert` 对**首次**插入返回 `true`、对**已存在**返回 `false`。原代码 `if insert(ptr) { log::error!(duplicate) }` 会在每次正常启动（首次泄漏）都误报"duplicate"，而对真正的重复泄漏静默。已改为 `if !insert(ptr)`，三处调用点（NVS / LLM backend / Wi-Fi handle）统一修复。
 
 ```rust
 fn leaked_boxes() -> MutexGuard<'static, HashSet<usize>> {
@@ -619,7 +620,7 @@ fn leaked_boxes() -> MutexGuard<'static, HashSet<usize>> {
         .lock().unwrap_or_else(|e| e.into_inner())
 }
 
-if leaked_boxes().insert(leaked_wifi as *mut _ as usize) {
+if !leaked_boxes().insert(leaked_wifi as *mut _ as usize) {
     log::error!("[wifi] wifi_handle is leaking a duplicate BlockingWifi");
 }
 ```

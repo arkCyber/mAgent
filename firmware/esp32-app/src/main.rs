@@ -241,6 +241,13 @@ static DEFAULT_NVS: OnceLock<&'static EspDefaultNvsPartition> = OnceLock::new();
 /// of 1-3 times per boot, so the contention cost is zero.
 static LEAKED_BOXES: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
 
+/// Registry of pointers already leaked via `Box::leak` so a future refactor
+/// that re-runs a one-shot init path (soft-reboot, OTA) surfaces a real
+/// double-leak instead of silently doubling heap use.
+///
+/// NOTE on `HashSet::insert` semantics (this was once inverted): `insert`
+/// returns `true` when the value was *newly* inserted and `false` when it was
+/// *already* present. So a genuine duplicate is detected with `!insert(...)`.
 fn leaked_boxes() -> std::sync::MutexGuard<'static, std::collections::HashSet<usize>> {
     LEAKED_BOXES
         .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
@@ -262,7 +269,8 @@ pub(crate) fn init_default_nvs() {
             // instead of silently leaking a second NVS partition
             // (which corrupts the partition state and trips a
             // `ESP_ERR_NVS_INVALID_STATE` later).
-            if leaked_boxes().insert(leaked as *const _ as usize) {
+            // `!insert(...)` is true only when the pointer is ALREADY present.
+            if !leaked_boxes().insert(leaked as *const _ as usize) {
                 log::error!(
                     "[nvs] init_default_nvs is leaking a duplicate NVS partition \
                      (same pointer as a previous leak)"
@@ -1477,7 +1485,8 @@ fn run_agent_loop(
                 // `LEAKED_BOXES` so a duplicate insert triggers an
                 // explicit error log instead of a quiet leak. Cost:
                 // one `HashSet` entry, no heap growth.
-                if leaked_boxes().insert(backend as *mut _ as usize) {
+                // `!insert(...)` is true only when the pointer is ALREADY present.
+                if !leaked_boxes().insert(backend as *mut _ as usize) {
                     log::error!(
                         "[magent] agent boot path is leaking a second LLM backend \
                          (same pointer as a previous leak); refactor leak site or \
@@ -1777,8 +1786,9 @@ fn setup_platform(
                     // path (e.g. an OTA reboot sequence) surfaces a
                     // duplicate-leak log instead of silently
                     // doubling the radio's heap footprint.
+                    // `!insert(...)` is true only when the pointer is ALREADY present.
                     let leaked_ptr = leaked_wifi as *mut _ as usize;
-                    if leaked_boxes().insert(leaked_ptr) {
+                    if !leaked_boxes().insert(leaked_ptr) {
                         log::error!(
                             "[wifi] wifi_handle is leaking a duplicate BlockingWifi \
                              (same pointer as a previous leak)"
