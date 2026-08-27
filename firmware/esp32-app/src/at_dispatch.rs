@@ -30,8 +30,9 @@
 //!   (no reboot required). Boot-time `connect_wifi` still applies on power-up.
 //! - Reset (`AT+RST`) — now performs a live `esp_restart()` (replies OK
 //!   first, then reboots after a short delay so the reply flushes).
-//! - Sign (`AT+SIGN`) — needs a hook into the existing
-//!   `IngressGateway::signer`; deferred to v0.3.
+//! - Sign (`AT+SIGN`) — now implemented: the dispatcher loads the device
+//!   identity directly and signs a payload, returning the canonical
+//!   signed-message JSON (no gateway context required).
 
 use core::fmt::Write as _;
 use heapless::{String as HeaplessString, Vec};
@@ -257,10 +258,7 @@ fn dispatch_inner<'a>(
         AtOp::Safemode => safemode_dispatch(cmd),
         AtOp::Ident => ident_query(),
         AtOp::IdentRot => ident_rot_dispatch(safe_mode),
-        AtOp::Sign => {
-            log::warn!("[at] SIGN needs IngressGateway context; deferred to v0.3");
-            AtOutcome::error(4)
-        }
+        AtOp::Sign => sign_dispatch(cmd),
         AtOp::Restore => {
             log::warn!("[at] RESTORE needs full-nvs-wipe; deferred to v0.3");
             AtOutcome::error(4)
@@ -889,6 +887,51 @@ fn ident_rot_dispatch(safe_mode: bool) -> AtOutcome {
     }
     let mut line = ReplyLine::new();
     let _ = write!(line, "+IDENTROT:{}", hex::encode(id.public_key().as_bytes()));
+    AtOutcome::Ok { data: line }
+}
+
+/// `AT+SIGN="<payload>"` — sign a payload with the device's Ed25519 identity
+/// and return the canonical signed-message JSON (signer DID + payload_hex +
+/// signature_hex). Previously deferred to v0.3 ("needs IngressGateway
+/// context"); the dispatcher can load the identity directly, so signing now
+/// works without the gateway. The signed message is the same wire format the
+/// ingress uses to sign every command envelope, so a host can verify it with
+/// the same `SignedMessage::from_json` / Ed25519 verify path.
+fn sign_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
+    let payload = match cmd.arg(0) {
+        Some(AtArg::Quoted(s)) => s,
+        _ => return AtOutcome::error(4),
+    };
+    if payload.is_empty() || payload.len() > 64 {
+        // Keep payload_hex short enough that the JSON reply fits in the
+        // 256-byte reply line (64 raw bytes -> 128 hex chars + DID + sig).
+        log::warn!("[at] SIGN: payload must be 1..=64 bytes");
+        return AtOutcome::error(7);
+    }
+    let stored = match nvs_load(NVS_KEY_IDENTITY, "magent") {
+        Some(s) => s,
+        None => {
+            log::warn!("[at] SIGN: no device identity in NVS");
+            return AtOutcome::error(9);
+        }
+    };
+    let seed = match crate::device_key::open_dev_identity(&stored) {
+        Ok(s) => s,
+        Err(_) => return AtOutcome::error(9),
+    };
+    let id = match Identity::from_secret_bytes(&seed) {
+        Ok(i) => i,
+        Err(_) => return AtOutcome::error(9),
+    };
+    let signed = match id.sign(payload) {
+        Ok(m) => m,
+        Err(_) => return AtOutcome::error(7),
+    };
+    let mut line = ReplyLine::new();
+    if signed.to_json_into(&mut line).is_err() {
+        log::warn!("[at] SIGN: signed message exceeds reply buffer");
+        return AtOutcome::error(7);
+    }
     AtOutcome::Ok { data: line }
 }
 
