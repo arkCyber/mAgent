@@ -292,6 +292,10 @@ pub fn run_sntp_supervisor<F>(
     // yet (unstable hotspot / still associating), skip the wait entirely —
     // the loop below re-checks `network_up` every tick and syncs the moment
     // a link appears.
+    //
+    // `did_first_sync` guards the link-up retry in the loop: once we have
+    // recorded a real sample we fall back to the normal periodic re-sync.
+    let mut did_first_sync = false;
     if !network_up.load(Ordering::Relaxed) {
         log::warn!("[sntp] no network link yet — deferring first sync (will retry on link-up)");
     } else if wait_for_first_sync(&sntp, FIRST_SYNC_TIMEOUT_MS) {
@@ -303,6 +307,7 @@ pub fn run_sntp_supervisor<F>(
                     wall, now
                 );
                 persist_to_nvs(&handle, &mut save_fn);
+                did_first_sync = true;
             }
         }
     } else {
@@ -361,6 +366,37 @@ pub fn run_sntp_supervisor<F>(
         // is wasted work.
         let status = sntp.get_sync_status();
         let elapsed_since_sync = now.saturating_sub(last_sync_ms);
+
+        // BUGFIX (2026-08-27): if the initial wait was deferred because the
+        // STA had no IP at boot, we never synced. The ESP-IDF SNTP daemon
+        // polls only when triggered, and the periodic re-sync below requires
+        // `status == Completed` (which never happens if we never synced). So
+        // the moment a link appears, nudge the daemon and do the first sync.
+        if !did_first_sync && network_up.load(Ordering::Relaxed) {
+            // Ask the IDF daemon to (re)start polling now that we have a link.
+            unsafe {
+                esp_idf_svc::sys::sntp_set_sync_status(
+                    esp_idf_svc::sys::sntp_sync_status_t_SNTP_SYNC_STATUS_RESET,
+                );
+            }
+            if wait_for_first_sync(&sntp, FIRST_SYNC_TIMEOUT_MS) {
+                if let Ok(Some(wall)) = read_rtc_unix() {
+                    let n = monotonic_ms();
+                    if record_sample(&handle, wall, 0, n).is_ok() {
+                        log::info!(
+                            "[sntp] first sync recorded on link-up: wall_unix={} monotonic_ms={}",
+                            wall, n
+                        );
+                        persist_to_nvs(&handle, &mut save_fn);
+                        last_sync_ms = n;
+                        did_first_sync = true;
+                    }
+                }
+            }
+            // If it still didn't complete within the timeout, leave
+            // `did_first_sync = false` so we retry on the next tick.
+        }
+
         if network_up.load(Ordering::Relaxed)
             && status == SyncStatus::Completed
             && elapsed_since_sync >= RESYNC_INTERVAL_S * 1000
