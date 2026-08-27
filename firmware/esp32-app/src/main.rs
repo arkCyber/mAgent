@@ -905,6 +905,10 @@ fn run_wifi_supervisor(
     let mut was_up: Option<bool> = None;
     let mut downs: u32 = 0;
     let mut last_heartbeat = 0u64;
+    // FAULT-TOLERANCE (2026-08-27): last time we printed the user-facing
+    // "hotspot not on 2.4GHz" hint, so it repeats only every ~2 min instead
+    // of spamming every reconnect cycle.
+    let mut last_ap_hint = 0u64;
     loop {
         std::thread::sleep(Duration::from_secs(3));
         let now = now_ms();
@@ -1010,6 +1014,17 @@ fn run_wifi_supervisor(
                 );
             } else {
                 log::warn!("[wifi-sup] attempting reconnect to {ssid} (last reason={reason})");
+                // FAULT-TOLERANCE (2026-08-27): give the operator a clear,
+                // periodic hint when the AP is genuinely absent (the classic
+                // iPhone-hotspot case where 2.4 GHz isn't being broadcast).
+                if reason == WIFI_REASON_NO_AP_FOUND && now.saturating_sub(last_ap_hint) > 120_000 {
+                    last_ap_hint = now;
+                    log::warn!(
+                        "[wifi-sup] SSID '{ssid}' not found for a while — if this is a phone \
+                         hotspot, enable 'Maximum Compatibility' (2.4 GHz) so the radio can \
+                         see it; the device will auto-connect the moment it appears"
+                    );
+                }
                 connect_wifi(&mut *wifi, &ssid, &pass, &status);
             }
             log::warn!("[wifi-sup] backoff {backoff}s before next attempt");
