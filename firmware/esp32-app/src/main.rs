@@ -249,6 +249,12 @@ static LEAKED_BOXES: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLoc
 /// consume operation, so each request triggers exactly one reconnect.
 pub static WIFI_RECONNECT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Cached summary of the most recent Wi-Fi scan, produced by the supervisor
+/// when the STA is disconnected (the case where `AT+CWLAP` is most useful for
+/// diagnosing "why can't I see my AP"). Read by the dispatcher for
+/// `AT+CWLAP`. Stored as a newline-separated `(ssid,rssi)` list.
+pub static LAST_SCAN: Mutex<Option<String>> = Mutex::new(None);
+
 /// Registry of pointers already leaked via `Box::leak` so a future refactor
 /// that re-runs a one-shot init path (soft-reboot, OTA) surfaces a real
 /// double-leak instead of silently doubling heap use.
@@ -909,6 +915,8 @@ fn run_wifi_supervisor(
     // "hotspot not on 2.4GHz" hint, so it repeats only every ~2 min instead
     // of spamming every reconnect cycle.
     let mut last_ap_hint = 0u64;
+    // Last time we ran a cached scan for `AT+CWLAP` (throttled to 60s).
+    let mut last_scan_ms = 0u64;
     loop {
         std::thread::sleep(Duration::from_secs(3));
         let now = now_ms();
@@ -1024,6 +1032,29 @@ fn run_wifi_supervisor(
                          hotspot, enable 'Maximum Compatibility' (2.4 GHz) so the radio can \
                          see it; the device will auto-connect the moment it appears"
                     );
+                }
+                // COMPLETION (2026-08-27): cache a fresh scan so `AT+CWLAP` can
+                // report which APs are actually in range — most useful when the
+                // configured AP is absent. Throttled to once per 60s to avoid
+                // hammering the radio with back-to-back scans (connect_wifi
+                // scans again internally anyway).
+                if now.saturating_sub(last_scan_ms) > 60_000 {
+                    last_scan_ms = now;
+                    match wifi.scan() {
+                        Ok(aps) => {
+                            let mut lines = String::new();
+                            for ap in aps.iter().take(20) {
+                                lines.push_str(&format!(
+                                    "({},{})\n",
+                                    ap.ssid.as_str(),
+                                    ap.signal_strength
+                                ));
+                            }
+                            *LAST_SCAN.lock().unwrap_or_else(|e| e.into_inner()) = Some(lines);
+                            log::info!("[wifi-sup] cached scan: {} APs visible", aps.len());
+                        }
+                        Err(e) => log::warn!("[wifi-sup] scan failed: {e}"),
+                    }
                 }
                 connect_wifi(&mut *wifi, &ssid, &pass, &status);
             }

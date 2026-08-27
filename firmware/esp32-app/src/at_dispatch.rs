@@ -240,10 +240,7 @@ fn dispatch_inner<'a>(
             log::info!("[at] CWQAP — disconnect issued (deferred to next boot)");
             AtOutcome::NoReply
         }
-        AtOp::CwLap => {
-            log::info!("[at] CWLAP deferred to background scan");
-            AtOutcome::ok_line("+CWLAP:scan-started")
-        }
+        AtOp::CwLap => cwlap_line(),
         AtOp::CwHostname => cwhostname_dispatch(cmd),
         AtOp::CwAutoconn => cwautoconn_dispatch(cmd),
         AtOp::CwReconnCfg => cwreconncfg_dispatch(cmd),
@@ -770,6 +767,26 @@ fn ifconfig_line(wifi_status: Option<&crate::WifiStatusHandle>) -> AtOutcome {
     let mut line = ReplyLine::new();
     let _ = write!(line, "+IFCONFIG:\"{}\"", escape_wire(&ip));
     AtOutcome::Ok { data: line }
+}
+
+/// `AT+CWLAP` — report the APs visible in the supervisor's most recent scan
+/// (cached when the STA is disconnected). Returns the cached list when
+/// available, else a "scan-started" placeholder if no scan has run yet.
+fn cwlap_line() -> AtOutcome {
+    let cached = crate::LAST_SCAN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    match cached {
+        Some(s) if !s.is_empty() => {
+            // Strip the trailing newline so the reply is a single line.
+            let trimmed = s.trim_end();
+            let mut line = ReplyLine::new();
+            let _ = write!(line, "+CWLAP:{trimmed}");
+            AtOutcome::Ok { data: line }
+        }
+        _ => AtOutcome::ok_line("+CWLAP:scan-started"),
+    }
 }
 
 fn cipstamac_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
