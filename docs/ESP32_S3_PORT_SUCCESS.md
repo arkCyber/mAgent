@@ -24,7 +24,9 @@ cd firmware/esp32-app && ./build-s3.sh              # 构建 S3（sdkconfig.defa
 ```
 
 ## 四、待后续验证（非阻塞）
-WiFi 联机 + BLE + DeepSeek 端到端、PSRAM 识别、web_admin 网页（http://<ip>/）、fetch_web 出站抓取。
+- ✅ **WiFi 联机**（2026-08-27）：SSID 大小写修正为 `arkSong@iPhone` 后，实机连上热点并拿到 IP `172.20.10.4`（rssi -31 dBm）。注：iPhone 热点需开启「最大兼容性」（2.4GHz）且热点会间歇性变不可见，属热点侧问题。
+- ✅ **PSRAM quad**（2026-08-27）：free_heap ~2.18MB，4MB quad PSRAM 确认生效。
+- ⬜ BLE + DeepSeek 端到端、web_admin 网页（http://<ip>/，受热点客户端隔离影响无法从同网段主机直连）、fetch_web 出站抓取。
 
 ## 五、S3 vs C61 功能审计矩阵（2026-08-27）
 

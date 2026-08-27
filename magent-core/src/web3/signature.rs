@@ -215,6 +215,7 @@ impl SignedMessage {
     ///
     /// Returns `Err(())` if `out` is too small (no partial write is left
     /// behind — the buffer is cleared first).
+    #[allow(clippy::result_unit_err)] // `()` is an intentional marker: the caller maps it to its own error code.
     pub fn to_json_into<const N: usize>(
         &self,
         out: &mut heapless::String<N>,

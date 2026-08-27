@@ -941,6 +941,7 @@ pub fn validate_passphrase(bytes: &[u8]) -> Result<(), &'static str> {
 ///
 /// Returns `Err(())` if `out` would overflow (caller decides the error
 /// code — typically the "too long" rejection).
+#[allow(clippy::result_unit_err)] // `()` is an intentional marker: the caller maps it to its own error code.
 pub fn unescape_quoted<const N: usize>(
     src: &[u8],
     out: &mut heapless::Vec<u8, N>,
@@ -1008,6 +1009,7 @@ fn hex_digit(c: u8) -> Option<u8> {
 ///
 /// `data_lines` is the list of `+CMD:...` lines that should appear
 /// before the terminating `OK`/`ERROR`. `term` decides the trailer.
+#[allow(clippy::result_unit_err)] // `()` is an intentional marker: the caller maps it to its own error code.
 pub fn build_response<'a>(
     data_lines: &[&[u8]],
     kind: AtResponseKind,

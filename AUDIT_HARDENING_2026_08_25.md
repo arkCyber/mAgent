@@ -2055,3 +2055,38 @@ cargo clippy -p magent-core --features std,web3,wallet,verifiable_credentials --
 **生产路径 unwrap**：✅ 已清零
 
 ---
+
+## 35. 第十轮加固（2026-08-27）
+
+本轮聚焦真实可达的健壮性问题 + 死代码清理 + 消除误报警告，全部改动经三套测试基线回归（std=705 / web3=985 / web3_app=1093）+ 属性测试（43）通过，固件 S3 交叉编译通过。
+
+### 35.1 `AgentTelemetry::success_rate_pct` 溢出加固（agent.rs）
+
+**原代码**：`((self.runs_ok * 100) / self.runs_total) as u8`。
+**风险**：`runs_ok * 100` 在 u32 计数器 > ~42M 时 debug 构建会 panic / release 回绕。
+**修复**：用 `u64` 拓宽乘积（永不上溢）+ `checked_div`（保留零除返回 `None` 语义）。
+**新增测试**：`success_rate_pct_is_overflow_safe`（`runs_total==runs_ok==u32::MAX` 必须返回 `Some(100)` 而非 panic/回绕）。
+
+### 35.2 死代码清理
+
+- `verifiable_credentials.rs`：删除未使用的 `DAYS_PER_4Y`/`DAYS_PER_1Y` 常量；`write_iso8601` 的 `pad4` 闭包移除未用的 `buf` 参数。
+- 移除 `iso8601_timestamp` / `format_unix_to_iso8601` 内的冗余 `use alloc::format` / `ToString`。
+
+### 35.3 消除误报风格告警
+
+- `time_sync.rs`（3 处）：`let _ = write!(...).map_err(...)?;` 的 unit 绑定 → 纯语句（`?` 已传播错误）。
+- `at.rs`（`unescape_quoted`/`build_response`）、`signature.rs`（`to_json_into`）：`Result<_, ()>` 是有意的调用方映射标记，加 `#[allow(clippy::result_unit_err)]` + 注释。
+
+### 35.4 验证结果
+
+```bash
+cargo test -p magent-core --features std                             # 705 passed
+cargo test -p magent-core --features std,web3,blockchain,ingress,mqtt  # 985 passed
+cargo test -p magent-core --features std,web3_app,wallet,web3          # 1093 passed
+cargo test -p magent-core --test property_tests --features std,web3_app,wallet,web3  # 43 passed
+cd firmware/esp32-app && ./build-s3.sh   # 固件 S3 交叉编译通过，SSID 仍正确烘焙
+```
+
+**第十轮修改文件**：`agent.rs`、`at.rs`、`time_sync.rs`、`web3/signature.rs`、`web3/verifiable_credentials.rs`。
+
+---

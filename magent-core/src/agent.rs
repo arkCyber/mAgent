@@ -304,7 +304,14 @@ impl AgentTelemetry {
         } else {
             // Multiply first to keep precision; u32 is plenty for
             // runs up to ~4 million before we lose the 1% digit.
-            Some(((self.runs_ok * 100) / self.runs_total) as u8)
+            //
+            // HARDENING (2026-08-27): compute the product in `u64` so
+            // `runs_ok * 100` can never overflow the u32 counters (the old
+            // `runs_ok * 100` could panic in debug builds past ~42M runs).
+            // `checked_div` can never return None here because of the
+            // `runs_total == 0` guard above — kept for clippy::manual_checked_ops.
+            let numerator = (self.runs_ok as u64) * 100;
+            Some(numerator.checked_div(self.runs_total as u64).unwrap_or(0) as u8)
         }
     }
 
@@ -1333,6 +1340,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(t.success_rate_pct(), Some(75));
+    }
+
+    #[test]
+    fn success_rate_pct_is_overflow_safe() {
+        // HARDENING (2026-08-27): `runs_ok * 100` must never panic/wrap on a
+        // u32 overflow. Near u32::MAX successful runs is unreachable on real
+        // hardware but the function must degrade gracefully (saturate at
+        // 100%) rather than panic in debug builds.
+        let t = AgentTelemetry {
+            runs_total: u32::MAX,
+            runs_ok: u32::MAX,
+            ..Default::default()
+        };
+        // saturating_mul(100) caps at u32::MAX, so the rate is 100% (both
+        // counters equal). No overflow panic.
+        assert_eq!(t.success_rate_pct(), Some(100));
+
+        // runs_ok near u32::MAX but total larger than ok => still a valid,
+        // in-range percentage, never a wrap/panic.
+        let t2 = AgentTelemetry {
+            runs_total: u32::MAX,
+            runs_ok: u32::MAX - 1,
+            ..Default::default()
+        };
+        let rate = t2.success_rate_pct().expect("runs_total>0");
+        assert!(rate <= 100, "rate {rate} exceeded 100");
     }
 
     #[test]

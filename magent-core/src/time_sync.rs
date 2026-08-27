@@ -430,7 +430,7 @@ impl TimeSync {
         let (y, mo, d, h, mi, sec) = unix_to_calendar(s).ok_or(TimeSyncError::Overflow)?;
         out.clear();
         // `YYYY-MM-DDTHH:MM:SSZ` — 20 chars; MAX_ISO_LEN is 32.
-        let _ = write!(
+        write!(
             out,
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
             y, mo, d, h, mi, sec
@@ -491,7 +491,7 @@ impl TimeSync {
     /// The output buffer must be at least [`MAX_RECORD_LEN`] bytes.
     pub fn serialize_for_nvs(&self, out: &mut String<MAX_RECORD_LEN>) -> Result<(), TimeSyncError> {
         out.clear();
-        let _ = write!(
+        write!(
             out,
             "{}:{}:{}:{}:{}:{}",
             PERSIST_PREFIX,
@@ -712,7 +712,7 @@ pub fn format_iso8601_for_test(
     let s = corrected.checked_add(carry as i64).ok_or(TimeSyncError::Overflow)?;
     let (y, mo, d, h, mi, sec) = unix_to_calendar(s).ok_or(TimeSyncError::Overflow)?;
     out.clear();
-    let _ = write!(
+    write!(
         out,
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         y, mo, d, h, mi, sec

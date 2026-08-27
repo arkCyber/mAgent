@@ -567,9 +567,6 @@ fn log_random_failure(where_: &str) {
 /// Caller should override with actual time in production.
 #[cfg(feature = "std")]
 fn iso8601_timestamp() -> String {
-    use alloc::format;
-    use alloc::string::ToString;
-
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -596,9 +593,6 @@ fn iso8601_timestamp() -> String {
 /// - Year/month/day are derived from the day count; hour/minute/second
 ///   from the seconds-of-day remainder.
 fn format_unix_to_iso8601(unix_secs: u64) -> String {
-    use alloc::format;
-    use alloc::string::String;
-
     const SECS_PER_DAY: u64 = 86_400;
 
     let days = (unix_secs / SECS_PER_DAY) as i64;
@@ -612,7 +606,7 @@ fn format_unix_to_iso8601(unix_secs: u64) -> String {
     let (year, month, day) = civil_from_days(days);
 
     let mut out = String::with_capacity(20);
-    let _ = write_iso8601(&mut out, year, month, day, hour, minute, second);
+    write_iso8601(&mut out, year, month, day, hour, minute, second);
     out
 }
 
@@ -629,15 +623,14 @@ fn write_iso8601(
     second: u32,
 ) {
     use alloc::string::ToString;
-    let mut buf: [u8; 4] = [0; 4];
-    let pad4 = |n: i64, buf: &mut [u8; 4]| -> alloc::string::String {
+    let pad4 = |n: i64| -> alloc::string::String {
         let mut s = n.to_string();
         while s.len() < 4 {
             s = alloc::format!("0{}", s);
         }
         s
     };
-    out.push_str(&pad4(year, &mut buf));
+    out.push_str(&pad4(year));
     out.push('-');
     if month < 10 {
         out.push('0');
@@ -674,8 +667,6 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     // Shift epoch from 1970-01-01 to 0000-03-01 so leap-day handling
     // becomes uniform.
     const DAYS_PER_CYCLE: i64 = 146_097; // 400-year Gregorian cycle
-    const DAYS_PER_4Y: i64 = 1461;
-    const DAYS_PER_1Y: i64 = 365;
 
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - (DAYS_PER_CYCLE - 1) } / DAYS_PER_CYCLE;
