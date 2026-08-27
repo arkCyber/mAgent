@@ -23,9 +23,9 @@
 # the native USB-JTAG). The board works fine via the CP2102 USB-UART bridge,
 # so PSRAM is safe to turn back on. With 2 MB PSRAM the `std::alloc` heap
 # backs the agent's memory budget (see `AgentConfig::with_max_memory`).
-CONFIG_SPIRAM=n
-CONFIG_SPIRAM_BOOT_INIT=n
-CONFIG_SPIRAM_USE_MALLOC=n
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
 
 # --------------------------------------------------------------------------
 # Wi-Fi (required for LLM RPC calls)
@@ -212,6 +212,7 @@ CONFIG_ESPTOOLPY_FLASHFREQ_40M=n
 # PATCHED (MicroAgent): pin PSRAM to 80 MHz to match flash. Without
 # this, ESP-IDF auto-selects 40 MHz for the legacy QSPI PSRAM on the
 # N8R2 board, which conflicts with the 80 MHz flash per AR2026-002.
+CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_SPEED_40M=n
 # PATCHED (MicroAgent): disable flash access that exercises the
