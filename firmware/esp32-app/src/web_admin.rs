@@ -61,12 +61,30 @@ fn render_index(wifi_status: &WifiStatusHandle) -> String {
     let s = wifi_status.lock().unwrap_or_else(|p| p.into_inner());
     let ip = html_escape(&s.ip);
     let ssid = html_escape(&s.ssid);
-    format!("<!DOCTYPE html><html><head><title>mAgent v{0}</title></head><body><h1>mAgent v{0}</h1><table><tr><td>version</td><td>{0}</td></tr><tr><td>state</td><td>{1}</td></tr><tr><td>ip</td><td>{2}</td></tr><tr><td>ssid</td><td>{3}</td></tr><tr><td>rssi</td><td>{4} dBm</td></tr><tr><td>heap</td><td>{5} B</td></tr><tr><td>uptime</td><td>{6} ms</td></tr></table><p><a href=/api/status>JSON status</a></p></body></html>", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, free_heap(), now_ms())
+    let reason = html_escape(reason_label(s.reason));
+    format!("<!DOCTYPE html><html><head><title>mAgent v{0}</title></head><body><h1>mAgent v{0}</h1><table><tr><td>version</td><td>{0}</td></tr><tr><td>state</td><td>{1}</td></tr><tr><td>ip</td><td>{2}</td></tr><tr><td>ssid</td><td>{3}</td></tr><tr><td>rssi</td><td>{4} dBm</td></tr><tr><td>wifi reason</td><td>{7} ({8})</td></tr><tr><td>heap</td><td>{5} B</td></tr><tr><td>uptime</td><td>{6} ms</td></tr></table><p><a href=/api/status>JSON status</a></p></body></html>", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, free_heap(), now_ms(), reason, s.reason)
 }
 
 fn render_status(wifi_status: &WifiStatusHandle) -> String {
     let s = wifi_status.lock().unwrap_or_else(|p| p.into_inner());
     let ip = json_escape(&s.ip);
     let ssid = json_escape(&s.ssid);
-    format!("{{\"version\":\"{}\",\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"free_heap_b\":{},\"uptime_ms\":{}}}", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, free_heap(), now_ms())
+    format!("{{\"version\":\"{}\",\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"wifi_reason\":{},\"free_heap_b\":{},\"uptime_ms\":{}}}", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, s.reason, free_heap(), now_ms())
+}
+
+/// Human-readable label for an ESP-IDF `WIFI_REASON_*` code. Unknown codes
+/// fall back to the raw number so operators can still look them up.
+fn reason_label(reason: u32) -> &'static str {
+    match reason {
+        0 => "none",
+        2 => "auth-expire",
+        3 => "auth-leave",
+        15 => "4-way-handshake-timeout",
+        200 => "beacon-timeout",
+        201 => "no-ap-found",
+        202 => "auth-fail (wrong password?)",
+        203 => "assoc-fail",
+        204 => "handshake-timeout",
+        other => "unknown",
+    }
 }
