@@ -1,5 +1,5 @@
 # =============================================================================
-# mAgent firmware — sdkconfig.defaults for ESP32-C61-DevKitC-1-N8R2
+# mAgent firmware — sdkconfig.defaults for ESP32-S3 (quad-PSRAM dev board)
 #
 # TRACE: REQ-FW-001, REQ-CFG-001, REQ-CFG-002, REQ-NET-001, REQ-FW-005
 #
@@ -7,11 +7,12 @@
 # On first `cargo build` esp-idf-svc generates `sdkconfig` from this file.
 # Re-run `cargo build` after editing.
 #
-# Board:  ESP32-C61-DevKitC-1-N8R2
-# Flash:  8 MB (N8)
-# PSRAM:  2 MB (R2)
-# Core:   RISC-V RV32IMAC  (single-core, hardware CAS)
-# Target: riscv32imac-unknown-none-elf  (set in firmware/esp32-app/.cargo/config.toml)
+# Board:  ESP32-S3 (4 MB flash, quad PSRAM)
+# Flash:  4 MB
+# PSRAM:  quad (this board: 4 MB external)
+# Core:   Xtensa LX7 (dual-core, hardware AES)
+# Target: xtensa-esp32s3-espidf  (see build-s3.sh; the C61 build uses
+#          build-c61.sh which temporarily swaps in sdkconfig.c61.defaults)
 # =============================================================================
 
 # --------------------------------------------------------------------------

@@ -26,8 +26,8 @@
 //!
 //! - Wi-Fi connect (`esp_wifi_connect`) — lives on the main thread;
 //!   we update NVS and let boot-time `connect_wifi` pick it up.
-//! - Reset (`AT+RST`) — semantically a no-op until v0.3 brings in the
-//!   full watchdog helper.
+//! - Reset (`AT+RST`) — now performs a live `esp_restart()` (replies OK
+//!   first, then reboots after a short delay so the reply flushes).
 //! - Sign (`AT+SIGN`) — needs a hook into the existing
 //!   `IngressGateway::signer`; deferred to v0.3.
 
@@ -215,7 +215,17 @@ fn dispatch_inner<'a>(
         AtOp::SetEcho { on: _ } => AtOutcome::NoReply,
         AtOp::GetVersion => version_string(),
         AtOp::Reset => {
-            log::warn!("[at] AT+RST — deferred to next boot (no live reset in v0.2)");
+            // AT+RST: reply OK, then reboot after a short delay so the
+            // OK line flushes out the UART before the radio/stack tears
+            // down. `esp_restart()` is a cold reboot (not a watchdog reset).
+            log::info!("[at] AT+RST — rebooting in 200ms");
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                // SAFETY: `esp_restart()` never returns; nothing to clean up.
+                unsafe {
+                    esp_idf_sys::esp_restart();
+                }
+            });
             AtOutcome::NoReply
         }
         AtOp::SysRam => sysram_line(),
@@ -747,16 +757,34 @@ fn cwreconncfg_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
 fn cipstamac_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
     match cmd.kind {
         AtCommandKind::Query => {
-            // PATCHED (MicroAgent): previously hard-coded a
-            // placeholder MAC ("02:00:00:00:00:01") which made
-            // it look like the feature worked while it didn't.
-            // We now refuse +CMDER:9 so operators can spot the
-            // gap; v0.3 wires this up to the real netif MAC.
-            log::warn!("[at] CIPSTAMAC? — not implemented in v0.2");
-            AtOutcome::error(9)
+            // CIPSTAMAC?: report the *real* STA netif MAC. Previously this
+            // hard-coded a placeholder ("02:00:00:00:00:01") which made it
+            // look like the feature worked, then was refused with +CMDER:9.
+            // We now read it from the radio via `esp_wifi_get_mac`.
+            let mut mac: [u8; 6] = [0u8; 6];
+            let rc = unsafe {
+                esp_idf_sys::esp_wifi_get_mac(
+                    esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+                    mac.as_mut_ptr(),
+                )
+            };
+            if rc != esp_idf_sys::ESP_OK {
+                log::warn!("[at] CIPSTAMAC? esp_wifi_get_mac failed: {rc}");
+                return AtOutcome::error(9);
+            }
+            let mut line = ReplyLine::new();
+            let _ = write!(
+                line,
+                "+CIPSTAMAC:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            );
+            AtOutcome::Ok { data: line }
         }
         AtCommandKind::Set => {
-            log::warn!("[at] CIPSTAMAC set deferred to v0.3");
+            // Setting a custom STA MAC requires stopping the radio first
+            // (`esp_wifi_set_mac` fails while running) and re-associating —
+            // risky mid-session, so it stays unsupported for now.
+            log::warn!("[at] CIPSTAMAC set — runtime MAC change not supported");
             AtOutcome::error(4)
         }
         _ => AtOutcome::error(4),
