@@ -920,7 +920,6 @@ fn http_get_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
 fn http_get_worker(url: &str) -> Result<ReplyLine, u8> {
     use embedded_svc::http::client::Client as HttpClient;
     use embedded_svc::http::Method;
-    use embedded_svc::io::Read as _;
     use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
     use std::net::ToSocketAddrs;
 
@@ -1024,7 +1023,7 @@ const CONNECT_TIMEOUT_S: u64 = 5;
 /// Extract `(host, port)` from a `http://` / `https://` URL. Handles
 /// optional userinfo (`user:pass@host`), a trailing port, and defaults
 /// (80 for http, 443 for https). Returns `None` for anything else.
-fn url_host_port(url: &str) -> Option<(String, u16)> {
+pub(crate) fn url_host_port(url: &str) -> Option<(String, u16)> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))?;

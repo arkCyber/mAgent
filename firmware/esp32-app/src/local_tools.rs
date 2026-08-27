@@ -152,11 +152,85 @@ fn read_sensor(args: &str) -> ToolResult {
     }
 }
 
+
+/// fetch_web url=<http(s)://...> - bounded HTTP GET that returns a short
+/// plain-text preview of the page body, mirroring AT+HTTPGET robustness
+/// (DNS/TCP preflight + hard timeout + bounded read) so a hung TLS
+/// handshake cannot stall the agent thread.
+fn fetch_web(args: &str) -> ToolResult {
+    use embedded_svc::http::client::Client as HttpClient;
+    use embedded_svc::http::Method;
+    use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
+    use std::net::ToSocketAddrs;
+
+    let pairs = parse_kv(args);
+    let url = kv(&pairs, "url", "").to_string();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return tool_result("fetch_web", format!("refusing non-http(s) URL: {url}"), false);
+    }
+    if url.len() > 512 {
+        return tool_result("fetch_web", "URL too long".into(), false);
+    }
+
+    let (host, port) = match crate::at_dispatch::url_host_port(&url) {
+        Some(hp) => hp,
+        None => return tool_result("fetch_web", "malformed URL".into(), false),
+    };
+    let authority = format!("{host}:{port}");
+    match authority.to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => {
+                if std::net::TcpStream::connect_timeout(&addr, core::time::Duration::from_secs(5)).is_err() {
+                    return tool_result("fetch_web", format!("connect timeout to {authority}"), false);
+                }
+            }
+            None => return tool_result("fetch_web", format!("no address for {authority}"), false),
+        },
+        Err(e) => return tool_result("fetch_web", format!("dns failed: {e}"), false),
+    }
+
+    let cfg = HttpConfig {
+        timeout: Some(core::time::Duration::from_secs(6)),
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        ..Default::default()
+    };
+    let conn = match EspHttpConnection::new(&cfg) {
+        Ok(c) => c,
+        Err(e) => return tool_result("fetch_web", format!("connect: {e}"), false),
+    };
+    let mut client = HttpClient::wrap(conn);
+    let headers = [("accept", "text/html,*/*")];
+    let request = match client.request(Method::Get, &url, &headers) {
+        Ok(r) => r,
+        Err(e) => return tool_result("fetch_web", format!("request: {e}"), false),
+    };
+    let mut response = match request.submit() {
+        Ok(r) => r,
+        Err(e) => return tool_result("fetch_web", format!("submit: {e}"), false),
+    };
+    let status = response.status();
+
+    let mut buf = [0u8; 256];
+    let mut read = 0usize;
+    while read < buf.len() {
+        match response.read(&mut buf[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(_) => break,
+        }
+    }
+    let lossy = String::from_utf8_lossy(&buf[..read]);
+    let data = format!("+FETCH:{} bytes={} preview={}", status, read, lossy.trim());
+    tool_result("fetch_web", data, (200..300).contains(&status))
+}
+
+
 impl ToolHandler for Esp32ToolHandler {
     fn handle(&self, call: &ToolCall) -> Option<ToolResult> {
         match call.name.as_str() {
             "write_gpio" => Some(write_gpio(call.arguments.as_str())),
             "read_sensor" => Some(read_sensor(call.arguments.as_str())),
+            "fetch_web" => Some(fetch_web(call.arguments.as_str())),
             _ => None,
         }
     }

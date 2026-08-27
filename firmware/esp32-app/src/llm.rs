@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use embedded_svc::http::client::Client as HttpClient;
 use embedded_svc::http::Method;
-use embedded_svc::io::{Read as _, Write as _};
+use embedded_svc::io::Write as _;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
 use magent_core::agent::LlmBackend;
 use magent_core::error::AgentError;

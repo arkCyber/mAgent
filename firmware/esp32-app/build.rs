@@ -283,6 +283,14 @@ fn do_patch(ld_path: &Path) {
         .collect::<Vec<_>>()
         .join("\n");
 
+    // PATCHED (MicroAgent): absorb the defmt crate orphan .defmt.* sections
+    // into .flash.rodata so the .defmt.end orphan does not split DROM into
+    // two flash-mapped segments (bootloader rejects with "multiple DROM").
+    let patched = patched.replace(
+        "_flash_rodata_start = ABSOLUTE(.);",
+        "_flash_rodata_start = ABSOLUTE(.);\n    *(.defmt.*) /* PATCHED: defmt into rodata for single DROM */",
+    );
+
     if patched != content {
         if let Err(e) = std::fs::write(ld_path, &patched) {
             println!(

@@ -41,6 +41,7 @@
 
 mod link_adapters;
 mod local_tools;
+mod web_admin;
 mod at_dispatch;
 mod device_key;
 mod llm;
@@ -864,7 +865,7 @@ fn connect_wifi(
 /// `connect_wifi` (the same multi-attempt association logic) and backs off
 /// exponentially so a dead AP doesn't hammer the radio in a tight loop.
 fn run_wifi_supervisor(
-    mut wifi: &'static mut BlockingWifi<EspWifi<'static>>,
+    wifi: &'static mut BlockingWifi<EspWifi<'static>>,
     status: WifiStatusHandle,
     ssid: String,
     pass: String,
@@ -1049,6 +1050,7 @@ fn load_device_key_for_seal() -> Result<[u8; 32], &'static str> {
     load_device_key_via_btdk()
 }
 
+#[allow(dead_code)]
 fn hex_nibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -1300,7 +1302,7 @@ fn run_ingress(
                                     } else {
                                         let now = now_ms();
                                         let mut force_flag = false;
-                                        if let Ok(mut g) = force_ntp_sync.lock() {
+                                        if let Ok(g) = force_ntp_sync.lock() {
                                             force_flag = *g;
                                         }
                                         let outcome = at_dispatch::dispatch(
@@ -1384,6 +1386,7 @@ fn dtrace(s: &str) {
 /// Entry point for the `agent-thread`.
 ///
 /// Drives the `MiniAgent` ReAct loop forever. TRACE: REQ-SAFE-001.
+#[cfg_attr(feature = "board-c61", allow(unused_variables))]
 fn run_agent_loop(
     task_handle: TaskHandle,
     reply_outbox: TaskHandle,
@@ -1524,7 +1527,7 @@ fn run_agent_loop(
         #[cfg(feature = "ble")]
         let from_ble = ble_task.is_some();
         #[cfg(not(feature = "ble"))]
-        let (ble_task, from_ble) = (None::<String>, false);
+        let (ble_task, _from_ble) = (None::<String>, false);
         let task = ble_task
             .or(pending)
             .unwrap_or_else(|| "read sensor temperature".to_string());
@@ -1971,6 +1974,19 @@ fn main() {
         log::warn!("[wifi-sup] no Wi-Fi handle — supervisor not started");
     }
 
+    // PATCHED (MicroAgent): web admin / status HTTP server. Serves an HTML
+    // dashboard + /api/status JSON on the STA interface. Only when lwIP is up.
+    if wifi_up {
+        let st = wifi_status.clone();
+        let wa = thread::Builder::new()
+            .name("web-admin".into())
+            .stack_size(8 * 1024)
+            .spawn(move || web_admin::run_web_admin(st));
+        if wa.is_err() {
+            log::warn!("[webadmin] thread spawn failed - no admin server");
+        }
+    }
+
     // PATCHED (MicroAgent): Initialize BLE GATT server for mAgent-Man
     // (moved BEFORE Wi-Fi bring-up for stability — see the block above
     // `provision_llm_config`; keeping the old slot would re-init BLE after
@@ -2026,6 +2042,7 @@ fn main() {
     // The agent is spawned with clones so the supervisor can restart it
     // later if it crashes (the `Arc`s are still held here).
     let mut agent_restarts: u32 = 0;
+    #[allow(unused_assignments)]
     let mut agent_handle: Option<std::thread::JoinHandle<()>> = None;
     {
         // Clone outside the `move` closure so main still holds the originals

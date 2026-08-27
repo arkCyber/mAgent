@@ -45,6 +45,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::format;
+use std::io::Read;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::string::{String, ToString};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -76,6 +78,13 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum number of results returned by `web_search`. The LLM only
 /// needs a handful of pointers to pick the most relevant URL.
 const MAX_SEARCH_RESULTS: usize = 8;
+
+/// Whether `fetch_url` / `webpage_summary` may reach RFC1918 private
+/// (10/8, 172.16/12, 192.168/16) addresses. Defaults to `false` so an
+/// agent that fetches URLs chosen by an LLM cannot be coerced into
+/// probing a local intranet. Set to `true` only when browsing trusted
+/// private documentation servers.
+const ALLOW_PRIVATE_NETWORKS: bool = false;
 
 /// One hit returned by [`web_search`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +349,61 @@ fn strip_script_style(body: &str) -> String {
     style_regex().replace_all(&body, " ").to_string()
 }
 
+/// Returns true when the response Content-Type is an HTML family we
+/// know how to render to plain text. Case-insensitive so a server that
+/// sends `Text/Html` isn't wrongly rejected.
+fn is_html_content_type(ct: &str) -> bool {
+    ct.to_ascii_lowercase().contains("html")
+}
+
+/// Reject URLs that point at loopback, link-local (APIPA / cloud
+/// metadata 169.254.169.254), or - unless [ALLOW_PRIVATE_NETWORKS]
+/// is set - RFC1918 private networks. This is the SSRF guard for the
+/// web tools.
+fn validate_fetch_url(url: &str) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!("refusing non-http(s) URL: {url}"));
+    }
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("").to_string();
+    let host: &str = match authority.rsplit_once('@') {
+        Some((_, h)) => h,
+        None => authority.as_str(),
+    };
+    if host.is_empty() {
+        return Err(format!("URL has no host: {url}"));
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
+        return Err(format!("refusing loopback/mDNS host: {host}"));
+    }
+    let lit = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = lit.parse::<Ipv4Addr>() {
+        let blocked = ip.is_loopback()
+            || is_link_local_v4(ip)
+            || (!ALLOW_PRIVATE_NETWORKS && ip.is_private());
+        if blocked {
+            return Err(format!("refusing non-public address: {host}"));
+        }
+    }
+    if let Ok(ip) = lit.parse::<Ipv6Addr>() {
+        let v4_blocked = ip.to_ipv4_mapped()
+            .map(|v4| v4.is_loopback() || is_link_local_v4(v4) || (!ALLOW_PRIVATE_NETWORKS && v4.is_private()))
+            .unwrap_or(false);
+        let blocked = ip.is_loopback() || ip.is_unicast_link_local() || v4_blocked;
+        if blocked {
+            return Err(format!("refusing non-public address: {host}"));
+        }
+    }
+    Ok(())
+}
+
+/// 169.254.0.0/16 - APIPA plus the cloud metadata endpoint 169.254.169.254.
+fn is_link_local_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 169 && o[1] == 254
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -416,15 +480,13 @@ pub fn web_search(args: &str) -> std::result::Result<String, String> {
 pub fn fetch_url(args: &str) -> std::result::Result<String, String> {
     let url =
         extract_query(args, "url").ok_or_else(|| "fetch_url: missing 'url' arg".to_string())?;
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(format!("fetch_url: refusing non-http(s) URL: {url}"));
-    }
+    validate_fetch_url(&url)?;
 
     let response = blocking_get_with_meta(&url)?;
 
     // Reject non-HTML content types — trying to HTML-parse a PNG or
     // JSON response produces garbage.
-    if !response.content_type.contains("html") {
+    if !is_html_content_type(&response.content_type) {
         return Err(format!(
             "fetch_url: content-type '{}' is not HTML; refusing to parse",
             response.content_type
@@ -454,14 +516,12 @@ pub fn fetch_url(args: &str) -> std::result::Result<String, String> {
 pub fn webpage_summary(args: &str) -> std::result::Result<String, String> {
     let url = extract_query(args, "url")
         .ok_or_else(|| "webpage_summary: missing 'url' arg".to_string())?;
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(format!("webpage_summary: refusing non-http(s) URL: {url}"));
-    }
+    validate_fetch_url(&url)?;
     let query = extract_query(args, "query").unwrap_or_default();
 
     let response = blocking_get_with_meta(&url)?;
 
-    if !response.content_type.contains("html") {
+    if !is_html_content_type(&response.content_type) {
         return Err(format!(
             "webpage_summary: content-type '{}' is not HTML; refusing to summarise",
             response.content_type
@@ -784,12 +844,35 @@ fn http_client() -> &'static reqwest::blocking::Client {
         reqwest::blocking::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .user_agent(USER_AGENT)
+            // Cap redirects so a hostile page cannot bounce us through a
+            // long chain to an internal address.
+            .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .expect("reqwest Client must build — check TLS backend availability")
     })
 }
 
 /// Minimal GET that returns the body as a `String`.
+/// Read up to cap bytes from reader, erroring if the stream would
+/// exceed the cap. Used instead of Response::text() so a server that
+/// omits Content-Length (chunked encoding) cannot force us to buffer
+/// an unbounded body into memory.
+fn read_capped<R: Read>(mut reader: R, cap: usize) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| format!("read body: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if out.len() + n > cap {
+            return Err(format!("body exceeds size limit {} bytes", cap));
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok(out)
+}
+
 fn blocking_get(url: &str) -> std::result::Result<String, String> {
     let meta = blocking_get_with_meta(url)?;
     Ok(meta.body)
@@ -823,43 +906,40 @@ fn blocking_get_with_meta(url: &str) -> std::result::Result<ResponseMeta, String
         .unwrap_or("")
         .to_string();
 
+    // SSRF guard: even if the initial URL was public, a redirect can
+    // land on an internal address (or the metadata endpoint). Re-check
+    // the post-redirect host before reading anything.
+    validate_fetch_url(&final_url).map_err(|e| format!("GET {url}: {e}"))?;
+
     // Respect the size cap before reading the full body.
-    let bytes = resp.content_length().unwrap_or(0) as usize;
-    if bytes > MAX_BODY_BYTES {
+    let declared = resp.content_length().unwrap_or(0) as usize;
+    if declared > MAX_BODY_BYTES {
         return Err(format!(
-            "GET {url}: body Content-Length {} bytes exceeds limit {} MB",
-            bytes,
+            "GET {url}: body Content-Length {declared} bytes exceeds limit {} MB",
             MAX_BODY_BYTES / (1024 * 1024)
         ));
     }
 
-    let body = resp
-        .text()
-        .map_err(|e| format!("read body from {url}: {e}"))?;
-
-    let bytes = body.len();
-    if bytes > MAX_BODY_BYTES {
-        return Err(format!(
-            "GET {url}: body {} bytes exceeds limit {} MB",
-            bytes,
-            MAX_BODY_BYTES / (1024 * 1024)
-        ));
-    }
-
+    // Fail fast on non-2xx so we do not buffer a (possibly large) error body.
     if !(200..300).contains(&status) {
         return Err(format!(
-            "GET {url} returned HTTP {status} ({} bytes)",
-            bytes
+            "GET {url} returned HTTP {status} (declared {declared} bytes)"
         ));
     }
+
+    // Bounded streaming read (handles chunked bodies with no
+    // Content-Length, which .text() would buffer unboundedly).
+    let bytes = read_capped(resp, MAX_BODY_BYTES)?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
 
     Ok(ResponseMeta {
         body,
         final_url,
         status,
         content_type,
-        bytes,
+        bytes: bytes.len(),
     })
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,4 +1273,77 @@ mod tests {
         assert_eq!(url_encode("hello世界"), "hello%E4%B8%96%E7%95%8C");
         assert_eq!(url_encode("foo?bar=1"), "foo%3Fbar%3D1");
     }
+
+    #[test]
+    fn validate_fetch_url_rejects_non_http() {
+        assert!(validate_fetch_url("ftp://example.com/file").is_err());
+        assert!(validate_fetch_url("javascript:alert(1)").is_err());
+        assert!(validate_fetch_url("").is_err());
+    }
+
+    #[test]
+    fn validate_fetch_url_rejects_loopback_hostname() {
+        assert!(validate_fetch_url("http://localhost/").is_err());
+        assert!(validate_fetch_url("http://foo.localhost/x").is_err());
+        assert!(validate_fetch_url("http://printer.local/").is_err());
+    }
+
+    #[test]
+    fn validate_fetch_url_rejects_loopback_and_link_local_ipv4() {
+        assert!(validate_fetch_url("http://127.0.0.1/").is_err());
+        assert!(validate_fetch_url("http://127.8.8.8/x").is_err());
+        assert!(validate_fetch_url("http://169.254.169.254/latest/meta-data/").is_err());
+    }
+
+    #[test]
+    fn validate_fetch_url_rejects_private_ipv4() {
+        assert!(validate_fetch_url("http://10.0.0.1/").is_err());
+        assert!(validate_fetch_url("http://172.16.0.1/").is_err());
+        assert!(validate_fetch_url("http://192.168.1.1/").is_err());
+    }
+
+    #[test]
+    fn validate_fetch_url_rejects_ipv6_loopback_and_link_local() {
+        assert!(validate_fetch_url("http://[::1]/").is_err());
+        assert!(validate_fetch_url("http://[fe80::1]/").is_err());
+        assert!(validate_fetch_url("http://[::ffff:127.0.0.1]/").is_err());
+        assert!(validate_fetch_url("http://[::ffff:192.168.0.1]/").is_err());
+    }
+
+    #[test]
+    fn validate_fetch_url_accepts_public_targets() {
+        assert!(validate_fetch_url("https://example.com/page").is_ok());
+        assert!(validate_fetch_url("http://8.8.8.8/").is_ok());
+        assert!(validate_fetch_url("https://1.1.1.1/dns").is_ok());
+    }
+
+    #[test]
+    fn validate_fetch_url_strips_userinfo() {
+        assert!(validate_fetch_url("https://user:pass@example.com/").is_ok());
+        assert!(validate_fetch_url("http://user@127.0.0.1/x").is_err());
+    }
+
+    #[test]
+    fn is_html_content_type_case_insensitive() {
+        assert!(is_html_content_type("text/html"));
+        assert!(is_html_content_type("Text/Html; charset=utf-8"));
+        assert!(is_html_content_type("application/xhtml+xml"));
+        assert!(!is_html_content_type("application/json"));
+        assert!(!is_html_content_type("image/png"));
+    }
+
+    #[test]
+    fn read_capped_under_limit() {
+        let data = b"hello world";
+        let out = read_capped(std::io::Cursor::new(data), 100).unwrap();
+        assert_eq!(out, data.to_vec());
+    }
+
+    #[test]
+    fn read_capped_stops_at_cap() {
+        let data = b"abcdefghijklmnopqrstuvwxyz";
+        let err = read_capped(std::io::Cursor::new(data), 10).unwrap_err();
+        assert!(err.contains("size limit"));
+    }
+
 }

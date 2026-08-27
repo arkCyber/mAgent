@@ -21,9 +21,16 @@ cd /Users/arksong/MicroAgent/firmware/esp32-app
 # Override the C61-specific cargo-config env (real shell env takes precedence
 # over cargo config `[env]` unless `force = true`).
 export MCU="ESP32S3"
-export ESP_IDF_SDKCONFIG_DEFAULTS="/Users/arksong/MicroAgent/firmware/esp32-app/sdkconfig.s3.defaults"
+export ESP_IDF_SDKCONFIG_DEFAULTS="/Users/arksong/MicroAgent/firmware/esp32-app/sdkconfig.defaults"
+# Xtensa bindgen: the esp-clang defaults to RISC-V; force the matching
+# Xtensa target so __XTENSA__ is defined (fixes riscv/csr.h + l32r asm).
+export BINDGEN_EXTRA_CLANG_ARGS="-target xtensa-esp32s3-none-elf"
+# S3 is Xtensa; force C crates (secp256k1_sys etc.) to build for Xtensa, not
+# the RISC-V CC set in .cargo/config.toml (else EM:RISCV objects fail to link).
+export CC="/Users/arksong/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+export CXX="/Users/arksong/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-g++"
 
-RUSTC_BOOTSTRAP=1 cargo build --target "${TARGET}" --features board-s3 --"${PROFILE}"
+RUSTC_BOOTSTRAP=1 cargo +esp build --target "${TARGET}" --no-default-features --features board-s3,wifi,uart --"${PROFILE}"
 
 echo ""
 echo "Build complete!"

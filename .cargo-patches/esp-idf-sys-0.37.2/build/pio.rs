@@ -192,7 +192,36 @@ pub fn build() -> Result<EspIdfBuildOutput> {
         cincl_args: build::CInclArgs::try_from(&pio_scons_vars)?,
         env_path: Some(pio_scons_vars.path.clone()),
         link_args,
-        bindgen: bindgen::Factory::from_scons_vars(&pio_scons_vars)?,
+        bindgen: {
+            let mut b = bindgen::Factory::from_scons_vars(&pio_scons_vars)?;
+            // PATCHED (MicroAgent): the esp-clang defaults to the RISC-V
+            // target when no --target is given, so an Xtensa (ESP32-S3/S2)
+            // build incorrectly defines __riscv and pulls in riscv/csr.h.
+            // Force the matching Xtensa clang target so __XTENSA__ is
+            // defined and the xtensa headers are used by bindgen.
+            if let Some(mcu) = pio_scons_vars.mcu.as_deref() {
+                let m = mcu.to_ascii_lowercase();
+                let t = if m.starts_with("esp32s3") {
+                    Some("xtensa-esp32s3")
+                } else if m.starts_with("esp32s2") {
+                    Some("xtensa-esp32s2")
+                } else if m.starts_with("esp32") && !m.starts_with("esp32c")
+                    && !m.starts_with("esp32p") && !m.starts_with("esp32h")
+                {
+                    Some("xtensa-esp32")
+                } else {
+                    None
+                };
+                if let Some(t) = t {
+                    b = b.with_clang_args([
+                        format!("--target={t}"),
+                        "-D__XTENSA__".to_string(),
+                    ]);
+                }
+            }
+            b
+        },
+
         components: EspIdfComponents::from_esp_idf(&esp_idf)?,
         kconfig_args: Box::new(
             kconfig::try_from_config_file(sdkconfig.clone())

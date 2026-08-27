@@ -69,9 +69,9 @@ below 64 KiB.
 | Platform | Architecture | Status | Build Command | Notes |
 |----------|--------------|--------|---------------|-------|
 | **nRF52840** | ARM Cortex-M4F | ✅ Ready | `cargo build -p magent-nrf52-app --release --target thumbv7em-none-eabihf` | Primary smartwatch platform, BLE 5.3 |
-| **ESP32-C61** | RISC-V 32-bit | ✅ Ready + Verified on HW | `cd firmware/esp32-app && MCU=ESP32C61 cargo build --release` | Wi-Fi 6 + BLE 5.0, std (esp-idf-svc), real local tools, bidirectional UART |
+| **ESP32-C61** | RISC-V 32-bit | ✅ Ready + Verified on HW | `cd firmware/esp32-app && ./build-c61.sh` | Wi-Fi 6 + BLE 5.0, std (esp-idf-svc), real local tools, bidirectional UART |
 | ESP32-C3/C6 | RISC-V 32-bit | 🔄 Compatible | Use ESP32-C61 config | Same architecture |
-| ESP32/S3 | Xtensa LX6/LX7 | 🔄 In Progress | TBD | Requires Xtensa toolchain |
+| **ESP32-S3** | Xtensa LX7 | ✅ Ready (builds + boots on HW) | `cd firmware/esp32-app && ./build-s3.sh` | 4MB flash; agent/local tools run on real hardware; WiFi/BLE/DeepSeek pending |
 
 ## 🏗️ Project Structure
 

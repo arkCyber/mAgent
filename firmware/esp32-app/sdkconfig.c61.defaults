@@ -23,9 +23,9 @@
 # the native USB-JTAG). The board works fine via the CP2102 USB-UART bridge,
 # so PSRAM is safe to turn back on. With 2 MB PSRAM the `std::alloc` heap
 # backs the agent's memory budget (see `AgentConfig::with_max_memory`).
-CONFIG_SPIRAM=n
-CONFIG_SPIRAM_BOOT_INIT=n
-CONFIG_SPIRAM_USE_MALLOC=n
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
 
 # --------------------------------------------------------------------------
 # Wi-Fi (required for LLM RPC calls)
@@ -195,9 +195,9 @@ CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
 # PATCHED (MicroAgent): ESP32-C61-DevKitC-1-N8R2 ships with an 8 MB
 # (N8) flash chip. ESP-IDF defaults to 2 MB unless overridden, which
 # makes `gen_esp32part.py` reject any partition layout larger than
-# ~2 MB. The N8R2 needs `CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y` so that
+# ~2 MB. The N8R2 needs `CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y` so that
 # `partitions.csv` (factory + ota_0 + ota_1 + storage) actually fits.
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 # PATCHED (MicroAgent): Espressif Bug Advisory AR2026-002 (May 2026)
 # documents that the ESP32-C61 has clock-asymmetry issues when flash
 # and PSRAM are running at different frequencies (e.g. flash at 80 MHz
@@ -293,9 +293,9 @@ CONFIG_LIBC_NEWLIB=n
 # regardless of PROJECT_DIR (which the native driver points at the
 # workspace root by default).
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="firmware/esp32-app/partitions.s3.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="firmware/esp32-app/partitions.csv"
 # Flash size — ESP32-C61-DevKitC-1-N8R2 ships 8 MB (N8).
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_ESPTOOLPY_FLASHFREQ_120M=n
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 

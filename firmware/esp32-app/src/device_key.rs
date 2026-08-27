@@ -67,6 +67,7 @@ pub enum BtdkStrength {
 
 impl BtdkStrength {
     /// Number of bytes of material actually collected.
+    #[allow(dead_code)]
     pub fn material_len(self) -> usize {
         match self {
             BtdkStrength::Full => 6 + 32 + 4,

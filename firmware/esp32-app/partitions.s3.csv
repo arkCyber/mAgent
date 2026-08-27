@@ -1,0 +1,10 @@
+# Name,     Type, SubType, Offset,  Size,   Flags
+# mAgent ESP32-S3 partition table (4MB flash, single factory app).
+# Connected S3 board reports 4MB flash; use a single 2MB factory app so the
+# 1.5MB app .bin fits, with the rest for SPIFFS storage. OTA is omitted for
+# the 4MB S3 (would not fit factory + 2 OTA at 1.5MB each).
+nvs,        data, nvs,     0x9000,  0x6000
+phy_init,   data, phy,     0xf000,  0x1000
+factory,    app,  factory, 0x10000, 0x200000
+storage,    data, spiffs,  0x210000,0x1E0000
+otadata,    data, ota,     0x3f0000,0x2000

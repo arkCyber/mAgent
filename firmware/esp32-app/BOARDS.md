@@ -36,3 +36,23 @@ cd firmware/esp32-app && ./build-s3.sh       # 或手动：
 - `sdkconfig.s3.defaults` → S3（8MB octal PSRAM、S3 分区、mbedTLS、lwIP）
 
 > **注意**：S3 配置文件与 `build-s3.sh` 是基于 ESP32-S3 标准配置的起点；**需在真实 S3 板卡上烧录验证**（WiFi + BLE 共存、DeepSeek 端到端、PSRAM 8MB 识别）。C61 配置已在本仓库验证可用。
+
+
+## ESP32-S3 构建已打通（2026-08-27 验证）
+
+`./build-s3.sh` 现在可以端到端构建出 Xtensa 固件（ELF + 经 espflash 生成可烧录 .bin）。关键点：
+
+- **工具链**：必须用 ESP-rs 的 `esp` 工具链（`cargo +esp`），它带完整 Xtensa LLVM 后端；stable 的 LLVM 无法处理 `-mtext-section-literals`。
+- **bindgen 目标**：esp-clang 默认按 RISC-V 解析，需 `BINDGEN_EXTRA_CLANG_ARGS="-target xtensa-esp32s3-none-elf"` 让 bindgen 正确 targeting xtensa（修复 riscv/csr.h）。
+- **l32r 字面量对齐**：`RUSTFLAGS="-C llvm-args=-mtext-section-literals"`，把字面量放进对齐的 .literal 节（修复 "l32r: misaligned literal target"）。
+- **C 交叉编译**：S3 是 Xtensa，`CC`/`CXX` 必须指向 `toolchain-xtensa-esp-elf` 的 `xtensa-esp32s3-elf-gcc`/`g++`，否则 secp256k1_sys 等 C 依赖会编成 RISC-V 对象（EM:243）导致链接失败。
+- **生成 .bin**：esptool `elf2image` 会因 .literal/.text 段落在同一 64KB flash 映射页而报错，改用 `espflash save-image --chip esp32s3 <elf> <bin>` 即可（内部合并段）。
+
+```bash
+cd firmware/esp32-app && ./build-s3.sh          # 产出 target/xtensa-esp32s3-espidf/release/magent-esp32-app
+espflash save-image --chip esp32s3 \\
+  target/xtensa-esp32s3-espidf/release/magent-esp32-app \\
+  target/xtensa-esp32s3-espidf/release/magent-esp32-app.bin
+```
+
+烧录（真实板子）：`espflash flash --chip esp32s3 -b 460800 <bin>`（WiFi+BLE+agent 已在 S3 上构建成功，需真实硬件验证联机/PSRAM 8MB）。

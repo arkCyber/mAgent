@@ -61,6 +61,7 @@ use magent_core::time_sync::{Source, TimeSync, DEFAULT_RESYNC_INTERVAL_S};
 pub const NVS_PERSIST_KEY: &str = magent_core::time_sync::PERSIST_KEY;
 
 /// NVS key for the timezone offset (minutes east of UTC).
+#[allow(dead_code)]
 pub const NVS_TZ_KEY: &str = magent_core::time_sync::TZ_KEY;
 
 /// Maximum number of SNTP servers the firmware tries in parallel.
@@ -93,6 +94,7 @@ pub type ForceSyncFlag = Arc<Mutex<bool>>;
 
 /// NVS namespace used for time-sync artefacts. Centralised here so
 /// the dispatcher and supervisor write to the same partition.
+#[allow(dead_code)]
 pub const NVS_NS: &str = "mag_ts";
 
 /// Build the default `SntpConf` (poll mode, immediate sync, four

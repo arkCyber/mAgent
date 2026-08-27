@@ -76,7 +76,7 @@ rustflags = [
 #   cargo install espup && espup install
 # TRACE: REQ-FW-001.
 [target.xtensa-esp32s3-espidf]
-linker = "/Users/arksong/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
+linker = "/Users/arksong/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"
 
 [unstable]
 # `riscv32imac-esp-espidf` is a Tier 3 target with no pre-built

@@ -165,4 +165,4 @@ board-s3  = ["esp-println/esp32s3"]   # ESP32-S3 (Xtensa, 240MHz, 8MB PSRAM)
 # ESP-IDF v6 and are not safe to bindgen into the Rust bindings).
 # TRACE: REQ-FW-001.
 [package.metadata.esp-idf-sys]
-esp_idf_components = ["driver", "esp_adc", "esp_bt", "esp_event", "esp_hw_support", "esp_lcd", "esp_netif", "esp_phy", "esp_pm", "esp_rom", "esp_system", "esp_timer", "esp_wifi", "espcoredump", "esptool_py", "freertos", "hal", "heap", "log", "lwip", "mbedtls", "newlib", "nvs_flash", "nvs_secure", "port", "pthread", "riscv", "sdmmc", "soc", "spi_flash", "spiffs", "tcp_transport", "ulp", "vfs", "wear_levelling", "wifi_provisioning", "wpa_supplicant", "xtensa"]
+esp_idf_components = ["driver", "esp_adc", "esp_bt", "esp_http_server", "esp_event", "esp_hw_support", "esp_lcd", "esp_netif", "esp_phy", "esp_pm", "esp_rom", "esp_system", "esp_timer", "esp_wifi", "espcoredump", "esptool_py", "freertos", "hal", "heap", "log", "lwip", "mbedtls", "newlib", "nvs_flash", "nvs_secure", "port", "pthread", "riscv", "sdmmc", "soc", "spi_flash", "spiffs", "tcp_transport", "ulp", "vfs", "wear_levelling", "wifi_provisioning", "wpa_supplicant", "xtensa"]

@@ -16,7 +16,7 @@
 CONFIG_IDF_TARGET_ESP32S3=y
 
 # ---- Flash: 8MB ----
-CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
 # ---- PSRAM: 8MB octal, used for the main heap (std::alloc) ----
@@ -66,7 +66,7 @@ CONFIG_LIBC_NEWLIB=n
 
 # ---- Partition table (4MB factory app partition to fit the full build) ----
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="firmware/esp32-app/partitions.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="firmware/esp32-app/partitions.s3.csv"
 
 # ---- BLE stability: this is a peripheral that never scans ----
 # Skip the Bluedroid adv-report queue allocation to free internal DRAM and
