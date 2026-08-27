@@ -2113,4 +2113,9 @@ cd firmware/esp32-app && ./build-s3.sh   # 固件 S3 交叉编译通过，SSID �
 [wifi-sup] backoff 3s before next attempt
 ```
 
+### 35.7 功能补全（H13/H14，2026-08-27，S3+C61 构建通过、S3 实机启动验证）
+
+- **H13：`AT+CWJAP=` 实时连接（无需重启）**。此前改 WiFi 凭据后要重启才生效。新增模块级静态信号 `WIFI_RECONNECT_REQUESTED: AtomicBool`：`AT+CWJAP=` 成功写 NVS 后置位；WiFi supervisor 每 tick `swap(false)` 消费该信号，重载 NVS 凭据并**立即强制重连**（即使当前已关联也能切换 AP）。无需改 `dispatch` 签名。
+- **H14：web_admin 暴露断开原因**。`/api/status` 新增 `wifi_reason` 字段；HTML 仪表盘新增 "wifi reason" 行（含可读标签，如 201=no-ap-found、202=auth-fail、204=handshake-timeout）。复用 H12 的 `WifiStatus.reason`（由 STA 断开事件回调维护），方便诊断不稳定热点。
+
 ---
