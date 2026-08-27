@@ -265,7 +265,7 @@ fn dispatch_inner<'a>(
             log::warn!("[at] RESTORE needs full-nvs-wipe; deferred to v0.3");
             AtOutcome::error(4)
         }
-        AtOp::Ifconfig => AtOutcome::ok_line("+IFCONFIG: deferred"),
+        AtOp::Ifconfig => ifconfig_line(wifi_status),
         AtOp::Ping6 => AtOutcome::error(4),
         AtOp::Agent => AtOutcome::NoReply, // handled upstream in main.rs
         AtOp::WifiPassUpgrade => wifipass_upgrade_dispatch(cmd),
@@ -758,6 +758,20 @@ fn cwreconncfg_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
         }
         _ => AtOutcome::error(4),
     }
+}
+
+/// `AT+IFCONFIG` — report the current STA IPv4 address (from the Wi-Fi
+/// supervisor's live snapshot). Previously this returned a hard-coded
+/// "+IFCONFIG: deferred"; now it reflects the real address (empty when the
+/// STA has no link yet).
+fn ifconfig_line(wifi_status: Option<&crate::WifiStatusHandle>) -> AtOutcome {
+    let ip = wifi_status
+        .and_then(|s| s.lock().ok())
+        .map(|g| g.ip.clone())
+        .unwrap_or_default();
+    let mut line = ReplyLine::new();
+    let _ = write!(line, "+IFCONFIG:\"{}\"", escape_wire(&ip));
+    AtOutcome::Ok { data: line }
 }
 
 fn cipstamac_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
