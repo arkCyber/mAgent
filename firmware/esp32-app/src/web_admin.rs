@@ -69,7 +69,8 @@ fn render_status(wifi_status: &WifiStatusHandle) -> String {
     let s = wifi_status.lock().unwrap_or_else(|p| p.into_inner());
     let ip = json_escape(&s.ip);
     let ssid = json_escape(&s.ssid);
-    format!("{{\"version\":\"{}\",\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"wifi_reason\":{},\"free_heap_b\":{},\"uptime_ms\":{}}}", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, s.reason, free_heap(), now_ms())
+    let reason_lbl = json_escape(reason_label(s.reason));
+    format!("{{\"version\":\"{}\",\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"wifi_reason\":{},\"wifi_reason_label\":\"{}\",\"free_heap_b\":{},\"uptime_ms\":{}}}", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, s.reason, reason_lbl, free_heap(), now_ms())
 }
 
 /// Human-readable label for an ESP-IDF `WIFI_REASON_*` code. Unknown codes
