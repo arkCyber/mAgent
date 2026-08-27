@@ -242,6 +242,13 @@ static DEFAULT_NVS: OnceLock<&'static EspDefaultNvsPartition> = OnceLock::new();
 /// of 1-3 times per boot, so the contention cost is zero.
 static LEAKED_BOXES: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
 
+/// Set by the AT dispatcher when `AT+CWJAP=` persists new Wi-Fi credentials,
+/// and polled (once) by the Wi-Fi supervisor so it can reload the credentials
+/// from NVS and force an immediate reconnect instead of waiting for the next
+/// boot (or for the current link to drop on its own). `swap(false)` is the
+/// consume operation, so each request triggers exactly one reconnect.
+pub static WIFI_RECONNECT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Registry of pointers already leaked via `Box::leak` so a future refactor
 /// that re-runs a one-shot init path (soft-reboot, OTA) surfaces a real
 /// double-leak instead of silently doubling heap use.
@@ -890,8 +897,8 @@ fn connect_wifi(
 fn run_wifi_supervisor(
     wifi: &'static mut BlockingWifi<EspWifi<'static>>,
     status: WifiStatusHandle,
-    ssid: String,
-    pass: String,
+    mut ssid: String,
+    mut pass: String,
     net_up: Arc<AtomicBool>,
 ) {
     log::info!("[wifi-sup] supervisor thread started (ssid={ssid})");
@@ -901,6 +908,23 @@ fn run_wifi_supervisor(
     loop {
         std::thread::sleep(Duration::from_secs(3));
         let now = now_ms();
+
+        // COMPLETION (2026-08-27): honour an `AT+CWJAP=` live-connect request.
+        // The dispatcher already persisted the new SSID/pass to NVS; we reload
+        // them and force an immediate reconnect (no reboot required). Runs even
+        // if currently associated, so switching APs is instant.
+        if WIFI_RECONNECT_REQUESTED.swap(false, Ordering::Relaxed) {
+            log::info!("[wifi-sup] AT+CWJAP changed credentials — reloading from NVS");
+            if let (Some(s), Some(p)) = provision_and_load_wifi_credentials() {
+                ssid = s;
+                pass = p;
+            }
+            log::info!("[wifi-sup] forcing reconnect to {ssid}");
+            connect_wifi(&mut *wifi, &ssid, &pass, &status);
+            was_up = None;
+            downs = 0;
+        }
+
         let connected = wifi.is_connected().unwrap_or(false);
         let ip = wifi
             .wifi_mut()

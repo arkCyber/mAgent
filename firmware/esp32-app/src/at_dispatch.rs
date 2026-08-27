@@ -24,8 +24,10 @@
 //!
 //! # What is NOT here (intentionally)
 //!
-//! - Wi-Fi connect (`esp_wifi_connect`) — lives on the main thread;
-//!   we update NVS and let boot-time `connect_wifi` pick it up.
+//! - Wi-Fi connect (`esp_wifi_connect`) — lives on the supervisor thread;
+//!   `AT+CWJAP=` updates NVS and raises `WIFI_RECONNECT_REQUESTED` so the
+//!   supervisor reloads the new credentials and reconnects immediately
+//!   (no reboot required). Boot-time `connect_wifi` still applies on power-up.
 //! - Reset (`AT+RST`) — now performs a live `esp_restart()` (replies OK
 //!   first, then reboots after a short delay so the reply flushes).
 //! - Sign (`AT+SIGN`) — needs a hook into the existing
@@ -543,6 +545,10 @@ fn cwjap_dispatch(cmd: &AtCommand<'_>, safe_mode: bool) -> AtOutcome {
                 validated.password.len(),
                 fingerprint.as_str(),
             );
+            // COMPLETION (2026-08-27): signal the Wi-Fi supervisor to reload the
+            // new credentials from NVS and reconnect immediately — no reboot
+            // required. The supervisor polls this flag once on its next tick.
+            crate::WIFI_RECONNECT_REQUESTED.store(true, core::sync::atomic::Ordering::Relaxed);
             AtOutcome::NoReply
         }
         AtCommandKind::Execute => {
