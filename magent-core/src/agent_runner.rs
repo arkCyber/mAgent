@@ -2313,39 +2313,42 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         // for the truncation step, but the savings are quadratic in
         // the number of iterations and the call-site can't easily
         // decide "should I compress this time?" on its own.
+        let mut stats = crate::conversation::CompressionStats::default();
+        // User-configurable compression (message-count slicing + tool-result
+        // truncation). Can be disabled via `CompressionPolicy::disabled()`.
         if self.config.compression.max_messages > 0
             || self.config.compression.tool_content_max_chars > 0
         {
-            let mut stats = crate::conversation::compress_messages(
+            stats = crate::conversation::compress_messages(
                 &mut self.messages,
                 &self.config.compression,
             );
-            // REQ-SCHED-001 / mem-3 (byte-GC): additionally bound the *dynamic
-            // byte* footprint of the live context cache — serde_json and long
-            // tool dumps can be far larger than the message count suggests, so
-            // a byte budget is the real heap-blast guard. `gc_to_budget` drops
-            // the oldest non-system messages until under
-            // `MAX_DYNAMIC_CONTEXT_BYTES` (512 KiB on the C61 / host, 2 MiB on
-            // the S3 8 MB octal PSRAM profile), preserving the system prompt
-            // and the current turn. A zero budget is a no-op, so this stays
-            // inside the same "compression active" gate.
-            let byte_stats = crate::conversation::gc_to_budget(
-                &mut self.messages,
-                crate::MAX_DYNAMIC_CONTEXT_BYTES,
-            );
-            stats.dropped += byte_stats.dropped;
-            stats.kept = self.messages.len();
-            self.emit_trace(TraceEvent::CompressionApplied {
-                kept: stats.kept,
-                dropped: stats.dropped,
-                tool_results_truncated: stats.tool_results_truncated,
-                bytes_saved: stats.bytes_saved,
-            });
-            // Persist the snapshot so the CLI's `--save-summary` path
-            // can read it without re-running compression.
-            self.last_compression_stats = Some(stats);
-            self.last_compression_policy = Some((&self.config.compression).into());
         }
+        // REQ-SCHED-001 / mem-3 (byte-GC): additionally bound the *dynamic
+        // byte* footprint of the live context cache — serde_json and long
+        // tool dumps can be far larger than the message count suggests, so a
+        // byte budget is the real heap-blast guard. This runs **unconditionally**
+        // (independent of `CompressionPolicy`) because heap-blast protection is
+        // not optional: `gc_to_budget` drops the oldest non-system messages
+        // until under `MAX_DYNAMIC_CONTEXT_BYTES` (512 KiB on the C61 / host,
+        // 2 MiB on the S3 8 MB octal PSRAM profile), preserving the system
+        // prompt and the current turn.
+        let byte_stats = crate::conversation::gc_to_budget(
+            &mut self.messages,
+            crate::MAX_DYNAMIC_CONTEXT_BYTES,
+        );
+        stats.dropped += byte_stats.dropped;
+        stats.kept = self.messages.len();
+        self.emit_trace(TraceEvent::CompressionApplied {
+            kept: stats.kept,
+            dropped: stats.dropped,
+            tool_results_truncated: stats.tool_results_truncated,
+            bytes_saved: stats.bytes_saved,
+        });
+        // Persist the snapshot so the CLI's `--save-summary` path
+        // can read it without re-running compression.
+        self.last_compression_stats = Some(stats);
+        self.last_compression_policy = Some((&self.config.compression).into());
 
         // Build the effective system prompt BEFORE we enter the
         // mutable-borrow scope on `self.backend`. The path through
