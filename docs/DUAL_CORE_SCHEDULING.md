@@ -146,4 +146,15 @@ For the ESP32-S3-WROOM-1-N8R8 (8 MB Octal PSRAM) target:
 > (the overlay sets `CONFIG_SPIRAM_MODE_OCT=y` + the stack protection). The
 > merged build compiles; validate on hardware before production.
 
+> **Runtime memory enforcement.** The `BudgetEnforcer::consume_memory` counter
+> is not invoked by the ReAct loop, so `with_max_memory` is a **configuration
+> ceiling / validation bound only** — it does not cap runtime allocation. Actual
+> runtime protection comes from three mechanisms: the embedded MiniAgent's
+> fixed heapless buffers, the host runner's byte-budget GC
+> (`gc_to_budget`/`MAX_DYNAMIC_CONTEXT_BYTES`), and the firmware LLM worker's
+> heap guard (refuses JSON parse below a 64 KiB free-heap floor). If the agent
+> is ever refactored to allocate large dynamic context on the S3 PSRAM, wiring
+> `consume_memory` into `think()`/tool handling would be the follow-up.
+
+
 
