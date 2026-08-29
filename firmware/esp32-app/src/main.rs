@@ -1487,10 +1487,14 @@ fn run_ingress(
                                                     );
                                                     *guard = Some(s.to_string());
                                                 }
-                                                // P3 / mem-3: start the agent-routed
-                                                // E2E measurement.
-                                                agent_cmd_at =
-                                                    Some(latency_metrics::now_us());
+                                                // NOTE: we deliberately do NOT set
+                                                // `agent_cmd_at` here. AT+AGENT writes an
+                                                // immediate `OK` acknowledgment below, which
+                                                // would be drained first and consume the
+                                                // timestamp before the agent's real reply
+                                                // (making e2e_agent measure the ack, not the
+                                                // agent). The non-AT natural-language path is
+                                                // where the first drained reply IS the agent's.
                                             }
                                         }
                                         // Reply plain `OK\r\n` so scripts know
