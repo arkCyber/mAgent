@@ -334,6 +334,19 @@ esp32 = [
 link_adapters = []
 mqtt = ["link_adapters", "std"]
 manual = ["link_adapters", "std"]
+
+# ---------------------------------------------------------------------------
+# ESP32-S3 large-heap profile (REQ-SCHED-001 / mem-1)
+# ---------------------------------------------------------------------------
+# The ESP32-S3-WROOM-1-N8R8 exposes 8 MB of Octal PSRAM backed `std::alloc`
+# heap (vs the C61's 2 MB Quad PSRAM). Enabling this feature raises the
+# configurable agent memory-budget ceiling (`MAX_CONFIGURABLE_MEMORY`) so the
+# ReAct loop / context cache can use the larger pool — while staying well
+# below it to guard against heap-blasting by a runaway LLM reply. It is a
+# *compile-time* board profile: the S3 firmware enables it via its own
+# `board-s3` feature; the C61 keeps the default (smaller) ceiling.
+s3-8mb-psram = []
+
 ingress = [
     "link_adapters",
     "web3",

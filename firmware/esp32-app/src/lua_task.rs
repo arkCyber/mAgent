@@ -708,11 +708,19 @@ impl HardwareBackend for Esp32Hardware {
 /// `Send` values and `std::thread` accepts it. Everything is created on the
 /// new thread and never moved across it.
 pub fn start_lua_task() {
-    let _ = std::thread::Builder::new()
-        .name("lua-thread".into())
-        // Lua's C stack + VM state needs room; 32 KiB matches the agent thread.
-        .stack_size(32 * 1024)
-        .spawn(move || {
+    let _ = crate::core_affinity::spawn_thread(
+        "lua-thread",
+        32 * 1024,
+        crate::core_affinity::ThreadProfile::REALTIME_AGENT,
+        move || {
+            // NOTE (audit-2026-08): the Lua app host is intentionally NOT
+            // subscribed to the RT watchdog. Its event loop (`AppRuntime::
+            // run_until_stop`) is a long-lived black box that never calls
+            // `esp_task_wdt_reset()`, so subscribing it here would make even a
+            // *normal* long-running Lua script false-trip the 18s watchdog and
+            // reboot the board. The watchdog protects the critical real-time
+            // paths (agent + ingress); the Lua host is best-effort and its
+            // stalls don't affect those. Its LLM/fetch_web feeds are no-ops.
             let hardware: SharedHardware = Arc::new(Mutex::new(Esp32Hardware));
             let mut agent = match MiniAgent::with_defaults() {
                 Ok(a) => a,
@@ -736,10 +744,40 @@ pub fn start_lua_task() {
                     crate::nvs_load_string(crate::NVS_KEY_LLM_API_KEY),
                 ) {
                     if !model.is_empty() && !key.is_empty() {
-                        log::info!("[lua] installing DeepSeek LLM backend (model={model})");
-                        let backend: &'static mut crate::llm::Esp32DeepSeekBackend =
-                            Box::leak(Box::new(crate::llm::Esp32DeepSeekBackend::new(&model, &key)));
-                        agent.set_llm_backend(backend);
+                        log::info!(
+                            "[lua] installing DeepSeek LLM backend via Core-0 worker (model={model})"
+                        );
+                        // P1 (REQ-SCHED-001): route the blocking DeepSeek call to
+                        // a Core-0 worker so the Lua app host (Core 1) never blocks
+                        // on TLS/HTTP. See llm.rs `ChannelLlmBackend`.
+                        let (llm_tx, llm_rx) = std::sync::mpsc::channel::<crate::llm::LlmRequest>();
+                        let worker = crate::core_affinity::spawn_thread(
+                            "llm-worker",
+                            24 * 1024,
+                            crate::core_affinity::ThreadProfile::IO_NETWORK,
+                            move || {
+                                crate::llm::run_llm_worker(
+                                    llm_rx,
+                                    crate::llm::Esp32DeepSeekBackend::new(&model, &key),
+                                );
+                            },
+                        );
+                        if worker.is_err() {
+                            log::warn!("[lua] LLM worker spawn failed — Lua uses local heuristic");
+                        } else {
+                            let backend: &'static mut crate::llm::ChannelLlmBackend =
+                                Box::leak(Box::new(crate::llm::ChannelLlmBackend::new(llm_tx)));
+                            // HARDENING (audit-2026-08 H9): register the leaked
+                            // pointer for duplicate-leak detection, mirroring the
+                            // main agent boot path.
+                            if !crate::leaked_boxes().insert(backend as *mut _ as usize) {
+                                log::error!(
+                                    "[lua] leaking a duplicate LLM backend (same pointer \
+                                     as a previous leak); refactor leak site"
+                                );
+                            }
+                            agent.set_llm_backend(backend);
+                        }
                     }
                 }
             }

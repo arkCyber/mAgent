@@ -97,6 +97,19 @@ CONFIG_OTA_ALLOW_HTTP=y
 # FreeRTOS — tune for firmware task layout
 # --------------------------------------------------------------------------
 CONFIG_FREERTOS_HZ=1000
+
+# --------------------------------------------------------------------------
+# Deterministic timing (REQ-SCHED-001 / P2) — lock the CPU frequency and
+# disable Dynamic Frequency Scaling so task-latency is repeatable.
+#   * CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y — ESP32-S3 max clock (fixed; a
+#     Kconfig "choice", so the numeric value is derived from the _240 selector).
+#   * CONFIG_PM_ENABLE=n                    — esp_pm off ⇒ no DFS, no
+#                                             light-sleep frequency drops.
+# (On the dual-core S3 this is what gives the Core 0 / Core 1 partitioning
+#  a bounded, repeatable WCET floor; see core_affinity.rs.)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_PM_ENABLE=n
+
 # PATCHED (MicroAgent): Main task stack size of 8 KiB (down from
 # 16 KiB). The crash at PC 0x40807e08 is in `xTaskCreate` for the
 # main task. Smaller stack reduces the heap pressure during boot.
@@ -228,6 +241,13 @@ CONFIG_ESPTOOLPY_FLASHFREQ_40M=n
 CONFIG_SPIRAM_MODE_QUAD=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_SPEED_40M=n
+# P3/REQ-SCHED-001 (mem-2): keep ALL task stacks in internal DRAM. Deny
+# FreeRTOS the ability to allocate task stacks from PSRAM — external-memory
+# stacks are slower, contend with the flash/PSRAM cache, and are harder to
+# harden against overflow. This is the hard protection that matches the
+# firmware's `configure_psram_thread_stacks()` (a deliberate no-op): the agent,
+# ingress and worker stacks all stay in internal SRAM.
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=n
 # PATCHED (MicroAgent): disable flash access that exercises the
 # shared Octal PSRAM bus during the app's first 100 ms, when the
 # DMA / cache subsystem is being configured. This is the second
@@ -247,22 +267,22 @@ CONFIG_ESP_PANIC_HANDLER_IRAM=y
 # during PSRAM startup.
 CONFIG_BOOTLOADER_WDT_ENABLE=n
 CONFIG_BOOTLOADER_WDT_TIME_MS=15000
-# PATCHED (MicroAgent): disable ALL watchdogs during boot. The
-# main task enters WFI (wait for interrupt) at the end of main()
-# while the spawned threads run. Without the task watchdog, the
-# main task IDLEs and the TG0 (Timer Group 0) hardware watchdog
-# eventually fires. With our current sdkconfig, the TG0 WDT is
-# the only watchdog still active, and it fires after a few seconds
-# of main task inactivity. Disable the interrupt WDT and the
-# task WDT — the main task's WFI is intentional, not a deadlock.
-# PATCHED (MicroAgent): disable the task watchdog so the main task
-# isn't reset if it doesn't yield within the default period. The
-# main task's only job is to spawn agent/ingress threads and join
-# them; without these threads feeding the watchdog, the main task
-# can sit in thread::sleep for the whole 60s agent loop.
-CONFIG_ESP_TASK_WDT_EN=n
-CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
-CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+# P3 (REQ-SCHED-001): real-time task watchdog, ISOLATED from the network
+# domain. Previously the task watchdog was disabled because ESP-IDF's
+# auto-init subscribed the main task, which IDLEs in WFI after spawning the
+# worker threads and would trip it. We now:
+#   * CONFIG_ESP_TASK_WDT_INIT=n  — ESP-IDF does NOT auto-subscribe the main
+#     task (that is the "isolation"): only the RT threads we explicitly
+#     subscribe in firmware (agent + ingress, via rt_watchdog.rs) are watched,
+#     and the Core-0 network workers (which legitimately block on lwIP/TLS)
+#     are never subscribed.
+# The 15s timeout + panic-on-trigger are set explicitly at runtime by
+# `rt_watchdog::arm()` (the legacy CONFIG_ESP_TASK_WDT_TIMEOUT_S / _PANIC
+# kconfig symbols do not exist in this ESP-IDF version), and the idle tasks
+# are subscribed there via `idle_core_mask=0b11` so a legitimately-idle system
+# never trips it.
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=n
 # PATCHED (MicroAgent): disable the interrupt watchdog. The
 # interrupt watchdog fires when no interrupt is serviced for the
 # configured timeout. Our main task sleeps in WFI; the watchdog

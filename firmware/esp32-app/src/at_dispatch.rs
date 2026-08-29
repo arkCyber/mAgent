@@ -222,6 +222,10 @@ fn dispatch_inner<'a>(
             // OK line flushes out the UART before the radio/stack tears
             // down. `esp_restart()` is a cold reboot (not a watchdog reset).
             log::info!("[at] AT+RST — rebooting in 200ms");
+            // The delay+reboot thread is short-lived and not network-bound:
+            // release it to the scheduler (Any) rather than inheriting the
+            // ingress thread's Core1 affinity.
+            crate::core_affinity::apply_profile(crate::core_affinity::ThreadProfile::UNPINNED);
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 // SAFETY: `esp_restart()` never returns; nothing to clean up.
@@ -268,6 +272,7 @@ fn dispatch_inner<'a>(
                 return AtOutcome::error(6);
             }
             log::info!("[at] AT+RESTORE — NVS erased; rebooting in 200ms");
+            crate::core_affinity::apply_profile(crate::core_affinity::ThreadProfile::UNPINNED);
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 // SAFETY: `esp_restart()` never returns; nothing to clean up.
@@ -385,6 +390,9 @@ fn ota_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
     };
     let url = url.to_string();
     log::info!("[at] AT+OTA=<{url}> — starting OTA");
+    // The OTA worker streams the image over HTTP and writes the OTA slot —
+    // heavy, network-facing work → I/O domain (Core 0).
+    crate::core_affinity::apply_profile(crate::core_affinity::ThreadProfile::IO_NETWORK);
     std::thread::spawn(move || match crate::ota::perform_ota(&url) {
         Ok(()) => log::info!("[ota] OTA completed; device rebooting"),
         Err(e) => log::error!("[ota] OTA failed: {e}"),
@@ -1157,21 +1165,37 @@ fn http_get_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
     // PATCHED (MicroAgent): the TLS handshake needs a real stack — the default
     // pthread stack (~4 KiB) overflows during a TLS handshake to
     // api.deepseek.com and panics the board ("Guru Meditation: Stack protection
-    // fault"). Give the worker 24 KiB like the ingress thread.
-    std::thread::Builder::new()
-        .name("httpget-worker".into())
-        .stack_size(24 * 1024)
-        .spawn(move || {
+    // fault"). Give the worker 24 KiB like the ingress thread. Network-facing
+    // (blocking TLS/HTTP) → I/O domain (Core 0).
+    crate::core_affinity::spawn_thread(
+        "httpget-worker",
+        24 * 1024,
+        crate::core_affinity::ThreadProfile::IO_NETWORK,
+        move || {
             let _ = tx.send(http_get_worker(&url));
-        })
-        .ok();
+        },
+    )
+    .ok();
 
-    match rx.recv_timeout(std::time::Duration::from_secs(12)) {
-        Ok(Ok(line)) => AtOutcome::Ok { data: line },
-        Ok(Err(code)) => AtOutcome::error(code),
-        Err(_) => {
-            log::warn!("[at] HTTPGET: worker timed out (12s) — reply dropped");
-            AtOutcome::error(6)
+    // P3: poll in 1s slices and re-feed the RT watchdog between polls so the
+    // ingress's 12s HTTPGET wait never eats into the 15s WDT margin (a real
+    // hang is still caught). Bounded to 12s total.
+    let deadline = crate::latency_metrics::now_us() + 12_000_000;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(Ok(line)) => return AtOutcome::Ok { data: line },
+            Ok(Err(code)) => return AtOutcome::error(code),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                crate::rt_watchdog::feed();
+                if crate::latency_metrics::now_us() >= deadline {
+                    log::warn!("[at] HTTPGET: worker timed out (12s) — reply dropped");
+                    return AtOutcome::error(6);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                log::warn!("[at] HTTPGET: worker channel closed — reply dropped");
+                return AtOutcome::error(6);
+            }
         }
     }
 }

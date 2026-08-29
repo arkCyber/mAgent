@@ -160,7 +160,11 @@ uart = []
 # PSRAM). To build for the ESP32-S3 (Xtensa, 8MB PSRAM), enable `board-s3` and
 # build with `--target xtensa-esp32s3-espidf --features board-s3`.
 board-c61 = ["esp-println/esp32c6"]   # ESP32-C61 (RISC-V, 160MHz, 2MB PSRAM)
-board-s3  = ["esp-println/esp32s3"]   # ESP32-S3 (Xtensa, 240MHz, 8MB PSRAM)
+# ESP32-S3 (Xtensa, 240MHz, 8MB PSRAM). Also enables the S3 large-heap profile
+# in magent-core (`s3-8mb-psram`) so the configurable agent memory-budget
+# ceiling rises from 1 MiB (C61) to 4 MiB — still bounded to prevent a runaway
+# LLM reply / context cache from exhausting the 8 MB pool (heap-blast guard).
+board-s3  = ["esp-println/esp32s3", "magent-core/s3-8mb-psram"]
 # Lua application host on the S3. OFF by default: `mlua`'s vendored Lua C
 # (`lua-src`) does not yet build for `xtensa-esp32s3-espidf` ("don't know how
 # to build Lua for xtensa-esp32s3-espidf"), so wiring it into `board-s3` would

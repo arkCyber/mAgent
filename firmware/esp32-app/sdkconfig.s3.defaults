@@ -25,6 +25,12 @@ CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
+# REQ-SCHED-001 (mem-2): keep ALL task stacks in internal DRAM. Deny FreeRTOS
+# external (PSRAM) task stacks — slower, contend with the flash/PSRAM cache,
+# and harder to harden against overflow. Matches the firmware's
+# `configure_psram_thread_stacks()` no-op: agent/ingress/worker stacks stay in
+# internal SRAM.
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=n
 
 # ---- Wi-Fi (needed for DeepSeek LLM RPC) ----
 CONFIG_ESP_WIFI_ENABLED=y

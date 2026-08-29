@@ -19,6 +19,16 @@
 //!  - **`ingress-thread`** — monitors UART0 for incoming commands and feeds
 //!    them to the `IngressGateway`.
 //!
+//! Additional supervisor threads (Wi-Fi, web-admin, SNTP) and the AT command
+//! workers (HTTPGET, OTA) are spawned as needed.
+//!
+//! # Dual-core affinity (ESP32-S3)
+//!
+//! On the dual-core ESP32-S3 (`--features board-s3`) every thread is pinned
+//! via `core_affinity::spawn_thread` so the network/IO work runs on Core 0
+//! (PRO) and the MiniAgent real-time domain on Core 1 (APP). See
+//! `core_affinity.rs` for the policy and the C61 single-core no-op fallback.
+//!
 //! # Wi-Fi provisioning
 //!
 //! Wi-Fi STA credentials are read from NVS at boot. Use `espflash write-nvs`
@@ -39,8 +49,11 @@
 //!
 //! TRACE: REQ-FW-001, REQ-FW-002, REQ-NET-001, REQ-SAFE-001.
 
+mod core_affinity;
+mod latency_metrics;
 mod link_adapters;
 mod local_tools;
+mod rt_watchdog;
 mod web_admin;
 mod at_dispatch;
 mod device_key;
@@ -64,7 +77,6 @@ use core::convert::TryFrom;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
 
 use esp_idf_svc::log::EspLogger;
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
@@ -1303,6 +1315,8 @@ fn run_ingress(
 ) {
     log::info!("[ingress] thread starting");
     dtrace("ingress:entry");
+    // P3: subscribe this real-time thread to the RT watchdog (S3 only).
+    rt_watchdog::subscribe_current();
 
     // PATCHED (MicroAgent): `UartAdapter` is now generic over the
     // underlying UART driver type (`T: Read + Write`). On the C61
@@ -1361,6 +1375,7 @@ fn run_ingress(
 
     loop {
         heartbeat.beat();
+        rt_watchdog::feed();
 
         // PATCHED (MicroAgent): drain any agent reply and send it back to the
         // host over the UART link (bidirectional communication). Adapter index
@@ -1376,6 +1391,9 @@ fn run_ingress(
 
         match gw.ingest() {
             Ok(Some(frame)) => {
+                // P3: E2E latency benchmark — time from a command arriving on
+                // the UART to its reply being queued in the outbox.
+                let t_cmd = latency_metrics::now_us();
                 // PATCHED (MicroAgent): log at INFO so received frames are
                 // visible with the default CONFIG_LOG_DEFAULT_LEVEL (the
                 // previous `log::debug!` was filtered out, making it look
@@ -1450,6 +1468,10 @@ fn run_ingress(
                                         if let Ok(g) = force_ntp_sync.lock() {
                                             force_flag = *g;
                                         }
+                                        // P3: WCET measurement of the real-time
+                                        // AT command path (parse already done;
+                                        // this is dispatch + render).
+                                        let t_dispatch = latency_metrics::now_us();
                                         let outcome = at_dispatch::dispatch(
                                             &cmd,
                                             now,
@@ -1472,8 +1494,15 @@ fn run_ingress(
                                                 if let Ok(mut g) = reply_outbox.lock() {
                                                     *g = Some(reply);
                                                 }
+                                                // E2E: command → reply ready.
+                                                latency_metrics::e2e_reply().record(
+                                                    latency_metrics::now_us().wrapping_sub(t_cmd),
+                                                );
                                             }
                                         }
+                                        latency_metrics::at_dispatch().record(
+                                            latency_metrics::now_us().wrapping_sub(t_dispatch),
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -1540,6 +1569,8 @@ fn run_agent_loop(
 ) {
     log::info!("[agent] thread starting");
     dtrace("agent:entry");
+    // P3: subscribe this real-time thread to the RT watchdog (S3 only).
+    rt_watchdog::subscribe_current();
 
     // HARDENING (audit-2026-08): replace `.expect()` with chained
     // `and_then` + `ok()` so future contributors who change these compile-time
@@ -1610,27 +1641,52 @@ fn run_agent_loop(
             nvs_load_string(NVS_KEY_LLM_API_KEY),
         ) {
             if !model.is_empty() && !key.is_empty() {
-                log::info!("[agent] installing DeepSeek LLM backend (model={model})");
-                let backend: &'static mut llm::Esp32DeepSeekBackend =
-                    Box::leak(Box::new(llm::Esp32DeepSeekBackend::new(&model, &key)));
-                // HARDENING (audit-2026-08 H9): the agent boot path
-                // intentionally leaks the LLM backend so the agent
-                // can hold a `&'static mut` reference. This is
-                // *one-shot* per boot, but a future refactor that
-                // re-leaks on every reconnect would silently double
-                // heap usage. We register the leaked pointer in
-                // `LEAKED_BOXES` so a duplicate insert triggers an
-                // explicit error log instead of a quiet leak. Cost:
-                // one `HashSet` entry, no heap growth.
-                // `!insert(...)` is true only when the pointer is ALREADY present.
-                if !leaked_boxes().insert(backend as *mut _ as usize) {
-                    log::error!(
-                        "[magent] agent boot path is leaking a second LLM backend \
-                         (same pointer as a previous leak); refactor leak site or \
-                         re-use the previous handle"
+                log::info!(
+                    "[agent] installing DeepSeek LLM backend via Core-0 worker (model={model})"
+                );
+                // P1 (REQ-SCHED-001): the blocking DeepSeek TLS/HTTP call must
+                // not run on this real-time thread (Core 1). Spawn a dedicated
+                // `llm-worker` pinned to Core 0 (I/O domain) that owns the real
+                // `Esp32DeepSeekBackend`; the agent installs a thin
+                // `ChannelLlmBackend` that forwards requests over an mpsc
+                // channel and blocks on the reply. The agent's wait is a
+                // condvar wait, so it yields Core 1 to the ingress/sensor tasks
+                // while the TLS/JSON runs on Core 0.
+                let (llm_tx, llm_rx) = std::sync::mpsc::channel::<llm::LlmRequest>();
+                let worker = core_affinity::spawn_thread(
+                    "llm-worker",
+                    24 * 1024,
+                    core_affinity::ThreadProfile::IO_NETWORK,
+                    move || {
+                        llm::run_llm_worker(llm_rx, llm::Esp32DeepSeekBackend::new(&model, &key));
+                    },
+                );
+                if worker.is_err() {
+                    log::warn!(
+                        "[agent] LLM worker spawn failed — running local heuristic only"
                     );
+                } else {
+                    // HARDENING (audit-2026-08 H9): the agent boot path
+                    // intentionally leaks the (channel) LLM backend so the agent
+                    // can hold a `&'static mut` reference. This is
+                    // *one-shot* per boot, but a future refactor that
+                    // re-leaks on every reconnect would silently double
+                    // heap usage. We register the leaked pointer in
+                    // `LEAKED_BOXES` so a duplicate insert triggers an
+                    // explicit error log instead of a quiet leak. Cost:
+                    // one `HashSet` entry, no heap growth.
+                    // `!insert(...)` is true only when the pointer is ALREADY present.
+                    let backend: &'static mut llm::ChannelLlmBackend =
+                        Box::leak(Box::new(llm::ChannelLlmBackend::new(llm_tx)));
+                    if !leaked_boxes().insert(backend as *mut _ as usize) {
+                        log::error!(
+                            "[magent] agent boot path is leaking a second LLM backend \
+                             (same pointer as a previous leak); refactor leak site or \
+                             re-use the previous handle"
+                        );
+                    }
+                    agent.set_llm_backend(backend);
                 }
-                agent.set_llm_backend(backend);
             }
         }
     } else {
@@ -1657,6 +1713,7 @@ fn run_agent_loop(
 
     loop {
         heartbeat.beat();
+        rt_watchdog::feed();
         let elapsed_ms = now_ms().saturating_sub(boot_ms);
 
         // PATCHED (MicroAgent): use the latest command queued by the ingress
@@ -1689,9 +1746,13 @@ fn run_agent_loop(
         // Reliability: wrap the run in `catch_unwind` so a panic inside a
         // tool handler or the ReAct loop (e.g. a bad GPIO op) does NOT kill
         // the agent thread — we log it and keep serving the next command.
+        // P3: measure the per-task ReAct execution time (tool calls + LLM).
+        let t_task = latency_metrics::now_us();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             futures::executor::block_on(agent.run(&task))
         }));
+        latency_metrics::agent_task()
+            .record(latency_metrics::now_us().wrapping_sub(t_task));
         match outcome {
             Ok(Ok(result)) => {
                 log::info!("[agent] result({task}): {result}");
@@ -1727,8 +1788,17 @@ fn run_agent_loop(
             log::info!(
                 "[health] agent alive — uptime {elapsed_ms} ms, free_heap {heap} B, iterations in current task ok"
             );
+            // P3: periodic latency / WCET benchmark report.
+            log::info!("[latency] {}", latency_metrics::report());
             last_health_log = now_ms();
         }
+
+        // P3: re-feed the RT watchdog *after* agent.run returns but before the
+        // 5s idle sleep below. Without this, a ReAct task that ends in a long
+        // blocking tool (e.g. fetch_web ~11s) would leave the gap from that
+        // tool's entry feed to the next loop-top feed at ~16s, too close to the
+        // 18s WDT timeout.
+        rt_watchdog::feed();
 
         // PATCHED (MicroAgent): poll frequently so UART-fed commands take
         // effect quickly (a 60s sleep made interactive commands feel dead).
@@ -1978,6 +2048,10 @@ fn configure_psram_thread_stacks() {
 fn main() {
     init_logging();
 
+    // P3 (REQ-SCHED-001): arm the real-time task watchdog (S3 only; no-op on
+    // the C61). Fail-open — if it can't start we keep running without it.
+    rt_watchdog::arm();
+
     // STABILITY (stability-2026-08): worker-thread stacks intentionally stay
     // in internal DRAM (SRAM). We previously tried routing them to PSRAM
     // (`stack_alloc_caps = MALLOC_CAP_SPIRAM`) to free internal RAM, but a
@@ -2133,17 +2207,13 @@ fn main() {
         let wssid = wifi_ssid.clone().unwrap_or_default();
         let wpass = wifi_pass.clone().unwrap_or_default();
         let net_up_for_sup = net_up.clone();
-        let sup = thread::Builder::new()
-            .name("wifi-supervisor".into())
-            // Keep this small — thread stacks come from the C61's limited
-            // internal RAM (~158 KiB), and the agent (64 KiB) + ingress
-            // (24 KiB) threads already consume most of it. The supervisor
-            // only does lightweight wifi queries (is_connected/rssi/ip), so
-            // 8 KiB is ample; a 24 KiB stack here starved the agent thread
-            // and its spawn failed.
-            .stack_size(8 * 1024)
-            .spawn(move || run_wifi_supervisor(wifi_handle, wstatus, wssid, wpass, net_up_for_sup))
-            .ok();
+        let sup = core_affinity::spawn_thread(
+            "wifi-supervisor",
+            8 * 1024,
+            core_affinity::ThreadProfile::IO_NETWORK,
+            move || run_wifi_supervisor(wifi_handle, wstatus, wssid, wpass, net_up_for_sup),
+        )
+        .ok();
         if sup.is_none() {
             log::error!("[wifi-sup] thread spawn failed — no reconnect supervision");
         }
@@ -2155,10 +2225,12 @@ fn main() {
     // dashboard + /api/status JSON on the STA interface. Only when lwIP is up.
     if wifi_up {
         let st = wifi_status.clone();
-        let wa = thread::Builder::new()
-            .name("web-admin".into())
-            .stack_size(8 * 1024)
-            .spawn(move || web_admin::run_web_admin(st));
+        let wa = core_affinity::spawn_thread(
+            "web-admin",
+            8 * 1024,
+            core_affinity::ThreadProfile::IO_NETWORK,
+            move || web_admin::run_web_admin(st),
+        );
         if wa.is_err() {
             log::warn!("[webadmin] thread spawn failed - no admin server");
         }
@@ -2232,14 +2304,12 @@ fn main() {
             "[agent] internal DRAM before spawn: {} B",
             unsafe { esp_idf_sys::esp_get_free_internal_heap_size() }
         );
-        agent_handle = match thread::Builder::new()
-            .name("agent-thread".into())
-            // 32 KiB: MiniAgent is heap-allocated (PSRAM) and MAX_BUFFER_SIZE
-            // stays at 2 KiB, so the task stack only needs a few 2 KiB stack
-            // temporaries in think(). (16-24 KiB was too tight and faulted.)
-            .stack_size(32 * 1024)
-            .spawn(move || run_agent_loop(th_task, th_reply, th_hb, safe_mode))
-        {
+        agent_handle = match core_affinity::spawn_thread(
+            "agent-thread",
+            32 * 1024,
+            core_affinity::ThreadProfile::REALTIME_AGENT,
+            move || run_agent_loop(th_task, th_reply, th_hb, safe_mode),
+        ) {
             Ok(h) => Some(h),
             Err(e) => {
                 log::error!(
@@ -2289,14 +2359,11 @@ fn main() {
         }
     }
 
-    let ingress_handle = thread::Builder::new()
-        .name("ingress-thread".into())
-        // PATCHED (MicroAgent): keep this modest. `AT+HTTPGET` runs its TLS
-        // handshake on a dedicated worker thread (see at_dispatch), so the
-        // ingress thread itself does no heavy network work. 24 KiB is the
-        // known-stable size (16 KiB overflowed a pthread stack).
-        .stack_size(24 * 1024)
-        .spawn(move || {
+    let ingress_handle = core_affinity::spawn_thread(
+        "ingress-thread",
+        24 * 1024,
+        core_affinity::ThreadProfile::REALTIME_INGRESS,
+        move || {
             run_ingress(
                 identity_clone,
                 ingress_uart,
@@ -2308,8 +2375,9 @@ fn main() {
                 time_sync_for_dispatch,
                 force_ntp_sync_for_dispatch,
             )
-        })
-        .ok();
+        },
+    )
+    .ok();
     if ingress_handle.is_none() {
         log::error!("[ingress] thread spawn failed — continuing without ingress");
     }
@@ -2342,10 +2410,11 @@ fn main() {
             let ts_for_supervisor = time_sync_for_supervisor.clone();
             let flag_for_supervisor = force_ntp_sync_for_thread.clone();
             let net_up_for_sntp = net_up.clone();
-            let sntp_handle = thread::Builder::new()
-                .name("sntp-supervisor".into())
-                .stack_size(8 * 1024)
-                .spawn(move || {
+            let sntp_handle = core_affinity::spawn_thread(
+                "sntp-supervisor",
+                8 * 1024,
+                core_affinity::ThreadProfile::IO_NETWORK,
+                move || {
                     sntp_sync::run_sntp_supervisor(
                         ts_for_supervisor,
                         flag_for_supervisor,
@@ -2358,8 +2427,9 @@ fn main() {
                             .is_ok()
                         },
                     );
-                })
-                .ok();
+                },
+            )
+            .ok();
             if sntp_handle.is_none() {
                 log::error!("[sntp] supervisor thread spawn failed");
             }
@@ -2413,11 +2483,13 @@ fn main() {
                 let th_task = agent_task.clone();
                 let th_reply = agent_reply.clone();
                 let th_hb = agent_hb_for_thread.clone();
-                agent_handle = thread::Builder::new()
-                    .name("agent-thread".into())
-                    .stack_size(32 * 1024)
-                    .spawn(move || run_agent_loop(th_task, th_reply, th_hb, safe_mode))
-                    .ok();
+                agent_handle = core_affinity::spawn_thread(
+                    "agent-thread",
+                    32 * 1024,
+                    core_affinity::ThreadProfile::REALTIME_AGENT,
+                    move || run_agent_loop(th_task, th_reply, th_hb, safe_mode),
+                )
+                .ok();
                 if agent_handle.is_none() {
                     log::error!("[agent] thread re-spawn failed — not retrying this round");
                 }

@@ -96,6 +96,17 @@ CONFIG_OTA_ALLOW_HTTP=y
 # FreeRTOS — tune for firmware task layout
 # --------------------------------------------------------------------------
 CONFIG_FREERTOS_HZ=1000
+
+# --------------------------------------------------------------------------
+# Deterministic timing (REQ-SCHED-001 / P2) — lock the CPU frequency and
+# disable Dynamic Frequency Scaling so task-latency is repeatable.
+#   * CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y — ESP32-C61 max clock (fixed; a
+#     Kconfig "choice", so the numeric value is derived from the _160 selector).
+#   * CONFIG_PM_ENABLE=n                    — esp_pm off ⇒ no DFS / light-sleep
+#                                             frequency drops.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+CONFIG_PM_ENABLE=n
+
 # PATCHED (MicroAgent): Main task stack size of 8 KiB (down from
 # 16 KiB). The crash at PC 0x40807e08 is in `xTaskCreate` for the
 # main task. Smaller stack reduces the heap pressure during boot.

@@ -310,6 +310,63 @@ pub fn approx_total_tokens(messages: &[Message]) -> usize {
         .sum()
 }
 
+/// Estimate the **dynamic heap footprint (bytes)** a conversation slice holds
+/// (REQ-SCHED-001 / mem-3). Sums message content, the tool-call name +
+/// serialised arguments, the optional `tool_call_id`, and a fixed per-message
+/// overhead for the `Vec<Message>` boxes / `String` capacities. This is what
+/// [`gc_to_budget`] uses to bound the live context cache that lives on the
+/// PSRAM heap — a *byte* budget is far more precise than the message-count
+/// policy for preventing a long session from exhausting the pool.
+pub fn estimate_bytes(messages: &[Message]) -> usize {
+    const PER_MSG_OVERHEAD: usize = 64;
+    messages
+        .iter()
+        .map(|m| {
+            let mut bytes = m.content.len() + PER_MSG_OVERHEAD;
+            if let Some(id) = &m.tool_call_id {
+                bytes += id.len() + 16;
+            }
+            if let Some(ref tc) = m.tool_call {
+                bytes += tc.name.len() + 32;
+                for (k, v) in &tc.arguments {
+                    bytes += k.len() + v.to_string().len() + 16;
+                }
+            }
+            bytes
+        })
+        .sum()
+}
+
+/// Garbage-collect a conversation slice down to a **byte** budget by dropping
+/// the oldest non-system messages (preserving the system prompt and the most
+/// recent turn, mirroring `slice_messages`'s anchor semantics). This is the
+/// memory-aware GC for the large dynamic context cache on the S3's PSRAM: it
+/// caps the live footprint so a long session or a huge tool dump cannot
+/// exhaust the pool.
+///
+/// `max_bytes == 0` means "opt out" (no byte-GC) and is a no-op.
+pub fn gc_to_budget(messages: &mut Vec<Message>, max_bytes: usize) -> CompressionStats {
+    let mut stats = CompressionStats::default();
+    if max_bytes == 0 {
+        stats.kept = messages.len();
+        return stats;
+    }
+    while estimate_bytes(messages) > max_bytes {
+        // Preserve the system prompt: only ever drop the oldest non-system.
+        let Some(drop_idx) = messages.iter().position(|m| m.role != Role::System) else {
+            break;
+        };
+        // Never drop the newest message (the current turn).
+        if drop_idx >= messages.len().saturating_sub(1) {
+            break;
+        }
+        messages.remove(drop_idx);
+        stats.dropped += 1;
+    }
+    stats.kept = messages.len();
+    stats
+}
+
 // ---------------------------------------------------------------------------
 // UTF-8 helpers (private)
 // ---------------------------------------------------------------------------
@@ -569,5 +626,50 @@ mod tests {
         assert_eq!(m.content.matches("[...truncated").count(), 1);
         // The tool_call_id survives.
         assert_eq!(m.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn estimate_bytes_counts_content_and_overhead() {
+        let v = vec![user("abcd"), assistant("efghijkl")];
+        // content bytes 4 + 8, plus 2 * PER_MSG_OVERHEAD (64).
+        assert_eq!(estimate_bytes(&v), 4 + 8 + 2 * 64);
+    }
+
+    #[test]
+    fn gc_to_budget_drops_oldest_non_system() {
+        let mut v = vec![
+            system("SYS"),
+            user("orig"),
+            assistant("a1"),
+            tool("c1", &"x".repeat(200)),
+            assistant("a2"),
+            user("latest"),
+        ];
+        let stats = gc_to_budget(&mut v, 150);
+        assert!(stats.dropped > 0);
+        // Bounded below the budget (or down to the floor of system+newest).
+        assert!(estimate_bytes(&v) <= 150 || v.len() <= 2);
+        // System prompt preserved at the head.
+        assert_eq!(v.first().unwrap().role, Role::System);
+        // The most recent turn (current user message) is preserved.
+        assert_eq!(v.last().unwrap().content, "latest");
+    }
+
+    #[test]
+    fn gc_to_budget_zero_is_noop() {
+        let mut v = vec![user("a"), assistant("b")];
+        let original = v.clone();
+        let stats = gc_to_budget(&mut v, 0);
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(v, original);
+    }
+
+    #[test]
+    fn gc_to_budget_under_budget_changes_nothing() {
+        let mut v = vec![user("a"), assistant("b")];
+        let original = v.clone();
+        let stats = gc_to_budget(&mut v, usize::MAX);
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(v, original);
     }
 }

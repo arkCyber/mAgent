@@ -360,6 +360,18 @@ pub const MAX_BUFFER_SIZE: usize = 2048;
 /// context before dropping the oldest. Buffers are on the PSRAM heap.
 pub const MAX_CONVERSATION_MESSAGES: usize = 20;
 
+/// Dynamic-context byte budget for the host conversation cache
+/// (REQ-SCHED-001 / mem-3). This is the `gc_to_budget` ceiling — the live
+/// `Vec<Message>` should be GC'd down to roughly this footprint so a long
+/// session or a huge tool dump cannot exhaust the PSRAM pool.
+/// Default (C61, 2 MB PSRAM) is 512 KiB; the S3 8 MB profile raises it to
+/// 2 MiB while still leaving the rest of the pool for Wi-Fi / TLS / workers.
+#[cfg(feature = "s3-8mb-psram")]
+pub const MAX_DYNAMIC_CONTEXT_BYTES: usize = 2 * 1024 * 1024; // 2 MiB — S3 8 MB octal PSRAM
+/// C61 / default 2 MB PSRAM dynamic-context budget: 512 KiB.
+#[cfg(not(feature = "s3-8mb-psram"))]
+pub const MAX_DYNAMIC_CONTEXT_BYTES: usize = 512 * 1024; // 512 KiB — C61 2 MB PSRAM
+
 /// Maximum number of concurrent tools
 pub const MAX_CONCURRENT_TOOLS: usize = 3;
 

@@ -163,6 +163,11 @@ fn fetch_web(args: &str) -> ToolResult {
     use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
     use std::net::ToSocketAddrs;
 
+    // P3: this tool does blocking DNS/TCP/TLS (up to ~11s) on the real-time
+    // agent thread, so re-feed the RT watchdog at entry to reset the timer
+    // before the long hop (no-op on the C61).
+    crate::rt_watchdog::feed();
+
     let pairs = parse_kv(args);
     let url = kv(&pairs, "url", "").to_string();
     if !(url.starts_with("http://") || url.starts_with("https://")) {

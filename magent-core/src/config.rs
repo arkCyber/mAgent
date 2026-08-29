@@ -12,12 +12,18 @@ const MAX_FIELD_LENGTH: usize = 64;
 
 /// Upper bound for the configurable agent memory budget (bytes).
 ///
-/// Reflects the ESP32-C61 N8R2 target (320 KB internal SRAM + 2 MB in-package
-/// PSRAM). 1 MiB is a deliberate safety ceiling on the `std::alloc` heap; the
-/// agent's own `heapless` buffers stay well below it, and larger budgets exist
-/// for context stored on the 2 MB PSRAM heap. Kept as one constant so the
+/// Default reflects the ESP32-C61 N8R2 (320 KB internal SRAM + 2 MB in-package
+/// PSRAM): a 1 MiB safety ceiling on the `std::alloc` heap. When compiled with
+/// `--features s3-8mb-psram` (the ESP32-S3-WROOM-1-N8R8, 8 MB octal PSRAM), the
+/// ceiling is raised to 4 MiB — still deliberately well below the 8 MB pool so
+/// a runaway LLM reply or a long context cache cannot exhaust PSRAM
+/// (heap-blast protection, REQ-SCHED-001 / mem-1). Kept as one constant so the
 /// validation and the builder cannot drift apart.
-pub const MAX_CONFIGURABLE_MEMORY: u32 = 1024 * 1024; // 1 MiB
+#[cfg(feature = "s3-8mb-psram")]
+pub const MAX_CONFIGURABLE_MEMORY: u32 = 4 * 1024 * 1024; // 4 MiB — S3 8 MB octal PSRAM
+/// C61 / default 2 MB PSRAM ceiling: 1 MiB (bounded to prevent heap-blast).
+#[cfg(not(feature = "s3-8mb-psram"))]
+pub const MAX_CONFIGURABLE_MEMORY: u32 = 1024 * 1024; // 1 MiB — C61 2 MB PSRAM
 
 /// Agent configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,11 +101,10 @@ impl AgentConfig {
                 reason: ConfigError::OutOfRange,
             });
         }
-        // Upper bound reflects the ESP32-C61 N8R2 target (320 KB internal
-        // SRAM + 2 MB in-package PSRAM). 1 MiB is a deliberate safety ceiling
-        // for the std::alloc heap — the agent's heapless buffers stay far
-        // below it, and larger budgets are for context that lives on the
-        // 2 MB PSRAM heap. (Historically this was hard-capped at 256 KiB.)
+        // Upper bound is the board's safety ceiling (see MAX_CONFIGURABLE_MEMORY):
+        // 1 MiB on the C61's 2 MB PSRAM, 4 MiB on the S3's 8 MB octal PSRAM. A
+        // value above it is a configuration error — it would let a runaway LLM
+        // reply or an unbounded context cache exhaust PSRAM (heap-blast guard).
         if self.max_memory > MAX_CONFIGURABLE_MEMORY {
             return Err(AgentError::ConfigurationError {
                 field: "max_memory",
@@ -234,5 +239,26 @@ mod tests {
             .with_max_memory(MAX_CONFIGURABLE_MEMORY + 1)
             .is_err());
         assert!(AgentConfig::default().with_max_memory(0).is_err());
+    }
+
+    #[cfg(feature = "s3-8mb-psram")]
+    #[test]
+    fn s3_ceiling_is_raised_but_still_bounded() {
+        // The S3 8 MB octal PSRAM profile raises the budget ceiling to 4 MiB
+        // but still rejects anything above it (heap-blast guard) and zero.
+        assert_eq!(MAX_CONFIGURABLE_MEMORY, 4 * 1024 * 1024);
+        assert!(AgentConfig::default().with_max_memory(4 * 1024 * 1024).is_ok());
+        assert!(AgentConfig::default()
+            .with_max_memory(4 * 1024 * 1024 + 1)
+            .is_err());
+        assert!(AgentConfig::default().with_max_memory(0).is_err());
+    }
+
+    #[cfg(not(feature = "s3-8mb-psram"))]
+    #[test]
+    fn default_ceiling_is_1_mib() {
+        // Without the S3 large-heap profile (C61 / host), the ceiling stays
+        // at the C61's 2 MB PSRAM budget of 1 MiB.
+        assert_eq!(MAX_CONFIGURABLE_MEMORY, 1024 * 1024);
     }
 }
