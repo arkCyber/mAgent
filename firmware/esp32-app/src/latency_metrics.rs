@@ -13,6 +13,21 @@
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::LazyLock;
 
+/// Structured snapshot of a channel's stats (milliseconds), for JSON telemetry
+/// and the web-admin `/api/status` endpoint. All fields are `0` until the
+/// channel has at least one sample.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimingSample {
+    /// Number of recorded samples.
+    pub count: u64,
+    /// Fastest observed duration (ms).
+    pub min_ms: u64,
+    /// Running average duration (ms).
+    pub avg_ms: u64,
+    /// Worst-case (max) observed duration (ms) — the WCET measurement.
+    pub wcet_ms: u64,
+}
+
 /// A single named timing channel.
 pub struct TimingChannel {
     count: AtomicU32,
@@ -89,6 +104,30 @@ impl TimingChannel {
             avg.max(0) / 1000,
             max / 1000
         )
+    }
+
+    /// Structured snapshot (milliseconds) for JSON telemetry (web-admin
+    /// `/api/status`). All-zero when the channel has no samples yet.
+    pub fn sample(&self) -> TimingSample {
+        let count = self.count.load(Ordering::Relaxed);
+        TimingSample {
+            count: count as u64,
+            min_ms: if count == 0 {
+                0
+            } else {
+                (self.min_us.load(Ordering::Relaxed) / 1000) as u64
+            },
+            avg_ms: if count == 0 {
+                0
+            } else {
+                (self.avg_us.load(Ordering::Relaxed).max(0) as u64) / 1000
+            },
+            wcet_ms: if count == 0 {
+                0
+            } else {
+                (self.max_us.load(Ordering::Relaxed) / 1000) as u64
+            },
+        }
     }
 
     /// Reset the channel (e.g. after a batch run / before a benchmark).
@@ -210,6 +249,23 @@ mod tests {
     fn empty_channel_reports_dash() {
         let ch = TimingChannel::new();
         assert_eq!(ch.report("llm_rt"), "llm_rt: -");
+    }
+
+    #[test]
+    fn sample_returns_structured_ms_values() {
+        let ch = TimingChannel::new();
+        ch.record(1_000_000); // 1 s in µs → 1000 ms
+        let s = ch.sample();
+        assert_eq!(s.count, 1);
+        assert_eq!(s.min_ms, 1000);
+        assert_eq!(s.avg_ms, 1000);
+        assert_eq!(s.wcet_ms, 1000);
+    }
+
+    #[test]
+    fn sample_empty_is_all_zero() {
+        let ch = TimingChannel::new();
+        assert_eq!(ch.sample(), TimingSample::default());
     }
 }
 

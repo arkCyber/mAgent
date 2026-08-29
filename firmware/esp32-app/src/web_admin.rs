@@ -62,7 +62,7 @@ fn render_index(wifi_status: &WifiStatusHandle) -> String {
     let ip = html_escape(&s.ip);
     let ssid = html_escape(&s.ssid);
     let reason = html_escape(reason_label(s.reason));
-    format!("<!DOCTYPE html><html><head><title>mAgent v{0}</title></head><body><h1>mAgent v{0}</h1><table><tr><td>version</td><td>{0}</td></tr><tr><td>state</td><td>{1}</td></tr><tr><td>ip</td><td>{2}</td></tr><tr><td>ssid</td><td>{3}</td></tr><tr><td>rssi</td><td>{4} dBm</td></tr><tr><td>wifi reason</td><td>{7} ({8})</td></tr><tr><td>heap</td><td>{5} B</td></tr><tr><td>uptime</td><td>{6} ms</td></tr></table><p><a href=/api/status>JSON status</a></p></body></html>", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, free_heap(), now_ms(), reason, s.reason)
+    format!("<!DOCTYPE html><html><head><title>mAgent v{0}</title></head><body><h1>mAgent v{0}</h1><table><tr><td>version</td><td>{0}</td></tr><tr><td>state</td><td>{1}</td></tr><tr><td>ip</td><td>{2}</td></tr><tr><td>ssid</td><td>{3}</td></tr><tr><td>rssi</td><td>{4} dBm</td></tr><tr><td>wifi reason</td><td>{7} ({8})</td></tr><tr><td>heap</td><td>{5} B</td></tr><tr><td>uptime</td><td>{6} ms</td></tr><tr><td>latency</td><td>{9}</td></tr></table><p><a href=/api/status>JSON status</a></p></body></html>", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, free_heap(), now_ms(), reason, s.reason, crate::latency_metrics::report())
 }
 
 fn render_status(wifi_status: &WifiStatusHandle) -> String {
@@ -70,7 +70,26 @@ fn render_status(wifi_status: &WifiStatusHandle) -> String {
     let ip = json_escape(&s.ip);
     let ssid = json_escape(&s.ssid);
     let reason_lbl = json_escape(reason_label(s.reason));
-    format!("{{\"version\":\"{}\",\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"wifi_reason\":{},\"wifi_reason_label\":\"{}\",\"free_heap_b\":{},\"uptime_ms\":{}}}", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, s.reason, reason_lbl, free_heap(), now_ms())
+    format!("{{\"version\":\"{}\",\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"wifi_reason\":{},\"wifi_reason_label\":\"{}\",\"free_heap_b\":{},\"uptime_ms\":{},\"latency\":{}}}", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, s.reason, reason_lbl, free_heap(), now_ms(), latency_json())
+}
+
+/// JSON object of the P3 WCET / latency channels for the `/api/status`
+/// endpoint. Each channel: `{n, min_ms, avg_ms, wcet_ms}`.
+fn latency_json() -> String {
+    use crate::latency_metrics as m;
+    let ch = |s: m::TimingSample| {
+        format!(
+            r#"{{"n":{},"min_ms":{},"avg_ms":{},"wcet_ms":{}}}"#,
+            s.count, s.min_ms, s.avg_ms, s.wcet_ms
+        )
+    };
+    format!(
+        r#"{{"llm_rt":{},"at_dispatch":{},"e2e_reply":{},"agent_task":{}}}"#,
+        ch(m::llm_rt().sample()),
+        ch(m::at_dispatch().sample()),
+        ch(m::e2e_reply().sample()),
+        ch(m::agent_task().sample()),
+    )
 }
 
 /// Human-readable label for an ESP-IDF `WIFI_REASON_*` code. Unknown codes
