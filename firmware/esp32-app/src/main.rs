@@ -1422,12 +1422,15 @@ fn run_ingress(
                     Ok(()) => log::info!("[ingress] reply sent to host: {reply}"),
                     Err(e) => log::warn!("[ingress] reply send failed: {e}"),
                 }
-                // P3 / mem-3: if this reply answers a command that was routed to
-                // the agent (natural-language / AT+AGENT), record the full
-                // agent-routed E2E latency.
-                if let Some(t) = agent_cmd_at.take() {
-                    latency_metrics::e2e_agent()
-                        .record(latency_metrics::now_us().wrapping_sub(t));
+                // P3 / mem-3: measure the agent-routed E2E latency. Only a real
+                // agent reply (the agent thread writes `RESULT[...]`) counts;
+                // an AT+AGENT `OK` ack or an intervening direct-AT reply must
+                // NOT consume the pending timestamp.
+                if reply.starts_with("RESULT[") {
+                    if let Some(t) = agent_cmd_at.take() {
+                        latency_metrics::e2e_agent()
+                            .record(latency_metrics::now_us().wrapping_sub(t));
+                    }
                 }
             }
         }
@@ -1487,14 +1490,13 @@ fn run_ingress(
                                                     );
                                                     *guard = Some(s.to_string());
                                                 }
-                                                // NOTE: we deliberately do NOT set
-                                                // `agent_cmd_at` here. AT+AGENT writes an
-                                                // immediate `OK` acknowledgment below, which
-                                                // would be drained first and consume the
-                                                // timestamp before the agent's real reply
-                                                // (making e2e_agent measure the ack, not the
-                                                // agent). The non-AT natural-language path is
-                                                // where the first drained reply IS the agent's.
+                                                // P3 / mem-3: start the agent-routed E2E
+                                                // measurement. Safe even though AT+AGENT
+                                                // writes an immediate `OK` ack below — the
+                                                // drain only consumes `agent_cmd_at` on a real
+                                                // `RESULT[...]` reply, not the ack.
+                                                agent_cmd_at =
+                                                    Some(latency_metrics::now_us());
                                             }
                                         }
                                         // Reply plain `OK\r\n` so scripts know
