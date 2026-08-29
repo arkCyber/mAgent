@@ -4,14 +4,14 @@
 
 #![cfg(feature = "wallet")]
 
-use alloc::collections::BTreeMap;
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
+use crate::web3::blockchain::{Address, EthereumSignature, Secp256k1Keypair, TransactionSigner};
 use crate::web3::wallet::error::{WalletError, WalletResult};
 use crate::web3::wallet::keystore::{Keystore, KeystoreError};
 use crate::web3::wallet::Mnemonic;
 use crate::web3::wallet::MnemonicType;
-use crate::web3::blockchain::{Address, EthereumSignature, Secp256k1Keypair, TransactionSigner};
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 /// A single component of a BIP-32/BIP-44 derivation path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,12 +25,18 @@ pub struct DerivationIndex {
 impl DerivationIndex {
     /// A non-hardened (normal) child index.
     pub fn normal(index: u32) -> Self {
-        Self { index, hardened: false }
+        Self {
+            index,
+            hardened: false,
+        }
     }
 
     /// A hardened child index.
     pub fn hardened(index: u32) -> Self {
-        Self { index, hardened: true }
+        Self {
+            index,
+            hardened: true,
+        }
     }
 
     /// The 32-bit BIP-32 serialisation: sets bit 31 for hardened indexes.
@@ -109,10 +115,7 @@ fn hmac_sha512(key: &[u8], data: &[u8]) -> [u8; 64] {
 /// supported (the only difference is the data hashed in HMAC-SHA512 —
 /// a hardened child serialises `0x00 || k_par`, a normal child the
 /// compressed parent public key).
-pub fn derive_private_key(
-    seed: &[u8; 64],
-    path: &DerivationPath,
-) -> Result<[u8; 32], WalletError> {
+pub fn derive_private_key(seed: &[u8; 64], path: &DerivationPath) -> Result<[u8; 32], WalletError> {
     use secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey};
 
     let secp = Secp256k1::new();
@@ -253,7 +256,12 @@ impl WalletManager {
     /// `passphrase`. Returns the derived wallet; the mnemonic is *not*
     /// returned — use [`WalletManager::create_wallet_phrase`] if you need
     /// to back it up.
-    pub fn create_wallet(&mut self, name: &str, passphrase: &str, path: &DerivationPath) -> WalletResult<Wallet> {
+    pub fn create_wallet(
+        &mut self,
+        name: &str,
+        passphrase: &str,
+        path: &DerivationPath,
+    ) -> WalletResult<Wallet> {
         // Generate a fresh 12-word mnemonic from secure entropy and persist
         // the derived key encrypted under `passphrase`, so the created
         // wallet is both unique and recoverable from the encrypted keystore.
@@ -311,7 +319,13 @@ impl WalletManager {
     /// Import a wallet from an existing mnemonic phrase (in-memory only;
     /// use [`WalletManager::store_encrypted`] to persist an encrypted
     /// keystore for it). The phrase must have a valid BIP-39 checksum.
-    pub fn import_wallet(&mut self, name: &str, phrase: &str, passphrase: &str, path: &DerivationPath) -> WalletResult<Wallet> {
+    pub fn import_wallet(
+        &mut self,
+        name: &str,
+        phrase: &str,
+        passphrase: &str,
+        path: &DerivationPath,
+    ) -> WalletResult<Wallet> {
         let mnemonic = Mnemonic::from_phrase(phrase)
             .map_err(|e| WalletError::InvalidMnemonic(format!("{:?}", e)))?;
 
@@ -405,7 +419,9 @@ mod tests {
     #[test]
     fn test_wallet_manager() {
         let mut manager = WalletManager::new();
-        let wallet = manager.create_wallet("test", "password", &DerivationPath::ethereum_default()).unwrap();
+        let wallet = manager
+            .create_wallet("test", "password", &DerivationPath::ethereum_default())
+            .unwrap();
         assert_eq!(wallet.name(), "test");
     }
 
@@ -423,7 +439,10 @@ mod tests {
         // and matches the wallet's own address.
         let sk = manager.unlock_private_key("alice", "").unwrap();
         let kp = crate::web3::blockchain::Secp256k1Keypair::from_secret_key(sk).unwrap();
-        assert_eq!(kp.public_key().to_address().to_hex(), wallet.address().to_hex());
+        assert_eq!(
+            kp.public_key().to_address().to_hex(),
+            wallet.address().to_hex()
+        );
     }
 
     #[test]
@@ -444,7 +463,12 @@ mod tests {
     fn create_wallet_phrase_returns_backup_mnemonic() {
         let mut manager = WalletManager::new();
         let (wallet, mnemonic) = manager
-            .create_wallet_phrase("carol", "pw", &DerivationPath::ethereum_default(), MnemonicType::Words24)
+            .create_wallet_phrase(
+                "carol",
+                "pw",
+                &DerivationPath::ethereum_default(),
+                MnemonicType::Words24,
+            )
             .unwrap();
         assert_eq!(mnemonic.word_count(), 24);
         assert!(mnemonic.has_valid_checksum());
@@ -452,7 +476,10 @@ mod tests {
         // The returned mnemonic re-imports to the same address.
         let sk = manager.unlock_private_key("carol", "pw").unwrap();
         let seed = mnemonic.to_seed("pw");
-        assert_eq!(sk, derive_private_key(&seed, &DerivationPath::ethereum_default()).unwrap());
+        assert_eq!(
+            sk,
+            derive_private_key(&seed, &DerivationPath::ethereum_default()).unwrap()
+        );
         assert!(!wallet.address().is_zero());
     }
 
@@ -560,7 +587,9 @@ mod tests {
         let phrase =
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let path = DerivationPath::ethereum_default();
-        let wallet = m.store_encrypted("alice", phrase, "hunter2", &path).unwrap();
+        let wallet = m
+            .store_encrypted("alice", phrase, "hunter2", &path)
+            .unwrap();
         assert!(m.has_stored("alice"));
 
         // Correct passphrase unlocks the exact derived key.

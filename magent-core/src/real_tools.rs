@@ -5,9 +5,9 @@
 
 #![cfg(feature = "std")]
 
-use crate::simulator::AgentSimulator;
 use crate::agent_runner::ToolExecutor;
 use crate::error::Result;
+use crate::simulator::AgentSimulator;
 use std::string::String;
 
 /// Test executor that uses the full simulator
@@ -47,6 +47,8 @@ impl Default for SimulatorExecutor {
 
 impl ToolExecutor for SimulatorExecutor {
     fn execute(&mut self, tool: &str, args: &str) -> std::result::Result<String, String> {
-        self.simulator.execute_tool(tool, args).map_err(|e| format!("{:?}", e))
+        self.simulator
+            .execute_tool(tool, args)
+            .map_err(|e| format!("{:?}", e))
     }
 }

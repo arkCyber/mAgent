@@ -9,10 +9,10 @@
 
 #![cfg(feature = "blockchain")]
 
+use magent_core::web3::blockchain::transaction::{TransactionBuilder, TransactionType};
 use magent_core::web3::blockchain::{
     Address, EventLog, Hash, Secp256k1Keypair, TransactionRequest, Wei,
 };
-use magent_core::web3::blockchain::transaction::{TransactionBuilder, TransactionType};
 
 /// End-to-end "agent builds + signs + verifies" smoke test. This
 /// is the smallest test that touches every layer of the
@@ -63,11 +63,8 @@ fn integration_eip1559_tx_sign_and_recover() {
     let kp = Secp256k1Keypair::generate();
     let to = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
 
-    let tx = TransactionBuilder::new(Some(to), 1).eip1559(
-        Wei::from_gwei(2),
-        Wei::from_gwei(50),
-        21_000,
-    );
+    let tx =
+        TransactionBuilder::new(Some(to), 1).eip1559(Wei::from_gwei(2), Wei::from_gwei(50), 21_000);
     tx.validate().expect("eip1559 tx must validate");
     let signed = tx.sign(&kp).expect("eip1559 sign must succeed");
 
@@ -176,8 +173,8 @@ fn integration_identity_binding_full_lifecycle() {
         "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
         address,
         1,
-        18000000,    // block number
-        1700000000,   // timestamp
+        18000000,   // block number
+        1700000000, // timestamp
     )
     .with_expiry(1800003600)
     .with_domain("app.example")
@@ -307,9 +304,7 @@ fn integration_eip712_sign_and_verify() {
     let kp = Secp256k1Keypair::generate();
 
     // Domain separator with one field: chainId=1.
-    let domain_type = TransactionSigner::eip712_hash_type_hash(
-        "EIP712Domain(uint256 chainId)",
-    );
+    let domain_type = TransactionSigner::eip712_hash_type_hash("EIP712Domain(uint256 chainId)");
     let mut chain_id_bytes = [0u8; 32];
     chain_id_bytes[31] = 1;
     let domain_sep = TransactionSigner::eip712_domain_separator(
@@ -331,8 +326,7 @@ fn integration_eip712_sign_and_verify() {
     let digest = TransactionSigner::eip712_digest(&domain_sep, &msg_struct);
 
     // Sign + verify.
-    let sig =
-        TransactionSigner::sign_typed_data_hash(kp.secret_key(), &digest).unwrap();
+    let sig = TransactionSigner::sign_typed_data_hash(kp.secret_key(), &digest).unwrap();
     assert!(
         TransactionSigner::verify(&digest, &sig, kp.address()).unwrap(),
         "EIP-712 signed digest must recover to the keypair's address"

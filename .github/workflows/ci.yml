@@ -82,14 +82,40 @@ jobs:
         # `firmware-*` jobs below, so we gate the strict lint here.
         run: cargo clippy -p magent-core --all-targets -- -D warnings
 
+      - name: cargo clippy — magent-hal, all targets, deny warnings
+        run: cargo clippy -p magent-hal --all-targets -- -D warnings
+
+      - name: cargo clippy — magent-lua (mlua engine), deny warnings
+        run: cargo clippy -p magent-lua --all-targets -- -D warnings
+
+      - name: cargo clippy — magent-lua (piccolo engine, S3 firmware), deny warnings
+        run: cargo clippy -p magent-lua --all-targets --features piccolo -- -D warnings
+
       - name: cargo test — host crates (firmware needs cross toolchains)
         # nRF52 / ESP32 firmware crates and the hardware integration harness
         # require chip toolchains; the `firmware-*` jobs build them. We test
         # everything else here.
         run: cargo test --workspace --exclude magent-nrf52-app --exclude magent-esp32-app --exclude magent-integration-test --locked
 
+      - name: cargo test — magent-lua (mlua + piccolo engines)
+        # The piccolo engine is what the ESP32-S3 firmware runs, so its tests
+        # must pass on the host too.
+        run: cargo test -p magent-lua --features piccolo
+
+      - name: cargo llvm-cov — magent-lua coverage (best-effort)
+        # Test-coverage signal via scripts/check-coverage.sh. Best-effort: the
+        # runner needs `cargo-llvm-cov` + `rustup llvm-tools`, which may not be
+        # installed; when absent we surface a warning, not a failure.
+        run: |
+          if command -v cargo-llvm-cov >/dev/null 2>&1; then
+            bash scripts/check-coverage.sh
+          else
+            echo "::warning::cargo-llvm-cov not installed; skipping coverage gate"
+          fi
+        continue-on-error: true
+
       - name: cargo deny — supply-chain advisory gate (best-effort)
-        # Best-effort because the project does not yet ship a `deny.toml`. If
+        # Best-effort because cargo-deny may not be installed on the runner. If
         # the binary is unavailable we surface a warning, not a failure.
         run: |
           if command -v cargo-deny >/dev/null 2>&1; then

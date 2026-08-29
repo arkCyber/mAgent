@@ -73,7 +73,10 @@ CONFIG_LWIP_TCP_MSS=1200
 # --------------------------------------------------------------------------
 # Use mbedTLS (the ESP-IDF default TLS stack). rustls is NOT used on firmware.
 CONFIG_ESP_TLS_USING_MBEDTLS=y
-# Allow HTTP for local testing (production should use HTTPS).
+# DEV-ONLY: skip TLS certificate verification + allow HTTP for local bring-up.
+# PRODUCTION MUST REMOVE THIS. Use `sdkconfig.prod.defaults` via `flash-secure.sh`,
+# which sets `CONFIG_ESP_TLS_INSECURE=n` (real cert verification, REQ-NET-001)
+# and enables Secure Boot v2 + Flash Encryption (REQ-FW-004).
 CONFIG_ESP_TLS_INSECURE=y
 # PATCHED (MicroAgent): compile in the mbedTLS CA certificate bundle so
 # `AT+HTTPGET=<https-url>` can verify server certs (needed because the

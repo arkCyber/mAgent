@@ -98,10 +98,9 @@ impl Mnemonic {
         let word_count = words.len();
 
         if word_count != 12 && word_count != 24 {
-            return Err(crate::web3::wallet::error::WalletError::InvalidMnemonic(format!(
-                "phrase must have 12 or 24 words, got {}",
-                word_count
-            )));
+            return Err(crate::web3::wallet::error::WalletError::InvalidMnemonic(
+                format!("phrase must have 12 or 24 words, got {}", word_count),
+            ));
         }
 
         let mut indices = [0u16; MAX_MNEMONIC_WORDS];
@@ -109,12 +108,17 @@ impl Mnemonic {
             match find_word(word) {
                 Some(idx) => indices[i] = idx as u16,
                 None => {
-                    return Err(crate::web3::wallet::error::WalletError::InvalidWord((*word).to_string()));
+                    return Err(crate::web3::wallet::error::WalletError::InvalidWord(
+                        (*word).to_string(),
+                    ));
                 }
             }
         }
 
-        let mnemonic = Mnemonic { indices, word_count };
+        let mnemonic = Mnemonic {
+            indices,
+            word_count,
+        };
         // Aerospace-grade: never accept a phrase whose checksum is wrong —
         // a single typo / corrupted word would otherwise silently derive a
         // different (wrong) key.
@@ -248,7 +252,10 @@ impl Mnemonic {
             indices[w] = idx as u16;
         }
 
-        let mnemonic = Mnemonic { indices, word_count };
+        let mnemonic = Mnemonic {
+            indices,
+            word_count,
+        };
         debug_assert!(mnemonic.has_valid_checksum());
         Ok(mnemonic)
     }
@@ -265,7 +272,6 @@ impl Mnemonic {
         OsRng.fill_bytes(&mut entropy);
         Self::from_entropy(&entropy)
     }
-
 
     /// Convert mnemonic to phrase string
     pub fn to_phrase(&self) -> String {
@@ -373,7 +379,10 @@ mod tests {
         let m = Mnemonic::from_phrase(
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
         );
-        assert!(matches!(m, Err(super::super::error::WalletError::InvalidChecksum)));
+        assert!(matches!(
+            m,
+            Err(super::super::error::WalletError::InvalidChecksum)
+        ));
     }
 
     #[test]
@@ -385,7 +394,10 @@ mod tests {
     #[test]
     fn rejects_word_not_in_list() {
         // "zzzzz" is not a BIP-39 word.
-        assert!(Mnemonic::from_phrase("zzzzz ability able about above absent absorb abstract absurd about above absent").is_err());
+        assert!(Mnemonic::from_phrase(
+            "zzzzz ability able about above absent absorb abstract absurd about above absent"
+        )
+        .is_err());
     }
 
     #[test]

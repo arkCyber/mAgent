@@ -20,7 +20,12 @@ description = "mAgent firmware for the ESP32-C61-DevKitC-1-N8R2 (N8R2, std)"
 # The `std` feature is needed because esp-idf-svc provides std:: threads.
 # `wallet` enables digital wallet with BIP-39, keystore, and wallet management.
 magent-core = { path = "../../magent-core", default-features = false, features = ["esp32", "link_adapters", "ingress", "web3", "boot-key", "wallet"] }
-
+# Lua application host (host/lua-app). Optional: only pulled in on the
+# ESP32-S3 (`board-s3,lua` features) so the RAM-limited C61 default build never
+# compiles the Lua VM. Built with `default-features = false, features =
+# ["piccolo"]` so NO `mlua` (vendored C) is compiled — `mlua` cannot build for
+# Xtensa; `piccolo` is pure Rust.
+magent-lua = { path = "../../host/lua-app", default-features = false, features = ["piccolo"], optional = true }
 # ---------------------------------------------------------------------------
 # ESP-IDF integration (the std story for the C61-N8R2).
 # ---------------------------------------------------------------------------
@@ -43,6 +48,8 @@ embedded-svc = "0.29"
 # JSON for the DeepSeek chat-completions request/response parsing (the LLM
 # backend installed into the agent).
 serde_json = { workspace = true }
+# URL-safe base64 decode for `AT+LUAAPP=<base64>` (operator Lua-app update).
+base64 = "0.22"
 
 # esp-idf-svc requires std. `std` is implied by the espidf feature above
 # but we set it explicitly so the dependency graph is self-documenting.
@@ -154,6 +161,12 @@ uart = []
 # build with `--target xtensa-esp32s3-espidf --features board-s3`.
 board-c61 = ["esp-println/esp32c6"]   # ESP32-C61 (RISC-V, 160MHz, 2MB PSRAM)
 board-s3  = ["esp-println/esp32s3"]   # ESP32-S3 (Xtensa, 240MHz, 8MB PSRAM)
+# Lua application host on the S3. OFF by default: `mlua`'s vendored Lua C
+# (`lua-src`) does not yet build for `xtensa-esp32s3-espidf` ("don't know how
+# to build Lua for xtensa-esp32s3-espidf"), so wiring it into `board-s3` would
+# break the S3 firmware build. Enable only once a Xtensa-compatible Lua engine
+# is used (or `mlua`/`lua-src` adds Xtensa support). See docs/LUA_SCRIPTING_S3.md.
+lua = ["dep:magent-lua"]
 
 # ---------------------------------------------------------------------------
 # esp-idf-sys metadata (consumed by `esp-idf-sys` 0.37 build.rs)

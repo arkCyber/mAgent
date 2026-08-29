@@ -13,9 +13,8 @@ use std::string::String;
 use magent_core::error::Web3ErrorKind;
 use magent_core::web3::{Identity, SignedMessage};
 use magent_core::web3_app::{
-    canonical_bytes_for_test, parse_and_verify_signed_run_report,
-    sign_run_report, verify_signed_run_report, RunReportFields, SignedRunReport,
-    CANONICAL_PAYLOAD_TYPE,
+    canonical_bytes_for_test, parse_and_verify_signed_run_report, sign_run_report,
+    verify_signed_run_report, RunReportFields, SignedRunReport, CANONICAL_PAYLOAD_TYPE,
 };
 
 // ---------------------------------------------------------------------------
@@ -25,19 +24,9 @@ use magent_core::web3_app::{
 #[test]
 fn sign_then_verify_round_trip() {
     let id = Identity::generate().unwrap();
-    let r = RunReportFields::new(
-        "the answer is 42",
-        3,
-        1,
-        "ollama",
-        true,
-        "Finished",
-        7,
-        800,
-    );
+    let r = RunReportFields::new("the answer is 42", 3, 1, "ollama", true, "Finished", 7, 800);
     let now = 1_700_000_000u64;
-    let signed =
-        sign_run_report(&id, now, None, None, r.clone()).expect("sign should not fail");
+    let signed = sign_run_report(&id, now, None, None, r.clone()).expect("sign should not fail");
     verify_signed_run_report(&signed, now + 60).expect("verify should succeed");
 }
 
@@ -163,7 +152,11 @@ fn verify_rejects_pre_window_now() {
     // The error is tagged as InvalidDid to flag the window
     // violation; semantically it's a "not yet valid" envelope.
     let msg = format!("{:?}", err);
-    assert!(msg.contains("not yet valid"), "expected 'not yet valid' in: {}", msg);
+    assert!(
+        msg.contains("not yet valid"),
+        "expected 'not yet valid' in: {}",
+        msg
+    );
 }
 
 #[test]
@@ -215,8 +208,8 @@ fn from_json_then_verify_convenience_helper_works() {
     let r = RunReportFields::new("ok", 1, 0, "mock", false, "Finished", 0, 0);
     let signed = sign_run_report(&id, 1_700_000_000, None, None, r).unwrap();
     let json = signed.to_json();
-    let _parsed =
-        parse_and_verify_signed_run_report(&json, 1_700_000_100).expect("parse+verify must succeed");
+    let _parsed = parse_and_verify_signed_run_report(&json, 1_700_000_100)
+        .expect("parse+verify must succeed");
 }
 
 #[test]
@@ -258,8 +251,7 @@ fn cross_protocol_replay_is_rejected() {
     // canonical bytes ("MAGENT_SRR_V1\n{...}\n") and feeds them
     // to ed25519-dalek, which finds that the signature actually
     // covered a different byte sequence ("hello").
-    let err =
-        verify_signed_run_report(&forged, 1_700_000_100).unwrap_err();
+    let err = verify_signed_run_report(&forged, 1_700_000_100).unwrap_err();
     assert!(
         matches!(err, Web3ErrorKind::SignatureVerificationFailed),
         "cross-protocol replay must be rejected: {:?}",

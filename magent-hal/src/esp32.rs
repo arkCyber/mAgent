@@ -54,7 +54,10 @@ impl Gpio for EspGpio {
     }
 
     fn set_level(&mut self, level: PinLevel) -> Result<(), Self::Error> {
-        if matches!(self.mode, PinMode::Input | PinMode::InputPullUp | PinMode::InputPullDown) {
+        if matches!(
+            self.mode,
+            PinMode::Input | PinMode::InputPullUp | PinMode::InputPullDown
+        ) {
             return Err(EspError::InvalidMode);
         }
         self.level = level;
@@ -146,6 +149,12 @@ impl EspBle {
             connected: false,
             tx_count: 0,
         }
+    }
+
+    /// Mark the link as connected / disconnected. On real hardware the BLE
+    /// glue calls this when a connection / disconnection event arrives.
+    pub fn set_connected(&mut self, connected: bool) {
+        self.connected = connected;
     }
 }
 
@@ -289,10 +298,7 @@ mod tests {
     fn gpio_blocks_driving_input() {
         let mut p = EspGpio::new(2);
         // Default mode is Input
-        assert_eq!(
-            p.set_level(PinLevel::High),
-            Err(EspError::InvalidMode)
-        );
+        assert_eq!(p.set_level(PinLevel::High), Err(EspError::InvalidMode));
     }
 
     #[test]
@@ -313,6 +319,17 @@ mod tests {
     }
 
     #[test]
+    fn ble_send_succeeds_when_connected() {
+        let mut b = EspBle::new();
+        b.set_connected(true);
+        assert!(b.is_connected());
+        assert_eq!(b.send(b"hello").unwrap(), 5);
+        b.set_connected(false);
+        assert!(!b.is_connected());
+        assert!(b.send(b"x").is_err());
+    }
+
+    #[test]
     fn temperature_reading_is_stable() {
         let mut s = EspTemperatureSensor::new(25.0);
         assert_eq!(s.read().unwrap(), 25.0);
@@ -323,5 +340,67 @@ mod tests {
         let mut p = EspPower::new();
         p.set(PowerProfile::LowPower).unwrap();
         assert_eq!(p.current(), PowerProfile::LowPower);
+    }
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use super::*;
+
+    #[test]
+    fn esp_error_display_and_std_error() {
+        assert_eq!(
+            format!("{}", EspError::InvalidMode),
+            "invalid pin mode for operation"
+        );
+        assert_eq!(format!("{}", EspError::OutOfRange), "address out of range");
+        assert_eq!(
+            format!("{}", EspError::NotConnected),
+            "BLE link is not connected"
+        );
+        // Implements std::error::Error with no source.
+        assert!(std::error::Error::source(&EspError::OutOfRange).is_none());
+    }
+
+    #[test]
+    fn gpio_pin_and_output_write_low() {
+        let mut g = EspGpio::new(5);
+        assert_eq!(g.pin(), 5);
+        g.configure(PinMode::Output).unwrap();
+        g.set_level(PinLevel::Low).unwrap();
+        assert_eq!(g.read_level().unwrap(), PinLevel::Low);
+    }
+
+    #[test]
+    fn flash_bounds_erase_and_and_only() {
+        let mut f = EspFlash::new(1024);
+        assert_eq!(f.capacity(), 1024);
+        assert_eq!(f.read(1000, &mut [0u8; 100]), Err(EspError::OutOfRange));
+        assert_eq!(f.write(1000, &[0u8; 100]), Err(EspError::OutOfRange));
+        // AND-only semantics (flash can only clear bits).
+        f.write(0, &[0xF0]).unwrap();
+        f.write(0, &[0x0F]).unwrap();
+        let mut b = [0u8; 1];
+        f.read(0, &mut b).unwrap();
+        assert_eq!(b[0], 0x00);
+        // Erase restores 0xFF.
+        f.erase_sector(0).unwrap();
+        f.read(0, &mut b).unwrap();
+        assert_eq!(b[0], 0xFF);
+    }
+
+    #[test]
+    fn power_all_profiles_roundtrip() {
+        let mut p = EspPower::default();
+        assert_eq!(p.current(), PowerProfile::Active);
+        for profile in [
+            PowerProfile::Idle,
+            PowerProfile::LowPower,
+            PowerProfile::DeepSleep,
+            PowerProfile::Active,
+        ] {
+            p.set(profile).unwrap();
+            assert_eq!(p.current(), profile);
+        }
     }
 }

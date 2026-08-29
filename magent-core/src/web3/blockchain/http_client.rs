@@ -16,11 +16,11 @@ use serde_json::Value;
 #[cfg(feature = "std")]
 use crate::error::Web3ErrorKind;
 #[cfg(feature = "std")]
-use crate::web3::blockchain::{Address, Hash, Wei};
-#[cfg(feature = "std")]
 use crate::web3::blockchain::client::{ChainClient, ChainId};
 #[cfg(feature = "std")]
 use crate::web3::blockchain::ChainConfig;
+#[cfg(feature = "std")]
+use crate::web3::blockchain::{Address, Hash, Wei};
 
 // Re-export the common types for use in this module
 #[cfg(all(feature = "std", feature = "esp32"))]
@@ -167,11 +167,7 @@ impl HttpRpcClient {
     /// retry on errors that *might* succeed next time (connection
     /// resets, timeouts, 5xx) — never on JSON-RPC application
     /// errors, which are returned directly by `call`.
-    fn http_post_with_retry(
-        &self,
-        body: &str,
-        method: &str,
-    ) -> Result<String, Web3ErrorKind> {
+    fn http_post_with_retry(&self, body: &str, method: &str) -> Result<String, Web3ErrorKind> {
         let mut last_err: Option<Web3ErrorKind> = None;
         for attempt in 0..=self.max_retries {
             match self.http_post(body) {
@@ -218,9 +214,7 @@ impl HttpRpcClient {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .build()
-            .map_err(|e| {
-                Web3ErrorKind::BlockchainError(format!("client build: {}", e))
-            })?;
+            .map_err(|e| Web3ErrorKind::BlockchainError(format!("client build: {}", e)))?;
 
         // POST the JSON-RPC request
         let response = client
@@ -228,9 +222,7 @@ impl HttpRpcClient {
             .header("content-type", "application/json")
             .body(body.to_string())
             .send()
-            .map_err(|e| {
-                Web3ErrorKind::BlockchainError(format!("request failed: {}", e))
-            })?;
+            .map_err(|e| Web3ErrorKind::BlockchainError(format!("request failed: {}", e)))?;
 
         // Read response body
         response
@@ -354,12 +346,7 @@ impl ChainClient for HttpRpcClient {
         parse_hex_wei(&result)
     }
 
-    fn estimate_gas(
-        &self,
-        to: &Address,
-        data: &[u8],
-        value: Wei,
-    ) -> Result<u64, Web3ErrorKind> {
+    fn estimate_gas(&self, to: &Address, data: &[u8], value: Wei) -> Result<u64, Web3ErrorKind> {
         let call_object = serde_json::json!({
             "to": to.to_hex(),
             "data": format!("0x{}", hex_encode(data)),
@@ -385,13 +372,18 @@ impl ChainClient for HttpRpcClient {
 
     fn send_raw_transaction(&self, signed_tx: &[u8]) -> Result<Hash, Web3ErrorKind> {
         let tx_hex = format!("0x{}", hex_encode(signed_tx));
-        let result: String = self.call("eth_sendRawTransaction", vec![serde_json::json!(tx_hex)])?;
+        let result: String =
+            self.call("eth_sendRawTransaction", vec![serde_json::json!(tx_hex)])?;
         Hash::from_hex(&result)
     }
 
-    fn get_transaction_receipt(&self, tx_hash: &Hash) -> Result<Option<crate::web3::blockchain::TransactionReceipt>, Web3ErrorKind> {
+    fn get_transaction_receipt(
+        &self,
+        tx_hash: &Hash,
+    ) -> Result<Option<crate::web3::blockchain::TransactionReceipt>, Web3ErrorKind> {
         let params = vec![serde_json::json!(tx_hash.to_hex())];
-        let result: Option<crate::web3::blockchain::TransactionReceipt> = self.call("eth_getTransactionReceipt", params)?;
+        let result: Option<crate::web3::blockchain::TransactionReceipt> =
+            self.call("eth_getTransactionReceipt", params)?;
         Ok(result)
     }
 
@@ -464,17 +456,15 @@ impl ChainClient for HttpRpcClient {
 #[cfg(feature = "std")]
 fn parse_hex_u64(hex: &str) -> Result<u64, Web3ErrorKind> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
-    u64::from_str_radix(hex, 16).map_err(|e| {
-        Web3ErrorKind::BlockchainError(format!("failed to parse u64: {}", e))
-    })
+    u64::from_str_radix(hex, 16)
+        .map_err(|e| Web3ErrorKind::BlockchainError(format!("failed to parse u64: {}", e)))
 }
 
 #[cfg(feature = "std")]
 fn parse_hex_wei(hex: &str) -> Result<Wei, Web3ErrorKind> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
-    let wei = u128::from_str_radix(hex, 16).map_err(|e| {
-        Web3ErrorKind::BlockchainError(format!("failed to parse wei: {}", e))
-    })?;
+    let wei = u128::from_str_radix(hex, 16)
+        .map_err(|e| Web3ErrorKind::BlockchainError(format!("failed to parse wei: {}", e)))?;
     Ok(Wei(wei))
 }
 
@@ -530,8 +520,7 @@ mod tests {
 
     #[test]
     fn test_http_client_with_timeout() {
-        let client = HttpRpcClient::new("https://eth.llamarpc.com", 1)
-            .with_timeout(60);
+        let client = HttpRpcClient::new("https://eth.llamarpc.com", 1).with_timeout(60);
         assert_eq!(client.rpc_url(), "https://eth.llamarpc.com");
     }
 
@@ -587,8 +576,7 @@ mod tests {
 
     #[test]
     fn test_client_from_chain_config() {
-        let chain = ChainConfig::new(1, "Ethereum")
-            .with_rpc_url("https://eth.llamarpc.com");
+        let chain = ChainConfig::new(1, "Ethereum").with_rpc_url("https://eth.llamarpc.com");
         let client = HttpRpcClient::from_chain(chain);
         assert_eq!(client.chain_id(), 1);
         assert_eq!(client.rpc_url(), "https://eth.llamarpc.com");
@@ -612,9 +600,8 @@ mod tests {
         // Calling RPC without reqwest enabled must surface the missing
         // feature, not panic.
         let client = HttpRpcClient::new("https://eth.llamarpc.com", 1);
-        let result: core::result::Result<u64, _> = client.get_nonce(
-            &Address::from_hex("0x0000000000000000000000000000000000000000").unwrap(),
-        );
+        let result: core::result::Result<u64, _> = client
+            .get_nonce(&Address::from_hex("0x0000000000000000000000000000000000000000").unwrap());
         assert!(result.is_err());
     }
 
@@ -624,8 +611,7 @@ mod tests {
             Address::from_hex("0x0000000000000000000000000000000000000001").unwrap(),
         );
         let json = serde_json::to_string(&log).unwrap();
-        let _decoded: crate::web3::blockchain::EventLog =
-            serde_json::from_str(&json).unwrap();
+        let _decoded: crate::web3::blockchain::EventLog = serde_json::from_str(&json).unwrap();
     }
 
     #[test]
@@ -696,8 +682,7 @@ mod tests {
 
     #[test]
     fn test_backoff_delay_doubles_until_cap() {
-        let client = HttpRpcClient::new("http://x", 1)
-            .with_backoff(100, 1_000);
+        let client = HttpRpcClient::new("http://x", 1).with_backoff(100, 1_000);
         assert_eq!(client.backoff_delay(0), 100);
         assert_eq!(client.backoff_delay(1), 200);
         assert_eq!(client.backoff_delay(2), 400);

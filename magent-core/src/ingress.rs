@@ -229,7 +229,11 @@ impl<A: LinkAdapter> IngressGateway<A> {
                 Ok(0) => continue,
                 Ok(n) => n,
                 Err(e) => {
-                    log::warn!("ingress adapter {:?} poll error: {:?}", adapter.source_kind(), e);
+                    log::warn!(
+                        "ingress adapter {:?} poll error: {:?}",
+                        adapter.source_kind(),
+                        e
+                    );
                     continue;
                 }
             };

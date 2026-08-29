@@ -1,0 +1,69 @@
+[package]
+name = "magent-lua"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Aerospace-grade Lua 5.4 scripting host for mAgent. Binds hardware.* and agent.reason() onto the chip-agnostic HAL (magent-hal) and MiniAgent (magent-core)."
+keywords = ["ai", "agent", "lua", "scripting", "embedded"]
+categories = ["embedded", "no-std"]
+
+# ---------------------------------------------------------------------------
+# mAgent Lua scripting host.
+#
+# Design (aerospace-grade):
+#   * Production paths never `unwrap()` / `panic!`; every fallible operation
+#     returns `Result` and errors propagate explicitly.
+#   * Lua is sandboxed: only safe stdlibs (BASE/STRING/TABLE/MATH), a memory
+#     cap, and an instruction budget so an infinite loop cannot wedge the
+#     host.
+#   * The `hardware.*` surface is a narrow `HardwareBackend` trait so the
+#     same Lua scripts run on the host simulator or a real chip (e.g. the
+#     ESP32-S3 firmware's esp-hal drivers) without changes.
+#   * The `agent.reason()` binding drives `MiniAgent` synchronously behind a
+#     mutex; a Lua `longjmp` (panic) is caught at the VM boundary and never
+#     unwinds across the Rust stack.
+# ---------------------------------------------------------------------------
+[dependencies]
+# Real Lua 5.4 (vendored, MIT). `lua54` builds the bundled C interpreter.
+# Optional: the ESP32-S3 cannot build `mlua` for Xtensa, so it is built only
+# when the default `mlua` feature is on. `--no-default-features --features
+# piccolo` builds magent-lua without `mlua` (pure-Rust, Xtensa-capable).
+mlua = { version = "0.10", features = ["lua54", "vendored"], optional = true }
+
+# Pure-Rust Lua interpreter (MIT). Unlike `mlua`, `piccolo` compiles for ANY
+# target (no C), including `xtensa-esp32s3-espidf` — so it is the engine the
+# ESP32-S3 firmware can actually build. It is Lua-5.1-ish (not full 5.4).
+# Enabled via the `piccolo` feature; the `mlua` engine stays the default.
+piccolo = { version = "0.3.3", optional = true }
+
+# Chip-agnostic agent runtime. `esp32` feature enables `MiniAgent` without
+# dragging in host `reqwest`/`ring` (the ESP32 firmware uses esp-idf's own
+# HTTP client). `default-features = false` keeps out `std`'s host-only
+# `agent_runner`/`reqwest` stack for magent-lua's own build (feature
+# unification still grants `std` to the host `cli` crate).
+magent-core = { path = "../../magent-core", default-features = false, features = ["esp32"] }
+
+# Chip-agnostic HAL trait surface + host RAM-backed nRF52840 adapters used
+# by `SimHardware`.
+magent-hal = { path = "../../magent-hal" }
+
+# Drive `MiniAgent::run` (async) synchronously inside a Lua callback.
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+
+[lints]
+workspace = true
+
+[features]
+# Default engine: `mlua` (real Lua 5.4, C vendored). Disable with
+# `--no-default-features` to drop `mlua` entirely.
+default = ["mlua"]
+mlua = ["dep:mlua"]
+# Use the pure-Rust `piccolo` engine instead of `mlua`. Xtensa-compatible
+# (no C), so the ESP32-S3 firmware `lua` feature should build with
+# `--no-default-features --features piccolo`.
+piccolo = ["dep:piccolo"]
+
+[dev-dependencies]

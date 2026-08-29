@@ -1,0 +1,18 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# mAgent OTA-only partition table — NO factory app.
+#
+# Required for `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` / anti-rollback
+# (REQ-FW-005): ESP-IDF's anti-rollback check rejects a `factory` app in the
+# table. Two symmetric OTA slots (2.5 MB each on 8 MB flash) + `otadata`.
+#
+# IMPORTANT: with no `factory` app, the first (factory) flash MUST write the
+# app image into `ota_0` (0x10000). The bootloader boots `ota_0` on a fresh
+# otadata. See `flash-secure.sh`.
+nvs,      data, nvs,     0x9000,  0x6000
+phy_init, data, phy,     0xf000,  0x1000
+ota_0,    app,  ota_0,   0x10000, 0x280000
+ota_1,    app,  ota_1,   0x290000, 0x280000
+storage,  data, spiffs,  0x510000, 0x100000
+coredump, data, coredump, 0x610000, 0x40000
+nvs_keys, data, nvs_keys, 0x650000, 0x1000
+otadata,  data, ota,     0x651000, 0x2000

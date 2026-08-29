@@ -96,18 +96,10 @@ impl WearLeveler {
     /// Get next sector for writing
     pub fn get_next_sector(&self) -> Result<u32> {
         match self.strategy {
-            WearLevelingStrategy::None => {
-                Ok(self.current_sector.get())
-            }
-            WearLevelingStrategy::Dynamic => {
-                self.dynamic_wear_leveling()
-            }
-            WearLevelingStrategy::Static => {
-                self.static_wear_leveling()
-            }
-            WearLevelingStrategy::Hybrid => {
-                self.hybrid_wear_leveling()
-            }
+            WearLevelingStrategy::None => Ok(self.current_sector.get()),
+            WearLevelingStrategy::Dynamic => self.dynamic_wear_leveling(),
+            WearLevelingStrategy::Static => self.static_wear_leveling(),
+            WearLevelingStrategy::Hybrid => self.hybrid_wear_leveling(),
         }
     }
 
@@ -148,7 +140,7 @@ impl WearLeveler {
         // Use dynamic for frequent writes, static for infrequent
         let write_count = self.write_count.get();
 
-        if write_count % 100 == 0 {
+        if write_count.is_multiple_of(100) {
             // Every 100 writes, use static leveling
             self.static_wear_leveling()
         } else {
@@ -231,7 +223,11 @@ impl WearLeveler {
             sectors,
             avg_writes_per_sector: avg_writes,
             max_sector_writes: max_writes,
-            min_sector_writes: if min_writes == u32::MAX { 0 } else { min_writes },
+            min_sector_writes: if min_writes == u32::MAX {
+                0
+            } else {
+                min_writes
+            },
         }
     }
 
@@ -421,7 +417,6 @@ mod tests {
         let wl = WearLeveler::new(10, 100);
 
         let wear = wl.calculate_wear_level();
-        assert!(wear >= 0.0 && wear <= 1.0);
+        assert!((0.0..=1.0).contains(&wear));
     }
 }
-

@@ -128,10 +128,12 @@ impl MonitoringManager {
     /// Record operation success
     pub fn operation_success(&mut self, execution_time_us: u32) {
         self.metrics.successful_operations += 1;
-        
+
         // Update average execution time
-        let total_time = self.metrics.average_execution_time_us * (self.metrics.successful_operations - 1);
-        self.metrics.average_execution_time_us = (total_time + execution_time_us) / self.metrics.successful_operations;
+        let total_time =
+            self.metrics.average_execution_time_us * (self.metrics.successful_operations - 1);
+        self.metrics.average_execution_time_us =
+            (total_time + execution_time_us) / self.metrics.successful_operations;
     }
 
     /// Record operation failure
@@ -145,11 +147,18 @@ impl MonitoringManager {
     }
 
     /// Add health check
-    pub fn add_health_check(&mut self, component: &str, status: HealthStatus, message: &str) -> Result<()> {
+    pub fn add_health_check(
+        &mut self,
+        component: &str,
+        status: HealthStatus,
+        message: &str,
+    ) -> Result<()> {
         let check = HealthCheck {
-            component: String::try_from(component).map_err(|_| AgentError::MemoryAllocationFailed {
-                requested: 32,
-                available: 0,
+            component: String::try_from(component).map_err(|_| {
+                AgentError::MemoryAllocationFailed {
+                    requested: 32,
+                    available: 0,
+                }
             })?,
             status,
             message: String::try_from(message).map_err(|_| AgentError::MemoryAllocationFailed {
@@ -296,15 +305,18 @@ mod tests {
         assert_eq!(m.get_health_status(), HealthStatus::Healthy);
 
         // All healthy → Healthy.
-        m.add_health_check("ble", HealthStatus::Healthy, "").unwrap();
+        m.add_health_check("ble", HealthStatus::Healthy, "")
+            .unwrap();
         assert_eq!(m.get_health_status(), HealthStatus::Healthy);
 
         // One degraded → Degraded.
-        m.add_health_check("sensor:hr", HealthStatus::Degraded, "noisy").unwrap();
+        m.add_health_check("sensor:hr", HealthStatus::Degraded, "noisy")
+            .unwrap();
         assert_eq!(m.get_health_status(), HealthStatus::Degraded);
 
         // Any unhealthy dominates.
-        m.add_health_check("wifi", HealthStatus::Unhealthy, "link down").unwrap();
+        m.add_health_check("wifi", HealthStatus::Unhealthy, "link down")
+            .unwrap();
         assert_eq!(m.get_health_status(), HealthStatus::Unhealthy);
     }
 
@@ -321,11 +333,18 @@ mod tests {
     fn health_check_buffer_evicts_oldest() {
         let mut m = MonitoringManager::new();
         for i in 0..20 {
-            m.add_health_check(&format!("comp{}", i), HealthStatus::Healthy, "").unwrap();
+            m.add_health_check(&format!("comp{}", i), HealthStatus::Healthy, "")
+                .unwrap();
         }
         // Capacity is 16; the 4 oldest are evicted.
         assert_eq!(m.get_health_checks().len(), 16);
-        assert!(m.get_health_checks()[0].component.as_str().contains("comp4"));
-        assert!(m.get_health_checks()[15].component.as_str().contains("comp19"));
+        assert!(m.get_health_checks()[0]
+            .component
+            .as_str()
+            .contains("comp4"));
+        assert!(m.get_health_checks()[15]
+            .component
+            .as_str()
+            .contains("comp19"));
     }
 }

@@ -269,6 +269,9 @@ pub enum AtOp {
     /// `AT+HTTPGET=<url>` — issue an HTTP GET to verify outbound
     /// network reachability (e.g. to a well-known website).
     HttpGet,
+    /// `AT+OTA=<url>` — stream an OTA firmware image from `url` to the
+    /// inactive OTA slot, verify it, then reboot into it.
+    Ota,
     /// `AT+LLMCFG?` / `AT+LLMCFG=<model>,<api_key>` — set / query the
     /// LLM backend parameters (model name + API key) used by the agent.
     LlmCfg,
@@ -285,6 +288,11 @@ pub enum AtOp {
     /// `AT+BLE?` / `AT+BLE=<ON|OFF|STATE>` — query / control the BLE
     /// peripheral (ESP32 only; nRF52 returns unsupported).
     Ble,
+    /// `AT+LUAAPP=<base64>` / `AT+LUAAPP?` — set / query the operator-provided
+    /// Lua application source. The source is **URL-safe base64** (no `+`/`/`)
+    /// so it survives AT argument parsing (which splits on commas); the
+    /// firmware decodes it and persists it as the boot `main.lua`.
+    LuaApp,
 }
 
 impl AtOp {
@@ -320,11 +328,13 @@ impl AtOp {
             AtOp::Agent => "+AGENT",
             AtOp::WifiPassUpgrade => "+WIFIPASSUPGRADE",
             AtOp::HttpGet => "+HTTPGET",
+            AtOp::Ota => "+OTA",
             AtOp::LlmCfg => "+LLMCFG",
             AtOp::Time => "+TIME",
             AtOp::NtpSync => "+NTPSYNC",
             AtOp::Timezone => "+TIMEZONE",
             AtOp::Ble => "+BLE",
+            AtOp::LuaApp => "+LUAAPP",
         }
     }
 }
@@ -837,11 +847,13 @@ fn classify_op(kw: &[u8]) -> Option<(AtOp, AtCommandKind)> {
         b"AGENT" => (AtOp::Agent, AtCommandKind::Set),
         b"WIFIPASSUPGRADE" => (AtOp::WifiPassUpgrade, AtCommandKind::Set),
         b"HTTPGET" => (AtOp::HttpGet, AtCommandKind::Set),
+        b"OTA" => (AtOp::Ota, AtCommandKind::Set),
         b"LLMCFG" => (AtOp::LlmCfg, AtCommandKind::Set),
         b"TIME" => (AtOp::Time, AtCommandKind::Query),
         b"NTPSYNC" => (AtOp::NtpSync, AtCommandKind::Execute),
         b"TIMEZONE" => (AtOp::Timezone, AtCommandKind::Set),
         b"BLE" => (AtOp::Ble, AtCommandKind::Set),
+        b"LUAAPP" => (AtOp::LuaApp, AtCommandKind::Set),
         _ => return None,
     })
 }
@@ -1129,6 +1141,51 @@ mod tests {
     }
 
     #[test]
+    fn parses_ota_with_url() {
+        let cmd = parse_line(b"AT+OTA=http://192.168.1.10/app.bin").unwrap();
+        assert_eq!(cmd.op, AtOp::Ota);
+        match cmd.args.first() {
+            Some(AtArg::Token(t)) => assert_eq!(t, b"http://192.168.1.10/app.bin"),
+            _ => panic!("expected token URL argument"),
+        }
+    }
+
+    #[test]
+    fn parses_ota_without_arg() {
+        // `AT+OTA` with no URL still parses to `Ota` (the firmware dispatcher
+        // rejects the missing URL with +CMDER:4, but the parser must not panic
+        // or misparse).
+        let cmd = parse_line(b"AT+OTA").unwrap();
+        assert_eq!(cmd.op, AtOp::Ota);
+        assert!(cmd.args.is_empty());
+    }
+
+    #[test]
+    fn parses_ota_query_kind_is_set() {
+        // `AT+OTA=<url>` is a Set command; ensure the kind is classified as such.
+        let cmd = parse_line(b"AT+OTA=http://h/app.bin").unwrap();
+        assert_eq!(cmd.kind, AtCommandKind::Set);
+    }
+
+    #[test]
+    fn parses_ota_https_url() {
+        let cmd = parse_line(b"AT+OTA=https://firmware.example.com/magent.bin").unwrap();
+        assert_eq!(cmd.op, AtOp::Ota);
+    }
+
+    #[test]
+    fn parses_restore() {
+        let cmd = parse_line(b"AT+RESTORE").unwrap();
+        assert_eq!(cmd.op, AtOp::Restore);
+    }
+
+    #[test]
+    fn parses_macrand() {
+        let cmd = parse_line(b"AT+MACRAND").unwrap();
+        assert_eq!(cmd.op, AtOp::MacRand);
+    }
+
+    #[test]
     fn parses_rst() {
         let cmd = parse_line(b"AT+RST").unwrap();
         assert_eq!(cmd.op, AtOp::Reset);
@@ -1263,6 +1320,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_sysram() {
+        let cmd = parse_line(b"AT+SYSRAM?").unwrap();
+        assert_eq!(cmd.op, AtOp::SysRam);
+        assert_eq!(cmd.kind, AtCommandKind::Query);
+    }
+
+    #[test]
+    fn parses_heap() {
+        let cmd = parse_line(b"AT+HEAP?").unwrap();
+        assert_eq!(cmd.op, AtOp::Heap);
+        assert_eq!(cmd.kind, AtCommandKind::Query);
+    }
+
+    #[test]
+    fn parses_httpget_set() {
+        let cmd = parse_line(b"AT+HTTPGET=http://example.com/").unwrap();
+        assert_eq!(cmd.op, AtOp::HttpGet);
+        assert_eq!(cmd.kind, AtCommandKind::Set);
+        match cmd.args.first() {
+            Some(AtArg::Token(t)) => assert_eq!(t, b"http://example.com/"),
+            _ => panic!("expected token URL"),
+        }
+    }
+
+    #[test]
+    fn parses_llmcfg_set() {
+        let cmd = parse_line(b"AT+LLMCFG=deepseek,sk-abc123").unwrap();
+        assert_eq!(cmd.op, AtOp::LlmCfg);
+        assert_eq!(cmd.kind, AtCommandKind::Set);
+    }
+
+    #[test]
     fn parses_sign() {
         let cmd = parse_line(b"AT+SIGN=\"hello\"").unwrap();
         assert_eq!(cmd.op, AtOp::Sign);
@@ -1312,6 +1401,29 @@ mod tests {
         let cmd = parse_line(b"AT+PING=\"192.168.1.1\"").unwrap();
         assert_eq!(cmd.op, AtOp::Ping6);
         assert_eq!(cmd.kind, AtCommandKind::Set);
+    }
+
+    #[test]
+    fn parses_ping6_unquoted() {
+        // `AT+PING=1.2.3.4` (no quotes) parses the host as a token arg.
+        let cmd = parse_line(b"AT+PING=192.168.1.1").unwrap();
+        assert_eq!(cmd.op, AtOp::Ping6);
+        assert_eq!(cmd.kind, AtCommandKind::Set);
+        match cmd.args.first() {
+            Some(AtArg::Token(t)) => assert_eq!(t, b"192.168.1.1"),
+            _ => panic!("expected token host"),
+        }
+    }
+
+    #[test]
+    fn parses_ping6_hostname() {
+        // Hostnames parse too (resolved by DNS in the firmware layer).
+        let cmd = parse_line(b"AT+PING=example.com").unwrap();
+        assert_eq!(cmd.op, AtOp::Ping6);
+        match cmd.args.first() {
+            Some(AtArg::Token(t)) => assert_eq!(t, b"example.com"),
+            _ => panic!("expected token hostname"),
+        }
     }
 
     #[test]
@@ -1717,6 +1829,23 @@ mod tests {
         assert_eq!(cmd.op, AtOp::Ble);
         assert_eq!(cmd.kind, AtCommandKind::Set);
         assert_eq!(cmd.op.name(), "+BLE");
+    }
+
+    #[test]
+    fn parses_luaapp_set_and_query() {
+        // URL-safe base64 (no `+`/`/`) survives the comma-splitting parser.
+        let cmd = parse_line(b"AT+LUAAPP=aGVsbG8td29ybGQ").unwrap();
+        assert_eq!(cmd.op, AtOp::LuaApp);
+        assert_eq!(cmd.kind, AtCommandKind::Set);
+        assert_eq!(cmd.op.name(), "+LUAAPP");
+        match cmd.arg(0) {
+            Some(AtArg::Token(t)) => assert_eq!(*t, b"aGVsbG8td29ybGQ"),
+            _ => panic!("expected token"),
+        }
+        // Query form.
+        let q = parse_line(b"AT+LUAAPP?").unwrap();
+        assert_eq!(q.op, AtOp::LuaApp);
+        assert_eq!(q.kind, AtCommandKind::Query);
     }
 
     #[test]

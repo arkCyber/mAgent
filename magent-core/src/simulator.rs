@@ -413,10 +413,7 @@ impl AgentSimulator {
                         // doesn't ship float support). We rely on the natural
                         // `Display` impl for `f32`, which gives 6 fractional
                         // digits by default.
-                        format!(
-                            "Accelerometer: X={}g Y={}g Z={}g",
-                            x, y, z
-                        )
+                        format!("Accelerometer: X={}g Y={}g Z={}g", x, y, z)
                     }
                     SimSensorType::Humidity => {
                         let humidity = self.sensors.read_humidity();
@@ -680,8 +677,7 @@ mod tests {
         // Either an answer (network is reachable) or a placeholder
         // error string — both prove we reached `web::web_search`.
         assert!(
-            body.starts_with("[")
-                || body.starts_with("error: web_search failed"),
+            body.starts_with('[') || body.starts_with("error: web_search failed"),
             "expected JSON hits or error, got {body}"
         );
     }

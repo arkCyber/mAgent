@@ -88,10 +88,7 @@ fn spawn_capture_server(
 
 /// Spawn N capture servers (each on a separate accept loop) sharing one
 /// listener. Used to test that the body buffer is reused across calls.
-fn spawn_capture_server_n(
-    listener: std::net::TcpListener,
-    n: usize,
-) -> Vec<Arc<Mutex<Vec<u8>>>> {
+fn spawn_capture_server_n(listener: std::net::TcpListener, n: usize) -> Vec<Arc<Mutex<Vec<u8>>>> {
     let captures: Vec<Arc<Mutex<Vec<u8>>>> =
         (0..n).map(|_| Arc::new(Mutex::new(Vec::new()))).collect();
     let caps = captures.clone();
@@ -184,7 +181,10 @@ impl MockExecutor {
 
 impl ToolExecutor for MockExecutor {
     fn execute(&mut self, tool: &str, args: &str) -> Result<String, String> {
-        self.calls.lock().unwrap().push((tool.to_string(), args.to_string()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((tool.to_string(), args.to_string()));
         if let Some(err) = self.errors.lock().unwrap().get(tool) {
             return Err(err.clone());
         }
@@ -262,7 +262,9 @@ fn empty_task_does_not_panic() {
 #[test]
 fn parse_tool_call_format_1_legacy() {
     let r = silent_runner(MockExecutor::default());
-    let (name, args) = r.parse_tool_call(r#"{"tool": "read_sensor", "args": {"sensor": "temperature"}}"#).unwrap();
+    let (name, args) = r
+        .parse_tool_call(r#"{"tool": "read_sensor", "args": {"sensor": "temperature"}}"#)
+        .unwrap();
     assert_eq!(name, "read_sensor");
     assert_eq!(
         args.get("sensor").and_then(|v| v.as_str()),
@@ -328,7 +330,10 @@ fn parse_tool_call_anthropic_invoke_format() {
     let xml = "<invoke name=\"fetch_url\">\n  <parameter name=\"url\">https://example.com</parameter>\n</invoke>";
     let (name, args) = r.parse_tool_call(xml).unwrap();
     assert_eq!(name, "fetch_url");
-    assert_eq!(args.get("url").and_then(|v| v.as_str()), Some("https://example.com"));
+    assert_eq!(
+        args.get("url").and_then(|v| v.as_str()),
+        Some("https://example.com")
+    );
 }
 
 #[test]
@@ -357,10 +362,14 @@ fn parse_tool_call_anthropic_multiple_parameters() {
 #[test]
 fn parse_tool_call_strips_code_fence_from_json() {
     let r = silent_runner(MockExecutor::default());
-    let fenced = "```json\n{\"tool\": \"read_sensor\", \"args\": {\"sensor\": \"temperature\"}}\n```";
+    let fenced =
+        "```json\n{\"tool\": \"read_sensor\", \"args\": {\"sensor\": \"temperature\"}}\n```";
     let (name, args) = r.parse_tool_call(fenced).unwrap();
     assert_eq!(name, "read_sensor");
-    assert_eq!(args.get("sensor").and_then(|v| v.as_str()), Some("temperature"));
+    assert_eq!(
+        args.get("sensor").and_then(|v| v.as_str()),
+        Some("temperature")
+    );
 }
 
 #[test]
@@ -394,8 +403,10 @@ fn parse_result_takes_precedence_over_tool_call() {
     // for the generic Format 3 fallback.
     let r = silent_runner(MockExecutor::default());
     let response = r#"{"result": "Environmental monitoring complete"}"#;
-    assert!(r.parse_tool_call(response).is_none(),
-        "result payload should not be a tool call");
+    assert!(
+        r.parse_tool_call(response).is_none(),
+        "result payload should not be a tool call"
+    );
     let parsed = r.parse_result(response).unwrap();
     assert_eq!(parsed, "Environmental monitoring complete");
 }
@@ -435,7 +446,9 @@ fn parse_result_does_not_terminate_on_chatter() {
     let r = silent_runner(MockExecutor::default());
     assert!(r.parse_result("OK").is_none());
     assert!(r.parse_result("Let me check the sensor first").is_none());
-    assert!(r.parse_result("I'll now read the humidity sensor").is_none());
+    assert!(r
+        .parse_result("I'll now read the humidity sensor")
+        .is_none());
 }
 
 #[test]
@@ -453,17 +466,24 @@ fn parse_tool_call_extracts_json_from_prose() {
     let resp = "I'll use the sensor: {\"tool\": \"read_sensor\", \"args\": {\"sensor\": \"temperature\"}}. Please wait.";
     let (name, args) = r.parse_tool_call(resp).unwrap();
     assert_eq!(name, "read_sensor");
-    assert_eq!(args.get("sensor").and_then(|v| v.as_str()), Some("temperature"));
+    assert_eq!(
+        args.get("sensor").and_then(|v| v.as_str()),
+        Some("temperature")
+    );
 }
 
 #[test]
 fn parse_tool_call_handles_string_braces_in_embedded_json() {
     // The balanced-brace scanner must not stop at a '}' inside a string value.
     let r = silent_runner(MockExecutor::default());
-    let resp = "Here: {\"tool\": \"fetch_url\", \"args\": {\"url\": \"https://example.com/a}\"}} done";
+    let resp =
+        "Here: {\"tool\": \"fetch_url\", \"args\": {\"url\": \"https://example.com/a}\"}} done";
     let (name, args) = r.parse_tool_call(resp).unwrap();
     assert_eq!(name, "fetch_url");
-    assert_eq!(args.get("url").and_then(|v| v.as_str()), Some("https://example.com/a}"));
+    assert_eq!(
+        args.get("url").and_then(|v| v.as_str()),
+        Some("https://example.com/a}")
+    );
 }
 
 // ============================================================================
@@ -498,7 +518,11 @@ fn sim_environmental_monitoring_runs_full_chain() {
     let exec = MockExecutor::with_response("read_sensor", "20.0");
     let mut runner = silent_runner(exec);
     let result = runner.run("Monitor the environment").unwrap();
-    assert!(runner.tool_call_count() >= 4, "got {}", runner.tool_call_count());
+    assert!(
+        runner.tool_call_count() >= 4,
+        "got {}",
+        runner.tool_call_count()
+    );
     assert!(result.contains("monitoring"));
 }
 
@@ -507,7 +531,9 @@ fn sim_flash_log_includes_ble() {
     let exec = MockExecutor::with_response("read_sensor", "1000");
     let mut runner = silent_runner(exec);
     let result = runner.run("Read sensors and save to flash").unwrap();
-    assert!(result.to_lowercase().contains("morning") || result.to_lowercase().contains("complete"));
+    assert!(
+        result.to_lowercase().contains("morning") || result.to_lowercase().contains("complete")
+    );
     assert!(runner.tool_call_count() >= 3);
 }
 
@@ -515,7 +541,9 @@ fn sim_flash_log_includes_ble() {
 fn sim_temperature_with_fan_control() {
     let exec = MockExecutor::with_response("read_sensor", "35.0");
     let mut runner = silent_runner(exec);
-    let result = runner.run("Check temperature and turn on fan if above 25C").unwrap();
+    let result = runner
+        .run("Check temperature and turn on fan if above 25C")
+        .unwrap();
     assert!(result.contains("fan"));
 }
 
@@ -656,11 +684,10 @@ fn ollama_wire_format_includes_system_first() {
     });
 
     let mut client = OllamaClient::new(&format!("http://{}", addr), "test-model");
-    let messages = vec![
-        Message::system("sys prompt"),
-        Message::user("hi"),
-    ];
-    let resp = client.chat_with_messages(&messages, SamplingParams::default()).unwrap();
+    let messages = vec![Message::system("sys prompt"), Message::user("hi")];
+    let resp = client
+        .chat_with_messages(&messages, SamplingParams::default())
+        .unwrap();
     assert_eq!(resp, "hello");
 
     let raw = captured.lock().unwrap().clone();
@@ -694,7 +721,9 @@ fn ollama_wire_format_serialises_tool_calls() {
         Message::user("detect fall"),
         Message::assistant_tool_call(tc),
     ];
-    let _ = client.chat_with_messages(&messages, SamplingParams::default()).unwrap();
+    let _ = client
+        .chat_with_messages(&messages, SamplingParams::default())
+        .unwrap();
 
     let raw = captured.lock().unwrap().clone();
     let body_str = std::str::from_utf8(extract_body(&raw)).unwrap().to_string();
@@ -719,18 +748,26 @@ fn ollama_body_buffer_is_reused_across_calls() {
 
     let mut client = OllamaClient::new(&format!("http://{}", addr), "m");
     let m1 = vec![Message::user("hi")];
-    let _ = client.chat_with_messages(&m1, SamplingParams::default()).unwrap();
+    let _ = client
+        .chat_with_messages(&m1, SamplingParams::default())
+        .unwrap();
     let m2 = vec![
         Message::user("hi"),
         Message::assistant_text("thinking..."),
         Message::user("now do x"),
     ];
-    let _ = client.chat_with_messages(&m2, SamplingParams::default()).unwrap();
+    let _ = client
+        .chat_with_messages(&m2, SamplingParams::default())
+        .unwrap();
 
     let raw1 = captures[0].lock().unwrap().clone();
     let raw2 = captures[1].lock().unwrap().clone();
-    let body1 = std::str::from_utf8(extract_body(&raw1)).unwrap().to_string();
-    let body2 = std::str::from_utf8(extract_body(&raw2)).unwrap().to_string();
+    let body1 = std::str::from_utf8(extract_body(&raw1))
+        .unwrap()
+        .to_string();
+    let body2 = std::str::from_utf8(extract_body(&raw2))
+        .unwrap()
+        .to_string();
     assert!(body1.contains("hi"));
     assert!(body2.contains("now do x"));
     let _: serde_json::Value = serde_json::from_str(&body1).unwrap();

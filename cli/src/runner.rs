@@ -959,7 +959,7 @@ impl<'a> RunCmd<'a> {
         // REPL loop
         loop {
             print!("\n❯ ");
-            io::stdout().flush().map_err(|e| RunError::Io(e))?;
+            io::stdout().flush().map_err(RunError::Io)?;
 
             let input = read_line_with_history("", &session);
 
@@ -1623,6 +1623,12 @@ pub(crate) fn default_system_prompt() -> String {
 // pieces we *can* test in isolation: prompt loading, report serialisation,
 // and the quiet/mode flag plumbing.
 
+// Clippy's `items_after_test_module` fires because the REPL implementation
+// lives between the tests and the helpers below. The cleanest fix would be
+// to move the `tests` mod to the bottom of the file, but the helpers it
+// exercises (e.g. `load_prompt_file`) are interspersed through the REPL
+// code, so the lift would be larger than the noise. Allow it explicitly.
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2359,6 +2365,7 @@ impl ReplSession {
         self.history_pos = self.history.len();
     }
 
+    #[allow(dead_code)]
     fn get_history_entry(&self, offset: isize) -> Option<&String> {
         let pos = self.history_pos as isize + offset;
         if pos < 0 || pos >= self.history.len() as isize {
@@ -2400,7 +2407,7 @@ impl TraceSink for ReplTraceSink {
                 };
                 let _ = write!(std::io::stderr(), "  🤖 {}", preview);
             }
-            TraceEvent::FinalResult { body } => {
+            TraceEvent::FinalResult { .. } => {
                 let _ = writeln!(std::io::stderr());
                 let _ = writeln!(std::io::stderr(), "  ─────────────────────────────");
             }
@@ -2416,7 +2423,7 @@ fn handle_repl_command(
     session: &mut ReplSession,
 ) -> ReplCommandResult {
     let parts: Vec<&str> = input.split_whitespace().collect();
-    let cmd = parts.first().map(|s| *s).unwrap_or("");
+    let cmd = parts.first().copied().unwrap_or("");
     let args: Vec<&str> = parts[1..].to_vec();
 
     match cmd.to_lowercase().as_str() {
@@ -2474,7 +2481,7 @@ fn handle_repl_command(
             // Get last task from history and run it again
             if let Some(last_task) = session.history.iter().rev().find(|h| !h.starts_with('/')) {
                 println!("Retrying: {}", last_task);
-                return ReplCommandResult::RunTask(last_task.clone());
+                ReplCommandResult::RunTask(last_task.clone())
             } else {
                 println!("No previous task to retry.");
                 ReplCommandResult::Continue

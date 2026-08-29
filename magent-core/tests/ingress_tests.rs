@@ -28,11 +28,17 @@ fn transparent_mode_passes_bytes_through() {
     gw.register(adapter).unwrap();
 
     let frame = gw.ingest().unwrap().expect("frame expected");
-    assert_eq!(frame.source, IngressSource::Mqtt {
-        topic: heapless::String::try_from("magent/cmd").unwrap(),
-    });
+    assert_eq!(
+        frame.source,
+        IngressSource::Mqtt {
+            topic: heapless::String::try_from("magent/cmd").unwrap(),
+        }
+    );
     assert_eq!(vec_to_slice(&frame.payload), b"hello-from-mqtt");
-    assert!(frame.envelope_json.is_none(), "transparent mode must not sign");
+    assert!(
+        frame.envelope_json.is_none(),
+        "transparent mode must not sign"
+    );
 
     // No-data round returns Ok(None).
     let again = gw.ingest().unwrap();
@@ -94,7 +100,10 @@ fn signed_mode_without_signer_errors() {
 fn empty_pool_errors() {
     let mut gw: IngressGateway<MqttAdapter> = IngressGateway::new(IngressMode::Transparent);
     let err = gw.ingest().unwrap_err();
-    assert!(matches!(err, magent_core::ingress::IngressError::NoAdapters));
+    assert!(matches!(
+        err,
+        magent_core::ingress::IngressError::NoAdapters
+    ));
 }
 
 #[test]

@@ -44,6 +44,9 @@ pub enum BleState {
     Idle,
     Initializing,
     Advertising,
+    // Reserved: connection state is tracked via the GATT event callback; the
+    // advertising state machine doesn't transition to this variant yet.
+    #[allow(dead_code)]
     Connected,
     Error,
 }
@@ -435,6 +438,18 @@ fn notify_char(uuid16: u16, data: &[u8]) {
     };
 }
 
+/// Push `data` to the connected BLE client on the SYS_RSP characteristic
+/// (used by the Lua app's `hardware.ble_send`). Returns an error when no BLE
+/// client is connected (GATT interface not registered yet / disconnected).
+#[cfg(feature = "lua")]
+pub(crate) fn ble_send_payload(data: &[u8]) -> Result<(), String> {
+    if GATT_IF.load(Ordering::SeqCst) == 0 {
+        return Err("ble_send: no connected BLE client (GATT iface=0)".into());
+    }
+    notify_char(SYS_RSP_UUID16, data);
+    Ok(())
+}
+
 /// System status, in the exact binary layout `ble-helper` parses
 /// (`parseSystemStatus`): state, wifi_state, free_heap(u32 BE), uptime_ms(u64 BE), err.
 fn build_system_status() -> [u8; 15] {
@@ -465,11 +480,12 @@ fn build_device_info() -> [u8; 36] {
     b[4..8].copy_from_slice(&mem_total.to_le_bytes());
     b[8..12].copy_from_slice(&mem_free.to_le_bytes());
     b[12..20].copy_from_slice(&(uptime_us / 1000).to_le_bytes());
-    // Chip model string (compile-time board switch).
+    // Chip model string (compile-time board switch). Exactly 9 bytes for the
+    // device-info field (bytes 20..29).
     #[cfg(feature = "board-c61")]
     let chip_model: &[u8; 9] = b"ESP32-C61";
     #[cfg(feature = "board-s3")]
-    let chip_model: &[u8; 9] = b"ESP32-S3";
+    let chip_model: &[u8; 9] = b"ESP32-S3 ";
     b[20..29].copy_from_slice(chip_model);
     b
 }
@@ -760,18 +776,13 @@ unsafe fn handle_gatt_write(p: &esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_writ
 
 /// Build the ESP-IDF Bluetooth controller config for the target chip.
 ///
-/// The `esp_bt_controller_config_t` field layout is identical across the C61
-/// and S3 (it comes from the same ESP-IDF `esp_bt.h` header), and the values
-/// below are the standard per-chip defaults. The ESP32-C61 controller rejects
-/// the auto-default, so these are spelled out explicitly; the ESP32-S3 accepts
-/// the same standard defaults. The only compile-time difference is the CPU
-/// clock (C61 = 160 MHz, S3 = 240 MHz), selected by the `board-*` feature.
+/// The C61 and S3 expose **different** `esp_bt_controller_config_t` layouts:
+/// the C61 uses the newer ESP32-C6-style struct (`config_version` /
+/// `config_magic` + ~66 fields); the ESP32-S3 uses the classic ESP32 BLE
+/// controller struct (`magic` / `version`, 47 fields). Each board gets its own
+/// constructor.
+#[cfg(feature = "board-c61")]
 fn bt_controller_config() -> esp_idf_sys::esp_bt_controller_config_t {
-    #[cfg(feature = "board-c61")]
-    const CPU_FREQ_MHZ: u8 = 160; // ESP32-C61 (RISC-V)
-    #[cfg(feature = "board-s3")]
-    const CPU_FREQ_MHZ: u8 = 240; // ESP32-S3 (Xtensa)
-
     esp_idf_sys::esp_bt_controller_config_t {
         config_version: esp_idf_sys::CONFIG_VERSION,
         ble_ll_resolv_list_size: 4,
@@ -814,7 +825,7 @@ fn bt_controller_config() -> esp_idf_sys::esp_bt_controller_config_t {
         cca_drop_mode: 0,
         cca_low_tx_pwr: 0,
         main_xtal_freq: 40,
-        cpu_freq_mhz: CPU_FREQ_MHZ,
+        cpu_freq_mhz: 160, // ESP32-C61 (RISC-V)
         ignore_wl_for_direct_adv: 0,
         enable_pcl: 0,
         csa2_select: 0,
@@ -839,6 +850,31 @@ fn bt_controller_config() -> esp_idf_sys::esp_bt_controller_config_t {
         enhanced_mem_resv: 0,
         rxbuf_reserved: 0,
         config_magic: esp_idf_sys::CONFIG_MAGIC,
+    }
+}
+
+#[cfg(feature = "board-s3")]
+fn bt_controller_config() -> esp_idf_sys::esp_bt_controller_config_t {
+    // ESP32-S3: classic ESP32 BLE controller config. Zero-init via `Default`
+    // fills the safety defaults; `magic`/`version` satisfy the controller's
+    // struct validator, and `bluetooth_mode` selects BLE-only (the S3 hardware
+    // also supports BR/EDR, but this build uses only the BLE subset).
+    // CPU clock is configured by sdkconfig, not here.
+    esp_idf_sys::esp_bt_controller_config_t {
+        magic: esp_idf_sys::ESP_BT_CTRL_CONFIG_MAGIC_VAL,
+        version: esp_idf_sys::ESP_BT_CTRL_CONFIG_VERSION,
+        controller_task_stack_size: 4096,
+        // ESP-IDF validates this MUST equal `ESP_TASK_BT_CONTROLLER_PRIO`
+        // (== ESP_TASK_PRIO_MAX - 2 == 23). The previous value (5) failed the
+        // check with ESP_ERR_INVALID_ARG (258) on real S3 hardware.
+        controller_task_prio: 23,
+        controller_task_run_cpu: 0,
+        bluetooth_mode: esp_idf_sys::esp_bt_mode_t_ESP_BT_MODE_BLE as u8,
+        // ESP-IDF validates ble_max_act in (0, BTDM_CONTROLLER_BLE_MAX_ACT_LIMIT]
+        // (default CONFIG_BT_CTRL_BLE_MAX_ACT == 6). Zero-init left it 0 →
+        // ESP_ERR_INVALID_ARG (258) on the S3.
+        ble_max_act: 6,
+        ..Default::default()
     }
 }
 
@@ -1029,6 +1065,7 @@ impl BleServer {
     /// issued synchronously; the GAP completion event is not awaited —
     /// the host only needs the advertising flag cleared and the state
     /// reflected as `Idle`.
+    #[allow(dead_code)] // public `BleServer` API, not yet called on the active path
     pub fn stop_advertising(&mut self) -> Result<(), BleError> {
         if !self.is_advertising {
             return Ok(());
@@ -1056,6 +1093,7 @@ impl BleServer {
 
     /// Tear down the BLE stack. Best-effort: logs errors but never
     /// panics and never leaves the handle in a half-initialised state.
+    #[allow(dead_code)] // public `BleServer` API, not yet called on the active path
     pub fn deinit(&mut self) {
         if self.is_advertising {
             let _ = self.stop_advertising();
@@ -1075,6 +1113,7 @@ impl BleServer {
 
     /// Explicitly set the reported state (used by GAP/GATTS callbacks to
     /// reflect connection / disconnection events).
+    #[allow(dead_code)] // public `BleServer` API, not yet called on the active path
     pub fn set_state(&mut self, state: BleState) {
         self.state = state;
     }
@@ -1083,6 +1122,7 @@ impl BleServer {
         self.state
     }
 
+    #[allow(dead_code)] // public `BleServer` API, not yet called on the active path
     pub fn is_active(&self) -> bool {
         self.is_initialized && self.is_advertising
     }

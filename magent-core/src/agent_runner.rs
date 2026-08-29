@@ -139,6 +139,14 @@ pub enum TraceEvent {
 /// sink (e.g. one that writes to a network socket) will starve the
 /// LLM call that follows it. If you need async / blocking I/O,
 /// push events into a channel and drain them on a separate task.
+///
+/// `Send + Sync` is *not* required on the trait itself: a sink's
+/// `event` method takes `&mut self`, so two threads calling it
+/// concurrently is impossible by construction. Adding the bound
+/// would forbid legitimate non-`Send` closures (e.g. those holding
+/// `Rc<RefCell<...>>` for test capture) without buying anything.
+/// Callers that need cross-thread delivery should wrap the sink in
+/// a `Mutex` and install it via [`SharedTraceSink`].
 pub trait TraceSink {
     /// Emit a single event. Called from the runner thread.
     fn event(&mut self, event: TraceEvent);
@@ -293,12 +301,13 @@ impl<F: FnMut(TraceEvent)> TraceSink for FnSink<F> {
 /// implementation behind a single field without paying for a
 /// generic parameter on every public method.
 ///
-/// Note: `TraceSink` itself is **not** `Send`. The runner is
-/// always single-threaded (one ReAct loop per `RealAgentRunner`)
-/// and the CLI's `Output` type holds non-`Send` stdout / stderr
-/// locks, so a `Send` bound would be both impossible to satisfy
-/// and pointless to require.
-pub type BoxedTraceSink = Box<dyn TraceSink>;
+/// The `+ Send + Sync` bound is needed *here*, not on the trait, so
+/// that [`SharedTraceSink`] (which wraps these in a `Mutex<Vec<_>>`)
+/// remains `Send + Sync` and can travel across threads inside an
+/// `Arc`. The trait itself intentionally drops the bound so
+/// non-`Send` sinks (e.g. test closures holding `Rc<RefCell<...>>`)
+/// can be installed when the runner is provably single-threaded.
+pub type BoxedTraceSink = Box<dyn TraceSink + Send + Sync>;
 
 /// Thread-safe interior-mutability wrapper around an optional
 /// boxed sink. The runner owns this and only ever calls
@@ -331,7 +340,9 @@ impl SharedTraceSink {
     fn lock_sinks(&self) -> std::sync::MutexGuard<'_, Vec<BoxedTraceSink>> {
         // HARDENING (clippy/redundant_closure_for_method_calls):
         // `PoisonError::into_inner` is available directly on the error.
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Append `sink` to the list. Subsequent events are delivered
@@ -345,10 +356,7 @@ impl SharedTraceSink {
     /// no sinks are installed, `f` is not called and `None` is
     /// returned — the runner falls back to its in-line verbose
     /// printing path.
-    pub fn with_sinks<R>(
-        &self,
-        f: impl FnOnce(&mut [&mut dyn TraceSink]) -> R,
-    ) -> Option<R> {
+    pub fn with_sinks<R>(&self, f: impl FnOnce(&mut [&mut dyn TraceSink]) -> R) -> Option<R> {
         let mut guard = self.lock_sinks();
         if guard.is_empty() {
             return None;
@@ -357,8 +365,10 @@ impl SharedTraceSink {
         // trait objects, then hand it to the closure as a slice.
         // The vector lives only for the duration of the call so no
         // sink escapes the borrow scope.
-        let mut refs: Vec<&mut dyn TraceSink> =
-            guard.iter_mut().map(|b| b.as_mut() as &mut dyn TraceSink).collect();
+        let mut refs: Vec<&mut dyn TraceSink> = guard
+            .iter_mut()
+            .map(|b| b.as_mut() as &mut dyn TraceSink)
+            .collect();
         Some(f(&mut refs))
     }
 
@@ -930,8 +940,11 @@ impl OllamaClient {
         }
 
         self.response_buf.clear();
-        self.response_buf
-            .extend_from_slice(&response.bytes().map_err(|e| format!("Read body failed: {}", e))?);
+        self.response_buf.extend_from_slice(
+            &response
+                .bytes()
+                .map_err(|e| format!("Read body failed: {}", e))?,
+        );
 
         let json: serde_json::Value = serde_json::from_slice(&self.response_buf)
             .map_err(|e| format!("JSON parse error: {}", e))?;
@@ -1003,7 +1016,11 @@ impl OllamaClient {
     /// calling `GET /api/tags`. Returns an empty list on any error
     /// (network failure, non-JSON body, missing `models` array).
     pub fn get_models(&self) -> Vec<String> {
-        if let Ok(response) = self.client.get(format!("{}/api/tags", self.base_url)).send() {
+        if let Ok(response) = self
+            .client
+            .get(format!("{}/api/tags", self.base_url))
+            .send()
+        {
             if let Ok(json) = response.json::<serde_json::Value>() {
                 return json["models"]
                     .as_array()
@@ -1059,7 +1076,9 @@ impl OllamaClient {
             return Err(format!("HTTP error: {}", response.status()));
         }
 
-        let json: serde_json::Value = response.json().map_err(|e| format!("JSON parse error: {}", e))?;
+        let json: serde_json::Value = response
+            .json()
+            .map_err(|e| format!("JSON parse error: {}", e))?;
         let content = json["response"]
             .as_str()
             .ok_or_else(|| "No content in response".to_string())?;
@@ -1316,7 +1335,9 @@ impl DeepSeekClient {
             .ok_or_else(|| {
                 format!(
                     "No content in response (choices={})",
-                    json.get("choices").map(ToString::to_string).unwrap_or_else(|| "<missing>".into())
+                    json.get("choices")
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "<missing>".into())
                 )
             })?;
         Ok(content.to_string())
@@ -1381,10 +1402,7 @@ impl DeepSeekClient {
     /// Delegates to the module-level [`write_message_into`] so we
     /// only have one place that knows the wire format. The Ollama
     /// client uses the same helper.
-    fn write_message_into(
-        buf: &mut Vec<u8>,
-        m: &Message,
-    ) -> std::result::Result<(), String> {
+    fn write_message_into(buf: &mut Vec<u8>, m: &Message) -> std::result::Result<(), String> {
         write_message_into(buf, m)
     }
 
@@ -1788,17 +1806,19 @@ fn parse_tool_call_from_json(
                     .get("name")
                     .and_then(|n| n.as_str())
                     .map(String::from)?;
-                let args_map: HashMap<String, serde_json::Value> =
-                    if let Some(args_str) = func.get("arguments").and_then(|a| a.as_str()) {
-                        // arguments is itself a JSON string
-                        serde_json::from_str(args_str).unwrap_or_default()
-                    } else if let Some(args_obj) =
-                        func.get("arguments").and_then(|a| a.as_object())
-                    {
-                        args_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                    } else {
-                        HashMap::new()
-                    };
+                let args_map: HashMap<String, serde_json::Value> = if let Some(args_str) =
+                    func.get("arguments").and_then(|a| a.as_str())
+                {
+                    // arguments is itself a JSON string
+                    serde_json::from_str(args_str).unwrap_or_default()
+                } else if let Some(args_obj) = func.get("arguments").and_then(|a| a.as_object()) {
+                    args_obj
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
                 return Some((name, args_map));
             }
         }
@@ -1832,7 +1852,6 @@ fn parse_tool_call_from_json(
 
     None
 }
-
 
 // ============================================================================
 // ReAct agent runner
@@ -1886,7 +1905,10 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
             last_compression_stats: None,
             last_compression_policy: None,
             backend_enabled: false,
-            backend: Some(Box::new(OllamaClient::new("http://localhost:11434", "llama3.2"))),
+            backend: Some(Box::new(OllamaClient::new(
+                "http://localhost:11434",
+                "llama3.2",
+            ))),
         }
     }
 
@@ -1903,7 +1925,10 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
             last_compression_stats: None,
             last_compression_policy: None,
             backend_enabled: false,
-            backend: Some(Box::new(OllamaClient::new("http://localhost:11434", "llama3.2"))),
+            backend: Some(Box::new(OllamaClient::new(
+                "http://localhost:11434",
+                "llama3.2",
+            ))),
         }
     }
 
@@ -1942,9 +1967,8 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         // `self.config.system_prompt` — the runner rebuilds the
         // prompt on every chat call, so storing the rendered prompt
         // would only cause confusion.
-        let mut out = String::with_capacity(
-            self.config.system_prompt.len() + tool_section.len() + 32,
-        );
+        let mut out =
+            String::with_capacity(self.config.system_prompt.len() + tool_section.len() + 32);
         out.push_str(&self.config.system_prompt);
         out.push_str("\n\n## Available tools\n");
         out.push_str(&tool_section);
@@ -1954,10 +1978,7 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
     /// Install (or replace) the trace sink. See
     /// [`RunnerConfig::trace_sink`] for the rationale. Pass `None`
     /// to revert to the historical silent / `println!` behaviour.
-    pub fn set_trace_sink(
-        &mut self,
-        sink: Option<std::sync::Arc<SharedTraceSink>>,
-    ) {
+    pub fn set_trace_sink(&mut self, sink: Option<std::sync::Arc<SharedTraceSink>>) {
         self.config.trace_sink = sink;
     }
 
@@ -2010,12 +2031,13 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
             // Deliver to every installed sink. `with_sinks` returns
             // `None` when the list is empty, in which case we fall
             // through to the legacy `println!` path below.
-            if sink.with_sinks(|sinks| {
-                for s in sinks.iter_mut() {
-                    s.event(event.clone());
-                }
-            })
-            .is_some()
+            if sink
+                .with_sinks(|sinks| {
+                    for s in sinks.iter_mut() {
+                        s.event(event.clone());
+                    }
+                })
+                .is_some()
             {
                 return;
             }
@@ -2037,7 +2059,10 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
                 using_real_llm,
             } => {
                 if using_real_llm {
-                    println!("[Agent] Connected to {} - using real AI reasoning", provider);
+                    println!(
+                        "[Agent] Connected to {} - using real AI reasoning",
+                        provider
+                    );
                 } else {
                     println!("[Agent] LLM backend not available - using simulated reasoning");
                 }
@@ -2068,7 +2093,11 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
                 }
             }
             TraceEvent::LlmResponse { body } => {
-                let display = if body.len() > 200 { &body[..200] } else { &body };
+                let display = if body.len() > 200 {
+                    &body[..200]
+                } else {
+                    &body
+                };
                 println!("[LLM Response] {}", display);
             }
             TraceEvent::ToolCallStart { name, arguments } => {
@@ -2230,44 +2259,44 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         self.messages.push(Message::user(task));
         self.state = AgentState::Thinking;
 
-// Main ReAct loop.
-//
-// v2: `iteration` counts LLM invocations (the only expensive step), not
-// raw loop iterations. State transitions (Executing -> Observing -> Thinking)
-// are free and don't consume budget. `max_tool_calls` still bounds the number
-// of tool executions.
-while self.state != AgentState::Finished && self.state != AgentState::Error {
-    if self.iteration >= self.config.max_iterations {
-        self.emit_trace(TraceEvent::BudgetExhausted {
-            kind: "iterations",
-            limit: self.config.max_iterations,
-        });
-        break;
-    }
+        // Main ReAct loop.
+        //
+        // v2: `iteration` counts LLM invocations (the only expensive step), not
+        // raw loop iterations. State transitions (Executing -> Observing -> Thinking)
+        // are free and don't consume budget. `max_tool_calls` still bounds the number
+        // of tool executions.
+        while self.state != AgentState::Finished && self.state != AgentState::Error {
+            if self.iteration >= self.config.max_iterations {
+                self.emit_trace(TraceEvent::BudgetExhausted {
+                    kind: "iterations",
+                    limit: self.config.max_iterations,
+                });
+                break;
+            }
 
-    if self.tool_call_count >= self.config.max_tool_calls {
-        self.emit_trace(TraceEvent::BudgetExhausted {
-            kind: "tool_calls",
-            limit: self.config.max_tool_calls,
-        });
-        break;
-    }
+            if self.tool_call_count >= self.config.max_tool_calls {
+                self.emit_trace(TraceEvent::BudgetExhausted {
+                    kind: "tool_calls",
+                    limit: self.config.max_tool_calls,
+                });
+                break;
+            }
 
-    match self.state {
-        AgentState::Thinking => {
-            self.iteration += 1;
-            self.think()?;
+            match self.state {
+                AgentState::Thinking => {
+                    self.iteration += 1;
+                    self.think()?;
+                }
+                AgentState::Executing => {
+                    // Tool was just executed; ready to observe the result.
+                    self.state = AgentState::Observing;
+                }
+                AgentState::Observing => {
+                    self.observe();
+                }
+                _ => break,
+            }
         }
-        AgentState::Executing => {
-            // Tool was just executed; ready to observe the result.
-            self.state = AgentState::Observing;
-        }
-        AgentState::Observing => {
-            self.observe();
-        }
-        _ => break,
-    }
-}
 
         self.get_result()
     }
@@ -2362,7 +2391,10 @@ while self.state != AgentState::Finished && self.state != AgentState::Error {
         // Record the assistant message. If it contains a tool call, store
         // it as a structured tool_call (no need to also keep `content`).
         if let Some((name, args)) = self.parse_tool_call(&response) {
-            let tc = ToolCall { name: name.clone(), arguments: args.clone() };
+            let tc = ToolCall {
+                name: name.clone(),
+                arguments: args.clone(),
+            };
             // Allocate the call id up-front and reuse it for BOTH the
             // assistant tool-call message and the tool-result message.
             // DeepSeek rejects the request if these ids differ.
@@ -2442,12 +2474,14 @@ while self.state != AgentState::Finished && self.state != AgentState::Error {
                 0 => r#"{"tool": "read_sensor", "args": {"sensor": "temperature"}}"#.to_string(),
                 1 => r#"{"tool": "read_sensor", "args": {"sensor": "humidity"}}"#.to_string(),
                 2 => r#"{"tool": "read_sensor", "args": {"sensor": "pressure"}}"#.to_string(),
-                3 => r#"{"tool": "ble_send", "args": {"data": "Environmental data logged"}}"#.to_string(),
+                3 => r#"{"tool": "ble_send", "args": {"data": "Environmental data logged"}}"#
+                    .to_string(),
                 _ => r#"{"result": "Environmental monitoring complete"}"#.to_string(),
             };
         }
 
-        if contains_any(&user_task_lower, &["read"]) && contains_any(&user_task_lower, &["sensor", "vital"])
+        if contains_any(&user_task_lower, &["read"])
+            && contains_any(&user_task_lower, &["sensor", "vital"])
             && contains_any(&user_task_lower, &["log", "flash", "save", "morning"])
         {
             return match tool_count {
@@ -2460,30 +2494,62 @@ while self.state != AgentState::Finished && self.state != AgentState::Error {
         }
 
         if (contains_any(&user_task_lower, &["temperature", "check temperature"]))
-            && (contains_any(&user_task_lower, &["above"]) || contains_any(&user_task_lower, &["fan", "cooling"]))
+            && (contains_any(&user_task_lower, &["above"])
+                || contains_any(&user_task_lower, &["fan", "cooling"]))
         {
             return match tool_count {
                 0 => r#"{"tool": "read_sensor", "args": {"sensor": "temperature"}}"#.to_string(),
                 1 => r#"{"tool": "write_gpio", "args": {"pin": 14, "state": "high"}}"#.to_string(),
-                _ => r#"{"result": "Temperature was above threshold, fan turned on at GPIO pin 14"}"#.to_string(),
+                _ => {
+                    r#"{"result": "Temperature was above threshold, fan turned on at GPIO pin 14"}"#
+                        .to_string()
+                }
             };
         }
 
-        if contains_any(&user_task_lower, &["humidity"]) && !contains_any(&user_task_lower, &["temperature", "pressure"]) {
-            return tool_then_done(tool_count, "read_sensor", r#"{"sensor": "humidity"}"#, "Humidity sensor reading completed");
+        if contains_any(&user_task_lower, &["humidity"])
+            && !contains_any(&user_task_lower, &["temperature", "pressure"])
+        {
+            return tool_then_done(
+                tool_count,
+                "read_sensor",
+                r#"{"sensor": "humidity"}"#,
+                "Humidity sensor reading completed",
+            );
         }
-        if contains_any(&user_task_lower, &["pressure"]) && !contains_any(&user_task_lower, &["humidity", "temperature"]) {
-            return tool_then_done(tool_count, "read_sensor", r#"{"sensor": "pressure"}"#, "Pressure sensor reading completed");
+        if contains_any(&user_task_lower, &["pressure"])
+            && !contains_any(&user_task_lower, &["humidity", "temperature"])
+        {
+            return tool_then_done(
+                tool_count,
+                "read_sensor",
+                r#"{"sensor": "pressure"}"#,
+                "Pressure sensor reading completed",
+            );
         }
-        if contains_any(&user_task_lower, &["temperature"]) && !contains_any(&user_task_lower, &["humidity", "pressure"]) {
-            return tool_then_done(tool_count, "read_sensor", r#"{"sensor": "temperature"}"#, "Temperature sensor reading completed");
+        if contains_any(&user_task_lower, &["temperature"])
+            && !contains_any(&user_task_lower, &["humidity", "pressure"])
+        {
+            return tool_then_done(
+                tool_count,
+                "read_sensor",
+                r#"{"sensor": "temperature"}"#,
+                "Temperature sensor reading completed",
+            );
         }
 
         if contains_any(&user_task_lower, &["accelerometer", "step", "motion"]) {
-            return tool_then_done(tool_count, "read_sensor", r#"{"sensor": "accelerometer"}"#, "Accelerometer reading completed");
+            return tool_then_done(
+                tool_count,
+                "read_sensor",
+                r#"{"sensor": "accelerometer"}"#,
+                "Accelerometer reading completed",
+            );
         }
 
-        if contains_any(&user_task_lower, &["led"]) && contains_any(&user_task_lower, &["on", "turn on", "enable"]) {
+        if contains_any(&user_task_lower, &["led"])
+            && contains_any(&user_task_lower, &["on", "turn on", "enable"])
+        {
             return tool_then_done(
                 tool_count,
                 "write_gpio",
@@ -2491,7 +2557,9 @@ while self.state != AgentState::Finished && self.state != AgentState::Error {
                 "LED turned on successfully",
             );
         }
-        if contains_any(&user_task_lower, &["led"]) && contains_any(&user_task_lower, &["off", "turn off", "disable"]) {
+        if contains_any(&user_task_lower, &["led"])
+            && contains_any(&user_task_lower, &["off", "turn off", "disable"])
+        {
             return tool_then_done(
                 tool_count,
                 "write_gpio",
@@ -2501,7 +2569,10 @@ while self.state != AgentState::Finished && self.state != AgentState::Error {
         }
 
         if contains_any(&user_task_lower, &["ble"])
-            && contains_any(&user_task_lower, &["notification", "alert", "send", "message"])
+            && contains_any(
+                &user_task_lower,
+                &["notification", "alert", "send", "message"],
+            )
         {
             return tool_then_done(
                 tool_count,
@@ -2511,7 +2582,9 @@ while self.state != AgentState::Finished && self.state != AgentState::Error {
             );
         }
 
-        if contains_any(&user_task_lower, &["flash"]) && contains_any(&user_task_lower, &["log", "save", "write"]) {
+        if contains_any(&user_task_lower, &["flash"])
+            && contains_any(&user_task_lower, &["log", "save", "write"])
+        {
             return tool_then_done(
                 tool_count,
                 "flash_write",
@@ -2870,10 +2943,7 @@ mod deepseek_client_tests {
         assert!(parsed["messages"].is_array());
         assert_eq!(parsed["messages"][0]["role"], "system");
         assert_eq!(parsed["messages"][1]["role"], "user");
-        assert_eq!(
-            parsed["messages"][1]["content"],
-            "Read the temperature"
-        );
+        assert_eq!(parsed["messages"][1]["content"], "Read the temperature");
     }
 
     // ---- New tests for the v2 (audited) implementation ----
@@ -2888,18 +2958,9 @@ mod deepseek_client_tests {
 
     #[test]
     fn try_with_endpoint_rejects_empty_key() {
-        assert!(DeepSeekClient::try_with_endpoint(
-            "https://x/v1", "m", ""
-        )
-        .is_none());
-        assert!(DeepSeekClient::try_with_endpoint(
-            "https://x/v1", "m", "\t\n"
-        )
-        .is_none());
-        assert!(DeepSeekClient::try_with_endpoint(
-            "https://x/v1", "m", "sk-abc"
-        )
-        .is_some());
+        assert!(DeepSeekClient::try_with_endpoint("https://x/v1", "m", "").is_none());
+        assert!(DeepSeekClient::try_with_endpoint("https://x/v1", "m", "\t\n").is_none());
+        assert!(DeepSeekClient::try_with_endpoint("https://x/v1", "m", "sk-abc").is_some());
     }
 
     #[test]
@@ -2915,11 +2976,7 @@ mod deepseek_client_tests {
         // Build with the low-level `with_endpoint` (which doesn't
         // validate) and confirm the high-level probe refuses to
         // call out.
-        let c = DeepSeekClient::with_endpoint(
-            "http://127.0.0.1:1",
-            "deepseek-chat",
-            "",
-        );
+        let c = DeepSeekClient::with_endpoint("http://127.0.0.1:1", "deepseek-chat", "");
         assert!(!c.check_connection());
     }
 
@@ -2957,7 +3014,8 @@ mod deepseek_client_tests {
         let mut c = DeepSeekClient::new("k");
         let tc = ToolCall {
             name: "read_sensor".to_string(),
-            arguments: serde_json::from_value(serde_json::json!({"sensor": "temperature"})).unwrap(),
+            arguments: serde_json::from_value(serde_json::json!({"sensor": "temperature"}))
+                .unwrap(),
         };
         let msg = Message {
             role: Role::Assistant,
@@ -2968,8 +3026,7 @@ mod deepseek_client_tests {
         let body = c
             .write_chat_body_for_test(&[msg], SamplingParams::default())
             .expect("write body");
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&body).expect("parse JSON");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("parse JSON");
         assert_eq!(parsed["messages"][0]["role"], "assistant");
         assert!(parsed["messages"][0]["content"].is_null());
         let tool_calls = parsed["messages"][0]["tool_calls"]
@@ -2978,10 +3035,7 @@ mod deepseek_client_tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0]["id"], "call_42");
         assert_eq!(tool_calls[0]["type"], "function");
-        assert_eq!(
-            tool_calls[0]["function"]["name"],
-            "read_sensor"
-        );
+        assert_eq!(tool_calls[0]["function"]["name"], "read_sensor");
     }
 
     #[test]
@@ -2998,8 +3052,7 @@ mod deepseek_client_tests {
         let body = c
             .write_chat_body_for_test(&[msg], SamplingParams::default())
             .expect("write body");
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&body).expect("parse JSON");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("parse JSON");
         assert_eq!(parsed["messages"][0]["role"], "tool");
         assert_eq!(parsed["messages"][0]["content"], "23.5");
         assert_eq!(parsed["messages"][0]["tool_call_id"], "call_42");
@@ -3012,13 +3065,9 @@ mod deepseek_client_tests {
         // format is clean anyway).
         let mut c = DeepSeekClient::new("k");
         let body = c
-            .write_chat_body_for_test(
-                &[Message::user("hi")],
-                SamplingParams::default(),
-            )
+            .write_chat_body_for_test(&[Message::user("hi")], SamplingParams::default())
             .expect("write body");
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&body).expect("parse JSON");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("parse JSON");
         assert!(parsed["messages"][0].get("tool_call_id").is_none());
     }
 
@@ -3033,8 +3082,7 @@ mod deepseek_client_tests {
                 SamplingParams::default(),
             )
             .expect("write body");
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&body).expect("parse JSON");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("parse JSON");
         assert_eq!(
             parsed["messages"][0]["content"],
             r#"she said "hi"\nnew line"#
@@ -3047,13 +3095,10 @@ mod deepseek_client_tests {
         // accessor surfaces it unchanged. `try_with_endpoint` (used
         // by the CLI) trims first, so callers that pass
         // `"  sk-...  "` get the trimmed key.
-        let raw = DeepSeekClient::with_endpoint(
-            "https://x/v1", "m", "  sk-abc  "
-        );
+        let raw = DeepSeekClient::with_endpoint("https://x/v1", "m", "  sk-abc  ");
         assert_eq!(raw.api_key(), "  sk-abc  ");
-        let trimmed =
-            DeepSeekClient::try_with_endpoint("https://x/v1", "m", "  sk-abc  ")
-                .expect("non-empty");
+        let trimmed = DeepSeekClient::try_with_endpoint("https://x/v1", "m", "  sk-abc  ")
+            .expect("non-empty");
         assert_eq!(trimmed.api_key(), "sk-abc");
     }
 
@@ -3087,8 +3132,8 @@ mod deepseek_client_tests {
         // the tool_call_id raw, which would break on ids containing
         // quotes / backslashes. Make sure that never regresses.
         let _c = OllamaClient::new("http://x", "m"); // existence check
-        // We can't intercept the outbound HTTP request here, so we
-        // round-trip via the same JSON encoder Ollama uses.
+                                                     // We can't intercept the outbound HTTP request here, so we
+                                                     // round-trip via the same JSON encoder Ollama uses.
         let id = r#"call_"weird\\id""#;
         let msg = Message {
             role: Role::Tool,
@@ -3100,8 +3145,7 @@ mod deepseek_client_tests {
         // it via the same free function DeepSeek uses.
         let mut buf = Vec::new();
         write_message_json(&mut buf, &msg).expect("write");
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&buf).expect("parse JSON");
+        let parsed: serde_json::Value = serde_json::from_slice(&buf).expect("parse JSON");
         assert_eq!(parsed["tool_call_id"], id);
     }
 }
@@ -3122,9 +3166,11 @@ mod compression_tests {
     use crate::real_tools::SimulatorExecutor;
 
     fn runner_with_policy(policy: CompressionPolicy) -> RealAgentRunner<SimulatorExecutor> {
-        let mut config = RunnerConfig::default();
-        config.probe_ollama_on_run = false;
-        config.compression = policy;
+        let config = RunnerConfig {
+            probe_ollama_on_run: false,
+            compression: policy,
+            ..Default::default()
+        };
         RealAgentRunner::with_config(SimulatorExecutor::new(), config)
     }
 
@@ -3140,13 +3186,20 @@ mod compression_tests {
         let mut runner = runner_with_policy(CompressionPolicy::disabled());
         // Push a long tool result and many messages.
         runner.messages.push(Message::user("hello"));
-        runner.messages.push(Message::tool("c1", &"x".repeat(5_000)));
+        runner
+            .messages
+            .push(Message::tool("c1", &"x".repeat(5_000)));
         for i in 0..50 {
-            runner.messages.push(Message::assistant_text(&format!("a{}", i)));
+            runner
+                .messages
+                .push(Message::assistant_text(&format!("a{}", i)));
         }
         let stats = runner.compress_now();
         assert_eq!(stats.dropped, 0, "disabled policy must not drop");
-        assert_eq!(stats.tool_results_truncated, 0, "disabled policy must not truncate");
+        assert_eq!(
+            stats.tool_results_truncated, 0,
+            "disabled policy must not truncate"
+        );
         assert_eq!(runner.messages().len(), 52);
     }
 
@@ -3156,7 +3209,9 @@ mod compression_tests {
             max_messages: 0, // disabled
             tool_content_max_chars: 100,
         });
-        runner.messages.push(Message::tool("c1", &"y".repeat(2_000)));
+        runner
+            .messages
+            .push(Message::tool("c1", &"y".repeat(2_000)));
         let stats = runner.compress_now();
         assert_eq!(stats.tool_results_truncated, 1);
         let msg = &runner.messages()[0];
@@ -3175,7 +3230,9 @@ mod compression_tests {
         runner.messages.push(Message::system("SYS"));
         runner.messages.push(Message::user("task"));
         for i in 0..20 {
-            runner.messages.push(Message::assistant_text(&format!("a{}", i)));
+            runner
+                .messages
+                .push(Message::assistant_text(&format!("a{}", i)));
         }
         let stats = runner.compress_now();
         assert_eq!(stats.kept, 4);
@@ -3281,7 +3338,7 @@ mod trace_sink_tests {
     use crate::conversation::CompressionPolicy;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn null_sink_swallows_events() {
@@ -3296,17 +3353,22 @@ mod trace_sink_tests {
 
     #[test]
     fn fn_sink_forwards_events() {
-        let captured: Rc<RefCell<Vec<TraceEvent>>> = Default::default();
+        // `Rc<RefCell<_>>` would make the closure non-`Send`, so the
+        // boxed `FnSink` couldn't be installed behind `BoxedTraceSink =
+        // Box<dyn TraceSink + Send + Sync>`. Tests use `Arc<Mutex<_>>`
+        // even though they're single-threaded, so the typed sink can
+        // be shared across threads (e.g. inside the CLI's `Arc`).
+        let captured: Arc<Mutex<Vec<TraceEvent>>> = Default::default();
         let captured_clone = captured.clone();
         let mut sink = FnSink::new(move |event| {
-            captured_clone.borrow_mut().push(event);
+            captured_clone.lock().unwrap().push(event);
         });
         sink.event(TraceEvent::FinalResult {
             body: "done".to_string(),
         });
-        assert_eq!(captured.borrow().len(), 1);
+        assert_eq!(captured.lock().unwrap().len(), 1);
         assert_eq!(
-            captured.borrow()[0],
+            captured.lock().unwrap()[0],
             TraceEvent::FinalResult {
                 body: "done".to_string()
             }
@@ -3331,10 +3393,10 @@ mod trace_sink_tests {
     #[test]
     fn shared_sink_routes_after_install() {
         let shared = Arc::new(SharedTraceSink::new());
-        let captured: Rc<RefCell<Vec<TraceEvent>>> = Default::default();
+        let captured: Arc<Mutex<Vec<TraceEvent>>> = Default::default();
         let captured_c = captured.clone();
         shared.install(Box::new(FnSink::new(move |event| {
-            captured_c.borrow_mut().push(event);
+            captured_c.lock().unwrap().push(event);
         })));
         shared.with_sinks(|sinks| {
             for s in sinks.iter_mut() {
@@ -3343,7 +3405,7 @@ mod trace_sink_tests {
                 });
             }
         });
-        assert_eq!(captured.borrow().len(), 1);
+        assert_eq!(captured.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -3362,23 +3424,23 @@ mod trace_sink_tests {
         // so only `LogSink` survived in the CLI. Make sure both
         // sinks now get every event.
         let shared = Arc::new(SharedTraceSink::new());
-        let captured_a: Rc<RefCell<usize>> = Default::default();
-        let captured_b: Rc<RefCell<usize>> = Default::default();
+        let captured_a: Arc<Mutex<usize>> = Default::default();
+        let captured_b: Arc<Mutex<usize>> = Default::default();
         let ca = captured_a.clone();
         let cb = captured_b.clone();
         shared.install(Box::new(FnSink::new(move |_| {
-            *ca.borrow_mut() += 1;
+            *ca.lock().unwrap() += 1;
         })));
         shared.install(Box::new(FnSink::new(move |_| {
-            *cb.borrow_mut() += 1;
+            *cb.lock().unwrap() += 1;
         })));
         shared.with_sinks(|sinks| {
             for s in sinks.iter_mut() {
                 s.event(TraceEvent::Observing);
             }
         });
-        assert_eq!(*captured_a.borrow(), 1, "first sink got the event");
-        assert_eq!(*captured_b.borrow(), 1, "second sink got the event too");
+        assert_eq!(*captured_a.lock().unwrap(), 1, "first sink got the event");
+        assert_eq!(*captured_b.lock().unwrap(), 1, "second sink got the event too");
     }
 
     #[test]
@@ -3398,9 +3460,11 @@ mod trace_sink_tests {
     fn runner_with_sink_and_policy(
         policy: CompressionPolicy,
     ) -> RealAgentRunner<crate::real_tools::SimulatorExecutor> {
-        let mut cfg = RunnerConfig::default();
-        cfg.probe_ollama_on_run = false;
-        cfg.compression = policy;
+        let cfg = RunnerConfig {
+            probe_ollama_on_run: false,
+            compression: policy,
+            ..Default::default()
+        };
         let mut exec = crate::real_tools::SimulatorExecutor::new();
         exec.connect_ble();
         RealAgentRunner::with_config(exec, cfg)
@@ -3409,22 +3473,24 @@ mod trace_sink_tests {
     #[test]
     fn runner_with_sink_runs_events_through_it() {
         let shared = Arc::new(SharedTraceSink::new());
-        let captured: Rc<RefCell<Vec<TraceEvent>>> = Default::default();
+        let captured: Arc<Mutex<Vec<TraceEvent>>> = Default::default();
         let captured_c = captured.clone();
         shared.install(Box::new(FnSink::new(move |event| {
-            captured_c.borrow_mut().push(event);
+            captured_c.lock().unwrap().push(event);
         })));
 
         let mut runner = runner_with_sink_and_policy(CompressionPolicy::disabled());
         runner.set_trace_sink(Some(shared));
         runner.set_verbose(false); // ensure fallback path is silent
-        // Drive the runner through the simulated path so no
-        // network probe happens.
+                                   // Drive the runner through the simulated path so no
+                                   // network probe happens.
         let result = runner.run("noop");
         assert!(result.is_ok(), "simulated run must succeed");
-        let events = captured.borrow();
+        let events = captured.lock().unwrap();
         assert!(
-            events.iter().any(|e| matches!(e, TraceEvent::RunStart { .. })),
+            events
+                .iter()
+                .any(|e| matches!(e, TraceEvent::RunStart { .. })),
             "missing RunStart event: got {} events",
             events.len()
         );

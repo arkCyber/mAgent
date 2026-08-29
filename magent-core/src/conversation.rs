@@ -235,14 +235,9 @@ pub fn slice_messages(messages: &mut Vec<Message>, max_messages: usize) -> usize
     }
 
     // Build the new list: preserved head + tail.
-    let mut new_messages: Vec<Message> =
-        Vec::with_capacity(max_messages);
+    let mut new_messages: Vec<Message> = Vec::with_capacity(max_messages);
     new_messages.extend(messages[..preserved_head].iter().cloned());
-    new_messages.extend(
-        messages[original_len - tail_budget..]
-            .iter()
-            .cloned(),
-    );
+    new_messages.extend(messages[original_len - tail_budget..].iter().cloned());
     *messages = new_messages;
     original_len - messages.len()
 }
@@ -251,7 +246,10 @@ pub fn slice_messages(messages: &mut Vec<Message>, max_messages: usize) -> usize
 /// oversized tool results, then slice the list to `max_messages`.
 ///
 /// Returns the counters so the caller can record what happened.
-pub fn compress_messages(messages: &mut Vec<Message>, policy: &CompressionPolicy) -> CompressionStats {
+pub fn compress_messages(
+    messages: &mut Vec<Message>,
+    policy: &CompressionPolicy,
+) -> CompressionStats {
     let mut stats = CompressionStats::default();
 
     // Step 1: truncate tool results that are too long. We do this
@@ -435,14 +433,14 @@ mod tests {
         assert_eq!(v[0].role, Role::System);
         assert_eq!(v[0].content, "SYS");
         // Original task survives.
-        assert!(v.iter().any(|m| m.role == Role::User && m.content == "orig task"));
+        assert!(v
+            .iter()
+            .any(|m| m.role == Role::User && m.content == "orig task"));
     }
 
     #[test]
     fn slice_prefers_newest_messages() {
-        let mut v: Vec<Message> = (0..20)
-            .map(|i| user(&format!("u{}", i)))
-            .collect();
+        let mut v: Vec<Message> = (0..20).map(|i| user(&format!("u{}", i))).collect();
         let dropped = slice_messages(&mut v, 5);
         assert_eq!(dropped, 15);
         assert_eq!(v.len(), 5);
@@ -471,15 +469,14 @@ mod tests {
         let dropped = slice_messages(&mut v, 2);
         assert!(dropped >= 1);
         // The user task is still there.
-        assert!(v.iter().any(|m| m.role == Role::User && m.content == "orig task"));
+        assert!(v
+            .iter()
+            .any(|m| m.role == Role::User && m.content == "orig task"));
     }
 
     #[test]
     fn compress_runs_both_steps() {
-        let mut v = vec![
-            system("SYS"),
-            user("orig task"),
-        ];
+        let mut v = vec![system("SYS"), user("orig task")];
         // Add long tool result that should be truncated.
         v.push(tool("c1", &"y".repeat(5_000)));
         // Pad with extra turns so the message count exceeds the cap.
@@ -509,10 +506,13 @@ mod tests {
     fn compress_zero_policy_is_noop() {
         let mut v = vec![user("a"), assistant("b"), tool("c1", "x")];
         let original = v.clone();
-        let stats = compress_messages(&mut v, &CompressionPolicy {
-            max_messages: 0,
-            tool_content_max_chars: 0,
-        });
+        let stats = compress_messages(
+            &mut v,
+            &CompressionPolicy {
+                max_messages: 0,
+                tool_content_max_chars: 0,
+            },
+        );
         assert_eq!(stats.dropped, 0);
         assert_eq!(stats.tool_results_truncated, 0);
         assert_eq!(v, original);
@@ -558,7 +558,7 @@ mod tests {
         // head of the tool payload happened to contain that exact sequence.
         // The marker is now built directly, so user bytes are untouched.
         let head_with_placeholder = "HEAD\x00BYTES\x00TAIL";
-        let body = format!("{} {}", head_with_placeholder, &"x".repeat(5_000));
+        let body = format!("{} {}", head_with_placeholder, "x".repeat(5_000));
         let mut m = tool("call_1", &body);
         assert!(truncate_tool_content(&mut m, 100));
         // The head — including the user's NUL-containing bytes — is preserved.

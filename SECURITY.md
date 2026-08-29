@@ -113,6 +113,51 @@ audit.** It is published to:
 Treat the self-audit as **a roadmap of design intent**, not as a
 certification. A third-party audit is on the post-funding roadmap.
 
+## Production hardening: Secure Boot v2 + Flash Encryption
+
+The default developer build intentionally keeps TLS verification relaxed
+(`CONFIG_ESP_TLS_INSECURE=y`) and does **not** burn security eFuses, so a
+development board is easy to flash and debug. **Do not ship that build.**
+
+For production units the repository ships a hardened provisioning path:
+
+- **`firmware/esp32-app/sdkconfig.prod.defaults`** — the security overlay:
+  - real mbedTLS certificate verification (removes `CONFIG_ESP_TLS_INSECURE`,
+    `CONFIG_OTA_ALLOW_HTTP`, `CONFIG_ESP_HTTP_CLIENT_ALLOW_HTTP_FOR_TESTS`);
+  - **Secure Boot v2** (`CONFIG_SECURE_BOOT` / `CONFIG_SECURE_BOOT_V2_ENABLED`);
+  - **Flash Encryption** (`CONFIG_SECURE_FLASH_ENC_ENABLED`,
+    release mode);
+  - **OTA rollback** (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`) — the production
+    build switches to the OTA-only table **`firmware/esp32-app/partitions.ota.csv`**
+    (no `factory` app, required by anti-rollback), per REQ-FW-005.
+- **`firmware/esp32-app/flash-secure.sh`** — the one-shot provisioning script:
+  generates/reuses the Secure Boot + flash-encryption keys, builds with the
+  overlay, signs the bootloader + app, and (only with `--apply`) burns the
+  eFuses, then flashes the signed/encrypted images.
+
+> ⚠️ **Irreversible.** Burning eFuses is a one-way operation with no software
+> recovery. Run `flash-secure.sh` **without** `--apply` first to prepare keys
+> and images, back up the key directory off-device, then re-run with `--apply`.
+> The exact eFuse/config values must be validated against the IDF version and
+> board before provisioning field units (REQ-FW-004, REQ-FW-005).
+
+## BLE command channel
+
+The BLE `SYS_CMD` characteristic (0x2A08) accepts **arbitrary AT commands** from
+any connected BLE client and dispatches them through the full AT engine
+(`dispatch_at_command`), replying on `SYS_RSP` (0x2A09). This includes
+destructive/privileged commands such as `AT+RESTORE` and `AT+OTA`. **There is no
+authentication or encryption on this channel today** — a device within BLE range
+that connects (e.g. default pairing) can reconfigure or reset the unit.
+
+For untrusted deployments:
+- enable BLE pairing + link-layer encryption (see `ble_config`), or
+- restrict who may connect (whitelist / out-of-band pairing), or
+- build without the `ble` feature (default), where the firmware is UART-only.
+
+Treat `SYS_CMD` as a control-plane channel that must be protected like the
+UART console.
+
 ## Bounty program
 
 The project does not currently run a paid bug-bounty program. We do

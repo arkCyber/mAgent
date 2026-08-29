@@ -73,3 +73,49 @@ impl Clone for AtOutcome {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ok_const_is_no_reply() {
+        assert_eq!(AtOutcome::OK, AtOutcome::NoReply);
+    }
+
+    #[test]
+    fn ok_line_copies_data_into_bounded_buffer() {
+        match AtOutcome::ok_line("+CWSTATE:4") {
+            AtOutcome::Ok { data } => assert_eq!(data.as_str(), "+CWSTATE:4"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ok_line_truncates_at_reply_line_max() {
+        let long = "x".repeat(REPLY_LINE_MAX + 50);
+        match AtOutcome::ok_line(&long) {
+            AtOutcome::Ok { data } => assert!(data.len() <= REPLY_LINE_MAX),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_builds_error_with_code() {
+        assert_eq!(AtOutcome::error(9), AtOutcome::Error { code: 9 });
+    }
+
+    #[test]
+    fn clone_mirrors_all_variants() {
+        assert_eq!(AtOutcome::ok_line("hi").clone(), AtOutcome::ok_line("hi"));
+        assert_eq!(AtOutcome::error(4).clone(), AtOutcome::error(4));
+        assert_eq!(AtOutcome::NoReply.clone(), AtOutcome::NoReply);
+    }
+
+    #[test]
+    fn is_debug_and_eq() {
+        assert!(format!("{:?}", AtOutcome::NoReply).contains("NoReply"));
+        assert!(format!("{:?}", AtOutcome::error(7)).contains('7'));
+        assert_ne!(AtOutcome::NoReply, AtOutcome::error(0));
+    }
+}

@@ -992,7 +992,7 @@ fn run_one_task(task: &ScheduledTask, out: &mut Output) -> Result<(), SchedulerE
             // the user which task failed via the surrounding log
             // line.
             path: PathBuf::from(format!("<magent run> (exit {})", exit)),
-            source: io::Error::new(io::ErrorKind::Other, buf),
+            source: io::Error::other(buf),
         })
     }
 }
@@ -1353,7 +1353,7 @@ fn day_of_week(year: i32, month: u8, day: u8) -> u8 {
 /// a single tick, which is acceptable for a cron daemon (the next
 /// tick will be correct).
 fn epoch_to_local(secs: u64, tz: &SchedulerTimezone) -> BrokenTime {
-    let s = (secs % 86_400) as u64;
+    let s = secs % 86_400;
     let mut day_secs = s;
     let hour = (day_secs / 3600) as u8;
     day_secs %= 3600;
@@ -1398,7 +1398,7 @@ fn epoch_to_local(secs: u64, tz: &SchedulerTimezone) -> BrokenTime {
     };
     if matches!(tz, SchedulerTimezone::Local) {
         let offset = local_offset_seconds();
-        apply_offset(&mut tm, offset as i64);
+        apply_offset(&mut tm, offset);
     }
     tm
 }
@@ -1448,7 +1448,7 @@ fn local_to_epoch(tm: &BrokenTime, tz: &SchedulerTimezone) -> u64 {
         + tm.minute as i64 * 60
         + tm.second as i64;
     if matches!(tz, SchedulerTimezone::Local) {
-        secs -= local_offset_seconds() as i64;
+        secs -= local_offset_seconds();
     }
     secs.max(0) as u64
 }
@@ -1789,8 +1789,12 @@ mod tests {
 
     #[test]
     fn interval_bounds_are_inclusive() {
-        assert!(MIN_INTERVAL_SECS >= 1);
-        assert!(MAX_INTERVAL_SECS <= 86_400);
+        // Constants known at compile time — re-assert here as a
+        // smoke check so a future refactor that flips a sign (or
+        // accidentally orders the constants) trips the test rather
+        // than silently changing the public contract.
+        const { assert!(MIN_INTERVAL_SECS >= 1) };
+        const { assert!(MAX_INTERVAL_SECS <= 86_400) };
     }
 
     #[test]
@@ -1843,9 +1847,11 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("scheduler.json");
-        let mut s = SchedulerState::default();
-        s.schema_version = 1;
-        s.last_started_at = Some(42);
+        let mut s = SchedulerState {
+            schema_version: 1,
+            last_started_at: Some(42),
+            ..Default::default()
+        };
         let mut stats = TaskStats::default();
         stats.record_success();
         s.tasks.insert("t".to_string(), stats);

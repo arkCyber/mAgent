@@ -9,6 +9,10 @@
 //! - `AT+BLE=OFF` — stop advertising
 //! - `AT+BLE=STATE` — print advertising state
 
+// The AT-bridge helpers are kept for wiring into the active `ble_config`
+// command dispatch; until then they are intentionally unused (reserved feature).
+#![allow(dead_code)]
+
 use crate::ble_config::{BleError, BleServer, BleState};
 
 /// Check if a command string is a BLE command

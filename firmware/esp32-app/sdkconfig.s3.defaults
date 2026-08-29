@@ -38,6 +38,10 @@ CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
 
 # ---- Network / TLS (mbedTLS, allow HTTP for local test) ----
 CONFIG_ESP_TLS_USING_MBEDTLS=y
+# DEV-ONLY: skip TLS certificate verification + allow HTTP for local bring-up.
+# PRODUCTION MUST REMOVE THIS. Use `sdkconfig.prod.defaults` via `flash-secure.sh`,
+# which sets `CONFIG_ESP_TLS_INSECURE=n` (real cert verification, REQ-NET-001)
+# and enables Secure Boot v2 + Flash Encryption (REQ-FW-004).
 CONFIG_ESP_TLS_INSECURE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_ESP_HTTP_CLIENT_ALLOW_HTTP_FOR_TESTS=y

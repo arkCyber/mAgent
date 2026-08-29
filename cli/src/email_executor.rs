@@ -200,6 +200,7 @@ impl fmt::Debug for CompositeExecutor {
 }
 
 /// Decide whether a tool name should be routed to the email MCP backend.
+#[allow(dead_code)]
 fn is_email_tool(tool: &str) -> bool {
     tool == "ble_send" || tool.starts_with("mcp__email__")
 }

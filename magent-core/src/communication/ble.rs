@@ -76,7 +76,7 @@ impl BleClient {
         // 3. Gateway forwards to cloud LLM API (or local Ollama)
         // 4. Wait for response
         // 5. Deserialize response
-        
+
         // For now, simulate response with more realistic content
         let response = if prompt.contains("temperature") {
             "The current temperature is 25.5°C"
@@ -103,7 +103,7 @@ impl BleClient {
         // 1. Serialize tool result to BLE message
         // 2. Send via BLE to gateway
         // 3. Gateway forwards to LLM API
-        
+
         Ok(())
     }
 
@@ -119,7 +119,7 @@ impl BleClient {
         // 1. Wait for BLE message from gateway
         // 2. Deserialize LLM response
         // 3. Parse tool calls if any
-        
+
         // For now, simulate response
         Ok(LlmResponse {
             content: heapless::String::try_from("Response content").unwrap(),
@@ -204,7 +204,8 @@ impl BleMessage {
         Ok(Self {
             message_type,
             message_id,
-            payload: heapless::String::try_from(payload).unwrap_or_else(|_| heapless::String::new()),
+            payload: heapless::String::try_from(payload)
+                .unwrap_or_else(|_| heapless::String::new()),
         })
     }
 
@@ -212,8 +213,8 @@ impl BleMessage {
     pub fn to_bytes(&self) -> Result<Vec<u8, 512>> {
         // PATCHED (MicroAgent): see `AgentConfig::to_bytes` for
         // the heapless 0.7→0.9 boundary rationale.
-        let buf = postcard::to_vec::<Self, 512>(self)
-            .map_err(|_| AgentError::ConfigurationError {
+        let buf =
+            postcard::to_vec::<Self, 512>(self).map_err(|_| AgentError::ConfigurationError {
                 field: "serialization",
                 reason: crate::error::ConfigError::TypeMismatch,
             })?;
@@ -233,4 +234,3 @@ impl BleMessage {
         })
     }
 }
-

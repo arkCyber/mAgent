@@ -172,10 +172,10 @@ pub mod skills;
 pub mod tools;
 
 // Health modules (work on both embedded and std)
-pub mod health_sensors;
-pub mod sports_coach;
-pub mod sleep_manager;
 pub mod early_warning;
+pub mod health_sensors;
+pub mod sleep_manager;
+pub mod sports_coach;
 pub mod voice_notification;
 
 // Cross-cutting embedded modules — these only need `core`/`alloc` and
@@ -193,7 +193,13 @@ pub mod safety;
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 pub mod power;
 
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std",
+    feature = "web3"
+))]
 pub mod security;
 
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
@@ -245,23 +251,29 @@ pub mod recovery;
 // ===========================================================================
 // These pull in `reqwest`, the `AgentSimulator`, and the full ReAct loop
 // runner, so they only make sense on a host OS.
-// PATCHED (MicroAgent): Excluded on ESP32 because they use reqwest/ring.
-#[cfg(all(feature = "std", not(feature = "esp32")))]
+// PATCHED (MicroAgent): excluded on the ESP-IDF *device* target
+// (`target_os = "espidf"`), so reqwest/ring never enter a firmware build.
+// We deliberately use `not(target_os = "espidf")` rather than
+// `not(feature = "esp32")`: a host crate such as `magent-lua` enables the
+// `esp32` feature (to get `MiniAgent`) while still building on a host OS,
+// and must NOT flip these modules off (that would break host crates like the
+// `cli` that import `agent_runner`).
+#[cfg(all(feature = "std", not(target_os = "espidf")))]
 pub mod simulator;
 
-#[cfg(all(feature = "std", not(feature = "esp32")))]
+#[cfg(all(feature = "std", not(target_os = "espidf")))]
 pub mod agent_runner;
 
-#[cfg(all(feature = "std", not(feature = "esp32")))]
+#[cfg(all(feature = "std", not(target_os = "espidf")))]
 pub mod conversation;
 
-#[cfg(all(feature = "std", not(feature = "esp32")))]
+#[cfg(all(feature = "std", not(target_os = "espidf")))]
 pub mod summary;
 
-#[cfg(all(feature = "std", not(feature = "esp32")))]
+#[cfg(all(feature = "std", not(target_os = "espidf")))]
 pub mod real_tools;
 
-#[cfg(all(feature = "std", not(feature = "esp32")))]
+#[cfg(all(feature = "std", not(target_os = "espidf")))]
 pub mod web;
 
 #[cfg(feature = "web3")]
@@ -307,7 +319,7 @@ pub mod nrf52_hal {
 pub use config::AgentConfig;
 
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
-pub use security::{SecurityManager, EncryptionMode, SecurityLevel};
+pub use security::{EncryptionMode, SecurityLevel, SecurityManager};
 
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 pub use agent::MiniAgent;

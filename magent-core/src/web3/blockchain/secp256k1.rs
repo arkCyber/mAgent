@@ -190,16 +190,16 @@ impl Secp256k1PublicKey {
         } else {
             signature[64]
         };
-        let recid = RecoveryId::from_i32(recid_byte as i32).map_err(|e| {
-            Web3ErrorKind::BlockchainError(format!("invalid recovery id: {}", e))
-        })?;
+        let recid = RecoveryId::from_i32(recid_byte as i32)
+            .map_err(|e| Web3ErrorKind::BlockchainError(format!("invalid recovery id: {}", e)))?;
         let sig = EcdsaSignature::from_compact(&signature[..64])
             .map_err(|e| Web3ErrorKind::BlockchainError(format!("invalid signature: {}", e)))?;
         let recoverable = RecoverableSignature::from_compact(&signature[..64], recid)
             .map_err(|e| Web3ErrorKind::BlockchainError(format!("invalid recoverable: {}", e)))?;
         let msg = Message::from_digest_slice(message_hash)
             .map_err(|e| Web3ErrorKind::BlockchainError(format!("invalid message: {}", e)))?;
-        let pk = secp.recover_ecdsa(&msg, &recoverable)
+        let pk = secp
+            .recover_ecdsa(&msg, &recoverable)
             .map_err(|e| Web3ErrorKind::BlockchainError(format!("recover failed: {}", e)))?;
         let _ = sig;
         let full = pk.serialize_uncompressed();
@@ -253,7 +253,11 @@ impl Secp256k1Keypair {
         let secret = Secp256k1SecretKey::from_bytes(bytes)?;
         let public = secret.public_key()?;
         let address = public.to_address();
-        Ok(Self { secret, public, address })
+        Ok(Self {
+            secret,
+            public,
+            address,
+        })
     }
 
     /// Import from hex string
@@ -263,7 +267,11 @@ impl Secp256k1Keypair {
         {
             let public = secret.public_key()?;
             let address = public.to_address();
-            Ok(Self { secret, public, address })
+            Ok(Self {
+                secret,
+                public,
+                address,
+            })
         }
         #[cfg(not(feature = "web3"))]
         {
@@ -311,10 +319,16 @@ pub fn generate_keypair() -> Secp256k1Keypair {
     let public_bytes = pk.serialize_uncompressed();
     let mut uncompressed = [0u8; 64];
     uncompressed.copy_from_slice(&public_bytes[1..65]);
-    let secret = Secp256k1SecretKey { bytes: secret_bytes };
+    let secret = Secp256k1SecretKey {
+        bytes: secret_bytes,
+    };
     let public = Secp256k1PublicKey { uncompressed };
     let address = public.to_address();
-    Secp256k1Keypair { secret, public, address }
+    Secp256k1Keypair {
+        secret,
+        public,
+        address,
+    }
 }
 
 /// Generate a deterministic test keypair (for tests only).
@@ -334,10 +348,16 @@ pub fn generate_test_keypair() -> Secp256k1Keypair {
     let public_bytes = pk.serialize_uncompressed();
     let mut uncompressed = [0u8; 64];
     uncompressed.copy_from_slice(&public_bytes[1..65]);
-    let secret = Secp256k1SecretKey { bytes: secret_bytes };
+    let secret = Secp256k1SecretKey {
+        bytes: secret_bytes,
+    };
     let public = Secp256k1PublicKey { uncompressed };
     let address = public.to_address();
-    Secp256k1Keypair { secret, public, address }
+    Secp256k1Keypair {
+        secret,
+        public,
+        address,
+    }
 }
 
 // ============================================================================
@@ -353,16 +373,23 @@ pub struct EthereumSignature {
 // Manual Serialize/Deserialize implementations for EthereumSignature
 // because [u8; 65] doesn't have a serde derive impl by default.
 impl serde::Serialize for EthereumSignature {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> core::result::Result<S::Ok, S::Error> {
         self.bytes.to_vec().serialize(serializer)
     }
 }
 
 impl<'de> serde::Deserialize<'de> for EthereumSignature {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> core::result::Result<Self, D::Error> {
         let bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::deserialize(deserializer)?;
         if bytes.len() != 65 {
-            return Err(serde::de::Error::custom("expected 65 bytes for EthereumSignature"));
+            return Err(serde::de::Error::custom(
+                "expected 65 bytes for EthereumSignature",
+            ));
         }
         let mut arr = [0u8; 65];
         arr.copy_from_slice(&bytes);
@@ -388,12 +415,16 @@ impl EthereumSignature {
 
     /// Get r value
     pub fn r(&self) -> &[u8; 32] {
-        self.bytes[..32].try_into().expect("signature is 65 bytes; first 32 are r")
+        self.bytes[..32]
+            .try_into()
+            .expect("signature is 65 bytes; first 32 are r")
     }
 
     /// Get s value
     pub fn s(&self) -> &[u8; 32] {
-        self.bytes[32..64].try_into().expect("signature is 65 bytes; s spans 32..64")
+        self.bytes[32..64]
+            .try_into()
+            .expect("signature is 65 bytes; s spans 32..64")
     }
 
     /// Convert to hex string
@@ -620,10 +651,7 @@ impl TransactionSigner {
     /// and [`Self::eip712_hash_struct`] before passing to
     /// [`Self::sign_typed_data_hash`].
     #[cfg(feature = "web3")]
-    pub fn eip712_digest(
-        domain_separator: &[u8; 32],
-        message_hash: &[u8; 32],
-    ) -> [u8; 32] {
+    pub fn eip712_digest(domain_separator: &[u8; 32], message_hash: &[u8; 32]) -> [u8; 32] {
         use sha3::{Digest, Keccak256};
         let mut hasher = Keccak256::new();
         hasher.update([0x19, 0x01]);
@@ -768,10 +796,7 @@ mod tests {
         let k1 = Secp256k1Keypair::generate();
         let k2 = Secp256k1Keypair::generate();
         assert_ne!(k1.address().to_hex(), k2.address().to_hex());
-        assert_ne!(
-            k1.secret_key().as_bytes(),
-            k2.secret_key().as_bytes()
-        );
+        assert_ne!(k1.secret_key().as_bytes(), k2.secret_key().as_bytes());
     }
 
     #[cfg(feature = "web3")]
@@ -787,7 +812,11 @@ mod tests {
         // (0x + 40 hex digits).
         assert_eq!(kp.address().to_hex().len(), 42);
         // Address hex should be lowercased.
-        assert!(kp.address().to_hex().chars().all(|c| c.is_ascii_hexdigit() || c == 'x'));
+        assert!(kp
+            .address()
+            .to_hex()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == 'x'));
     }
 
     #[cfg(feature = "web3")]
@@ -831,12 +860,8 @@ mod tests {
         let tx_hash: [u8; 32] = [0x42; 32];
         let chain_id = 1u64;
 
-        let sig = TransactionSigner::sign_legacy_eip155(
-            kp.secret_key(),
-            &tx_hash,
-            chain_id,
-        )
-        .unwrap();
+        let sig =
+            TransactionSigner::sign_legacy_eip155(kp.secret_key(), &tx_hash, chain_id).unwrap();
 
         // Re-derive the expected v from a fresh signature's recid, because
         // sign_legacy_eip155 overwrites the v byte in-place.
@@ -878,10 +903,7 @@ mod tests {
         let sig = TransactionSigner::sign_hash(kp.secret_key(), &msg_hash).unwrap();
 
         let recovered = Secp256k1PublicKey::recover_from(&msg_hash, sig.as_bytes()).unwrap();
-        assert_eq!(
-            recovered.to_address().to_hex(),
-            kp.address().to_hex()
-        );
+        assert_eq!(recovered.to_address().to_hex(), kp.address().to_hex());
     }
 
     #[test]
@@ -936,14 +958,8 @@ mod tests {
     fn test_eip712_domain_separator_omits_unset_fields() {
         // A domain with no fields reduces to keccak256(type_hash).
         let type_hash = [7u8; 32];
-        let none = TransactionSigner::eip712_domain_separator(
-            &type_hash,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let none =
+            TransactionSigner::eip712_domain_separator(&type_hash, None, None, None, None, None);
         // A domain with one field set is different from the empty case.
         let some = TransactionSigner::eip712_domain_separator(
             &type_hash,
@@ -989,9 +1005,8 @@ mod tests {
         let kp = Secp256k1Keypair::generate();
 
         // 1. Domain separator.
-        let domain_type = TransactionSigner::eip712_hash_type_hash(
-            "EIP712Domain(string name,uint256 chainId)",
-        );
+        let domain_type =
+            TransactionSigner::eip712_hash_type_hash("EIP712Domain(string name,uint256 chainId)");
         let name_hash = TransactionSigner::eip712_hash_type_hash("MyDApp");
         let chain_id_bytes: [u8; 32] = {
             // chainId = 1, big-endian 32-byte.
@@ -1009,14 +1024,12 @@ mod tests {
         );
 
         // 2. Message struct hash.
-        let person_type =
-            TransactionSigner::eip712_hash_type_hash("Person(address wallet)");
+        let person_type = TransactionSigner::eip712_hash_type_hash("Person(address wallet)");
         let mut wallet_bytes = [0u8; 32];
         // 20-byte address → left-pad with zeros to 32.
         let addr_bytes = kp.address().0;
         wallet_bytes[12..32].copy_from_slice(&addr_bytes);
-        let msg_struct =
-            TransactionSigner::eip712_hash_struct(&person_type, &[&wallet_bytes]);
+        let msg_struct = TransactionSigner::eip712_hash_struct(&person_type, &[&wallet_bytes]);
 
         // 3. Final digest.
         let digest = TransactionSigner::eip712_digest(&domain_sep, &msg_struct);
@@ -1037,8 +1050,7 @@ mod tests {
         let kp = Secp256k1Keypair::generate();
         let digest: [u8; 32] = [0x42; 32];
 
-        let sig =
-            TransactionSigner::sign_typed_data_hash(kp.secret_key(), &digest).unwrap();
+        let sig = TransactionSigner::sign_typed_data_hash(kp.secret_key(), &digest).unwrap();
         assert!(TransactionSigner::verify(&digest, &sig, kp.address()).unwrap());
     }
 

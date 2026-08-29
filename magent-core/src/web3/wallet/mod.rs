@@ -37,11 +37,11 @@
 
 #![cfg(feature = "wallet")]
 
-pub mod error;
 pub mod bip39;
 /// Official BIP-39 English wordlist (2048 words). Internal data table;
 /// parse/generate through [`bip39`] rather than indexing this directly.
 mod english;
+pub mod error;
 pub mod keystore;
 pub mod wallet;
 
@@ -49,10 +49,10 @@ pub mod wallet;
 #[cfg(feature = "esp32_nvs")]
 pub mod esp32_nvs;
 
-pub use error::{WalletError, WalletResult};
 pub use bip39::{Mnemonic, MnemonicType, WordList};
+pub use error::{WalletError, WalletResult};
 pub use keystore::{Keystore, KeystoreError, KeystoreMetadata};
 pub use wallet::{
-    derive_address, derive_private_key, sign_transaction_hash, Wallet, WalletManager,
-    DerivationPath,
+    derive_address, derive_private_key, sign_transaction_hash, DerivationPath, Wallet,
+    WalletManager,
 };

@@ -57,9 +57,9 @@ impl HeartRateZone {
             HeartRateZone::WarmUp
         } else if percentage < 70.0 {
             HeartRateZone::FatBurn
-        } else if percentage < 85.0 {
+        } else if percentage < 80.0 {
             HeartRateZone::Cardio
-        } else if percentage < 95.0 {
+        } else if percentage < 90.0 {
             HeartRateZone::Peak
         } else {
             HeartRateZone::Danger
@@ -617,5 +617,205 @@ mod std_impl {
 
             EcgData::new(hr, rhythm, rr_interval, 95, 0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heart_rate_zone_names() {
+        assert_eq!(HeartRateZone::Rest.name(), "Rest");
+        assert_eq!(HeartRateZone::WarmUp.name(), "Warm-up");
+        assert_eq!(HeartRateZone::FatBurn.name(), "Fat Burn");
+        assert_eq!(HeartRateZone::Cardio.name(), "Cardio");
+        assert_eq!(HeartRateZone::Peak.name(), "Peak");
+        assert_eq!(HeartRateZone::Danger.name(), "Danger");
+    }
+
+    #[test]
+    fn heart_rate_zone_matches_documented_bands() {
+        // age 30 -> max_hr 190. Bands: <50 Rest, <60 WarmUp, <70 FatBurn,
+        // <80 Cardio, <90 Peak, >=90 Danger.
+        assert_eq!(HeartRateZone::from_hr_and_age(90, 30), HeartRateZone::Rest);
+        assert_eq!(
+            HeartRateZone::from_hr_and_age(95, 30),
+            HeartRateZone::WarmUp
+        );
+        assert_eq!(
+            HeartRateZone::from_hr_and_age(114, 30),
+            HeartRateZone::FatBurn
+        );
+        assert_eq!(
+            HeartRateZone::from_hr_and_age(133, 30),
+            HeartRateZone::Cardio
+        );
+        assert_eq!(HeartRateZone::from_hr_and_age(152, 30), HeartRateZone::Peak);
+        assert_eq!(
+            HeartRateZone::from_hr_and_age(171, 30),
+            HeartRateZone::Danger
+        );
+        assert_eq!(
+            HeartRateZone::from_hr_and_age(189, 30),
+            HeartRateZone::Danger
+        );
+    }
+
+    #[test]
+    fn stress_level_from_hrv_and_description() {
+        assert_eq!(StressLevel::from_hrv(80.0), StressLevel::Low);
+        assert_eq!(StressLevel::from_hrv(79.9), StressLevel::Moderate);
+        assert_eq!(StressLevel::from_hrv(50.0), StressLevel::Moderate);
+        assert_eq!(StressLevel::from_hrv(49.9), StressLevel::High);
+        assert_eq!(StressLevel::from_hrv(25.0), StressLevel::High);
+        assert_eq!(StressLevel::from_hrv(24.9), StressLevel::VeryHigh);
+        assert_eq!(StressLevel::Low.description(), "Relaxed");
+        assert_eq!(StressLevel::Moderate.description(), "Normal");
+        assert_eq!(StressLevel::High.description(), "Stressed");
+        assert_eq!(StressLevel::VeryHigh.description(), "Very Stressed");
+    }
+
+    #[test]
+    fn glucose_status_and_descriptions() {
+        assert_eq!(GlucoseStatus::from_glucose(69.9), GlucoseStatus::Low);
+        assert_eq!(GlucoseStatus::from_glucose(70.0), GlucoseStatus::Normal);
+        assert_eq!(GlucoseStatus::from_glucose(99.9), GlucoseStatus::Normal);
+        assert_eq!(GlucoseStatus::from_glucose(100.0), GlucoseStatus::Elevated);
+        assert_eq!(GlucoseStatus::from_glucose(125.9), GlucoseStatus::Elevated);
+        assert_eq!(GlucoseStatus::from_glucose(126.0), GlucoseStatus::High);
+        assert!(GlucoseStatus::Low.description().contains("Hypoglycemia"));
+        assert!(GlucoseStatus::High.description().contains("Diabetes"));
+    }
+
+    #[test]
+    fn heart_rhythm_descriptions() {
+        assert_eq!(HeartRhythm::Normal.description(), "Normal Sinus Rhythm");
+        assert_eq!(
+            HeartRhythm::Bradycardia.description(),
+            "Bradycardia (HR < 60 BPM)"
+        );
+        assert_eq!(
+            HeartRhythm::Tachycardia.description(),
+            "Tachycardia (HR > 100 BPM)"
+        );
+        assert_eq!(
+            HeartRhythm::Irregular.description(),
+            "Irregular Rhythm Detected"
+        );
+        assert_eq!(HeartRhythm::Other.description(), "Other Rhythm Pattern");
+    }
+
+    #[test]
+    fn sensor_data_methods() {
+        let hr = HeartRateData::new(100, 60.0, Some(98), 1000);
+        assert!(hr.is_safe());
+        assert_eq!(hr.zone(), HeartRateZone::from_hr_and_age(100, 30));
+        assert_eq!(hr.stress_level(), StressLevel::Moderate);
+        let hi = HeartRateData::new(200, 10.0, None, 0);
+        assert!(!hi.is_safe());
+        assert_eq!(hi.stress_level(), StressLevel::VeryHigh);
+
+        let g = GlucoseData::new(90.0, 0, 1);
+        assert_eq!(g.status(), GlucoseStatus::Normal);
+        assert!(g.is_safe());
+        let g_high = GlucoseData::new(200.0, 0, 1);
+        assert!(!g_high.is_safe());
+        assert_eq!(g_high.status(), GlucoseStatus::High);
+
+        let ecg_ok = EcgData::new(72, HeartRhythm::Normal, 833.0, 90, 1);
+        assert!(ecg_ok.is_quality_acceptable());
+        let ecg_bad = EcgData::new(72, HeartRhythm::Irregular, 833.0, 50, 1);
+        assert!(!ecg_bad.is_quality_acceptable());
+
+        assert!(TemperatureData::new(37.0, 1).is_normal());
+        assert!(TemperatureData::new(38.0, 1).has_fever());
+        assert!(!TemperatureData::new(35.0, 1).is_normal());
+        assert!(!TemperatureData::new(35.0, 1).has_fever());
+    }
+
+    #[test]
+    fn user_profile_default_new_and_errors() {
+        let d = UserProfile::default();
+        assert_eq!(d.age, 30);
+        assert_eq!(d.resting_hr, 60);
+        assert_eq!(d.max_hr, 190);
+        assert_eq!(d.heart_rate_reserve(), 130);
+
+        let p = UserProfile::new(40, "Alice", "123").unwrap();
+        assert_eq!(p.age, 40);
+        assert_eq!(p.max_hr, 180);
+        assert_eq!(p.heart_rate_reserve(), 120);
+
+        // Overlong name / contact -> typed error, not a panic.
+        let long_name = "x".repeat(65);
+        assert!(UserProfile::new(30, &long_name, "123").is_err());
+        let long_contact = "1".repeat(33);
+        assert!(UserProfile::new(30, "A", &long_contact).is_err());
+    }
+
+    #[test]
+    fn target_hr_covers_all_zones() {
+        let p = UserProfile::default(); // rest 60, max 190, hrr 130
+        assert_eq!(p.target_hr(HeartRateZone::Rest), (60, 60));
+        assert_eq!(p.target_hr(HeartRateZone::Danger), (190, 220));
+        let (lo, hi) = p.target_hr(HeartRateZone::Cardio);
+        assert!(lo <= hi);
+        assert!(lo >= 60 && hi <= 190);
+    }
+
+    #[test]
+    fn manager_tracks_history_and_trends() {
+        let mut m = HealthSensorManager::new();
+        assert_eq!(m.profile().age, 30);
+
+        assert!(m.latest_heart_rate().is_none());
+        assert!(m.average_hr(5).is_none());
+        assert!(m.average_hrv(5).is_none());
+        assert!(!m.is_exercising());
+        assert_eq!(m.current_stress(), StressLevel::Low);
+
+        m.add_heart_rate(HeartRateData::new(70, 60.0, None, 1))
+            .unwrap();
+        m.add_heart_rate(HeartRateData::new(100, 20.0, None, 2))
+            .unwrap();
+        m.add_heart_rate(HeartRateData::new(110, 10.0, None, 3))
+            .unwrap();
+
+        assert_eq!(m.heart_rate_history().len(), 3);
+        assert_eq!(m.latest_heart_rate().unwrap().hr, 110);
+        assert!((m.average_hr(3).unwrap() - 93.33).abs() < 0.1);
+        assert!((m.average_hrv(2).unwrap() - 15.0).abs() < 0.01);
+        assert!(m.is_exercising(), "110 > resting 60 + 30");
+        assert_eq!(m.current_stress(), StressLevel::VeryHigh);
+
+        m.add_glucose(GlucoseData::new(95.0, 0, 1)).unwrap();
+        assert_eq!(m.latest_glucose().unwrap().glucose, 95.0);
+        m.add_ecg(EcgData::new(72, HeartRhythm::Normal, 833.0, 90, 1))
+            .unwrap();
+        assert_eq!(m.latest_ecg().unwrap().hr, 72);
+        m.add_temperature(TemperatureData::new(37.0, 1)).unwrap();
+        assert!((m.latest_temperature().unwrap().temperature - 37.0).abs() < 1e-6);
+
+        m.clear_history();
+        assert!(m.latest_heart_rate().is_none());
+        assert!(m.latest_glucose().is_none());
+        assert!(m.latest_ecg().is_none());
+        assert!(m.latest_temperature().is_none());
+    }
+
+    #[test]
+    fn history_caps_at_max_and_drops_oldest() {
+        let mut m = HealthSensorManager::new();
+        for i in 0..MAX_HEALTH_HISTORY as u32 + 5 {
+            m.add_heart_rate(HeartRateData::new((i % 200) as u16, 50.0, None, i))
+                .unwrap();
+        }
+        assert_eq!(m.hr_history.len(), MAX_HEALTH_HISTORY);
+        // Oldest (timestamps 0..5) dropped; latest is MAX+4.
+        assert_eq!(
+            m.latest_heart_rate().unwrap().timestamp,
+            MAX_HEALTH_HISTORY as u32 + 4
+        );
     }
 }

@@ -192,7 +192,13 @@ impl Keystore {
         if self.salt.len() != SALT_LEN || self.nonce.len() != NONCE_LEN {
             return Err(KeystoreError::Malformed("salt/nonce length".into()));
         }
-        let key = derive_key(passphrase, &self.salt, self.memory_kib, self.time_cost, self.parallelism)?;
+        let key = derive_key(
+            passphrase,
+            &self.salt,
+            self.memory_kib,
+            self.time_cost,
+            self.parallelism,
+        )?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
         let plaintext = cipher
             .decrypt(Nonce::from_slice(&self.nonce), self.ciphertext.as_slice())
@@ -260,7 +266,9 @@ impl Keystore {
         let ciphertext = bytes[16 + SALT_LEN + NONCE_LEN..].to_vec();
 
         if version != KEYSTORE_VERSION {
-            return Err(KeystoreError::Malformed(format!("unsupported version {version}")));
+            return Err(KeystoreError::Malformed(format!(
+                "unsupported version {version}"
+            )));
         }
         Ok(Self {
             name: name.to_string(),
@@ -357,16 +365,14 @@ mod tests {
     use super::*;
 
     const KEY: [u8; 32] = [
-        0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-        0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
-        0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+        0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60,
+        0x70, 0x80,
     ];
 
     #[test]
     fn encrypt_decrypt_round_trips() {
-        let ks =
-            Keystore::encrypt_private_key("w", &KEY, "hunter2", Some("0xabc".into())).unwrap();
+        let ks = Keystore::encrypt_private_key("w", &KEY, "hunter2", Some("0xabc".into())).unwrap();
         assert!(ks.is_sealed());
         let decrypted = ks.decrypt_private_key("hunter2").unwrap();
         assert_eq!(decrypted, KEY);
@@ -477,4 +483,3 @@ mod tests {
         assert_eq!(hex_encode(&[]), "");
     }
 }
-

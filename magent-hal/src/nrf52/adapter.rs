@@ -234,8 +234,7 @@ impl Ble for NrfBle {
     type Error = NrfError;
 
     fn is_connected(&self) -> bool {
-        self.connected
-            .load(core::sync::atomic::Ordering::Acquire)
+        self.connected.load(core::sync::atomic::Ordering::Acquire)
     }
 
     fn send(&mut self, data: &[u8]) -> Result<usize, Self::Error> {
@@ -336,7 +335,10 @@ impl Default for NrfPower {
 impl core::fmt::Debug for NrfPower {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("NrfPower")
-            .field("current", &Self::decode(self.current.load(core::sync::atomic::Ordering::Acquire)))
+            .field(
+                "current",
+                &Self::decode(self.current.load(core::sync::atomic::Ordering::Acquire)),
+            )
             .finish()
     }
 }
@@ -352,5 +354,99 @@ impl Power for NrfPower {
         self.current
             .store(Self::encode(profile), core::sync::atomic::Ordering::Release);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nrf_error_display() {
+        assert_eq!(
+            format!("{}", NrfError::InvalidMode),
+            "invalid pin mode for operation"
+        );
+        assert_eq!(format!("{}", NrfError::OutOfRange), "address out of range");
+        assert_eq!(
+            format!("{}", NrfError::NotConnected),
+            "BLE link is not connected"
+        );
+        assert_eq!(format!("{}", NrfError::Backend), "nRF52 backend error");
+    }
+
+    #[test]
+    fn gpio_configure_write_read() {
+        let mut g = NrfGpio::new(13);
+        assert_eq!(g.pin(), 13);
+        g.configure(PinMode::Output).unwrap();
+        assert!(matches!(g.read_level(), Ok(PinLevel::Low)));
+        g.set_level(PinLevel::High).unwrap();
+        assert!(matches!(g.read_level(), Ok(PinLevel::High)));
+        // Input mode rejects writes.
+        g.configure(PinMode::Input).unwrap();
+        assert_eq!(g.set_level(PinLevel::High), Err(NrfError::InvalidMode));
+    }
+
+    #[test]
+    fn flash_roundtrip_erase_and_bounds() {
+        let mut f = NrfFlash::new(1024);
+        assert_eq!(f.capacity(), 1024);
+        let mut buf = [0u8; 4];
+        f.read(0, &mut buf).unwrap();
+        assert_eq!(buf, [0xFF; 4]);
+        f.write(8, &[0xAB, 0xCD]).unwrap();
+        f.read(8, &mut buf[..2]).unwrap();
+        assert_eq!(&buf[..2], &[0xAB, 0xCD]);
+        assert_eq!(f.read(1000, &mut [0u8; 100]), Err(NrfError::OutOfRange));
+        assert_eq!(f.write(1000, &[0u8; 100]), Err(NrfError::OutOfRange));
+        f.erase_sector(0).unwrap();
+        f.read(8, &mut buf[..2]).unwrap();
+        assert_eq!(&buf[..2], &[0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn flash_write_is_and_only() {
+        let mut f = NrfFlash::new(1024);
+        f.write(0, &[0xF0]).unwrap();
+        f.write(0, &[0x0F]).unwrap();
+        let mut b = [0u8; 1];
+        f.read(0, &mut b).unwrap();
+        assert_eq!(b[0], 0x00); // 0xF0 & 0x0F = 0x00 (flash can only clear bits)
+    }
+
+    #[test]
+    fn ble_connect_and_send() {
+        let mut b = NrfBle::new();
+        assert!(!b.is_connected());
+        assert_eq!(b.send(b"hi"), Err(NrfError::NotConnected));
+        b.set_connected(true);
+        assert!(b.is_connected());
+        assert_eq!(b.send(b"hello").unwrap(), 5);
+        b.set_connected(false);
+        assert!(!b.is_connected());
+    }
+
+    #[test]
+    fn temperature_read() {
+        let mut t = NrfTemperature::new(37.5);
+        assert_eq!(t.read().unwrap(), 37.5);
+        let mut d = NrfTemperature::default();
+        assert_eq!(d.read().unwrap(), 25.0);
+    }
+
+    #[test]
+    fn power_profiles_roundtrip() {
+        let mut p = NrfPower::new();
+        assert_eq!(p.current(), PowerProfile::Active);
+        for profile in [
+            PowerProfile::Idle,
+            PowerProfile::LowPower,
+            PowerProfile::DeepSleep,
+            PowerProfile::Active,
+        ] {
+            p.set(profile).unwrap();
+            assert_eq!(p.current(), profile);
+        }
     }
 }

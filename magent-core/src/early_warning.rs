@@ -315,17 +315,20 @@ impl EcgAnalysis {
             self.risk_level = AlertSeverity::Critical;
             self.recommendation = String::try_from(
                 "Serious cardiac anomaly detected. Seek immediate medical attention.",
-            ).unwrap();
+            )
+            .unwrap();
         } else if anomaly_count >= 2 {
             self.risk_level = AlertSeverity::High;
             self.recommendation = String::try_from(
                 "Multiple cardiac irregularities detected. Consult a cardiologist.",
-            ).unwrap();
+            )
+            .unwrap();
         } else if anomaly_count >= 1 {
             self.risk_level = AlertSeverity::Medium;
             self.recommendation = String::try_from(
                 "Minor cardiac irregularity detected. Monitor and consider medical consultation.",
-            ).unwrap();
+            )
+            .unwrap();
         }
     }
 }
@@ -463,10 +466,17 @@ impl EarlyWarningSystem {
     /// Add hospital
     pub fn add_hospital(&mut self, hospital: Hospital) -> Result<()> {
         if self.hospitals.push(hospital.clone()).is_err() {
-            // Remove farthest if full
-            if let Some(pos) = self.hospitals.iter().position(|h| {
-                h.distance_m.unwrap_or(u32::MAX) > hospital.distance_m.unwrap_or(u32::MAX)
-            }) {
+            // Remove the farthest hospital to make room (they're kept sorted by
+            // distance, so the farthest is the max-distance element). Evicting
+            // the farthest (not the first-farther-than-new) matches the stated
+            // "keep the nearest hospitals" policy.
+            if let Some(pos) = self
+                .hospitals
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, h)| h.distance_m.unwrap_or(u32::MAX))
+                .map(|(i, _)| i)
+            {
                 let _ = self.hospitals.remove(pos);
                 let _ = self.hospitals.push(hospital);
             }
@@ -992,7 +1002,11 @@ mod tests {
         let mut m = mgr();
         // 50 mg/dL < 54 → critical regardless of consecutive count.
         let alert = m
-            .process_glucose(&GlucoseData::new(50.0, -1, 400_000), &UserProfile::default(), 400_000)
+            .process_glucose(
+                &GlucoseData::new(50.0, -1, 400_000),
+                &UserProfile::default(),
+                400_000,
+            )
             .expect("alert");
         assert_eq!(alert.alert_type, AlertType::GlucoseLow);
         assert_eq!(alert.severity, AlertSeverity::Critical);
@@ -1004,12 +1018,20 @@ mod tests {
         let mut m = mgr();
         // First low (60) → Medium (consecutive_low_count 1 < 2).
         let a1 = m
-            .process_glucose(&GlucoseData::new(60.0, -1, 400_000), &UserProfile::default(), 400_000)
+            .process_glucose(
+                &GlucoseData::new(60.0, -1, 400_000),
+                &UserProfile::default(),
+                400_000,
+            )
             .expect("first");
         assert_eq!(a1.severity, AlertSeverity::Medium);
         // Second low (65) → High (consecutive_low_count 2 >= 2).
         let a2 = m
-            .process_glucose(&GlucoseData::new(65.0, -1, 700_000), &UserProfile::default(), 700_000)
+            .process_glucose(
+                &GlucoseData::new(65.0, -1, 700_000),
+                &UserProfile::default(),
+                700_000,
+            )
             .expect("second");
         assert_eq!(a2.severity, AlertSeverity::High);
     }
@@ -1018,7 +1040,11 @@ mod tests {
     fn glucose_critical_high_triggers_critical() {
         let mut m = mgr();
         let alert = m
-            .process_glucose(&GlucoseData::new(260.0, 1, 400_000), &UserProfile::default(), 400_000)
+            .process_glucose(
+                &GlucoseData::new(260.0, 1, 400_000),
+                &UserProfile::default(),
+                400_000,
+            )
             .expect("alert");
         assert_eq!(alert.alert_type, AlertType::GlucoseHigh);
         assert_eq!(alert.severity, AlertSeverity::Critical);
@@ -1029,13 +1055,25 @@ mod tests {
         let mut m = mgr();
         // Three high readings (200) → Medium, Medium, then High.
         let a1 = m
-            .process_glucose(&GlucoseData::new(200.0, 1, 400_000), &UserProfile::default(), 400_000)
+            .process_glucose(
+                &GlucoseData::new(200.0, 1, 400_000),
+                &UserProfile::default(),
+                400_000,
+            )
             .expect("1");
         let a2 = m
-            .process_glucose(&GlucoseData::new(200.0, 1, 700_000), &UserProfile::default(), 700_000)
+            .process_glucose(
+                &GlucoseData::new(200.0, 1, 700_000),
+                &UserProfile::default(),
+                700_000,
+            )
             .expect("2");
         let a3 = m
-            .process_glucose(&GlucoseData::new(200.0, 1, 1_000_000), &UserProfile::default(), 1_000_000)
+            .process_glucose(
+                &GlucoseData::new(200.0, 1, 1_000_000),
+                &UserProfile::default(),
+                1_000_000,
+            )
             .expect("3");
         assert_eq!(a1.severity, AlertSeverity::Medium);
         assert_eq!(a2.severity, AlertSeverity::Medium);
@@ -1047,7 +1085,11 @@ mod tests {
         // Falling (trend -1) below 100 → GlucoseTrendFalling.
         let mut m = mgr();
         let a = m
-            .process_glucose(&GlucoseData::new(90.0, -1, 400_000), &UserProfile::default(), 400_000)
+            .process_glucose(
+                &GlucoseData::new(90.0, -1, 400_000),
+                &UserProfile::default(),
+                400_000,
+            )
             .expect("falling");
         assert_eq!(a.alert_type, AlertType::GlucoseTrendFalling);
         assert_eq!(a.severity, AlertSeverity::Medium);
@@ -1055,7 +1097,11 @@ mod tests {
         // Rising (trend 1) above 150 → GlucoseTrendRising.
         let mut m2 = mgr();
         let a2 = m2
-            .process_glucose(&GlucoseData::new(160.0, 1, 400_000), &UserProfile::default(), 400_000)
+            .process_glucose(
+                &GlucoseData::new(160.0, 1, 400_000),
+                &UserProfile::default(),
+                400_000,
+            )
             .expect("rising");
         assert_eq!(a2.alert_type, AlertType::GlucoseTrendRising);
     }
@@ -1063,28 +1109,50 @@ mod tests {
     #[test]
     fn glucose_normal_produces_no_alert() {
         let mut m = mgr();
-        assert!(m.process_glucose(&GlucoseData::new(100.0, 0, 400_000), &UserProfile::default(), 400_000).is_none());
+        assert!(m
+            .process_glucose(
+                &GlucoseData::new(100.0, 0, 400_000),
+                &UserProfile::default(),
+                400_000
+            )
+            .is_none());
     }
 
     #[test]
     fn glucose_alerts_respect_cooldown() {
         let mut m = mgr();
         // First critical-low alert at t=400000.
-        assert!(m.process_glucose(&GlucoseData::new(50.0, -1, 400_000), &UserProfile::default(), 400_000).is_some());
+        assert!(m
+            .process_glucose(
+                &GlucoseData::new(50.0, -1, 400_000),
+                &UserProfile::default(),
+                400_000
+            )
+            .is_some());
         // A second alert 30s later (within the 5-min cooldown) is suppressed.
-        assert!(m.process_glucose(&GlucoseData::new(52.0, -1, 430_000), &UserProfile::default(), 430_000).is_none());
+        assert!(m
+            .process_glucose(
+                &GlucoseData::new(52.0, -1, 430_000),
+                &UserProfile::default(),
+                430_000
+            )
+            .is_none());
     }
 
     #[test]
     fn ecg_bradycardia_and_tachycardia_are_critical() {
         let mut m = mgr();
         // Bradycardia with hr < 40 → Critical.
-        let (alert, _analysis) = m.process_ecg(&ecg(35, HeartRhythm::Bradycardia, 120_000), 120_000).expect("brady");
+        let (alert, _analysis) = m
+            .process_ecg(&ecg(35, HeartRhythm::Bradycardia, 120_000), 120_000)
+            .expect("brady");
         assert_eq!(alert.severity, AlertSeverity::Critical);
 
         let mut m2 = mgr();
         // Tachycardia with hr > 180 → Critical.
-        let (alert2, _) = m2.process_ecg(&ecg(190, HeartRhythm::Tachycardia, 120_000), 120_000).expect("tachy");
+        let (alert2, _) = m2
+            .process_ecg(&ecg(190, HeartRhythm::Tachycardia, 120_000), 120_000)
+            .expect("tachy");
         assert_eq!(alert2.severity, AlertSeverity::Critical);
     }
 
@@ -1094,7 +1162,9 @@ mod tests {
         // "serious" by `assess_risk`, which escalates the overall risk to
         // Critical (conservative over-alerting).
         let mut m = mgr();
-        let (alert, _) = m.process_ecg(&ecg(80, HeartRhythm::Irregular, 120_000), 120_000).expect("alert");
+        let (alert, _) = m
+            .process_ecg(&ecg(80, HeartRhythm::Irregular, 120_000), 120_000)
+            .expect("alert");
         assert_eq!(alert.alert_type, AlertType::EcgAnomaly);
         assert_eq!(alert.severity, AlertSeverity::Critical);
     }
@@ -1102,7 +1172,9 @@ mod tests {
     #[test]
     fn ecg_normal_produces_no_alert() {
         let mut m = mgr();
-        assert!(m.process_ecg(&ecg(70, HeartRhythm::Normal, 120_000), 120_000).is_none());
+        assert!(m
+            .process_ecg(&ecg(70, HeartRhythm::Normal, 120_000), 120_000)
+            .is_none());
     }
 
     #[test]
@@ -1130,7 +1202,10 @@ mod tests {
     #[test]
     fn predict_glucose_trend_requires_three_readings() {
         let m = mgr();
-        let two = vec![GlucoseData::new(100.0, 0, 0), GlucoseData::new(105.0, 0, 60_000)];
+        let two = vec![
+            GlucoseData::new(100.0, 0, 0),
+            GlucoseData::new(105.0, 0, 60_000),
+        ];
         assert!(m.predict_glucose_trend(&two).is_none());
         assert!(m.predict_glucose_trend(&[]).is_none());
     }
@@ -1183,5 +1258,189 @@ mod tests {
         assert_eq!(near_no_er.distance_string().as_str(), "300m");
         let unknown = Hospital::new("U", "a", "0"); // distance_m = None
         assert_eq!(unknown.distance_string().as_str(), "Distance unknown");
+    }
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use super::*;
+    use crate::health_sensors::{GlucoseData, UserProfile};
+
+    #[test]
+    fn alert_severity_names_and_emergency() {
+        assert_eq!(AlertSeverity::Low.name(), "Low");
+        assert_eq!(AlertSeverity::Medium.name(), "Medium");
+        assert_eq!(AlertSeverity::High.name(), "High");
+        assert_eq!(AlertSeverity::Critical.name(), "Critical");
+        assert!(!AlertSeverity::Low.requires_emergency());
+        assert!(!AlertSeverity::High.requires_emergency());
+        assert!(AlertSeverity::Critical.requires_emergency());
+    }
+
+    #[test]
+    fn alert_acknowledge_and_emergency_flags() {
+        let mut a = HealthAlert::new(
+            1,
+            AlertType::GlucoseLow,
+            AlertSeverity::Critical,
+            50.0,
+            70.0,
+            "low",
+            "eat",
+            0,
+        );
+        assert!(!a.acknowledged);
+        assert!(!a.emergency_contacted);
+        a.acknowledge();
+        a.mark_emergency_notified();
+        assert!(a.acknowledged);
+        assert!(a.emergency_contacted);
+    }
+
+    #[test]
+    fn contacts_capacity_and_sort() {
+        let mut s = EarlyWarningSystem::new();
+        for i in 0..MAX_EMERGENCY_CONTACTS {
+            s.add_emergency_contact(EmergencyContact::new(&format!("c{i}"), "1", "f", i as u8))
+                .unwrap();
+        }
+        let err = s
+            .add_emergency_contact(EmergencyContact::new("extra", "1", "f", 0))
+            .unwrap_err();
+        assert!(matches!(err, AgentError::MemoryAllocationFailed { .. }));
+        assert_eq!(s.emergency_contacts().len(), MAX_EMERGENCY_CONTACTS);
+        assert_eq!(s.emergency_contacts()[0].priority, 0);
+    }
+
+    #[test]
+    fn hospitals_capacity_replaces_farthest() {
+        let mut s = EarlyWarningSystem::new();
+        for i in 0..8u32 {
+            let mut h = Hospital::new(&format!("h{i}"), "addr", "tel");
+            h.distance_m = Some(i * 1000);
+            s.add_hospital(h).unwrap();
+        }
+        assert_eq!(s.hospitals().len(), 8);
+        let mut closer = Hospital::new("closer", "addr", "tel");
+        closer.distance_m = Some(100);
+        s.add_hospital(closer).unwrap();
+        assert_eq!(s.hospitals().len(), 8);
+        assert!(s.hospitals().iter().any(|h| h.name.as_str() == "closer"));
+        assert!(!s.hospitals().iter().any(|h| h.name.as_str() == "h7"));
+    }
+
+    #[test]
+    fn nearest_er_and_specialty() {
+        let mut s = EarlyWarningSystem::new();
+        let mut cardio = Hospital::new("Cardio", "a", "t");
+        cardio.has_er = true;
+        cardio.has_cardiology = true;
+        cardio.distance_m = Some(2000);
+        let mut er_only = Hospital::new("ER", "a", "t");
+        er_only.has_er = true;
+        er_only.distance_m = Some(1000);
+        let mut no_er = Hospital::new("Clinic", "a", "t");
+        no_er.has_er = false;
+        no_er.distance_m = Some(100);
+        s.add_hospital(er_only).unwrap();
+        s.add_hospital(cardio).unwrap();
+        s.add_hospital(no_er).unwrap();
+        assert_eq!(s.nearest_er().unwrap().name.as_str(), "ER");
+        assert_eq!(
+            s.nearest_with_specialty(true, false).unwrap().name.as_str(),
+            "Cardio"
+        );
+        assert!(s.nearest_with_specialty(false, false).is_none());
+    }
+
+    #[test]
+    fn hospital_distance_string_variants() {
+        let mut h = Hospital::new("h", "a", "t");
+        h.distance_m = Some(500);
+        assert_eq!(h.distance_string().as_str(), "500m");
+        h.distance_m = Some(2500);
+        assert_eq!(h.distance_string().as_str(), "2.5km");
+        h.distance_m = None;
+        assert_eq!(h.distance_string().as_str(), "Distance unknown");
+    }
+
+    #[test]
+    fn glucose_trend_risk_description() {
+        let mut p = GlucoseTrendPrediction {
+            predicted_30min: 0.0,
+            predicted_60min: 0.0,
+            trend: 0,
+            rate_of_change: 0.0,
+            risk_level: 0,
+            confidence: 0,
+        };
+        assert_eq!(p.risk_description(), "Low risk");
+        p.risk_level = 50;
+        assert_eq!(p.risk_description(), "Moderate risk");
+        p.risk_level = 75;
+        assert_eq!(p.risk_description(), "High risk");
+        p.risk_level = 100;
+        assert_eq!(p.risk_description(), "Critical risk");
+    }
+
+    #[test]
+    fn ecg_anomaly_descriptions() {
+        assert!(EcgAnomalyType::IrregularRhythm
+            .description()
+            .contains("Irregular"));
+        assert!(EcgAnomalyType::ProlongedQt.description().contains("QT"));
+        assert!(EcgAnomalyType::Bradycardia.description().contains("slow"));
+        assert!(EcgAnomalyType::TWaveInversion
+            .description()
+            .contains("inversion"));
+    }
+
+    #[test]
+    fn alert_ack_queries_and_emergency_message() {
+        let mut s = EarlyWarningSystem::new();
+        s.add_emergency_contact(EmergencyContact::new("c", "1", "f", 0))
+            .unwrap();
+        let mut er = Hospital::new("St Mary", "Main St", "555");
+        er.has_er = true;
+        er.distance_m = Some(500);
+        s.add_hospital(er).unwrap();
+
+        let alert = s
+            .process_glucose(
+                &GlucoseData::new(50.0, 0, 1),
+                &UserProfile::default(),
+                300_001,
+            )
+            .unwrap();
+        assert_eq!(alert.alert_type, AlertType::GlucoseLow);
+        assert_eq!(alert.severity, AlertSeverity::Critical);
+        assert_eq!(s.alert_history().len(), 1);
+        assert_eq!(s.unacknowledged_alerts().len(), 1);
+        assert_eq!(s.critical_alerts().len(), 1);
+
+        assert!(s.acknowledge_alert(alert.id));
+        assert!(!s.acknowledge_alert(999), "unknown id must return false");
+        assert_eq!(s.unacknowledged_alerts().len(), 0);
+        assert_eq!(s.critical_alerts().len(), 0);
+        assert!(s.alert_history()[0].acknowledged);
+
+        let msg = s.generate_emergency_message(&s.alert_history()[0]);
+        assert!(msg.as_str().contains("最近医院"));
+        assert!(msg.as_str().contains("St Mary"));
+        assert!(msg.as_str().contains("低血糖警告"));
+    }
+
+    #[test]
+    fn emergency_message_without_er_omits_hospital() {
+        let mut s = EarlyWarningSystem::new();
+        let alert = s
+            .process_glucose(
+                &GlucoseData::new(50.0, 0, 1),
+                &UserProfile::default(),
+                300_001,
+            )
+            .unwrap();
+        let msg = s.generate_emergency_message(&alert);
+        assert!(!msg.as_str().contains("最近医院"));
     }
 }

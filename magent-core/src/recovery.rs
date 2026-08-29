@@ -113,6 +113,7 @@ impl RecoveryManager {
             #[cfg(feature = "web3")]
             AgentError::Web3Error { .. } => RecoveryStrategy::Abort,
             AgentError::Unknown { .. } => RecoveryStrategy::Abort,
+            AgentError::CryptoError { .. } => RecoveryStrategy::Abort,
         }
     }
 
@@ -263,6 +264,221 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
         // Delays applied on retries 1,2,3 => 100 + 200 + 400 = 700ms.
         assert_eq!(total.load(Ordering::SeqCst), 700);
+    }
+
+    #[test]
+    fn get_strategy_maps_network_and_storage() {
+        use crate::error::{AgentError as E, NetworkError, SensorError, StorageError};
+        let r = RecoveryManager::with_defaults();
+
+        assert_eq!(
+            r.get_strategy(&E::NetworkConnectionFailed {
+                reason: NetworkError::Timeout
+            }),
+            RecoveryStrategy::RetryWithBackoff
+        );
+        assert_eq!(
+            r.get_strategy(&E::NetworkTimeout {
+                operation: "fetch",
+                duration_ms: 1
+            }),
+            RecoveryStrategy::RetryWithBackoff
+        );
+
+        assert_eq!(
+            r.get_strategy(&E::StorageReadFailed {
+                address: 0,
+                reason: StorageError::ReadError
+            }),
+            RecoveryStrategy::Retry
+        );
+        assert_eq!(
+            r.get_strategy(&E::StorageReadFailed {
+                address: 0,
+                reason: StorageError::CorruptedData
+            }),
+            RecoveryStrategy::Fallback
+        );
+        assert_eq!(
+            r.get_strategy(&E::StorageReadFailed {
+                address: 0,
+                reason: StorageError::BadAddress
+            }),
+            RecoveryStrategy::Abort
+        );
+        assert_eq!(
+            r.get_strategy(&E::StorageWriteFailed {
+                address: 0,
+                reason: StorageError::WriteProtected
+            }),
+            RecoveryStrategy::Reset
+        );
+        assert_eq!(
+            r.get_strategy(&E::StorageWriteFailed {
+                address: 0,
+                reason: StorageError::OutOfSpace
+            }),
+            RecoveryStrategy::Fallback
+        );
+        assert_eq!(
+            r.get_strategy(&E::StorageWriteFailed {
+                address: 0,
+                reason: StorageError::WriteError
+            }),
+            RecoveryStrategy::Retry
+        );
+
+        assert_eq!(
+            r.get_strategy(&E::SensorReadFailed {
+                sensor: "hr",
+                reason: SensorError::Timeout
+            }),
+            RecoveryStrategy::RetryWithBackoff
+        );
+        assert_eq!(
+            r.get_strategy(&E::SensorReadFailed {
+                sensor: "hr",
+                reason: SensorError::NotInitialized
+            }),
+            RecoveryStrategy::Reset
+        );
+        assert_eq!(
+            r.get_strategy(&E::SensorReadFailed {
+                sensor: "hr",
+                reason: SensorError::InvalidValue
+            }),
+            RecoveryStrategy::Fallback
+        );
+    }
+
+    #[test]
+    fn get_strategy_maps_budget_validation_and_fatal() {
+        use crate::error::{AgentError as E, ConfigError, GpioOperation, ValidationError};
+        let r = RecoveryManager::with_defaults();
+
+        assert_eq!(
+            r.get_strategy(&E::MemoryAllocationFailed {
+                requested: 1,
+                available: 0
+            }),
+            RecoveryStrategy::Abort
+        );
+        assert_eq!(
+            r.get_strategy(&E::MemoryBudgetExhausted { used: 1, limit: 0 }),
+            RecoveryStrategy::Abort
+        );
+        assert_eq!(
+            r.get_strategy(&E::IterationBudgetExhausted { used: 1, limit: 0 }),
+            RecoveryStrategy::Skip
+        );
+
+        assert_eq!(
+            r.get_strategy(&E::InputValidationFailed {
+                field: "task",
+                reason: ValidationError::TooLong
+            }),
+            RecoveryStrategy::Abort
+        );
+        assert_eq!(
+            r.get_strategy(&E::ConfigurationError {
+                field: "model",
+                reason: ConfigError::InvalidValue
+            }),
+            RecoveryStrategy::Reset
+        );
+        assert_eq!(
+            r.get_strategy(&E::GpioOperationFailed {
+                pin: 1,
+                operation: GpioOperation::Read
+            }),
+            RecoveryStrategy::Retry
+        );
+
+        assert_eq!(
+            r.get_strategy(&E::OperationTimeout {
+                operation: "security",
+                timeout_ms: 1
+            }),
+            RecoveryStrategy::Abort
+        );
+        assert_eq!(
+            r.get_strategy(&E::OperationTimeout {
+                operation: "http",
+                timeout_ms: 1
+            }),
+            RecoveryStrategy::RetryWithBackoff
+        );
+
+        assert_eq!(
+            r.get_strategy(&E::BufferOverflow {
+                capacity: 1,
+                attempted: 2
+            }),
+            RecoveryStrategy::Abort
+        );
+        assert_eq!(
+            r.get_strategy(&E::StackOverflow { used: 1, limit: 0 }),
+            RecoveryStrategy::Abort
+        );
+        assert_eq!(
+            r.get_strategy(&E::InvalidStateTransition { from: "a", to: "b" }),
+            RecoveryStrategy::Abort
+        );
+        assert_eq!(
+            r.get_strategy(&E::Unknown { code: 0 }),
+            RecoveryStrategy::Abort
+        );
+
+        #[cfg(feature = "web3")]
+        assert_eq!(
+            r.get_strategy(&E::Web3Error {
+                kind: crate::error::Web3ErrorKind::InvalidDid {
+                    raw: "did:key:bad".into(),
+                },
+            }),
+            RecoveryStrategy::Abort
+        );
+    }
+
+    #[test]
+    fn should_retry_respects_max_retries_and_strategy() {
+        use crate::error::AgentError as E;
+        let r = RecoveryManager::new(3, 100);
+
+        let retryable = E::NetworkTimeout {
+            operation: "fetch",
+            duration_ms: 1,
+        };
+        assert!(r.should_retry(&retryable, 0));
+        assert!(r.should_retry(&retryable, 2));
+        assert!(!r.should_retry(&retryable, 3), ">= max_retries must stop");
+
+        let abort = E::Unknown { code: 1 };
+        assert!(!r.should_retry(&abort, 0));
+        let skip = E::IterationBudgetExhausted { used: 1, limit: 0 };
+        assert!(!r.should_retry(&skip, 0));
+    }
+
+    #[test]
+    fn default_fallback_provides_zero_values() {
+        let f = DefaultFallback;
+        let f32v: f32 = f.get_fallback();
+        let u32v: u32 = f.get_fallback();
+        let boolv: bool = f.get_fallback();
+        assert_eq!(f32v, 0.0);
+        assert_eq!(u32v, 0);
+        assert!(!boolv);
+    }
+
+    #[test]
+    fn new_and_defaults_set_expected_limits() {
+        let r = RecoveryManager::new(0, 5);
+        assert_eq!(r.max_retries, 0);
+        assert_eq!(r.backoff_base_ms, 5);
+        let d = RecoveryManager::default();
+        assert_eq!(d.max_retries, 3);
+        assert_eq!(d.backoff_base_ms, 100);
+        assert!(d.delay.is_none());
     }
 }
 

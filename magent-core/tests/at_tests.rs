@@ -11,10 +11,9 @@
 //! integration tests rather than `cfg(test)` blocks.
 
 use magent_core::at::{
-    is_at_line, parse_line, parse_u32, parse_i32, build_response, AtArg,
-    AtCommandKind, AtOp, AtParseError, AtParseErrorKind, AtResponseKind,
-    MAX_LINE, validate_mac, validate_passphrase, validate_ssid,
-    trim_line_terminator, MAX_RESPONSE,
+    build_response, is_at_line, parse_i32, parse_line, parse_u32, trim_line_terminator,
+    validate_mac, validate_passphrase, validate_ssid, AtArg, AtCommandKind, AtOp, AtParseError,
+    AtParseErrorKind, AtResponseKind, MAX_LINE, MAX_RESPONSE,
 };
 use magent_core::at_validate::{validate_cwjap_set, validate_cwmode_set};
 
@@ -150,7 +149,9 @@ fn esp_at_compat_at_cipstamac() {
     let cmd = parse_line(b"AT+CIPSTAMAC=\"aa:bb:cc:dd:ee:ff\"").expect("CIPSTAMAC");
     assert_eq!(cmd.op, AtOp::CipStaMac);
     match cmd.arg(0) {
-        Some(AtArg::Quoted(m)) => assert_eq!(validate_mac(m), Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])),
+        Some(AtArg::Quoted(m)) => {
+            assert_eq!(validate_mac(m), Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]))
+        }
         _ => panic!("mac"),
     }
 }
@@ -201,11 +202,20 @@ fn all_documented_verbs_parse() {
         (b"AT+HTTPGET=\"http://example.com/\"", AtOp::HttpGet),
         (b"AT+LLMCFG=\"deepseek-chat\",\"sk-abc\"", AtOp::LlmCfg),
     ];
-    assert_eq!(cases.len(), 31, "documented verb count drifted; update this table");
+    assert_eq!(
+        cases.len(),
+        31,
+        "documented verb count drifted; update this table"
+    );
     for (line, expected) in cases {
-        let cmd = parse_line(line)
-            .unwrap_or_else(|e| panic!("{line:?} should parse but failed: {e:?}"));
-        assert_eq!(cmd.op, *expected, "op mismatch for {:?}", String::from_utf8_lossy(line));
+        let cmd =
+            parse_line(line).unwrap_or_else(|e| panic!("{line:?} should parse but failed: {e:?}"));
+        assert_eq!(
+            cmd.op,
+            *expected,
+            "op mismatch for {:?}",
+            String::from_utf8_lossy(line)
+        );
     }
 }
 
@@ -216,13 +226,35 @@ fn every_op_has_a_stable_audit_name() {
     // carry a non-empty, stable identifier so logs stay greppable.
     assert_eq!(AtOp::Ping.name(), "");
     for op in [
-        AtOp::SetEcho { on: true }, AtOp::GetVersion, AtOp::Reset, AtOp::SysRam,
-        AtOp::SysLog, AtOp::SysStore, AtOp::CwMode, AtOp::CwJap, AtOp::CwQap,
-        AtOp::CwLap, AtOp::CwHostname, AtOp::CwAutoconn, AtOp::CwReconnCfg,
-        AtOp::CwState, AtOp::CipStaMac, AtOp::MacRand, AtOp::Heap, AtOp::Uptime,
-        AtOp::Safemode, AtOp::Ident, AtOp::IdentRot, AtOp::Sign, AtOp::Restore,
-        AtOp::Ifconfig, AtOp::Ping6, AtOp::Agent, AtOp::WifiPassUpgrade,
-        AtOp::HttpGet, AtOp::LlmCfg,
+        AtOp::SetEcho { on: true },
+        AtOp::GetVersion,
+        AtOp::Reset,
+        AtOp::SysRam,
+        AtOp::SysLog,
+        AtOp::SysStore,
+        AtOp::CwMode,
+        AtOp::CwJap,
+        AtOp::CwQap,
+        AtOp::CwLap,
+        AtOp::CwHostname,
+        AtOp::CwAutoconn,
+        AtOp::CwReconnCfg,
+        AtOp::CwState,
+        AtOp::CipStaMac,
+        AtOp::MacRand,
+        AtOp::Heap,
+        AtOp::Uptime,
+        AtOp::Safemode,
+        AtOp::Ident,
+        AtOp::IdentRot,
+        AtOp::Sign,
+        AtOp::Restore,
+        AtOp::Ifconfig,
+        AtOp::Ping6,
+        AtOp::Agent,
+        AtOp::WifiPassUpgrade,
+        AtOp::HttpGet,
+        AtOp::LlmCfg,
     ] {
         assert!(!op.name().is_empty(), "{op:?} must have an audit name");
     }
@@ -380,16 +412,16 @@ fn long_line_over_max_is_not_panic() {
 #[test]
 fn ssid_length_validation() {
     assert!(validate_ssid(b"").is_err());
-    assert!(validate_ssid(&vec![b'x'; 32]).is_ok());
-    assert!(validate_ssid(&vec![b'x'; 33]).is_err());
+    assert!(validate_ssid(&[b'x'; 32]).is_ok());
+    assert!(validate_ssid(&[b'x'; 33]).is_err());
 }
 
 #[test]
 fn passphrase_length_validation() {
     assert!(validate_passphrase(b"").is_ok());
     assert!(validate_passphrase(b"hunter2").is_ok());
-    assert!(validate_passphrase(&vec![b'p'; 64]).is_ok());
-    assert!(validate_passphrase(&vec![b'p'; 65]).is_err());
+    assert!(validate_passphrase(&[b'p'; 64]).is_ok());
+    assert!(validate_passphrase(&[b'p'; 65]).is_err());
 }
 
 #[test]

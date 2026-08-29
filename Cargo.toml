@@ -23,6 +23,7 @@ members = [
     "host/email-mcp",
     "host/mqtt-mcp",
     "host/mcp-tool-executor",
+    "host/lua-app",
 
     # Command-line tool — `magent run …`. Standalone binary that wires
     # `magent-core` to an Ollama server (or the canned mock backend).
@@ -58,6 +59,11 @@ homepage = "https://github.com/arkCyber/mAgent"
 readme = "README.md"
 keywords = ["ai", "agent", "embedded", "nrf52840", "bare-metal"]
 categories = ["embedded", "no-std"]
+# Minimum Supported Rust Version (MSRV). The CI `host` job runs stable, so this
+# is the documented floor (edition-2021 codebase); it is propagated to every
+# workspace member via `rust-version.workspace = true`. 1.87 because
+# `magent-core` uses `is_multiple_of` (stable in 1.87).
+rust-version = "1.87"
 
 # ---------------------------------------------------------------------------
 # Workspace-wide lints

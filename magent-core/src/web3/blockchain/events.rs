@@ -29,8 +29,8 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Web3ErrorKind;
 use super::{Address, Hash};
+use crate::error::Web3ErrorKind;
 
 /// A parsed event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,22 +171,28 @@ fn parse_u64_be(bytes: &[u8]) -> Option<u64> {
 // ============================================================================
 
 /// ERC-20 Transfer event signature.
-pub const ERC20_TRANSFER_SIGNATURE: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+pub const ERC20_TRANSFER_SIGNATURE: &str =
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 /// ERC-20 Approval event signature.
-pub const ERC20_APPROVAL_SIGNATURE: &str = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+pub const ERC20_APPROVAL_SIGNATURE: &str =
+    "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 
 /// ERC-721 Transfer event signature.
-pub const ERC721_TRANSFER_SIGNATURE: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+pub const ERC721_TRANSFER_SIGNATURE: &str =
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 /// ERC-721 Approval event signature.
-pub const ERC721_APPROVAL_SIGNATURE: &str = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+pub const ERC721_APPROVAL_SIGNATURE: &str =
+    "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 
 /// ERC-721 ApprovalForAll event signature.
-pub const ERC721_APPROVAL_FOR_ALL_SIGNATURE: &str = "0x17307e15039eb7685ead1c26fbd2b2b09b3e4a9f8b0e8f8d4c9a8d7e6f5c4b3";
+pub const ERC721_APPROVAL_FOR_ALL_SIGNATURE: &str =
+    "0x17307e15039eb7685ead1c26fbd2b2b09b3e4a9f8b0e8f8d4c9a8d7e6f5c4b3";
 
 /// DIDRegistry DIDSSet event signature.
-pub const DID_REGISTRY_DID_SET_SIGNATURE: &str = "0x1234567890123456789012345678901234567890123456789012345678901234";
+pub const DID_REGISTRY_DID_SET_SIGNATURE: &str =
+    "0x1234567890123456789012345678901234567890123456789012345678901234";
 
 // ============================================================================
 // ERC-20 Event Types
@@ -214,11 +220,14 @@ impl Erc20Transfer {
             ));
         }
 
-        let from = event.topic_as_address(1)
-            .ok_or_else(|| Web3ErrorKind::BlockchainError("failed to parse 'from' address".to_string()))?;
-        let to = event.topic_as_address(2)
-            .ok_or_else(|| Web3ErrorKind::BlockchainError("failed to parse 'to' address".to_string()))?;
-        let amount = event.data_as_u256()
+        let from = event.topic_as_address(1).ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("failed to parse 'from' address".to_string())
+        })?;
+        let to = event.topic_as_address(2).ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("failed to parse 'to' address".to_string())
+        })?;
+        let amount = event
+            .data_as_u256()
             .ok_or_else(|| Web3ErrorKind::BlockchainError("failed to parse amount".to_string()))?;
 
         Ok(Self {
@@ -262,11 +271,14 @@ impl Erc20Approval {
             ));
         }
 
-        let owner = event.topic_as_address(1)
-            .ok_or_else(|| Web3ErrorKind::BlockchainError("failed to parse 'owner' address".to_string()))?;
-        let spender = event.topic_as_address(2)
-            .ok_or_else(|| Web3ErrorKind::BlockchainError("failed to parse 'spender' address".to_string()))?;
-        let amount = event.data_as_u256()
+        let owner = event.topic_as_address(1).ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("failed to parse 'owner' address".to_string())
+        })?;
+        let spender = event.topic_as_address(2).ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("failed to parse 'spender' address".to_string())
+        })?;
+        let amount = event
+            .data_as_u256()
             .ok_or_else(|| Web3ErrorKind::BlockchainError("failed to parse amount".to_string()))?;
 
         Ok(Self {
@@ -304,17 +316,22 @@ impl Erc721Transfer {
             ));
         }
 
-        let from = event.topic_as_address(1)
-            .ok_or_else(|| Web3ErrorKind::BlockchainError("failed to parse 'from' address".to_string()))?;
-        let to = event.topic_as_address(2)
-            .ok_or_else(|| Web3ErrorKind::BlockchainError("failed to parse 'to' address".to_string()))?;
-        let token_id_bytes = event.topics.get(3)
+        let from = event.topic_as_address(1).ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("failed to parse 'from' address".to_string())
+        })?;
+        let to = event.topic_as_address(2).ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("failed to parse 'to' address".to_string())
+        })?;
+        let token_id_bytes = event
+            .topics
+            .get(3)
             .ok_or_else(|| Web3ErrorKind::BlockchainError("missing token ID topic".to_string()))?
             .as_bytes();
 
         // Parse token ID as U256
-        let token_id = parse_u256_be(token_id_bytes)
-            .ok_or_else(|| Web3ErrorKind::BlockchainError("failed to parse token ID".to_string()))?;
+        let token_id = parse_u256_be(token_id_bytes).ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("failed to parse token ID".to_string())
+        })?;
 
         Ok(Self {
             event: event.clone(),
@@ -360,10 +377,12 @@ impl Erc721ApprovalForAll {
             ));
         }
 
-        let owner = event.topic_as_address(1)
-            .ok_or_else(|| Web3ErrorKind::BlockchainError("failed to parse 'owner' address".to_string()))?;
-        let operator = event.topic_as_address(2)
-            .ok_or_else(|| Web3ErrorKind::BlockchainError("failed to parse 'operator' address".to_string()))?;
+        let owner = event.topic_as_address(1).ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("failed to parse 'owner' address".to_string())
+        })?;
+        let operator = event.topic_as_address(2).ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("failed to parse 'operator' address".to_string())
+        })?;
 
         let approved = if !event.data.is_empty() {
             event.data[31] != 0
@@ -570,13 +589,21 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, Web3ErrorKind> {
             b'0'..=b'9' => chunk[0] - b'0',
             b'a'..=b'f' => chunk[0] - b'a' + 10,
             b'A'..=b'F' => chunk[0] - b'A' + 10,
-            _ => return Err(Web3ErrorKind::BlockchainError("invalid hex digit".to_string())),
+            _ => {
+                return Err(Web3ErrorKind::BlockchainError(
+                    "invalid hex digit".to_string(),
+                ))
+            }
         };
         let lo = match chunk[1] {
             b'0'..=b'9' => chunk[1] - b'0',
             b'a'..=b'f' => chunk[1] - b'a' + 10,
             b'A'..=b'F' => chunk[1] - b'A' + 10,
-            _ => return Err(Web3ErrorKind::BlockchainError("invalid hex digit".to_string())),
+            _ => {
+                return Err(Web3ErrorKind::BlockchainError(
+                    "invalid hex digit".to_string(),
+                ))
+            }
         };
         out.push((hi << 4) | lo);
     }
@@ -586,9 +613,8 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, Web3ErrorKind> {
 /// Parse a hex string as u64.
 fn parse_hex_u64(s: &str) -> Result<u64, Web3ErrorKind> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    u64::from_str_radix(s, 16).map_err(|e| {
-        Web3ErrorKind::BlockchainError(format!("failed to parse u64: {}", e))
-    })
+    u64::from_str_radix(s, 16)
+        .map_err(|e| Web3ErrorKind::BlockchainError(format!("failed to parse u64: {}", e)))
 }
 
 // ============================================================================
@@ -663,7 +689,13 @@ mod tests {
 
         let filter = EventFilter::new(contract)
             .with_signature(sig)
-            .with_topic(1, Hash::from_hex("0xa123456789012345678901234567890123456789000000000000000000000000").unwrap())
+            .with_topic(
+                1,
+                Hash::from_hex(
+                    "0xa123456789012345678901234567890123456789000000000000000000000000",
+                )
+                .unwrap(),
+            )
             .with_block_range(16000000, 17000000);
 
         assert!(filter.address.is_some());
@@ -742,7 +774,8 @@ mod tests {
             0,
         );
 
-        let transfer = Erc20Transfer::from_event(&event).expect("must parse a well-formed Transfer");
+        let transfer =
+            Erc20Transfer::from_event(&event).expect("must parse a well-formed Transfer");
         assert_eq!(transfer.from.to_hex(), from.to_hex());
         assert_eq!(transfer.to.to_hex(), to.to_hex());
         assert_eq!(transfer.amount, 1_000_000_000_000_000_000);

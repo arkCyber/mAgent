@@ -8,15 +8,14 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Web3ErrorKind;
 use super::{Address, Hash, Wei};
+use crate::error::Web3ErrorKind;
 
 #[cfg(feature = "web3")]
 use sha3::{Digest, Keccak256};
 
 /// Transaction type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TransactionType {
     /// Legacy transaction (EIP-155).
     #[default]
@@ -37,7 +36,6 @@ impl TransactionType {
         }
     }
 }
-
 
 /// A transaction request before signing.
 #[derive(Debug, Clone)]
@@ -68,12 +66,7 @@ pub struct TransactionRequest {
 
 impl TransactionRequest {
     /// Create a new transaction request.
-    pub fn new(
-        to: Option<Address>,
-        value: Wei,
-        data: Vec<u8>,
-        chain_id: u64,
-    ) -> Self {
+    pub fn new(to: Option<Address>, value: Wei, data: Vec<u8>, chain_id: u64) -> Self {
         Self {
             tx_type: TransactionType::Legacy,
             nonce: 0,
@@ -108,11 +101,7 @@ impl TransactionRequest {
     }
 
     /// Set the transaction type to EIP-1559 and configure fees.
-    pub fn with_eip1559_fees(
-        mut self,
-        max_priority_fee: Wei,
-        max_fee: Wei,
-    ) -> Self {
+    pub fn with_eip1559_fees(mut self, max_priority_fee: Wei, max_fee: Wei) -> Self {
         self.tx_type = TransactionType::Eip1559;
         self.max_priority_fee_per_gas = Some(max_priority_fee);
         self.max_fee_per_gas = Some(max_fee);
@@ -146,8 +135,7 @@ impl TransactionRequest {
             TransactionType::Legacy | TransactionType::Eip2930 => {
                 if self.gas_price.is_zero() {
                     return Err(Web3ErrorKind::BlockchainError(
-                        "gas_price must be > 0 for legacy / EIP-2930 transactions"
-                            .to_string(),
+                        "gas_price must be > 0 for legacy / EIP-2930 transactions".to_string(),
                     ));
                 }
             }
@@ -178,10 +166,7 @@ impl TransactionRequest {
     pub fn max_cost(&self) -> Wei {
         let price = match self.tx_type {
             TransactionType::Legacy | TransactionType::Eip2930 => self.gas_price.as_wei(),
-            TransactionType::Eip1559 => self
-                .max_fee_per_gas
-                .unwrap_or(self.gas_price)
-                .as_wei(),
+            TransactionType::Eip1559 => self.max_fee_per_gas.unwrap_or(self.gas_price).as_wei(),
         };
         let gas = self.gas_limit as u128;
         let total = price.saturating_mul(gas);
@@ -213,7 +198,7 @@ impl TransactionRequest {
             rlp_encode_uint128(self.value.as_wei()),
             rlp_encode_bytes(&self.data),
             rlp_encode_uint(self.chain_id),
-            vec![0x80],        // v = 0
+            vec![0x80],         // v = 0
             rlp_encode_uint(0), // r = 0
             rlp_encode_uint(0), // s = 0
         ];
@@ -229,12 +214,8 @@ impl TransactionRequest {
         let items = vec![
             rlp_encode_uint(self.chain_id),
             rlp_encode_uint(self.nonce),
-            rlp_encode_uint128(
-                self.max_priority_fee_per_gas.unwrap_or(Wei::ZERO).as_wei(),
-            ),
-            rlp_encode_uint128(
-                self.max_fee_per_gas.unwrap_or(self.gas_price).as_wei(),
-            ),
+            rlp_encode_uint128(self.max_priority_fee_per_gas.unwrap_or(Wei::ZERO).as_wei()),
+            rlp_encode_uint128(self.max_fee_per_gas.unwrap_or(self.gas_price).as_wei()),
             rlp_encode_uint(self.gas_limit),
             match &self.to {
                 Some(addr) => rlp_encode_address(addr),
@@ -276,15 +257,17 @@ impl TransactionRequest {
     fn encode_access_list_rlp(&self) -> Vec<u8> {
         match &self.access_list {
             Some(list) => {
-                let items: Vec<Vec<Vec<u8>>> = list.iter().map(|item| {
-                    let keys: Vec<Vec<u8>> = item.storage_keys.iter().map(|k| {
-                        rlp_encode_bytes(k.as_bytes())
-                    }).collect();
-                    vec![
-                        rlp_encode_address(&item.address),
-                        rlp_encode_list(&keys),
-                    ]
-                }).collect();
+                let items: Vec<Vec<Vec<u8>>> = list
+                    .iter()
+                    .map(|item| {
+                        let keys: Vec<Vec<u8>> = item
+                            .storage_keys
+                            .iter()
+                            .map(|k| rlp_encode_bytes(k.as_bytes()))
+                            .collect();
+                        vec![rlp_encode_address(&item.address), rlp_encode_list(&keys)]
+                    })
+                    .collect();
                 rlp_encode_list(&items.iter().map(|i| rlp_encode_list(i)).collect::<Vec<_>>())
             }
             None => vec![0x80], // Empty list
@@ -473,11 +456,7 @@ impl TransactionBuilder {
 
         let sig = match self.request.tx_type {
             TransactionType::Legacy => {
-                TransactionSigner::sign_legacy_eip155(
-                    keypair.secret_key(),
-                    &tx_hash,
-                    chain_id,
-                )?
+                TransactionSigner::sign_legacy_eip155(keypair.secret_key(), &tx_hash, chain_id)?
             }
             TransactionType::Eip2930 | TransactionType::Eip1559 => {
                 TransactionSigner::sign_hash(keypair.secret_key(), &tx_hash)?
@@ -734,12 +713,7 @@ mod tests {
     #[test]
     fn test_transaction_request_creation() {
         let to = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
-        let tx = TransactionRequest::new(
-            Some(to),
-            Wei::from_ether(1),
-            vec![],
-            1,
-        );
+        let tx = TransactionRequest::new(Some(to), Wei::from_ether(1), vec![], 1);
 
         assert_eq!(tx.chain_id, 1);
         assert_eq!(tx.value.as_wei(), 1_000_000_000_000_000_000);
@@ -766,11 +740,7 @@ mod tests {
         let to = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
         let tx = TransactionBuilder::new(Some(to), 1)
             .value(Wei::from_ether(0))
-            .eip1559(
-                Wei::from_gwei(2),
-                Wei::from_gwei(50),
-                21000,
-            )
+            .eip1559(Wei::from_gwei(2), Wei::from_gwei(50), 21000)
             .build()
             .clone();
 
@@ -840,11 +810,9 @@ mod tests {
         hasher.update(&signed.raw_transaction[..unsigned_len]);
         let hash: [u8; 32] = hasher.finalize().into();
         let fresh = TransactionSigner::sign_hash(kp.secret_key(), &hash).unwrap();
-        let recovered = crate::web3::blockchain::Secp256k1PublicKey::recover_from(
-            &hash,
-            fresh.as_bytes(),
-        )
-        .unwrap();
+        let recovered =
+            crate::web3::blockchain::Secp256k1PublicKey::recover_from(&hash, fresh.as_bytes())
+                .unwrap();
         assert_eq!(recovered.to_address().to_hex(), kp.address().to_hex());
     }
 
@@ -854,8 +822,11 @@ mod tests {
         use crate::web3::blockchain::Secp256k1Keypair;
         let to = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
         let kp = Secp256k1Keypair::generate();
-        let tx = TransactionBuilder::new(Some(to), 1)
-            .eip1559(Wei::from_gwei(2), Wei::from_gwei(50), 21_000);
+        let tx = TransactionBuilder::new(Some(to), 1).eip1559(
+            Wei::from_gwei(2),
+            Wei::from_gwei(50),
+            21_000,
+        );
         let signed = tx.sign(&kp).unwrap();
         // For EIP-1559 / EIP-2930 transactions, v must be 0 or 1
         // (y_parity), NOT the EIP-155-formatted v (which would be >= 37).

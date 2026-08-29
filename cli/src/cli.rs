@@ -110,7 +110,7 @@ pub struct GlobalFlags {
 #[derive(Debug, Clone)]
 pub enum Command {
     /// `magent run [OPTIONS] <TASK>` — run an agent task (or REPL if no task).
-    Run(RunOptions),
+    Run(Box<RunOptions>),
     /// `magent run --help` / `magent help run` — print `run`-specific usage.
     RunHelp,
     /// `magent set-prompt ...` — manage stored system prompts.
@@ -577,7 +577,7 @@ impl Args {
 #[derive(Debug, Clone)]
 enum RunParseOutcome {
     /// A real `run` invocation with a task and options.
-    Run(RunOptions),
+    Run(Box<RunOptions>),
     /// `magent run --help` / `magent run -h` — caller should print
     /// `run_help_text()` and exit 0.
     Help,
@@ -773,7 +773,7 @@ fn parse_run_args<'a>(
     if opts.task.is_empty() && !opts.repl_mode {
         return Err(ParseError::MissingTask);
     }
-    Ok(RunParseOutcome::Run(opts))
+    Ok(RunParseOutcome::Run(Box::new(opts)))
 }
 
 /// Internal return type for `parse_set_prompt_args` so we can
@@ -1686,12 +1686,12 @@ fn parse_rfc3339(s: &str) -> Result<u64, String> {
         return Err(format!("missing field separators in {:?}", s));
     }
     let year = slice_int(&normalized[0..4], "year")?;
-    let month = slice_int(&normalized[5..7], "month")? as i32;
-    let day = slice_int(&normalized[8..10], "day")? as i32;
-    let hour = slice_int(&normalized[11..13], "hour")? as i32;
-    let minute = slice_int(&normalized[14..16], "minute")? as i32;
-    let second = slice_int(&normalized[17..19], "second")? as i32;
-    if month < 1 || month > 12 {
+    let month = slice_int(&normalized[5..7], "month")?;
+    let day = slice_int(&normalized[8..10], "day")?;
+    let hour = slice_int(&normalized[11..13], "hour")?;
+    let minute = slice_int(&normalized[14..16], "minute")?;
+    let second = slice_int(&normalized[17..19], "second")?;
+    if !(1..=12).contains(&month) {
         return Err(format!("month {} out of range", month));
     }
     if day < 1 || day > days_in_month_pub(year, month as u8) as i32 {
@@ -1711,8 +1711,8 @@ fn parse_rfc3339(s: &str) -> Result<u64, String> {
             return Err(format!("bad offset {:?}; expected ±HH:MM", tail));
         }
         let sign = if tail.starts_with('-') { -1 } else { 1 };
-        let oh = slice_int(&tail[1..3], "offset hour")? as i32;
-        let om = slice_int(&tail[4..6], "offset minute")? as i32;
+        let oh = slice_int(&tail[1..3], "offset hour")?;
+        let om = slice_int(&tail[4..6], "offset minute")?;
         sign * (oh * 3600 + om * 60)
     } else {
         return Err(format!("unexpected tail {:?}; expected Z or ±HH:MM", tail));

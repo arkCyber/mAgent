@@ -34,15 +34,18 @@
 //! ```
 
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+use once_cell::sync::OnceCell;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[allow(unused_imports)]
-use crate::error::Web3ErrorKind;
-#[allow(unused_imports)]
 use super::esp32_client::parse_hex;
+#[allow(unused_imports)]
+use crate::error::Web3ErrorKind;
 
 // ============================================================================
 // HTTP Client Configuration
@@ -84,10 +87,15 @@ impl HttpClientConfig {
     /// malformed input rather than panicking.
     pub fn from_url(url: &str) -> Self {
         let use_tls = url.starts_with("https://");
-        let after_scheme = url
+        // Only http/https URLs are valid RPC endpoints. Anything else
+        // (ftp://, other schemes, garbage, empty) falls back to the safe
+        // default instead of mis-parsing into a bogus/hostile host string.
+        let Some(after_scheme) = url
             .strip_prefix("https://")
             .or_else(|| url.strip_prefix("http://"))
-            .unwrap_or(url);
+        else {
+            return Self::default();
+        };
         // Drop path before splitting on `:` so the host never leaks
         // a route (e.g. `host/path` → `host`).
         let host_part = after_scheme.split('/').next().unwrap_or(after_scheme);
@@ -100,6 +108,22 @@ impl HttpClientConfig {
             port,
             use_tls,
             ..Default::default()
+        }
+    }
+
+    /// Build a `scheme://host[:port]` authority string suitable for
+    /// concatenating with a request path to form a full URL.
+    ///
+    /// Omits the default port for the scheme (443 for `https`, 80 for
+    /// `http`) so the authority stays compact and RPC endpoints that
+    /// expect a bare host remain compatible.
+    pub fn base_url(&self) -> String {
+        let scheme = if self.use_tls { "https" } else { "http" };
+        let default_port = if self.use_tls { 443 } else { 80 };
+        if self.port == default_port {
+            format!("{scheme}://{}", self.host)
+        } else {
+            format!("{scheme}://{}:{}", self.host, self.port)
         }
     }
 }
@@ -137,7 +161,10 @@ impl JsonRpcRequest {
     pub fn get_balance(address: &str, block: &str) -> Self {
         Self::new(
             "eth_getBalance",
-            vec![Value::String(address.to_string()), Value::String(block.to_string())],
+            vec![
+                Value::String(address.to_string()),
+                Value::String(block.to_string()),
+            ],
         )
     }
 
@@ -145,7 +172,10 @@ impl JsonRpcRequest {
     pub fn get_nonce(address: &str, block: &str) -> Self {
         Self::new(
             "eth_getTransactionCount",
-            vec![Value::String(address.to_string()), Value::String(block.to_string())],
+            vec![
+                Value::String(address.to_string()),
+                Value::String(block.to_string()),
+            ],
         )
     }
 
@@ -161,7 +191,10 @@ impl JsonRpcRequest {
 
     /// eth_call
     pub fn call(params: Value) -> Self {
-        Self::new("eth_call", vec![params, Value::String("latest".to_string())])
+        Self::new(
+            "eth_call",
+            vec![params, Value::String("latest".to_string())],
+        )
     }
 
     /// eth_sendRawTransaction
@@ -291,6 +324,143 @@ pub trait HttpClientTrait: core::fmt::Debug {
     fn close(&mut self);
 }
 
+// ============================================================================
+// Transport abstraction
+// ============================================================================
+//
+// `HttpClientTrait` (above) is the *public* per-request API surface. The
+// `Transport` trait below is the *pluggable wire backend* that actually moves
+// bytes to the RPC endpoint. Keeping them separate is what lets the `no_std`
+// core stay dependency-free: `magent-core` never depends on `esp-idf-svc` /
+// `reqwest`; the firmware and host crates inject their own `Transport` and the
+// core just serialises/parses JSON-RPC over it (REQ-NET-004).
+
+/// A pluggable HTTP wire backend for [`EspHttpClient`].
+///
+/// `url` is the full `scheme://host[:port]` authority (from
+/// [`HttpClientConfig::base_url`]); `path` is the request path (usually `/` for
+/// JSON-RPC). Implementations return the raw response body or an [`HttpError`].
+///
+/// `Send + Sync` is required so a `Transport` can be shared behind an `Arc`
+/// across threads (the firmware agent thread) without locking.
+///
+/// NOTE: `Debug` is `core::fmt::Debug` to stay `no_std`-compatible (REQ-SAFE-001).
+pub trait Transport: core::fmt::Debug + Send + Sync {
+    /// Perform an HTTP POST of `body` to `url + path` and return the response body.
+    fn post(
+        &self,
+        url: &str,
+        path: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<String, HttpError>;
+
+    /// Perform an HTTP GET of `url + path` and return the response body.
+    fn get(&self, url: &str, path: &str) -> Result<String, HttpError>;
+}
+
+/// An `Arc`-shared, thread-safe transport handle.
+pub type SharedTransport = Arc<dyn Transport>;
+
+/// Global process-wide default transport.
+///
+/// [`EspHttpClient::new`] / [`EspHttpClient::from_url`] fall back to this when
+/// no explicit transport is supplied, so firmware and host crates can install a
+/// real backend **once** at startup and every `EspHttpClient` constructed by
+/// `agent_tools` automatically uses it — no threading of a transport through
+/// every call site.
+static DEFAULT_TRANSPORT: OnceCell<SharedTransport> = OnceCell::new();
+
+/// Install the process-wide default [`Transport`] (idempotent).
+///
+/// Returns `Err(t)` with the supplied handle if a default is already installed
+/// (e.g. if the firmware boot path is re-entered after a soft reboot). Failure
+/// is non-fatal: an explicit transport on a per-client basis still wins.
+pub fn set_default_transport(t: SharedTransport) -> Result<(), SharedTransport> {
+    DEFAULT_TRANSPORT.set(t)
+}
+
+/// The current default transport, or a `MockTransport` if none was installed.
+fn default_transport() -> SharedTransport {
+    DEFAULT_TRANSPORT
+        .get()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(MockTransport))
+}
+
+/// A no-op transport that fails with a descriptive error.
+///
+/// This is the **safety fallback** used when no transport has been installed
+/// (REQ-NET-002: never silently fake a success). It exists so `EspHttpClient`
+/// remains constructible in unit tests and in the bare `no_std` core, while a
+/// real RPC call on a device that forgot to install a transport fails loudly
+/// instead of hanging or returning garbage.
+#[derive(Debug, Clone, Default)]
+pub struct MockTransport;
+
+impl Transport for MockTransport {
+    fn post(
+        &self,
+        _url: &str,
+        _path: &str,
+        _body: &str,
+        _headers: &[(&str, &str)],
+    ) -> Result<String, HttpError> {
+        Err(HttpError::ConnectionFailed(
+            "no Transport installed: call magent_core::web3::blockchain::esp32_http::\
+             set_default_transport(...) or use EspHttpClient::with_transport(...)"
+                .to_string(),
+        ))
+    }
+
+    fn get(&self, _url: &str, _path: &str) -> Result<String, HttpError> {
+        Err(HttpError::ConnectionFailed(
+            "no Transport installed: call set_default_transport(...) or \
+             use EspHttpClient::with_transport(...)"
+                .to_string(),
+        ))
+    }
+}
+
+/// A transport that returns preprogrammed response bodies.
+///
+/// Used by the unit tests below to exercise the full JSON-RPC
+/// serialise → POST → parse pipeline against a fixed, offline backend
+/// (no network, no host HTTP stack required).
+#[derive(Debug, Clone, Default)]
+pub struct StaticTransport {
+    /// Response body returned by every `post` call.
+    pub post_response: String,
+    /// Response body returned by every `get` call.
+    pub get_response: String,
+}
+
+impl StaticTransport {
+    /// Build a transport that answers every POST with `post_response`.
+    pub fn posting(post_response: impl Into<String>) -> Self {
+        Self {
+            post_response: post_response.into(),
+            get_response: String::new(),
+        }
+    }
+}
+
+impl Transport for StaticTransport {
+    fn post(
+        &self,
+        _url: &str,
+        _path: &str,
+        _body: &str,
+        _headers: &[(&str, &str)],
+    ) -> Result<String, HttpError> {
+        Ok(self.post_response.clone())
+    }
+
+    fn get(&self, _url: &str, _path: &str) -> Result<String, HttpError> {
+        Ok(self.get_response.clone())
+    }
+}
+
 /// HTTP errors
 #[derive(Debug, Clone)]
 pub enum HttpError {
@@ -333,23 +503,41 @@ impl core::fmt::Display for HttpError {
 /// - `embedded-http` crate
 #[derive(Debug, Clone)]
 pub struct EspHttpClient {
-    #[allow(dead_code)]
     config: HttpClientConfig,
     connected: bool,
+    transport: SharedTransport,
 }
 
 impl EspHttpClient {
-    /// Create new client
+    /// Create new client using the process-wide default transport
+    /// (or `MockTransport` if none was installed via
+    /// [`set_default_transport`]).
     pub fn new(config: HttpClientConfig) -> Self {
         Self {
             config,
             connected: false,
+            transport: default_transport(),
         }
     }
 
     /// Create from URL
     pub fn from_url(url: &str) -> Self {
         Self::new(HttpClientConfig::from_url(url))
+    }
+
+    /// Create a client bound to an explicit transport, bypassing the
+    /// process-wide default.
+    pub fn with_transport(config: HttpClientConfig, transport: SharedTransport) -> Self {
+        Self {
+            config,
+            connected: false,
+            transport,
+        }
+    }
+
+    /// Swap the wire backend after construction.
+    pub fn set_transport(&mut self, transport: SharedTransport) {
+        self.transport = transport;
     }
 
     /// Connect to server
@@ -382,34 +570,19 @@ impl EspHttpClient {
         let response = self.post_raw("/", &body)?;
 
         // Parse response
-        serde_json::from_str(&response)
-            .map_err(|e| HttpError::InvalidResponse(e.to_string()))
+        serde_json::from_str(&response).map_err(|e| HttpError::InvalidResponse(e.to_string()))
     }
 
     /// Raw POST request
-    pub fn post_raw(&mut self, _path: &str, _body: &str) -> Result<String, HttpError> {
-        // PLACEHOLDER: In production, implement actual HTTP POST
-        // using esp-idf HTTP client:
-        //
-        // ```rust,ignore
-        // use esp_idf_hal::http::client::EspHttpClient;
-        //
-        // let mut client = EspHttpClient::new();
-        // let mut response = client.post(
-        //     &self.config.host,
-        //     path,
-        //     &[("Content-Type", "application/json")],
-        //     body.as_bytes(),
-        // ).map_err(|e| HttpError::ConnectionFailed(e.to_string()))?;
-        //
-        // let mut buf = [0u8; 4096];
-        // let len = response.read(&mut buf).map_err(HttpError::InvalidResponse)?;
-        // Ok(core::str::from_utf8(&buf[..len]).unwrap().to_string())
-        // ```
-
-        Err(HttpError::ConnectionFailed(
-            "ESP32 HTTP client not implemented - integrate esp-idf".to_string(),
-        ))
+    ///
+    /// Serialises a JSON-RPC body over the configured [`Transport`]. The
+    /// concrete wire implementation (esp-idf / reqwest / mock) is injected at
+    /// construction time; this method only builds the authority URL and hands
+    /// the body to the transport (REQ-NET-004).
+    pub fn post_raw(&mut self, path: &str, body: &str) -> Result<String, HttpError> {
+        let url = self.config.base_url();
+        let headers = [("content-type", "application/json")];
+        self.transport.post(&url, path, body, &headers)
     }
 
     /// Get block number
@@ -419,12 +592,9 @@ impl EspHttpClient {
         match response.result {
             JsonRpcResult::Success { result, .. } => {
                 let hex = result.trim_start_matches("0x");
-                u64::from_str_radix(hex, 16)
-                    .map_err(|e| HttpError::InvalidResponse(e.to_string()))
+                u64::from_str_radix(hex, 16).map_err(|e| HttpError::InvalidResponse(e.to_string()))
             }
-            JsonRpcResult::Error { error, .. } => {
-                Err(HttpError::InvalidResponse(error.message))
-            }
+            JsonRpcResult::Error { error, .. } => Err(HttpError::InvalidResponse(error.message)),
         }
     }
 
@@ -435,12 +605,9 @@ impl EspHttpClient {
         match response.result {
             JsonRpcResult::Success { result, .. } => {
                 let hex = result.trim_start_matches("0x");
-                u128::from_str_radix(hex, 16)
-                    .map_err(|e| HttpError::InvalidResponse(e.to_string()))
+                u128::from_str_radix(hex, 16).map_err(|e| HttpError::InvalidResponse(e.to_string()))
             }
-            JsonRpcResult::Error { error, .. } => {
-                Err(HttpError::InvalidResponse(error.message))
-            }
+            JsonRpcResult::Error { error, .. } => Err(HttpError::InvalidResponse(error.message)),
         }
     }
 
@@ -451,12 +618,9 @@ impl EspHttpClient {
         match response.result {
             JsonRpcResult::Success { result, .. } => {
                 let hex = result.trim_start_matches("0x");
-                u64::from_str_radix(hex, 16)
-                    .map_err(|e| HttpError::InvalidResponse(e.to_string()))
+                u64::from_str_radix(hex, 16).map_err(|e| HttpError::InvalidResponse(e.to_string()))
             }
-            JsonRpcResult::Error { error, .. } => {
-                Err(HttpError::InvalidResponse(error.message))
-            }
+            JsonRpcResult::Error { error, .. } => Err(HttpError::InvalidResponse(error.message)),
         }
     }
 
@@ -467,12 +631,9 @@ impl EspHttpClient {
         match response.result {
             JsonRpcResult::Success { result, .. } => {
                 let hex = result.trim_start_matches("0x");
-                u128::from_str_radix(hex, 16)
-                    .map_err(|e| HttpError::InvalidResponse(e.to_string()))
+                u128::from_str_radix(hex, 16).map_err(|e| HttpError::InvalidResponse(e.to_string()))
             }
-            JsonRpcResult::Error { error, .. } => {
-                Err(HttpError::InvalidResponse(error.message))
-            }
+            JsonRpcResult::Error { error, .. } => Err(HttpError::InvalidResponse(error.message)),
         }
     }
 
@@ -482,9 +643,7 @@ impl EspHttpClient {
         let response: JsonRpcResponse<String> = self.rpc(&request)?;
         match response.result {
             JsonRpcResult::Success { result, .. } => Ok(result),
-            JsonRpcResult::Error { error, .. } => {
-                Err(HttpError::InvalidResponse(error.message))
-            }
+            JsonRpcResult::Error { error, .. } => Err(HttpError::InvalidResponse(error.message)),
         }
     }
 
@@ -497,25 +656,23 @@ impl EspHttpClient {
         let response: JsonRpcResponse<Option<TransactionReceiptResponse>> = self.rpc(&request)?;
         match response.result {
             JsonRpcResult::Success { result, .. } => Ok(result),
-            JsonRpcResult::Error { error, .. } => {
-                Err(HttpError::InvalidResponse(error.message))
-            }
+            JsonRpcResult::Error { error, .. } => Err(HttpError::InvalidResponse(error.message)),
         }
     }
 }
 
 impl HttpClientTrait for EspHttpClient {
-    fn post(&self, _request: &JsonRpcRequest) -> Result<String, HttpError> {
-        // Placeholder - use rpc() method instead
-        Err(HttpError::ConnectionFailed(
-            "use rpc() method".to_string(),
-        ))
+    fn post(&self, request: &JsonRpcRequest) -> Result<String, HttpError> {
+        let body = serde_json::to_string(request)
+            .map_err(|e| HttpError::InvalidResponse(e.to_string()))?;
+        let url = self.config.base_url();
+        let headers = [("content-type", "application/json")];
+        self.transport.post(&url, "/", &body, &headers)
     }
 
-    fn get(&self, _path: &str) -> Result<String, HttpError> {
-        Err(HttpError::ConnectionFailed(
-            "GET not implemented".to_string(),
-        ))
+    fn get(&self, path: &str) -> Result<String, HttpError> {
+        let url = self.config.base_url();
+        self.transport.get(&url, path)
     }
 
     fn is_connected(&self) -> bool {
@@ -604,19 +761,18 @@ impl TransactionPoller {
     pub fn poll(&mut self, tx_hash: &str) -> PollStatus {
         match self.client.get_transaction_receipt(tx_hash) {
             Ok(Some(receipt)) => {
-                let status = u64::from_str_radix(
-                    receipt.status.trim_start_matches("0x"),
-                    16,
-                ).unwrap_or(0);
+                let status =
+                    u64::from_str_radix(receipt.status.trim_start_matches("0x"), 16).unwrap_or(0);
                 if status == 1 {
                     PollStatus::Confirmed(receipt)
                 } else {
                     PollStatus::Failed
                 }
             }
-            Ok(None) => {
-                PollStatus::Pending { attempts: 0, delay_ms: self.poll_interval_ms }
-            }
+            Ok(None) => PollStatus::Pending {
+                attempts: 0,
+                delay_ms: self.poll_interval_ms,
+            },
             Err(e) => PollStatus::Error(e.to_string()),
         }
     }
@@ -675,6 +831,31 @@ mod tests {
     }
 
     #[test]
+    fn test_config_from_url_malformed_no_panic() {
+        // Malformed / hostile URLs must never panic (REQ-NET-003): the parser
+        // returns sensible defaults instead.
+        for bad in ["", "://", "http://", "not a url", "http://:9999/", "ftp://h/"] {
+            let cfg = HttpClientConfig::from_url(bad);
+            // Host may be empty, but port must stay a valid u16 and use_tls sane.
+            assert!(cfg.port > 0);
+            let _ = cfg.base_url();
+        }
+    }
+
+    #[test]
+    fn test_config_from_url_rejects_non_http_scheme() {
+        // Non-http(s) schemes must not be mis-parsed into a bogus host; they
+        // fall back to the safe default (defense against scheme confusion).
+        let def = HttpClientConfig::default();
+        for bad in ["ftp://host/x", "gopher://h", "ws://h", "not a url", ""] {
+            let cfg = HttpClientConfig::from_url(bad);
+            assert_eq!(cfg.host, def.host, "scheme {bad:?} should be rejected");
+            assert_eq!(cfg.port, def.port);
+            assert_eq!(cfg.use_tls, def.use_tls);
+        }
+    }
+
+    #[test]
     fn test_config_from_url_with_path() {
         let config = HttpClientConfig::from_url("https://eth.llamarpc.com/path/to/resource");
         assert_eq!(config.host, "eth.llamarpc.com");
@@ -698,14 +879,16 @@ mod tests {
 
     #[test]
     fn test_rpc_request_get_balance() {
-        let req = JsonRpcRequest::get_balance("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21", "latest");
+        let req =
+            JsonRpcRequest::get_balance("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21", "latest");
         assert_eq!(req.method, "eth_getBalance");
         assert_eq!(req.params.len(), 2);
     }
 
     #[test]
     fn test_rpc_request_get_nonce() {
-        let req = JsonRpcRequest::get_nonce("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21", "pending");
+        let req =
+            JsonRpcRequest::get_nonce("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21", "pending");
         assert_eq!(req.method, "eth_getTransactionCount");
         assert_eq!(req.params.len(), 2);
     }
@@ -791,7 +974,8 @@ mod tests {
 
     #[test]
     fn test_parse_response_error() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
         let response: JsonRpcResponse<String> = serde_json::from_str(json).unwrap();
         match response.result {
             JsonRpcResult::Error { id, error } => {
@@ -837,8 +1021,12 @@ mod tests {
     fn test_http_error_variants() {
         assert!(HttpError::Timeout.to_string().contains("timeout"));
         assert!(HttpError::BufferOverflow.to_string().contains("overflow"));
-        assert!(HttpError::DnsFailed("test".to_string()).to_string().contains("DNS"));
-        assert!(HttpError::TlsError("test".to_string()).to_string().contains("TLS"));
+        assert!(HttpError::DnsFailed("test".to_string())
+            .to_string()
+            .contains("DNS"));
+        assert!(HttpError::TlsError("test".to_string())
+            .to_string()
+            .contains("TLS"));
     }
 
     #[test]
@@ -862,6 +1050,150 @@ mod tests {
         let result = client.connect();
         // Result depends on implementation status
         assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_base_url_default_ports() {
+        assert_eq!(
+            HttpClientConfig::from_url("https://eth.llamarpc.com").base_url(),
+            "https://eth.llamarpc.com"
+        );
+        assert_eq!(
+            HttpClientConfig::from_url("http://localhost:8545").base_url(),
+            "http://localhost:8545"
+        );
+        // Explicit default port is normalised away.
+        assert_eq!(
+            HttpClientConfig::from_url("https://polygon-rpc.com:443").base_url(),
+            "https://polygon-rpc.com"
+        );
+        // Non-default port is preserved.
+        assert_eq!(
+            HttpClientConfig::from_url("http://127.0.0.1:8080").base_url(),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn test_rpc_success_via_static_transport() {
+        // A valid `eth_blockNumber` response over the offline static transport.
+        let t = StaticTransport::posting(r#"{"jsonrpc":"2.0","id":0,"result":"0x1f4"}"#);
+        let mut client = EspHttpClient::with_transport(
+            HttpClientConfig::from_url("https://eth.llamarpc.com"),
+            Arc::new(t),
+        );
+        // 0x1f4 == 500
+        assert_eq!(client.get_block_number().unwrap(), 500);
+    }
+
+    #[test]
+    fn test_rpc_error_via_static_transport() {
+        // A JSON-RPC error object must surface as an HttpError, not panic.
+        let t = StaticTransport::posting(
+            r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"Method not found"}}"#,
+        );
+        let mut client = EspHttpClient::with_transport(
+            HttpClientConfig::from_url("https://eth.llamarpc.com"),
+            Arc::new(t),
+        );
+        let res = client.get_block_number();
+        assert!(matches!(res, Err(HttpError::InvalidResponse(_))));
+    }
+
+    #[test]
+    fn test_rpc_malformed_response_is_error_not_panic() {
+        // A non-JSON response body must surface as an error, never a panic
+        // (hostile RPC endpoint / truncated body).
+        let t = StaticTransport::posting("this is not json");
+        let mut client = EspHttpClient::with_transport(
+            HttpClientConfig::from_url("https://eth.llamarpc.com"),
+            Arc::new(t),
+        );
+        let res = client.get_block_number();
+        assert!(matches!(res, Err(HttpError::InvalidResponse(_))));
+    }
+
+    /// A transport that always returns a fixed `HttpError` (used to verify the
+    /// JSON-RPC layer propagates transport-level failures unchanged).
+    #[derive(Debug)]
+    struct ErrTransport {
+        err: HttpError,
+    }
+
+    impl Transport for ErrTransport {
+        fn post(
+            &self,
+            _url: &str,
+            _path: &str,
+            _body: &str,
+            _headers: &[(&str, &str)],
+        ) -> Result<String, HttpError> {
+            Err(self.err.clone())
+        }
+        fn get(&self, _url: &str, _path: &str) -> Result<String, HttpError> {
+            Err(self.err.clone())
+        }
+    }
+
+    #[test]
+    fn test_rpc_propagates_transport_connection_error() {
+        let t: SharedTransport = Arc::new(ErrTransport {
+            err: HttpError::ConnectionFailed("rpc endpoint down".to_string()),
+        });
+        let mut client = EspHttpClient::with_transport(
+            HttpClientConfig::from_url("https://eth.llamarpc.com"),
+            t,
+        );
+        let res = client.get_block_number();
+        assert!(matches!(res, Err(HttpError::ConnectionFailed(msg)) if msg.contains("down")));
+    }
+
+    #[test]
+    fn test_rpc_propagates_transport_timeout() {
+        let t: SharedTransport = Arc::new(ErrTransport { err: HttpError::Timeout });
+        let mut client = EspHttpClient::with_transport(
+            HttpClientConfig::from_url("https://eth.llamarpc.com"),
+            t,
+        );
+        let res = client.get_block_number();
+        assert!(matches!(res, Err(HttpError::Timeout)));
+    }
+
+    #[test]
+    fn test_rpc_fails_loudly_without_transport() {
+        // A MockTransport (the no-backend fallback) must return Err — never a
+        // fabricated success (REQ-NET-002).
+        let mut client = EspHttpClient::with_transport(
+            HttpClientConfig::from_url("https://eth.llamarpc.com"),
+            Arc::new(MockTransport),
+        );
+        assert!(client.get_block_number().is_err());
+    }
+
+    #[test]
+    fn test_get_via_static_transport() {
+        let t = StaticTransport {
+            get_response: r#"{"ok":true}"#.to_string(),
+            ..Default::default()
+        };
+        let client = EspHttpClient::with_transport(
+            HttpClientConfig::from_url("http://localhost:8545"),
+            Arc::new(t),
+        );
+        let body = client.get("/v1/status").unwrap();
+        assert!(body.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn test_set_default_transport_roundtrip() {
+        // Installing a process-wide default makes `EspHttpClient::new` /
+        // `from_url` pick it up automatically (the firmware boot path uses
+        // this to inject the real esp-idf transport once).
+        let t: SharedTransport =
+            Arc::new(StaticTransport::posting(r#"{"jsonrpc":"2.0","id":0,"result":"0x1"}"#));
+        let _ = set_default_transport(t);
+        let mut client = EspHttpClient::from_url("https://eth.llamarpc.com");
+        assert!(client.get_block_number().is_ok());
     }
 
     #[test]

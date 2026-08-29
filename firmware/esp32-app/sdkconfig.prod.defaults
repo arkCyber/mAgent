@@ -1,0 +1,61 @@
+# ==============================================================================
+# mAgent PRODUCTION security overlay (Secure Boot v2 + Flash Encryption).
+# ==============================================================================
+# Overlay on top of `sdkconfig.defaults` for release / production builds.
+# Consumed by `flash-secure.sh`, which merges this into the build and performs
+# the one-time, IRREVERSIBLE eFuse provisioning.
+#
+# ⚠️ WARNING — READ BEFORE FLASHING ⚠️
+#   Burning a device with Secure Boot + Flash Encryption is a ONE-WAY operation.
+#   There is NO software recovery once `espefuse` writes the eFuses. The signing
+#   keys MUST be backed up off-device first (the script refuses to burn eFuses
+#   until `--apply` and a key backup dir are provided).
+#
+# NOTE ON CONFIG NAMES: these keys target ESP-IDF v5.x on the ESP32-C61 (RISC-V)
+# and ESP32-S3 (Xtensa) boards this repo ships. They are the standard Secure
+# Boot v2 + Flash Encryption knobs; verify the exact values against the IDF
+# version resolved for your board (`idf.py menuconfig` → Security features)
+# before flashing production hardware.
+
+# ----------------------------------------------------------------------------
+# 1) Real TLS verification — remove the dev-only "skip verification" escape.
+# ----------------------------------------------------------------------------
+# REQ-NET-001: mbedTLS + the compiled-in CA certificate bundle. Production must
+# NOT skip server-certificate verification.
+CONFIG_ESP_TLS_INSECURE=n
+CONFIG_ESP_HTTP_CLIENT_ALLOW_HTTP_FOR_TESTS=n
+CONFIG_OTA_ALLOW_HTTP=n
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# ----------------------------------------------------------------------------
+# 2) Secure Boot v2 (REQ-FW-004)
+# ----------------------------------------------------------------------------
+# Signing is done AFTER the build by `espsecure.py sign_data` (flash-secure.sh).
+# We deliberately do NOT set `CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES` — that
+# would require a signing key at build time and double-sign the image.
+CONFIG_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_V2_ENABLED=y
+
+# ----------------------------------------------------------------------------
+# 3) Flash Encryption (REQ-FW-004)
+# ----------------------------------------------------------------------------
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+# Release mode: no debug access to the flash. Choose development-only `DEVELOPMENT`
+# mode for bring-up, then rebuild with RELEASE for field units.
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_RELEASE=y
+
+# ----------------------------------------------------------------------------
+# 4) OTA rollback (REQ-FW-005) — requires an OTA-only partition table.
+# ----------------------------------------------------------------------------
+# NOTE: enabling anti-rollback forces an OTA-only layout (no `factory` app).
+# Pair this with `partitions.ota.csv` (see docs) — the default `partitions.csv`
+# ships a `factory` app, which ESP-IDF's anti-rollback check rejects.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=y
+
+# --- OTA-only partition table ---
+# Anti-rollback rejects a `factory` app in the table, so the production build
+# switches to `partitions.ota.csv` (two OTA slots, no factory). First flash
+# must write the app into `ota_0` (0x10000) — see `flash-secure.sh`.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="firmware/esp32-app/partitions.ota.csv"

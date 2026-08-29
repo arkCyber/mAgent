@@ -70,9 +70,7 @@ use crate::tools::{Tool, ToolType};
 
 #[cfg(feature = "web3")]
 #[allow(unused_imports)]
-use crate::web3::blockchain::{
-    Address, Hash, Wei,
-};
+use crate::web3::blockchain::{Address, Hash, Wei};
 
 #[cfg(feature = "web3")]
 use crate::error::try_heapless;
@@ -80,15 +78,12 @@ use crate::error::try_heapless;
 #[cfg(all(feature = "web3", feature = "esp32"))]
 #[allow(unused_imports)]
 use crate::web3::blockchain::{
-    EspHttpClient, TransactionPoller,
-    BlockchainState, BlockchainPollResult,
+    BlockchainPollResult, BlockchainState, EspHttpClient, TransactionPoller,
 };
 
 #[cfg(all(feature = "web3", feature = "esp32"))]
 #[allow(unused_imports)]
-use crate::web3::blockchain::esp32_http::{
-    PollStatus, HttpClientConfig,
-};
+use crate::web3::blockchain::esp32_http::{HttpClientConfig, PollStatus};
 
 #[cfg(feature = "web3")]
 use crate::web3::identity::Identity;
@@ -100,10 +95,10 @@ use serde_json::{json, Value};
 // Standard HTTP RPC client (gated on std)
 #[cfg(all(feature = "web3", feature = "std"))]
 #[allow(unused_imports)]
-use crate::web3::blockchain::http_client::HttpRpcClient;
+use crate::web3::blockchain::client::{ChainClient, ChainId};
 #[cfg(all(feature = "web3", feature = "std"))]
 #[allow(unused_imports)]
-use crate::web3::blockchain::client::{ChainClient, ChainId};
+use crate::web3::blockchain::http_client::HttpRpcClient;
 
 // ============================================================================
 // Blockchain Tool Types
@@ -465,10 +460,12 @@ fn backend_get_balance(
     address: &str,
 ) -> core::result::Result<Wei, AgentError> {
     if let BlockchainBackend::Esp32 { client, .. } = backend {
-        let raw = client.get_balance(address).map_err(|_| AgentError::ConfigurationError {
-            field: "blockchain",
-            reason: crate::error::ConfigError::NotConfigured,
-        })?;
+        let raw = client
+            .get_balance(address)
+            .map_err(|_| AgentError::ConfigurationError {
+                field: "blockchain",
+                reason: crate::error::ConfigError::NotConfigured,
+            })?;
         Ok(Wei(raw))
     } else {
         Err(AgentError::ConfigurationError {
@@ -491,11 +488,9 @@ fn backend_get_balance(
         })?;
         client
             .get_balance(&addr)
-            .map_err(|_e| {
-                AgentError::ConfigurationError {
-                    field: "blockchain_rpc",
-                    reason: crate::error::ConfigError::MissingField,
-                }
+            .map_err(|_e| AgentError::ConfigurationError {
+                field: "blockchain_rpc",
+                reason: crate::error::ConfigError::MissingField,
             })
     } else {
         Err(AgentError::ConfigurationError {
@@ -524,10 +519,12 @@ fn backend_get_nonce(
     address: &str,
 ) -> core::result::Result<u64, AgentError> {
     if let BlockchainBackend::Esp32 { client, .. } = backend {
-        client.get_nonce(address).map_err(|_| AgentError::ConfigurationError {
-            field: "blockchain",
-            reason: crate::error::ConfigError::MissingField,
-        })
+        client
+            .get_nonce(address)
+            .map_err(|_| AgentError::ConfigurationError {
+                field: "blockchain",
+                reason: crate::error::ConfigError::MissingField,
+            })
     } else {
         Err(AgentError::ConfigurationError {
             field: "blockchain",
@@ -547,10 +544,12 @@ fn backend_get_nonce(
             field: "blockchain_address",
             reason: crate::error::ConfigError::MissingField,
         })?;
-        client.get_nonce(&addr).map_err(|_| AgentError::ConfigurationError {
-            field: "blockchain_rpc",
-            reason: crate::error::ConfigError::MissingField,
-        })
+        client
+            .get_nonce(&addr)
+            .map_err(|_| AgentError::ConfigurationError {
+                field: "blockchain_rpc",
+                reason: crate::error::ConfigError::MissingField,
+            })
     } else {
         Err(AgentError::ConfigurationError {
             field: "blockchain",
@@ -572,18 +571,18 @@ fn backend_get_nonce(
 
 /// Get gas price via the appropriate backend.
 #[cfg(feature = "esp32")]
-fn backend_get_gas_price(
-    backend: &mut BlockchainBackend,
-) -> core::result::Result<u64, AgentError> {
+fn backend_get_gas_price(backend: &mut BlockchainBackend) -> core::result::Result<u64, AgentError> {
     if let BlockchainBackend::Esp32 { client, .. } = backend {
         // `EspHttpClient::get_gas_price` returns wei (u128) but the
         // host-side `ChainClient::get_gas_price` returns gwei (u64).
         // We match the host convention by truncating; satellite and
         // IoT workloads never need sub-gwei precision.
-        let wei = client.get_gas_price().map_err(|_| AgentError::ConfigurationError {
-            field: "blockchain",
-            reason: crate::error::ConfigError::NotConfigured,
-        })?;
+        let wei = client
+            .get_gas_price()
+            .map_err(|_| AgentError::ConfigurationError {
+                field: "blockchain",
+                reason: crate::error::ConfigError::NotConfigured,
+            })?;
         Ok((wei / Wei::GWEI.0) as u64)
     } else {
         Err(AgentError::ConfigurationError {
@@ -594,14 +593,14 @@ fn backend_get_gas_price(
 }
 
 #[cfg(all(feature = "std", not(feature = "esp32")))]
-fn backend_get_gas_price(
-    backend: &mut BlockchainBackend,
-) -> core::result::Result<u64, AgentError> {
+fn backend_get_gas_price(backend: &mut BlockchainBackend) -> core::result::Result<u64, AgentError> {
     if let BlockchainBackend::Std { client } = backend {
-        let wei = client.get_gas_price().map_err(|_| AgentError::ConfigurationError {
-            field: "blockchain_rpc",
-            reason: crate::error::ConfigError::MissingField,
-        })?;
+        let wei = client
+            .get_gas_price()
+            .map_err(|_| AgentError::ConfigurationError {
+                field: "blockchain_rpc",
+                reason: crate::error::ConfigError::MissingField,
+            })?;
         Ok(wei.as_wei() as u64)
     } else {
         Err(AgentError::ConfigurationError {
@@ -627,10 +626,12 @@ fn backend_get_block_number(
     backend: &mut BlockchainBackend,
 ) -> core::result::Result<u64, AgentError> {
     if let BlockchainBackend::Esp32 { client, .. } = backend {
-        client.get_block_number().map_err(|_| AgentError::ConfigurationError {
-            field: "blockchain",
-            reason: crate::error::ConfigError::MissingField,
-        })
+        client
+            .get_block_number()
+            .map_err(|_| AgentError::ConfigurationError {
+                field: "blockchain",
+                reason: crate::error::ConfigError::MissingField,
+            })
     } else {
         Err(AgentError::ConfigurationError {
             field: "blockchain",
@@ -644,10 +645,12 @@ fn backend_get_block_number(
     backend: &mut BlockchainBackend,
 ) -> core::result::Result<u64, AgentError> {
     if let BlockchainBackend::Std { client } = backend {
-        client.get_block_number().map_err(|_| AgentError::ConfigurationError {
-            field: "blockchain_rpc",
-            reason: crate::error::ConfigError::MissingField,
-        })
+        client
+            .get_block_number()
+            .map_err(|_| AgentError::ConfigurationError {
+                field: "blockchain_rpc",
+                reason: crate::error::ConfigError::MissingField,
+            })
     } else {
         Err(AgentError::ConfigurationError {
             field: "blockchain",
@@ -698,12 +701,13 @@ fn backend_send_transaction(
             field: "blockchain_tx",
             reason: crate::error::ConfigError::MissingField,
         })?;
-        let hash = client
-            .send_raw_transaction(&bytes)
-            .map_err(|_| AgentError::ConfigurationError {
-                field: "blockchain_rpc",
-                reason: crate::error::ConfigError::MissingField,
-            })?;
+        let hash =
+            client
+                .send_raw_transaction(&bytes)
+                .map_err(|_| AgentError::ConfigurationError {
+                    field: "blockchain_rpc",
+                    reason: crate::error::ConfigError::MissingField,
+                })?;
         Ok(hash.to_hex())
     } else {
         Err(AgentError::ConfigurationError {
@@ -1010,14 +1014,38 @@ pub fn create_blockchain_tools() -> Vec<Tool, 8> {
         }};
     }
 
-    push_tool!("get_balance", "Get ETH balance for an Ethereum address. Args: {\"address\": \"0x...\"}");
-    push_tool!("get_nonce", "Get transaction count (nonce) for an Ethereum address. Args: {\"address\": \"0x...\"}");
-    push_tool!("get_gas_price", "Get current gas price in Gwei. No args required.");
-    push_tool!("get_block_number", "Get current block number. No args required.");
-    push_tool!("send_transaction", "Send a signed transaction. Args: {\"transaction\": \"0x...\"}");
-    push_tool!("poll_transaction", "Poll for transaction confirmation. Args: {\"tx_hash\": \"0x...\"} or uses pending tx.");
-    push_tool!("blockchain_status", "Get blockchain client status. No args required.");
-    push_tool!("sign_message", "Sign a message with the agent's identity key. Args: {\"message\": \"...\"}");
+    push_tool!(
+        "get_balance",
+        "Get ETH balance for an Ethereum address. Args: {\"address\": \"0x...\"}"
+    );
+    push_tool!(
+        "get_nonce",
+        "Get transaction count (nonce) for an Ethereum address. Args: {\"address\": \"0x...\"}"
+    );
+    push_tool!(
+        "get_gas_price",
+        "Get current gas price in Gwei. No args required."
+    );
+    push_tool!(
+        "get_block_number",
+        "Get current block number. No args required."
+    );
+    push_tool!(
+        "send_transaction",
+        "Send a signed transaction. Args: {\"transaction\": \"0x...\"}"
+    );
+    push_tool!(
+        "poll_transaction",
+        "Poll for transaction confirmation. Args: {\"tx_hash\": \"0x...\"} or uses pending tx."
+    );
+    push_tool!(
+        "blockchain_status",
+        "Get blockchain client status. No args required."
+    );
+    push_tool!(
+        "sign_message",
+        "Sign a message with the agent's identity key. Args: {\"message\": \"...\"}"
+    );
 
     tools
 }
@@ -1064,11 +1092,7 @@ pub fn verify_signature(
     // 2. Verify the signature using the identity's public key directly
     //    (not by re-signing). `verify_signature` returns true/false for
     //    any cryptographic failure with no panics.
-    let valid = crate::web3::verify_signature(
-        identity.public_key(),
-        signature_hex,
-        message_bytes,
-    );
+    let valid = crate::web3::verify_signature(identity.public_key(), signature_hex, message_bytes);
     if valid {
         BlockchainToolResult::success("Signature verified successfully".to_string())
     } else {
@@ -1249,14 +1273,20 @@ mod tests {
     fn test_parse_address_from_args_json() {
         let args = r#"{"address": "0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21"}"#;
         let addr = parse_address_from_args(args);
-        assert_eq!(addr, Some("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21".to_string()));
+        assert_eq!(
+            addr,
+            Some("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21".to_string())
+        );
     }
 
     #[test]
     fn test_parse_address_from_args_plain() {
         let args = "0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21";
         let addr = parse_address_from_args(args);
-        assert_eq!(addr, Some("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21".to_string()));
+        assert_eq!(
+            addr,
+            Some("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21".to_string())
+        );
     }
 
     #[test]
@@ -1416,7 +1446,8 @@ mod tests {
     #[test]
     fn test_tool_result_from_impl() {
         // Test using Into<String> trait
-        let result_success: BlockchainToolResult = BlockchainToolResult::success(String::from("test"));
+        let result_success: BlockchainToolResult =
+            BlockchainToolResult::success(String::from("test"));
         assert!(result_success.success);
 
         let result_error: BlockchainToolResult = BlockchainToolResult::error(String::from("error"));
@@ -1482,10 +1513,7 @@ mod tests {
         // math yields `whole=1`, `frac=234_567_000_000_000_000`,
         // `frac6 = frac/10^15 = 234`. So the last decimal drops
         // off — verified to ensure no hidden f64 rounding sneaks in.
-        assert_eq!(
-            wei_to_eth_string(1_234_567_000_000_000_000),
-            "1.000234 ETH"
-        );
+        assert_eq!(wei_to_eth_string(1_234_567_000_000_000_000), "1.000234 ETH");
         assert_eq!(wei_to_eth_string(WEI_PER_ETH), "1.000000 ETH");
         assert_eq!(wei_to_eth_string(0), "0.000000 ETH");
     }

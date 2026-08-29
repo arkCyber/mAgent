@@ -157,6 +157,7 @@ MicroAgent/
 │   ├── email-mcp/          # Email MCP server (IMAP/SMTP)
 │   ├── mqtt-mcp/           # MQTT MCP server
 │   ├── mcp-tool-executor/  # MCP tool executor
+│   ├── lua-app/            # Lua 5.4 scripting host: hardware.* + agent.reason + AppRuntime (61 tests)
 │   └── magent-man/         # Tauri desktop "Device Manager" app (BLE config)
 │
 ├── cli/                     # `magent` command-line tool
@@ -404,7 +405,8 @@ magent summary rollback boot-hang 2                # promote history[2] to activ
 | **`AT+WIFIPASSUPGRADE=1` (DBO1 → DBO2 in-place migration)** | ✅ | ✅ |
 | Crash-loop detection + safe mode | ✅ | ✅ |
 | Health monitoring (heartbeat, free-heap) | ✅ | ✅ |
-| OTA Updates | 🔄 | 🔄 |
+| **`AT+PING` (IPv4 ICMP via esp_ping; hostname DNS)** | ✅ | ✅ |
+| OTA Updates (`AT+OTA` + anti-rollback confirm; awaits on-hardware) | 🔄 | 🔄 |
 | **Cloud LLM backends (DeepSeek / Ollama, pluggable)** | ✅ | ✅ |
 | **Web browsing (`web_search` / `fetch_url` / `webpage_summary`)** | ✅ (host) | ✅ (host) |
 | **Weather query (`get_weather`, Open-Meteo, no key)** | ✅ (host) | ✅ (host) |

@@ -325,7 +325,7 @@ impl<'a> SummaryCmd<'a> {
                     out.write_human("(no summaries on disk yet)\n");
                 } else {
                     let mut s = String::new();
-                    let _ = writeln!(&mut s, "{:<24} {:<10} {:<8} {}", "TOPIC", "UPDATED", "KEPT", "TAGS");
+                    let _ = writeln!(&mut s, "{:<24} {:<10} {:<8} TAGS", "TOPIC", "UPDATED", "KEPT");
                     for r in &records {
                         let updated = format_unix_short(r.updated_at);
                         let tags = if r.metadata.tags.is_empty() {

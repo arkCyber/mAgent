@@ -7,5 +7,4 @@
 fn test_verifiable_credentials_feature_available() {
     // The verifiable_credentials feature flag is tested through successful compilation.
     // Full VC tests require wallet integration which is configured at runtime.
-    assert!(true);
 }

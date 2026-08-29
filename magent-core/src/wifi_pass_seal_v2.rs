@@ -214,8 +214,8 @@ impl core::fmt::Display for SealError {
 
 /// HKDF-Extract: returns a 32-byte PRK.
 fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(salt)
-        .expect("HMAC accepts any key length");
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(salt).expect("HMAC accepts any key length");
     mac.update(ikm);
     let tag = mac.finalize().into_bytes();
     let mut out = [0u8; 32];
@@ -229,8 +229,8 @@ fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
 /// hard-coded to 0x01.
 fn hkdf_expand(prk: &[u8; 32], info: &[u8], out: &mut [u8]) {
     debug_assert!(out.len() <= 32);
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(prk)
-        .expect("HMAC accepts any key length");
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(prk).expect("HMAC accepts any key length");
     mac.update(info);
     mac.update(&[0x01]);
     let tag = mac.finalize().into_bytes();
@@ -270,8 +270,8 @@ fn hex_decode_byte(hi: u8, lo: u8) -> Option<u8> {
 // ---------------------------------------------------------------------------
 
 fn mac_bytes(mac_key: &[u8], nonce: &[u8], cipher: &[u8]) -> [u8; MAC_LEN] {
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(mac_key)
-        .expect("HMAC accepts any key length");
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(mac_key).expect("HMAC accepts any key length");
     mac.update(nonce);
     mac.update(cipher);
     let tag = mac.finalize().into_bytes();
@@ -327,7 +327,8 @@ pub fn seal_str(
     //    Use a small intermediate buffer for the hex payload,
     //    then push it into the heapless::String.
     out.clear();
-    out.push_str(DBO2_PREFIX).map_err(|_| SealError::OutputFull)?;
+    out.push_str(DBO2_PREFIX)
+        .map_err(|_| SealError::OutputFull)?;
     for &b in nonce.iter() {
         let mut buf = [0u8; 2];
         hex_encode_byte(&mut buf, b)?;
@@ -390,16 +391,16 @@ pub fn open_sealed_v2<'a>(
         let nonce_hex = &payload.as_bytes()[..2 * NONCE_LEN];
         let mut nonce = [0u8; NONCE_LEN];
         for i in 0..NONCE_LEN {
-            nonce[i] = hex_decode_byte(nonce_hex[i * 2], nonce_hex[i * 2 + 1])
-                .ok_or(SealError::BadHex)?;
+            nonce[i] =
+                hex_decode_byte(nonce_hex[i * 2], nonce_hex[i * 2 + 1]).ok_or(SealError::BadHex)?;
         }
 
         // Decode MAC (last MAC_LEN hex chars).
         let mac_hex = &payload.as_bytes()[payload.len() - 2 * MAC_LEN..];
         let mut stored_mac = [0u8; MAC_LEN];
         for i in 0..MAC_LEN {
-            stored_mac[i] = hex_decode_byte(mac_hex[i * 2], mac_hex[i * 2 + 1])
-                .ok_or(SealError::BadHex)?;
+            stored_mac[i] =
+                hex_decode_byte(mac_hex[i * 2], mac_hex[i * 2 + 1]).ok_or(SealError::BadHex)?;
         }
 
         // Decode cipher (middle portion).
@@ -447,7 +448,9 @@ pub fn open_sealed_v2<'a>(
         // Fall back to DBO1 / legacy.
         match wifi_pass_seal::open_sealed_bytes(stored, device_key, out) {
             Ok(wifi_pass_seal::OpenOutcome::DecodedBytes) => Ok(OpenOutcome::Dbo1Decoded),
-            Ok(wifi_pass_seal::OpenOutcome::LegacyPlaintext(s)) => Ok(OpenOutcome::LegacyPlaintext(s)),
+            Ok(wifi_pass_seal::OpenOutcome::LegacyPlaintext(s)) => {
+                Ok(OpenOutcome::LegacyPlaintext(s))
+            }
             Err(e) => Err(match e {
                 wifi_pass_seal::SealError::PlaintextTooLong => SealError::PlaintextTooLong,
                 wifi_pass_seal::SealError::EmptyKey => SealError::EmptyKey,
@@ -485,8 +488,7 @@ pub const MAX_SECRET_PLAINTEXT: usize = 256;
 
 /// Maximum encoded length for a blob produced by [`seal_secret`]:
 /// `DBO2:`(5) + 2*NONCE_LEN + 2*MAX_SECRET_PLAINTEXT + 2*MAC_LEN.
-pub const MAX_SECRET_ENCODED_LEN: usize =
-    5 + 2 * (NONCE_LEN + MAX_SECRET_PLAINTEXT + MAC_LEN);
+pub const MAX_SECRET_ENCODED_LEN: usize = 5 + 2 * (NONCE_LEN + MAX_SECRET_PLAINTEXT + MAC_LEN);
 
 /// Outcome of [`open_secret`].
 #[derive(Debug, PartialEq, Eq)]
@@ -544,7 +546,8 @@ pub fn seal_secret(
 
     // 4. Write the wire format: "DBO2:" + hex(nonce) + hex(cipher) + hex(mac).
     out.clear();
-    out.push_str(DBO2_PREFIX).map_err(|_| SealError::OutputFull)?;
+    out.push_str(DBO2_PREFIX)
+        .map_err(|_| SealError::OutputFull)?;
     for &b in nonce.iter() {
         let mut buf = [0u8; 2];
         hex_encode_byte(&mut buf, b)?;
@@ -566,8 +569,6 @@ pub fn seal_secret(
     Ok(())
 }
 
-
-
 /// Open a secret stored by [`seal_secret`].
 ///
 /// * `DBO2:` prefix present → decode, MAC-verify (constant time), decrypt
@@ -577,8 +578,8 @@ pub fn seal_secret(
 ///   sealing existed). The caller is expected to re-seal such an entry on
 ///   the next successful open, mirroring the Wi-Fi `AT+WIFIPASSUPGRADE`
 ///   migration pattern.
-pub fn open_secret<'a>(
-    stored: &'a str,
+pub fn open_secret(
+    stored: &str,
     device_key: &[u8],
     out: &mut Vec<u8, MAX_SECRET_PLAINTEXT>,
 ) -> Result<SecretOpenOutcome, SealError> {
@@ -587,7 +588,8 @@ pub fn open_secret<'a>(
     };
 
     // Must at least hold nonce + MAC; cipher length must be even (hex).
-    if payload.len() < 2 * (NONCE_LEN + MAC_LEN) || !(payload.len() - 2 * MAC_LEN).is_multiple_of(2) {
+    if payload.len() < 2 * (NONCE_LEN + MAC_LEN) || !(payload.len() - 2 * MAC_LEN).is_multiple_of(2)
+    {
         return Err(SealError::BadLength);
     }
 
@@ -595,16 +597,16 @@ pub fn open_secret<'a>(
     let nonce_hex = &payload.as_bytes()[..2 * NONCE_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     for i in 0..NONCE_LEN {
-        nonce[i] = hex_decode_byte(nonce_hex[i * 2], nonce_hex[i * 2 + 1])
-            .ok_or(SealError::BadHex)?;
+        nonce[i] =
+            hex_decode_byte(nonce_hex[i * 2], nonce_hex[i * 2 + 1]).ok_or(SealError::BadHex)?;
     }
 
     // Decode MAC (last MAC_LEN hex chars).
     let mac_hex = &payload.as_bytes()[payload.len() - 2 * MAC_LEN..];
     let mut stored_mac = [0u8; MAC_LEN];
     for i in 0..MAC_LEN {
-        stored_mac[i] = hex_decode_byte(mac_hex[i * 2], mac_hex[i * 2 + 1])
-            .ok_or(SealError::BadHex)?;
+        stored_mac[i] =
+            hex_decode_byte(mac_hex[i * 2], mac_hex[i * 2 + 1]).ok_or(SealError::BadHex)?;
     }
 
     // Decode cipher (middle portion).
@@ -618,8 +620,8 @@ pub fn open_secret<'a>(
     }
     let mut cipher: Vec<u8, MAX_SECRET_PLAINTEXT> = Vec::new();
     for i in 0..cipher_len {
-        let b = hex_decode_byte(cipher_hex[i * 2], cipher_hex[i * 2 + 1])
-            .ok_or(SealError::BadHex)?;
+        let b =
+            hex_decode_byte(cipher_hex[i * 2], cipher_hex[i * 2 + 1]).ok_or(SealError::BadHex)?;
         cipher.push(b).map_err(|_| SealError::OutputFull)?;
     }
 
@@ -646,7 +648,6 @@ pub fn open_secret<'a>(
     }
     Ok(SecretOpenOutcome::Dbo2Decoded)
 }
-
 
 // ---------------------------------------------------------------------------
 // Algorithm introspection
@@ -718,8 +719,7 @@ mod tests {
 
     #[test]
     fn max_plaintext_round_trips() {
-        const PLAIN: &str =
-            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        const PLAIN: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
         assert_eq!(PLAIN.len(), MAX_PLAINTEXT);
         let nonce = test_nonce();
         let mut sealed: HeaplessString<MAX_ENCODED_LEN> = HeaplessString::new();
@@ -884,8 +884,7 @@ mod tests {
 
         // Step 4: open the DBO2 blob.
         let mut recovered_again: Vec<u8, MAX_PLAINTEXT> = Vec::new();
-        let outcome2 =
-            open_sealed_v2(&dbo2_blob, TEST_KEY, &mut recovered_again).unwrap();
+        let outcome2 = open_sealed_v2(&dbo2_blob, TEST_KEY, &mut recovered_again).unwrap();
         assert_eq!(outcome2, OpenOutcome::Dbo2Decoded);
 
         // Step 5: byte-identical.
@@ -921,8 +920,7 @@ mod tests {
 
     #[test]
     fn seal_rejects_oversized_plaintext() {
-        const BIG: &str =
-            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        const BIG: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
         assert_eq!(BIG.len(), MAX_PLAINTEXT + 1);
         let nonce = test_nonce();
         let mut sealed: HeaplessString<MAX_ENCODED_LEN> = HeaplessString::new();
@@ -992,7 +990,13 @@ mod tests {
     fn secret_tamper_is_detected() {
         let nonce = test_nonce();
         let mut blob: HeaplessString<MAX_SECRET_ENCODED_LEN> = HeaplessString::new();
-        seal_secret(b"sk-abcdefghijklmnopqrstuvwxyz", TEST_KEY, &nonce, &mut blob).unwrap();
+        seal_secret(
+            b"sk-abcdefghijklmnopqrstuvwxyz",
+            TEST_KEY,
+            &nonce,
+            &mut blob,
+        )
+        .unwrap();
         // Flip one hex character in the middle of the blob by rebuilding
         // it with a single nibble changed.
         let mid = blob.len() / 2;

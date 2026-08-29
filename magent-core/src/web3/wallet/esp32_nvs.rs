@@ -129,21 +129,37 @@ impl core::fmt::Display for WalletStorageError {
 impl From<WalletStorageError> for crate::web3::wallet::error::WalletError {
     fn from(e: WalletStorageError) -> Self {
         match e {
-            WalletStorageError::NotFound => crate::web3::wallet::error::WalletError::KeystoreError("wallet not found".into()),
-            WalletStorageError::StorageFull => crate::web3::wallet::error::WalletError::KeystoreError("storage full".into()),
-            WalletStorageError::InvalidName => crate::web3::wallet::error::WalletError::KeystoreError("invalid name".into()),
-            WalletStorageError::EncryptionFailed(s) => crate::web3::wallet::error::WalletError::EncryptionFailed(s),
-            WalletStorageError::DecryptionFailed(s) => crate::web3::wallet::error::WalletError::DecryptionFailed(s),
-            WalletStorageError::NvsError(s) => crate::web3::wallet::error::WalletError::KeystoreError(s),
-            WalletStorageError::SerializationError => crate::web3::wallet::error::WalletError::KeystoreError("serialization failed".into()),
+            WalletStorageError::NotFound => {
+                crate::web3::wallet::error::WalletError::KeystoreError("wallet not found".into())
+            }
+            WalletStorageError::StorageFull => {
+                crate::web3::wallet::error::WalletError::KeystoreError("storage full".into())
+            }
+            WalletStorageError::InvalidName => {
+                crate::web3::wallet::error::WalletError::KeystoreError("invalid name".into())
+            }
+            WalletStorageError::EncryptionFailed(s) => {
+                crate::web3::wallet::error::WalletError::EncryptionFailed(s)
+            }
+            WalletStorageError::DecryptionFailed(s) => {
+                crate::web3::wallet::error::WalletError::DecryptionFailed(s)
+            }
+            WalletStorageError::NvsError(s) => {
+                crate::web3::wallet::error::WalletError::KeystoreError(s)
+            }
+            WalletStorageError::SerializationError => {
+                crate::web3::wallet::error::WalletError::KeystoreError(
+                    "serialization failed".into(),
+                )
+            }
             WalletStorageError::CorruptedIndex(s) => {
                 // Use `format!` through `alloc` only on the `std`-enabled
                 // build to keep the `no_std + alloc` variant free of the
                 // dependency. The `WalletError::KeystoreError` variant is
                 // already `String`-backed.
-                crate::web3::wallet::error::WalletError::KeystoreError(
-                    alloc::format!("wallet index corrupted: {s}"),
-                )
+                crate::web3::wallet::error::WalletError::KeystoreError(alloc::format!(
+                    "wallet index corrupted: {s}"
+                ))
             }
         }
     }
@@ -193,8 +209,8 @@ pub fn store_wallet<N: esp_idf_svc::nvs::NvsDefault>(
     };
 
     // Find existing slot or empty slot
-    let slot = find_slot_by_name(&index, name)
-        .or_else(|| index.wallets.iter().position(|w| w.is_none()));
+    let slot =
+        find_slot_by_name(&index, name).or_else(|| index.wallets.iter().position(|w| w.is_none()));
 
     let slot = match slot {
         Some(s) => s,
@@ -360,16 +376,17 @@ fn save_index<N: esp_idf_svc::nvs::NvsDefault>(
     nvs: &esp_idf_svc::nvs::EspNvs<N>,
     index: &WalletStoreIndex,
 ) -> Result<(), WalletStorageError> {
-    let json = serde_json_core::to_string(index)
-        .map_err(|_| WalletStorageError::SerializationError)?;
+    let json =
+        serde_json_core::to_string(index).map_err(|_| WalletStorageError::SerializationError)?;
     nvs.set_str(INDEX_KEY, &json)
         .map_err(|e| WalletStorageError::NvsError(e.to_string()))
 }
 
 fn find_slot_by_name(index: &WalletStoreIndex, name: &str) -> Option<usize> {
-    index.wallets.iter().position(|w| {
-        w.as_ref().map_or(false, |e| e.name.as_str() == name)
-    })
+    index
+        .wallets
+        .iter()
+        .position(|w| w.as_ref().map_or(false, |e| e.name.as_str() == name))
 }
 
 /// Get current Unix timestamp (ESP32)

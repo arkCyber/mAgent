@@ -184,7 +184,9 @@ fn title_regex() -> &'static Regex {
 /// acceptable for a minimal implementation).
 fn script_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?is)<script\b[^>]*>.*?</script>").expect("hardcoded script regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"(?is)<script\b[^>]*>.*?</script>").expect("hardcoded script regex")
+    })
 }
 
 /// Remove `<style>` blocks. Same trade-offs as `script_regex`.
@@ -229,8 +231,9 @@ fn decode_html_entities(s: &str) -> String {
                 None => {
                     // Numeric entity: `&#1234;` or `&#x1F4A9;`
                     if let Some(stripped) = buf.strip_prefix('#') {
-                        let parsed = if let Some(hex) =
-                            stripped.strip_prefix('x').or_else(|| stripped.strip_prefix('X'))
+                        let parsed = if let Some(hex) = stripped
+                            .strip_prefix('x')
+                            .or_else(|| stripped.strip_prefix('X'))
                         {
                             u32::from_str_radix(hex, 16).ok()
                         } else {
@@ -387,8 +390,13 @@ fn validate_fetch_url(url: &str) -> Result<(), String> {
         }
     }
     if let Ok(ip) = lit.parse::<Ipv6Addr>() {
-        let v4_blocked = ip.to_ipv4_mapped()
-            .map(|v4| v4.is_loopback() || is_link_local_v4(v4) || (!ALLOW_PRIVATE_NETWORKS && v4.is_private()))
+        let v4_blocked = ip
+            .to_ipv4_mapped()
+            .map(|v4| {
+                v4.is_loopback()
+                    || is_link_local_v4(v4)
+                    || (!ALLOW_PRIVATE_NETWORKS && v4.is_private())
+            })
             .unwrap_or(false);
         let blocked = ip.is_loopback() || ip.is_unicast_link_local() || v4_blocked;
         if blocked {
@@ -413,8 +421,8 @@ fn is_link_local_v4(ip: Ipv4Addr) -> bool {
 /// `args` should contain `query=...`. Also accepts a bare token
 /// (no `=`), matching the convention used by `read_sensor` / etc.
 pub fn web_search(args: &str) -> std::result::Result<String, String> {
-    let query =
-        extract_query(args, "query").ok_or_else(|| "web_search: missing 'query' arg".to_string())?;
+    let query = extract_query(args, "query")
+        .ok_or_else(|| "web_search: missing 'query' arg".to_string())?;
     if query.trim().is_empty() {
         return Err("web_search: empty query".to_string());
     }
@@ -436,17 +444,14 @@ pub fn web_search(args: &str) -> std::result::Result<String, String> {
         // We try branch 1 first, then branch 2. Each branch has a
         // self-contained href/title/snippet set, so they never bleed
         // into each other.
-        let (href, title_raw, snippet_raw) = if let (Some(h), Some(t), Some(s)) =
-            (cap.get(1), cap.get(2), cap.get(3))
-        {
-            (h.as_str(), t.as_str(), s.as_str())
-        } else if let (Some(h), Some(t), Some(s)) =
-            (cap.get(4), cap.get(5), cap.get(6))
-        {
-            (h.as_str(), t.as_str(), s.as_str())
-        } else {
-            continue;
-        };
+        let (href, title_raw, snippet_raw) =
+            if let (Some(h), Some(t), Some(s)) = (cap.get(1), cap.get(2), cap.get(3)) {
+                (h.as_str(), t.as_str(), s.as_str())
+            } else if let (Some(h), Some(t), Some(s)) = (cap.get(4), cap.get(5), cap.get(6)) {
+                (h.as_str(), t.as_str(), s.as_str())
+            } else {
+                continue;
+            };
 
         let title = normalise_whitespace(&strip_and_decode(title_raw));
         let snippet = normalise_whitespace(&strip_and_decode(snippet_raw));
@@ -545,7 +550,8 @@ pub fn webpage_summary(args: &str) -> std::result::Result<String, String> {
     // couldn't be summarised (rather than silently returning `""`).
     if sentences.is_empty() {
         return Err("webpage_summary: could not split page into sentences \
-             (no terminating punctuation found); page may be empty or non-textual".to_string());
+             (no terminating punctuation found); page may be empty or non-textual"
+            .to_string());
     }
 
     let ranked = rank_sentences(&sentences, &query);
@@ -598,8 +604,8 @@ fn wmo_description(code: i64) -> &'static str {
 ///
 /// `args` accepts both `{"city":"Beijing"}` and `city=Beijing`.
 pub fn get_weather(args: &str) -> std::result::Result<String, String> {
-    let city = extract_query(args, "city")
-        .ok_or_else(|| "get_weather: missing 'city' arg".to_string())?;
+    let city =
+        extract_query(args, "city").ok_or_else(|| "get_weather: missing 'city' arg".to_string())?;
     let city = city.trim();
     if city.is_empty() {
         return Err("get_weather: empty city".to_string());
@@ -610,8 +616,8 @@ pub fn get_weather(args: &str) -> std::result::Result<String, String> {
         url_encode(city)
     );
     let geo_body = blocking_get(&geo_url)?;
-    let geo: serde_json::Value = serde_json::from_str(&geo_body)
-        .map_err(|e| format!("get_weather: geocode parse: {e}"))?;
+    let geo: serde_json::Value =
+        serde_json::from_str(&geo_body).map_err(|e| format!("get_weather: geocode parse: {e}"))?;
     let result = geo
         .get("results")
         .and_then(|r| r.as_array())
@@ -645,16 +651,31 @@ pub fn get_weather(args: &str) -> std::result::Result<String, String> {
         lon = lon,
     );
     let fc_body = blocking_get(&fc_url)?;
-    let fc: serde_json::Value = serde_json::from_str(&fc_body)
-        .map_err(|e| format!("get_weather: forecast parse: {e}"))?;
+    let fc: serde_json::Value =
+        serde_json::from_str(&fc_body).map_err(|e| format!("get_weather: forecast parse: {e}"))?;
 
-    let current = fc.get("current").cloned().unwrap_or_else(|| serde_json::json!({}));
-    let daily = fc.get("daily").cloned().unwrap_or_else(|| serde_json::json!({}));
-    let current_code = current.get("weather_code").and_then(serde_json::Value::as_i64).unwrap_or(-1);
+    let current = fc
+        .get("current")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let daily = fc
+        .get("daily")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let current_code = current
+        .get("weather_code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(-1);
 
     // Build a compact, labelled daily summary so the LLM doesn't have to
     // interpret raw WMO codes.
-    let arr = |k: &str| daily.get(k).and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let arr = |k: &str| {
+        daily
+            .get(k)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
     let days = arr("time");
     let maxs = arr("temperature_2m_max");
     let mins = arr("temperature_2m_min");
@@ -861,7 +882,9 @@ fn read_capped<R: Read>(mut reader: R, cap: usize) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("read body: {e}"))?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("read body: {e}"))?;
         if n == 0 {
             break;
         }
@@ -939,7 +962,6 @@ fn blocking_get_with_meta(url: &str) -> std::result::Result<ResponseMeta, String
         content_type,
         bytes: bytes.len(),
     })
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,8 +1200,7 @@ mod tests {
 
     #[test]
     fn strip_script_style_removes_blocks() {
-        let body =
-            "Hello<script>alert(1)</script>world<style>body{}</style>done";
+        let body = "Hello<script>alert(1)</script>world<style>body{}</style>done";
         let out = strip_script_style(body);
         assert!(!out.contains("alert(1)"));
         assert!(!out.contains("body{}"));
@@ -1229,9 +1250,9 @@ mod tests {
     #[test]
     fn rank_sentences_tiebreak_favours_longer() {
         let sentences = vec![
-            "Rust.".to_string(),           // score=1, len=1
+            "Rust.".to_string(),               // score=1, len=1
             "Rust is a language.".to_string(), // score=1, len=4
-            "Python.".to_string(),          // score=0
+            "Python.".to_string(),             // score=0
         ];
         let ranked = rank_sentences(&sentences, "rust");
         assert_eq!(ranked[0].0, 1); // longer sentence wins tiebreak
@@ -1345,5 +1366,4 @@ mod tests {
         let err = read_capped(std::io::Cursor::new(data), 10).unwrap_err();
         assert!(err.contains("size limit"));
     }
-
 }

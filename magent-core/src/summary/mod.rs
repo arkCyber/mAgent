@@ -107,9 +107,9 @@ mod record;
 
 pub use record::{
     validate_metadata, validate_topic, CompressionPolicySnapshot, HistoryEntry, MessageDto,
-    SummaryBuilder, SummaryError, SummaryMetadata, SummaryRecord, SummarySource, CURRENT_SCHEMA_VERSION, HISTORY_MAX,
-    MAX_RECORD_BYTES, SUMMARY_AUTHOR_MAX, SUMMARY_DESCRIPTION_MAX, SUMMARY_LLM_MAX, SUMMARY_TAG_MAX,
-    SUMMARY_TAGS_MAX, SUMMARY_TOPIC_MAX,
+    SummaryBuilder, SummaryError, SummaryMetadata, SummaryRecord, SummarySource,
+    CURRENT_SCHEMA_VERSION, HISTORY_MAX, MAX_RECORD_BYTES, SUMMARY_AUTHOR_MAX,
+    SUMMARY_DESCRIPTION_MAX, SUMMARY_LLM_MAX, SUMMARY_TAGS_MAX, SUMMARY_TAG_MAX, SUMMARY_TOPIC_MAX,
 };
 
 // ---------------------------------------------------------------------------
@@ -234,15 +234,9 @@ impl FileSummaryStore {
             .open(&path)
             .map_err(|e| SummaryError::Write {
                 path: path.display().to_string(),
-                source: format!(
-                    "could not acquire lock for topic {:?}: {}",
-                    topic, e
-                ),
+                source: format!("could not acquire lock for topic {:?}: {}", topic, e),
             })?;
-        Ok(TopicLockGuard {
-            path,
-            _file: file,
-        })
+        Ok(TopicLockGuard { path, _file: file })
     }
 
     /// Inner helper that performs the atomic write. Caller MUST
@@ -329,12 +323,7 @@ impl FileSummaryStore {
         // than trying to detect the filesystem.
         fs::rename(&tmp, &target).map_err(|e| SummaryError::Write {
             path: target.display().to_string(),
-            source: format!(
-                "rename {} → {}: {}",
-                tmp.display(),
-                target.display(),
-                e
-            ),
+            source: format!("rename {} → {}: {}", tmp.display(), target.display(), e),
         })?;
 
         // Best-effort dir fsync. Some filesystems (e.g. tmpfs) reject
@@ -821,7 +810,10 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         };
-        assert!(matches!(store.save(bad), Err(SummaryError::InvalidTopic(_))));
+        assert!(matches!(
+            store.save(bad),
+            Err(SummaryError::InvalidTopic(_))
+        ));
         // And make sure the legit save above didn't leak.
         let rec = SummaryBuilder::new("ok")
             .unwrap()
@@ -978,10 +970,7 @@ mod tests {
                 for i in 0..20 {
                     let rec = SummaryBuilder::new("contended")
                         .unwrap()
-                        .with_window(&[Message::user(&format!(
-                            "tid={} iter={}",
-                            tid, i
-                        ))])
+                        .with_window(&[Message::user(&format!("tid={} iter={}", tid, i))])
                         .with_stats(CompressionStats {
                             kept: 1 + i,
                             ..Default::default()
@@ -1031,7 +1020,9 @@ mod tests {
         }"#;
         let r = parse(raw, Path::new("future.json"));
         match r {
-            Err(SummaryError::UnsupportedSchema { found, supported, .. }) => {
+            Err(SummaryError::UnsupportedSchema {
+                found, supported, ..
+            }) => {
                 assert_eq!(found, 999);
                 assert_eq!(supported, CURRENT_SCHEMA_VERSION);
             }

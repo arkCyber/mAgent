@@ -186,8 +186,11 @@ impl DidKey {
     /// `true` if the body begins with a multicodec prefix we
     /// recognise (Ed25519 public or secret key).
     fn has_recognised_multicodec(&self) -> bool {
-        self.multicodec_and_key.starts_with(&ED25519_PUB_MULTICODEC_PREFIX)
-            || self.multicodec_and_key.starts_with(&ED25519_SEC_MULTICODEC_PREFIX)
+        self.multicodec_and_key
+            .starts_with(&ED25519_PUB_MULTICODEC_PREFIX)
+            || self
+                .multicodec_and_key
+                .starts_with(&ED25519_SEC_MULTICODEC_PREFIX)
     }
 
     /// `true` if the DID encodes an Ed25519 public key.
@@ -220,9 +223,7 @@ impl DidKey {
     pub fn as_str(&self) -> String {
         // Allocate a string of the exact size we need up front
         // so the encoding pass doesn't grow the buffer.
-        let mut s = String::with_capacity(
-            "did:key:z".len() + self.multicodec_and_key.len() * 2,
-        );
+        let mut s = String::with_capacity("did:key:z".len() + self.multicodec_and_key.len() * 2);
         s.push_str("did:key:z");
         s.push_str(&bs58::encode(&self.multicodec_and_key).into_string());
         s
@@ -237,10 +238,11 @@ impl DidKey {
     /// recognised multicodec, but this method specifically wants
     /// the public-key tag, so we re-verify the length here.
     pub fn ed25519_public_key(&self) -> Result<&[u8], Web3ErrorKind> {
-        if !self.multicodec_and_key.starts_with(&ED25519_PUB_MULTICODEC_PREFIX) {
-            return Err(Web3ErrorKind::InvalidDid {
-                raw: self.as_str(),
-            });
+        if !self
+            .multicodec_and_key
+            .starts_with(&ED25519_PUB_MULTICODEC_PREFIX)
+        {
+            return Err(Web3ErrorKind::InvalidDid { raw: self.as_str() });
         }
         let body = &self.multicodec_and_key[ED25519_PUB_MULTICODEC_PREFIX.len()..];
         if body.len() != ED25519_PUB_LEN {
@@ -252,10 +254,11 @@ impl DidKey {
     /// Extract the raw 32-byte Ed25519 secret key (only valid for
     /// `did:key` constructed from a private key).
     pub fn ed25519_secret_key(&self) -> Result<&[u8], Web3ErrorKind> {
-        if !self.multicodec_and_key.starts_with(&ED25519_SEC_MULTICODEC_PREFIX) {
-            return Err(Web3ErrorKind::InvalidDid {
-                raw: self.as_str(),
-            });
+        if !self
+            .multicodec_and_key
+            .starts_with(&ED25519_SEC_MULTICODEC_PREFIX)
+        {
+            return Err(Web3ErrorKind::InvalidDid { raw: self.as_str() });
         }
         let body = &self.multicodec_and_key[ED25519_SEC_MULTICODEC_PREFIX.len()..];
         if body.len() != ED25519_SEC_LEN {
@@ -300,7 +303,10 @@ mod tests {
     #[test]
     fn rejects_wrong_length_public_key() {
         let err = DidKey::from_ed25519_public_key(&[1, 2, 3]).unwrap_err();
-        assert!(matches!(err, Web3ErrorKind::InvalidPublicKey { actual_len: 3 }));
+        assert!(matches!(
+            err,
+            Web3ErrorKind::InvalidPublicKey { actual_len: 3 }
+        ));
     }
 
     #[test]
@@ -389,8 +395,7 @@ mod tests {
     /// base58 encoder (e.g. a wrong alphabet mapping).
     #[test]
     fn round_trip_public_key_with_all_byte_values() {
-        let pk_bytes: [u8; ED25519_PUB_LEN] =
-            core::array::from_fn(|i| (i * 8) as u8);
+        let pk_bytes: [u8; ED25519_PUB_LEN] = core::array::from_fn(|i| (i * 8) as u8);
         let did = DidKey::from_ed25519_public_key(&pk_bytes).unwrap();
         let s = did.as_str();
         let parsed = DidKey::from_string(&s).unwrap();
@@ -423,7 +428,10 @@ mod tests {
         let pk_bytes = [7u8; ED25519_PUB_LEN];
         let did = DidKey::from_ed25519_public_key(&pk_bytes).unwrap();
         let raw = did.raw_bytes();
-        assert_eq!(raw.len(), ED25519_PUB_MULTICODEC_PREFIX.len() + ED25519_PUB_LEN);
+        assert_eq!(
+            raw.len(),
+            ED25519_PUB_MULTICODEC_PREFIX.len() + ED25519_PUB_LEN
+        );
         assert!(raw.starts_with(&ED25519_PUB_MULTICODEC_PREFIX));
         assert_eq!(&raw[ED25519_PUB_MULTICODEC_PREFIX.len()..], &pk_bytes[..]);
     }
@@ -441,6 +449,7 @@ mod tests {
     /// invariant: every string that parses successfully must round-trip
     /// through `as_str()` and parse again identically.
     #[test]
+    #[allow(clippy::vec_init_then_push)] // deliberate, explicit boundary-case list
     fn from_string_never_panics_and_round_trips_on_success() {
         // A structurally-valid did that we use to seed round-trip checks.
         let valid = DidKey::from_ed25519_public_key(&[7u8; ED25519_PUB_LEN]).unwrap();
@@ -485,15 +494,11 @@ mod tests {
 
         for c in &cases {
             // Must never panic.
-            match DidKey::from_string(c) {
-                Ok(did) => {
-                    // Invariant: a successfully-parsed DID round-trips.
-                    let s = did.as_str();
-                    let reparsed = DidKey::from_string(&s)
-                        .expect("as_str() output must re-parse");
-                    assert_eq!(did.as_str(), reparsed.as_str());
-                }
-                Err(_) => {} // rejections are fine; the point is no panic
+            if let Ok(did) = DidKey::from_string(c) {
+                // Invariant: a successfully-parsed DID round-trips.
+                let s = did.as_str();
+                let reparsed = DidKey::from_string(&s).expect("as_str() output must re-parse");
+                assert_eq!(did.as_str(), reparsed.as_str());
             }
         }
     }

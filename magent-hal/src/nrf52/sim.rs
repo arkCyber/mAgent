@@ -220,8 +220,8 @@ pub mod simulation {
     impl Default for BleConnParams {
         fn default() -> Self {
             Self {
-                min_interval: 50,    // 50ms
-                max_interval: 100,   // 100ms
+                min_interval: 50,  // 50ms
+                max_interval: 100, // 100ms
                 slave_latency: 0,
                 supervision_timeout: 4000, // 4s
             }
@@ -422,8 +422,7 @@ pub mod simulation {
             self.voltage_mv.store(new_voltage, Ordering::SeqCst);
 
             // Update low battery flag
-            self.low_battery
-                .store(new_percent < 20, Ordering::SeqCst);
+            self.low_battery.store(new_percent < 20, Ordering::SeqCst);
         }
     }
 

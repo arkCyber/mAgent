@@ -305,9 +305,7 @@ impl FaultDetector {
         self.last_error_type.set(Some(error.category()));
 
         if count >= self.error_threshold {
-            return Err(AgentError::Unknown {
-                code: 0xDEAD,
-            });
+            return Err(AgentError::Unknown { code: 0xDEAD });
         }
         Ok(())
     }
@@ -328,4 +326,3 @@ impl FaultDetector {
         self.last_error_type.get()
     }
 }
-

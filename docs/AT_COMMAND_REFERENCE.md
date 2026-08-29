@@ -92,7 +92,7 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 | `AT+SYSLOG=<0..5>` | `OK` | Set log level at runtime. | `log::set_max_level`. |
 | `AT+SYSSTORE?` / `=0/1` | `+SYSSTORE:<0/1>` `OK` | Persist configuration to NVS on (1) or off (0). Default 1. | NVS key `mag_at:sysstore`. |
 | `AT+UPTIME?` | `+UPTIME:<ms>` `OK` | Milliseconds since boot. | `esp_timer_get_time()/1000`. |
-| `AT+HEAP?` | `+SYSRAM:<bytes>` `OK` | Alias of `AT+SYSRAM?`. | — |
+| `AT+HEAP?` | `+HEAP:<bytes>` `OK` | Reports free heap (bytes). | `esp_get_free_heap_size()` (2026-08-28: was `+SYSRAM:` alias). |
 
 ### 3.2 Wi-Fi
 
@@ -119,7 +119,7 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 |---|---|---|---|
 | `AT+CIPSTAMAC?` | `+CIPSTAMAC:"aa:bb:cc:dd:ee:ff"` `OK` | Read the **real** station MAC via `esp_wifi_get_mac`. | Implemented 2026-08-27 (previously a hard-coded placeholder). |
 | `AT+CIPSTAMAC="aa:bb:cc:dd:ee:ff"` | `+CMDER:4` `ERROR` | Set station MAC. | Requires stopping the radio first; runtime MAC change not supported. |
-| `AT+MACRAND?` / `=0/1` | `+CMDER:9` `ERROR` | Toggle MAC randomisation. | Deferred to v0.3. |
+| `AT+MACRAND` | `+MACRAND:"aa:bb:cc:dd:ee:ff"` `OK` | Generate a random, locally-administered STA MAC (TRNG) and apply it via `esp_wifi_set_mac`. | Implemented 2026-08-28 (was `+CMDER:9`). Requires the Wi-Fi interface to be stopped (e.g. safe mode); otherwise `+CMDER:6`. |
 | `AT+IDENT?` | `+IDENT:<hex-pubkey>` `OK` | Ed25519 public key (did:key material) in hex. Returns `+IDENT:NO_IDENTITY` if absent. | Read-only; the firmware regenerates identity from hardware TRNG on first boot. |
 | `AT+IDENTROT` | `+IDENTROT:<hex-pubkey>` `OK` | Generate new Ed25519 seed from TRNG and overwrite NVS. | **Refused in `safe mode`**. Atomically persists hex-encoded 32-byte seed to `magent:dev_identity`. |
 
@@ -136,15 +136,33 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
 | `AT+IFCONFIG?` | `+IFCONFIG:"<ip>"` `OK` | Report the current STA IP (from the supervisor snapshot). Empty when the STA has no link. | Implemented 2026-08-27 (previously `+IFCONFIG: deferred`). Netmask/gateway still deferred. |
-| `AT+PING="host"` | `+CMDER:4` `ERROR` | ICMP ping. | Awaiting an ICMP stack module. |
+| `AT+PING="host"` | `+PING: reply=N rtt=Xus` `OK` | ICMP echo via esp_ping; IPv4/IPv6 literal or hostname (DNS). | Implemented 2026-08-28; IPv6 (e.g. `::1`) added 2026-08-28. |
 
 ### 3.6 Restore / agent passthrough
 
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
-| `AT+RESTORE` | `+CMDER:4` `ERROR` | Factory reset (wipe NVS). | **Not implemented in v0.2** to avoid accidental data loss. Track in v0.3 with explicit `AT+RESTORECONFIRM` follow-up. |
+| `AT+RESTORE` | `OK` (reboots in 200 ms) | Factory reset: erase the **entire** NVS region (`nvs_flash_erase`) then reboot. Destructive and irreversible. | Implemented 2026-08-28 (was refused). The device regenerates a fresh device identity on next boot. |
 | `AT+SIGN="text"` | `<signed-message JSON>` `OK` | Sign the payload with the device Ed25519 identity; returns canonical signed-message JSON (signer DID + payload_hex + signature_hex). | Implemented 2026-08-27 (previously `+CMDER:4`). Payload 1..=64 bytes so the reply fits the 256-byte line. |
 | `AT+AGENT="<text>"` | `OK` | Escape hatch: hand the rest of the line to the agent's ReAct loop. | Useful when you want to script via AT but ask the LLM. |
+
+### 3.7 OTA firmware update
+
+| Command | Reply | Effect | Aerograde note |
+|---|---|---|---|
+| `AT+OTA=<url>` | `+OTA:STARTED` `OK` | Stream the firmware image at `url` into the inactive OTA slot (`esp_ota_begin`/`write`/`end`), verify it, set it as the next boot target, and reboot. Runs on a worker thread. | Implemented 2026-08-28 (REQ-FW-005). Every failure aborts the OTA handle and leaves the running firmware untouched. Requires an `ota_0`/`ota_1` + `otadata` partition table. Logs `[ota] OTA completed / failed` on completion. |
+
+### 3.8 Additional implemented commands
+
+| Command | Reply | Effect | Aerograde note |
+|---|---|---|---|
+| `AT+BLE?` / `AT+BLE=` | `+CMDER:9` `ERROR` | Query / control BLE advertising state. | Parser + syntax validation implemented; the actual `BleServer` control op is still a placeholder pending shared-server wiring. |
+| `AT+HTTPGET=<url>` | `OK` / body | Issue an HTTP GET to verify outbound reachability. | TLS via mbedTLS + CA certificate bundle (worker thread). |
+| `AT+LLMCFG=<model>,<api_key>` | `OK` | Set / query the LLM backend parameters (DeepSeek). | NVS-backed (`mag_at:llm_model` / `mag_at:llm_api_key`). |
+| `AT+LUAAPP=<b64>` | `OK` | Upload the Lua app source (base64) for the S3 Lua host; `AT+LUAAPP?` reports length. | `lua` feature (S3 only). |
+| `AT+NTPSYNC` | `OK` | Force an SNTP time sync. | Requires network up (skipped in safe mode). |
+| `AT+TIME?` | `+TIME:…` | Report current wall-clock time (ISO 8601). | Via `sntp_sync`. |
+| `AT+TIMEZONE=<zone>` | `OK` | Set the timezone. | NVS-backed. |
 
 ---
 
@@ -451,10 +469,11 @@ that makes the in-place migration safe.
 | `AT+CIPSTAMAC?` | ✅ real MAC | — |
 | `AT+CIPSTAMAC` set | refused | live cycle |
 | `AT+SIGN` | ✅ implemented | — |
-| `AT+RESTORE` | refused (safe NVS wipe pending) | implemented |
+| `AT+RESTORE` | ✅ implemented (NVS wipe + reboot) | — |
 | `AT+PING` | refused | needs ICMP |
 | `AT+IFCONFIG` | ✅ live IP (mask/gw pending) | lwip netif dump |
-| `AT+MACRAND` | refused | needs driver restart |
+| `AT+MACRAND` | ✅ implemented (wifi stopped) | live cycle |
+| `AT+OTA=<url>` | ✅ implemented (stream + verify + reboot) | OTA-only table + rollback |
 | **DBO1 password seal** | ✅ | ✅ (kept for read-back compat) |
 | **DBO2 password seal** | ✅ (default for new writes) | ✅ |
 | **`AT+WIFIPASSUPGRADE?` / `=1`** | ✅ (DBO1 → DBO2 in-place migration) | ✅ |

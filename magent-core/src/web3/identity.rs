@@ -71,10 +71,8 @@ use rand_core::{OsRng, RngCore};
 use crate::error::Web3ErrorKind;
 
 use super::did::DidKey;
-use super::error::{
-    base58_err, invalid_pk, invalid_sk,
-};
-use super::signature::{SignedMessage, Signature, SIGNATURE_LEN};
+use super::error::{base58_err, invalid_pk, invalid_sk};
+use super::signature::{Signature, SignedMessage, SIGNATURE_LEN};
 
 /// Number of bytes in an Ed25519 public key.
 pub const PUBLIC_KEY_LEN: usize = 32;
@@ -308,7 +306,11 @@ impl Identity {
         let mut bytes = [0u8; SIGNATURE_LEN];
         bytes.copy_from_slice(&sig.to_bytes());
         let signature = Signature::from_bytes(&bytes)?;
-        Ok(SignedMessage::new(self.did.clone(), payload.to_vec(), signature))
+        Ok(SignedMessage::new(
+            self.did.clone(),
+            payload.to_vec(),
+            signature,
+        ))
     }
 
     /// Verify a [`SignedMessage`] against an expected payload.
@@ -389,11 +391,7 @@ impl fmt::Debug for Identity {
 ///
 /// For the failure reason, use
 /// [`verify_signature_detailed`] instead.
-pub fn verify_signature(
-    public: &PublicKey,
-    signature_hex: &str,
-    payload: &[u8],
-) -> bool {
+pub fn verify_signature(public: &PublicKey, signature_hex: &str, payload: &[u8]) -> bool {
     verify_signature_detailed(public, signature_hex, payload).is_ok()
 }
 
@@ -406,12 +404,16 @@ pub fn verify_signature_detailed(
     payload: &[u8],
 ) -> Result<(), Web3ErrorKind> {
     let sig = Signature::from_hex(signature_hex)?;
-    let verifying_key =
-        VerifyingKey::from_bytes(public.as_bytes()).map_err(|_| Web3ErrorKind::InvalidPublicKey {
+    let verifying_key = VerifyingKey::from_bytes(public.as_bytes()).map_err(|_| {
+        Web3ErrorKind::InvalidPublicKey {
             actual_len: public.as_bytes().len(),
-        })?;
+        }
+    })?;
     verifying_key
-        .verify(payload, &ed25519_dalek::Signature::from_bytes(sig.to_bytes()))
+        .verify(
+            payload,
+            &ed25519_dalek::Signature::from_bytes(sig.to_bytes()),
+        )
         .map_err(|_| Web3ErrorKind::SignatureVerificationFailed)?;
     Ok(())
 }
@@ -517,7 +519,10 @@ mod tests {
         assert!(s.starts_with("did:key:z"));
         let parsed = DidKey::from_string(&s).unwrap();
         assert_eq!(parsed, *id.did_key());
-        assert_eq!(parsed.ed25519_public_key().unwrap(), id.public_key().as_bytes());
+        assert_eq!(
+            parsed.ed25519_public_key().unwrap(),
+            id.public_key().as_bytes()
+        );
     }
 
     #[test]
@@ -611,10 +616,7 @@ mod tests {
                 .iter()
                 .any(|&b| b != 0)
         };
-        assert!(
-            !still_present,
-            "SecretKey drop did not zero the seed bytes"
-        );
+        assert!(!still_present, "SecretKey drop did not zero the seed bytes");
 
         // Explicitly free the heap allocation. `ManuallyDrop`
         // suppresses the Box's automatic Drop; we re-create

@@ -9,7 +9,7 @@
 #
 # Board:  ESP32-S3 (4 MB flash, quad PSRAM)
 # Flash:  4 MB
-# PSRAM:  quad (this board: 4 MB external)
+# PSRAM:  quad (this board: 2 MB external)
 # Core:   Xtensa LX7 (dual-core, hardware AES)
 # Target: xtensa-esp32s3-espidf  (see build-s3.sh; the C61 build uses
 #          build-c61.sh which temporarily swaps in sdkconfig.c61.defaults)
@@ -60,7 +60,7 @@ CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
 CONFIG_ESP_WIFI_11KV_SUPPORT=n
 CONFIG_ESP_WIFI_11R_SUPPORT=n
-CONFIG_LWIP_IPV6=n
+CONFIG_LWIP_IPV6=y
 CONFIG_LWIP_WND_SCALE=0
 CONFIG_LWIP_MAX_SOCKETS=10
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
@@ -74,7 +74,10 @@ CONFIG_LWIP_TCP_MSS=1200
 # --------------------------------------------------------------------------
 # Use mbedTLS (the ESP-IDF default TLS stack). rustls is NOT used on firmware.
 CONFIG_ESP_TLS_USING_MBEDTLS=y
-# Allow HTTP for local testing (production should use HTTPS).
+# DEV-ONLY: skip TLS certificate verification + allow HTTP for local bring-up.
+# PRODUCTION MUST REMOVE THIS. Use `sdkconfig.prod.defaults` via `flash-secure.sh`,
+# which sets `CONFIG_ESP_TLS_INSECURE=n` (real cert verification, REQ-NET-001)
+# and enables Secure Boot v2 + Flash Encryption (REQ-FW-004).
 CONFIG_ESP_TLS_INSECURE=y
 # PATCHED (MicroAgent): compile in the mbedTLS CA certificate bundle so
 # `AT+HTTPGET=<https-url>` can verify server certs (needed because the
@@ -122,15 +125,24 @@ CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=n
 
 # --------------------------------------------------------------------------
-# ESP32-C61-specific
+# Bluetooth / BLE (Bluedroid)
 # --------------------------------------------------------------------------
-# C61 does not have BT Classic; only BLE 5 is available.
+# BLE is enabled for the configuration service (mAgent-Man). Classic BT is not
+# used on this S3 build (only the BLE subset of the Bluedroid stack is on).
 CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
-CONFIG_BT_BLE_50_FEATURES_SUPPORTED=y
+# BLE 5.0 disabled: its extended advertising / 2M PHY / long packets need
+# substantially more BLE-controller DMA internal DRAM, which the S3 can't
+# provide alongside the agent threads (ESP_ERR_NO_MEM 257). The config/GATT
+# service works on BLE 4.2, so we trade BLE-5 features for a bootable BLE.
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
 # Enable BLE for configuration service (mAgent-Man)
 CONFIG_BT_ENABLED=y
 # Use Bluedroid stack (required by esp-idf-svc BLE API)
 CONFIG_BT_BLUEDROID_ENABLED=y
+# Allocate Bluedroid host memory from PSRAM first, freeing internal DRAM for
+# the BLE controller. Without this the S3's BLE init hits ESP_ERR_NO_MEM (257)
+# at ~244 KB free internal DRAM.
+CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
 CONFIG_BT_NIMBLE_ENABLED=n
 CONFIG_BT_BTC_TASK_STACK_SIZE=8192
 # BT controller memory configuration

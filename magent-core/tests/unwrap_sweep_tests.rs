@@ -5,11 +5,11 @@
 //! produce correct, panic-free output for both short and overlong inputs.
 
 use magent_core::{
+    early_warning::{AlertSeverity, AlertType, EmergencyContact, HealthAlert, Hospital},
     error::try_heapless,
-    voice_notification::{VoiceMessage, Notification, NotificationType, VoiceCategory},
-    sports_coach::{CoachingMessage, CoachingMessageType},
-    early_warning::{AlertType, AlertSeverity, HealthAlert, EmergencyContact, Hospital},
     health_sensors::UserProfile,
+    sports_coach::{CoachingMessage, CoachingMessageType},
+    voice_notification::{Notification, NotificationType, VoiceCategory, VoiceMessage},
 };
 
 const BIG_STR: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -91,8 +91,13 @@ fn voice_message_new_truncates_long_text() {
 #[test]
 fn notification_new_short() {
     let n = Notification::new(
-        1, "title", "body",
-        NotificationType::Screen, 1, VoiceCategory::System, 0,
+        1,
+        "title",
+        "body",
+        NotificationType::Screen,
+        1,
+        VoiceCategory::System,
+        0,
     );
     assert_eq!(n.title.as_str(), "title");
     assert_eq!(n.body.as_str(), "body");
@@ -102,8 +107,13 @@ fn notification_new_short() {
 fn notification_new_truncates_long_title() {
     let big = "T".repeat(128);
     let n = Notification::new(
-        1, &big, "body",
-        NotificationType::Screen, 1, VoiceCategory::System, 0,
+        1,
+        &big,
+        "body",
+        NotificationType::Screen,
+        1,
+        VoiceCategory::System,
+        0,
     );
     assert!(n.title.len() <= 64); // cap = 64-1
 }
@@ -112,8 +122,13 @@ fn notification_new_truncates_long_title() {
 fn notification_new_truncates_long_body() {
     let big = "B".repeat(512);
     let n = Notification::new(
-        1, "title", &big,
-        NotificationType::Screen, 1, VoiceCategory::System, 0,
+        1,
+        "title",
+        &big,
+        NotificationType::Screen,
+        1,
+        VoiceCategory::System,
+        0,
     );
     assert!(n.body.len() <= 256); // cap = 256-1
 }
@@ -135,11 +150,7 @@ fn coaching_message_new_short() {
 #[test]
 fn coaching_message_new_truncates_long_text() {
     let big = "V".repeat(256);
-    let msg = CoachingMessage::new(
-        CoachingMessageType::BreathingCorrection,
-        &big,
-        1,
-    );
+    let msg = CoachingMessage::new(CoachingMessageType::BreathingCorrection, &big, 1);
     assert!(msg.voice_text.len() <= 128); // cap = 128-1
     assert!(msg.voice_text.chars().all(|c| c == 'V'));
 }

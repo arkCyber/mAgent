@@ -169,13 +169,19 @@ impl RunReportFields {
     /// variant on overflow so callers can surface the problem.
     pub fn validate(&self) -> Result<(), Web3ErrorKind> {
         if self.answer.len() > ANSWER_MAX {
-            Err(Web3ErrorKind::InvalidSecretKeyLength { actual: self.answer.len() })?;
+            Err(Web3ErrorKind::InvalidSecretKeyLength {
+                actual: self.answer.len(),
+            })?;
         }
         if self.provider.len() > PROVIDER_MAX {
-            Err(Web3ErrorKind::InvalidSecretKeyLength { actual: self.provider.len() })?;
+            Err(Web3ErrorKind::InvalidSecretKeyLength {
+                actual: self.provider.len(),
+            })?;
         }
         if self.state.len() > STATE_MAX {
-            Err(Web3ErrorKind::InvalidSecretKeyLength { actual: self.state.len() })?;
+            Err(Web3ErrorKind::InvalidSecretKeyLength {
+                actual: self.state.len(),
+            })?;
         }
         Ok(())
     }
@@ -388,16 +394,7 @@ mod tests {
     use super::*;
 
     fn sample_report() -> RunReportFields {
-        RunReportFields::new(
-            "the answer is 42",
-            3,
-            1,
-            "ollama",
-            true,
-            "Finished",
-            7,
-            800,
-        )
+        RunReportFields::new("the answer is 42", 3, 1, "ollama", true, "Finished", 7, 800)
     }
 
     /// Tiny alias so the test bodies don't have to spell out
@@ -528,8 +525,7 @@ mod tests {
             "signer": "did:key:z6Mkfakefakefakefakefakefake",
             "signature_hex": "00"
         }"#;
-        let parsed: SignedRunReport =
-            serde_json::from_str(wrong).unwrap();
+        let parsed: SignedRunReport = serde_json::from_str(wrong).unwrap();
         assert_eq!(parsed.payload_type, "magent/run_report:v999");
         // The integration test `verify_rejects_unknown_payload_type`
         // pins the reject-on-verify behaviour end-to-end.

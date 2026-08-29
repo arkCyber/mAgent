@@ -176,4 +176,3 @@ impl Default for PowerManager {
         Self::new()
     }
 }
-

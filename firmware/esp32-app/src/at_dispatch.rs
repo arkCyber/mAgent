@@ -246,30 +246,170 @@ fn dispatch_inner<'a>(
         AtOp::CwReconnCfg => cwreconncfg_dispatch(cmd),
         AtOp::CwState => cwstate_line(wifi_status),
         AtOp::CipStaMac => cipstamac_dispatch(cmd),
-        AtOp::MacRand => {
-            log::warn!("[at] MACRAND: not implemented in v0.2");
-            AtOutcome::error(9)
-        }
-        AtOp::Heap => sysram_line(),
+        AtOp::MacRand => macrand_dispatch(),
+        AtOp::Heap => heap_line(),
         AtOp::Uptime => uptime_line(now_ms),
         AtOp::Safemode => safemode_dispatch(cmd),
         AtOp::Ident => ident_query(),
         AtOp::IdentRot => ident_rot_dispatch(safe_mode),
         AtOp::Sign => sign_dispatch(cmd),
         AtOp::Restore => {
-            log::warn!("[at] RESTORE needs full-nvs-wipe; deferred to v0.3");
-            AtOutcome::error(4)
+            // AT+RESTORE: full factory reset — erase the ENTIRE NVS region
+            // (Wi-Fi credentials, device identity, AT config, all namespaces)
+            // then reboot. Destructive and irreversible: the device will
+            // regenerate a fresh device identity on next boot.
+            log::warn!("[at] AT+RESTORE — erasing ALL NVS (factory reset)");
+            // SAFETY: `nvs_flash_erase()` takes no pointers and performs a
+            // full flash erase of the NVS partition. Called from the ingress
+            // thread, which does not hold an NVS handle at this point.
+            let rc = unsafe { esp_idf_sys::nvs_flash_erase() };
+            if rc != esp_idf_sys::ESP_OK {
+                log::error!("[at] RESTORE failed to erase NVS (0x{:x})", rc);
+                return AtOutcome::error(6);
+            }
+            log::info!("[at] AT+RESTORE — NVS erased; rebooting in 200ms");
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                // SAFETY: `esp_restart()` never returns; nothing to clean up.
+                unsafe { esp_idf_sys::esp_restart(); }
+            });
+            AtOutcome::NoReply
         }
         AtOp::Ifconfig => ifconfig_line(wifi_status),
-        AtOp::Ping6 => AtOutcome::error(4),
+        AtOp::Ping6 => ping_dispatch(cmd),
         AtOp::Agent => AtOutcome::NoReply, // handled upstream in main.rs
         AtOp::WifiPassUpgrade => wifipass_upgrade_dispatch(cmd),
         AtOp::HttpGet => http_get_dispatch(cmd),
+        AtOp::Ota => ota_dispatch(cmd),
         AtOp::LlmCfg => llmcfg_dispatch(cmd),
         AtOp::Time => time_dispatch(cmd, time_sync, now_ms),
         AtOp::NtpSync => ntp_sync_dispatch(cmd, time_sync, force_ntp_sync, safe_mode),
         AtOp::Timezone => timezone_dispatch(cmd, time_sync),
         AtOp::Ble => ble_dispatch(cmd),
+        AtOp::LuaApp => luaapp_dispatch(cmd),
+    }
+}
+
+/// Handle `AT+LUAAPP=<base64>` (set the operator Lua app) / `AT+LUAAPP?`
+/// (query its size). URL-safe base64 (no `+`/`/`) survives the comma-splitting
+/// AT parser as a single token, so arbitrary Lua survives losslessly. Only
+/// available when the firmware is built with the `lua` feature.
+#[cfg(feature = "lua")]
+fn luaapp_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
+    use base64::Engine as _;
+    match cmd.kind {
+        AtCommandKind::Set => {
+            let Some(arg) = cmd.args.first() else {
+                return AtOutcome::error(4);
+            };
+            let token = match arg {
+                AtArg::Token(t) => *t,
+                _ => return AtOutcome::error(4),
+            };
+            let bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token) {
+                Ok(b) => b,
+                Err(_) => return AtOutcome::error(7),
+            };
+            let src = match core::str::from_utf8(&bytes) {
+                Ok(s) => s,
+                Err(_) => return AtOutcome::error(7),
+            };
+            match crate::lua_task::set_lua_app_source(src) {
+                Ok(()) => AtOutcome::NoReply,
+                Err(_) => AtOutcome::error(7),
+            }
+        }
+        AtCommandKind::Query => match crate::lua_task::lua_app_source_len() {
+            Some(len) => AtOutcome::ok_line(format!("+LUAAPP:{len}")),
+            None => AtOutcome::ok_line("+LUAAPP:0"),
+        },
+        _ => AtOutcome::error(4),
+    }
+}
+
+/// `AT+LUAAPP` when the Lua app host is not built into the firmware.
+#[cfg(not(feature = "lua"))]
+fn luaapp_dispatch(_cmd: &AtCommand<'_>) -> AtOutcome {
+    AtOutcome::error(9) // unsupported: Lua app host not built
+}
+
+/// `AT+MACRAND` — assign a fresh, locally-administered random MAC to the STA
+/// interface (privacy: a device presents a different MAC on each run).
+///
+/// Wi-Fi must be *stopped* (e.g. safe mode) because `esp_wifi_set_mac` refuses
+/// to change the MAC while the interface is running; otherwise it returns
+/// `+CMDER:6`. The first octet is forced to the locally-administered/unicast
+/// range so we never collide with a vendor OUI.
+fn macrand_dispatch() -> AtOutcome {
+    let mut mac = [0u8; 6];
+    for b in mac.iter_mut() {
+        // SAFETY: `esp_random()` (hardware TRNG) takes no arguments and is
+        // thread-safe; a per-byte read is fine.
+        *b = unsafe { esp_idf_sys::esp_random() } as u8;
+    }
+    // First octet: clear the multicast bit (bit0), set the locally
+    // administered bit (bit1) — 0x02 in the least-significant bits.
+    mac[0] = (mac[0] & 0xFE) | 0x02;
+    // SAFETY: `mac` is a valid 6-byte buffer valid for the duration of the
+    // call; `esp_wifi_set_mac` copies it before returning.
+    let rc = unsafe {
+        esp_idf_sys::esp_wifi_set_mac(esp_idf_sys::wifi_interface_t_WIFI_IF_STA, mac.as_ptr())
+    };
+    if rc != esp_idf_sys::ESP_OK {
+        log::warn!(
+            "[at] MACRAND failed (0x{:x}); Wi-Fi interface must be stopped first",
+            rc
+        );
+        return AtOutcome::error(6);
+    }
+    let mac_str = format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+    AtOutcome::ok_line(format!("+MACRAND:{mac_str}"))
+}
+
+/// `AT+OTA=<url>` — kick off an OTA update on a worker thread and reply
+/// immediately. The OTA thread downloads the image to the inactive slot,
+/// verifies it, and reboots; progress/failure is logged there.
+fn ota_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
+    // The URL is a single token argument, e.g. `AT+OTA=http://host/app.bin`.
+    let Some(url_bytes) = cmd.args.first().and_then(|a| match a {
+        AtArg::Token(t) => Some(*t),
+        _ => None,
+    }) else {
+        return AtOutcome::error(4);
+    };
+    let Ok(url) = core::str::from_utf8(url_bytes) else {
+        return AtOutcome::error(7);
+    };
+    let url = url.to_string();
+    log::info!("[at] AT+OTA=<{url}> — starting OTA");
+    std::thread::spawn(move || match crate::ota::perform_ota(&url) {
+        Ok(()) => log::info!("[ota] OTA completed; device rebooting"),
+        Err(e) => log::error!("[ota] OTA failed: {e}"),
+    });
+    AtOutcome::ok_line("+OTA:STARTED")
+}
+
+/// `AT+PING=<host>` — ICMP echo via esp_ping. Accepts an IPv4 literal or
+/// hostname, with or without quotes (`AT+PING=1.2.3.4` / `AT+PING="1.2.3.4"`).
+/// IPv6 (`AT+PING6`) is a follow-up.
+fn ping_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
+    let Some(host) = cmd.args.first().and_then(|a| match a {
+        AtArg::Token(t) => Some(*t),
+        AtArg::Quoted(t) => Some(*t),
+        _ => None,
+    }) else {
+        return AtOutcome::error(4);
+    };
+    let Ok(host) = core::str::from_utf8(host) else {
+        return AtOutcome::error(7);
+    };
+    let now = (unsafe { esp_idf_sys::esp_timer_get_time() }.max(0) / 1000) as u64;
+    match crate::ping::ping_ipv4(host, now) {
+        Ok(line) => AtOutcome::ok_line(line),
+        Err(code) => AtOutcome::error(code),
     }
 }
 
@@ -304,13 +444,19 @@ fn cwstate_line(wifi_status: Option<&crate::WifiStatusHandle>) -> AtOutcome {
 // ---------------------------------------------------------------------------
 
 fn version_string() -> AtOutcome {
-    let s: &str = concat!(
-        "mAgent v",
-        env!("CARGO_PKG_VERSION"),
-        " / AT v0.2 / esp32-c61",
-    );
+    // Board label is chip-specific (not hard-coded to C61).
+    #[cfg(feature = "board-s3")]
+    let chip = "esp32-s3";
+    #[cfg(feature = "board-c61")]
+    let chip = "esp32-c61";
+    #[cfg(not(any(feature = "board-s3", feature = "board-c61")))]
+    let chip = "unknown";
     let mut line = ReplyLine::new();
-    let _ = write!(line, "+GMR:{}", s);
+    let _ = write!(
+        line,
+        "+GMR:mAgent v{} / AT v0.2 / {chip}",
+        env!("CARGO_PKG_VERSION")
+    );
     AtOutcome::Ok { data: line }
 }
 
@@ -318,6 +464,13 @@ fn sysram_line() -> AtOutcome {
     let heap = unsafe { esp_idf_sys::esp_get_free_heap_size() };
     let mut line = ReplyLine::new();
     let _ = write!(line, "+SYSRAM:{}", heap);
+    AtOutcome::Ok { data: line }
+}
+
+fn heap_line() -> AtOutcome {
+    let heap = unsafe { esp_idf_sys::esp_get_free_heap_size() };
+    let mut line = ReplyLine::new();
+    let _ = write!(line, "+HEAP:{}", heap);
     AtOutcome::Ok { data: line }
 }
 

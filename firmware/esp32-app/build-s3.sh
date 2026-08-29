@@ -14,7 +14,7 @@ CFG="/Users/arksong/MicroAgent/firmware/esp32-app/.cargo/config.toml"
 
 echo "=== mAgent ESP32-S3 build (${PROFILE}) ==="
 echo "  target:   ${TARGET}"
-echo "  features: board-s3"
+echo "  features: board-s3,wifi,uart,ble,lua (BLE + Lua app host on the S3)"
 
 cd /Users/arksong/MicroAgent/firmware/esp32-app
 
@@ -33,8 +33,12 @@ export MAGENT_WIFI_SSID="arkSong@iPhone"
 export MAGENT_WIFI_PASS="Ark314159"
 export CXX="/Users/arksong/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-g++"
 
-RUSTC_BOOTSTRAP=1 cargo +esp build --target "${TARGET}" --no-default-features --features board-s3,wifi,uart --"${PROFILE}"
+RUSTC_BOOTSTRAP=1 cargo +esp build --target "${TARGET}" --no-default-features --features board-s3,wifi,uart,ble,lua --"${PROFILE}"
 
 echo ""
 echo "Build complete!"
 echo "  ELF: target/${TARGET}/${PROFILE}/magent-esp32-app"
+echo ""
+echo "Flash (link the S3 first):"
+echo "  espflash flash --monitor target/${TARGET}/${PROFILE}/magent-esp32-app"
+echo "Watch the console for the '[lua] <driver> ok/err' hardware self-test lines."

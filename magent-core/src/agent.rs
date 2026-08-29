@@ -353,7 +353,6 @@ impl AgentTelemetry {
 /// because the supervisor only needs "did something fail, and
 /// roughly which class?". For a precise diff the operator runs
 /// `AT+ERR=DETAIL`.
-
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 pub struct MiniAgent {
     #[allow(dead_code)]
@@ -1330,7 +1329,6 @@ mod tests {
         assert_eq!(name, "write_gpio");
     }
 
-    #[test]
     /// Extract an explicit GPIO pin number from a task's natural-language
     /// text, e.g. "set gpio 5 high" or "pin 7 low". Returns `None` when no
     /// pin is mentioned, so the caller falls back to `pick_tool`'s default.
@@ -1823,16 +1821,20 @@ mod tests {
 
     #[test]
     fn bad_config_max_iterations_zero_rejected() {
-        let mut cfg = AgentConfig::default();
-        cfg.max_iterations = 0;
+        let cfg = AgentConfig {
+            max_iterations: 0,
+            ..Default::default()
+        };
         let result = MiniAgent::new(cfg);
         assert!(result.is_err());
     }
 
     #[test]
     fn bad_config_empty_name_rejected() {
-        let mut cfg = AgentConfig::default();
-        cfg.name = heapless::String::new();
+        let cfg = AgentConfig {
+            name: heapless::String::new(),
+            ..Default::default()
+        };
         let result = MiniAgent::new(cfg);
         assert!(result.is_err());
     }

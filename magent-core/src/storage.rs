@@ -35,7 +35,7 @@ where
         let address = offset as usize;
 
         // Validate address
-        if address % self.page_size != 0 {
+        if !address.is_multiple_of(self.page_size) {
             return Err(AgentError::StorageReadFailed {
                 address: offset,
                 reason: StorageError::BadAddress,
@@ -57,7 +57,7 @@ where
         let address = offset as usize;
 
         // Validate address alignment
-        if address % self.page_size != 0 {
+        if !address.is_multiple_of(self.page_size) {
             return Err(AgentError::StorageWriteFailed {
                 address: offset,
                 reason: StorageError::BadAddress,
@@ -65,7 +65,7 @@ where
         }
 
         // Validate data size
-        if data.len() % self.page_size != 0 {
+        if !data.len().is_multiple_of(self.page_size) {
             return Err(AgentError::StorageWriteFailed {
                 address: offset,
                 reason: StorageError::BadAddress,
@@ -174,7 +174,6 @@ fn parse_kv_header(buf: &[u8]) -> Option<KvHeader> {
     })
 }
 
-
 impl<F> KvStore<F>
 where
     F: NorFlash,
@@ -204,7 +203,8 @@ where
         let mut offset: u32 = 0;
         let mut buf = [0u8; 512];
 
-        while offset < 65536 { // Scan up to 64KB
+        while offset < 65536 {
+            // Scan up to 64KB
             // HARDENING (audit-2026-08 H1): previously a flash read
             // error here was silently absorbed (`break` -> return
             // `Ok(None)`), so a transient I/O fault on header byte 0
@@ -251,8 +251,8 @@ where
 
                 // Calculate CRC of data
                 let mut crc: u16 = 0;
-                for i in 0..crc_offset {
-                    crc ^= buf[i] as u16;
+                for &byte in &buf[..crc_offset] {
+                    crc ^= byte as u16;
                     crc = crc.wrapping_mul(0x1021);
                 }
 
@@ -423,7 +423,7 @@ where
         let capacity = self.storage.capacity();
         let start_sector = (self.base_address as usize / sector) as u32;
         let end_byte = self.base_address as usize + capacity;
-        let end_sector = ((end_byte + sector - 1) / sector) as u32;
+        let end_sector = end_byte.div_ceil(sector) as u32;
         let mut s = start_sector;
         while s < end_sector {
             self.storage.erase(s)?;
@@ -463,22 +463,24 @@ where
                 })?;
 
             let key = &buf[1..1 + hdr.key_len];
-            if !skip_key.map_or(false, |sk| key == sk.as_bytes()) {
+            if !skip_key.is_some_and(|sk| key == sk.as_bytes()) {
                 let mut k = heapless::Vec::<u8, 32>::new();
                 let mut v = heapless::Vec::<u8, 256>::new();
-                k.extend_from_slice(key).map_err(|_| AgentError::StorageWriteFailed {
-                    address: self.base_address + offset,
-                    reason: StorageError::CorruptedData,
-                })?;
+                k.extend_from_slice(key)
+                    .map_err(|_| AgentError::StorageWriteFailed {
+                        address: self.base_address + offset,
+                        reason: StorageError::CorruptedData,
+                    })?;
                 v.extend_from_slice(&buf[3 + hdr.key_len..3 + hdr.key_len + hdr.value_len])
                     .map_err(|_| AgentError::StorageWriteFailed {
                         address: self.base_address + offset,
                         reason: StorageError::CorruptedData,
                     })?;
-                live.push((k, v)).map_err(|_| AgentError::StorageWriteFailed {
-                    address: self.base_address + offset,
-                    reason: StorageError::OutOfSpace,
-                })?;
+                live.push((k, v))
+                    .map_err(|_| AgentError::StorageWriteFailed {
+                        address: self.base_address + offset,
+                        reason: StorageError::OutOfSpace,
+                    })?;
             }
 
             offset += entry_size as u32;
@@ -568,8 +570,8 @@ where
             let stored_crc = u16::from_le_bytes([buf[crc_offset], buf[crc_offset + 1]]);
 
             let mut crc: u16 = 0;
-            for i in 0..crc_offset {
-                crc ^= buf[i] as u16;
+            for &byte in &buf[..crc_offset] {
+                crc ^= byte as u16;
                 crc = crc.wrapping_mul(0x1021);
             }
 
@@ -797,7 +799,10 @@ mod tests {
         kv.set("alpha", b"value-1").unwrap();
         assert_eq!(kv.get("alpha").unwrap().unwrap(), b"value-1");
         kv.delete("alpha").unwrap();
-        assert!(matches!(kv.get("alpha"), Ok(None)), "key must be gone after delete");
+        assert!(
+            matches!(kv.get("alpha"), Ok(None)),
+            "key must be gone after delete"
+        );
     }
 
     #[test]
@@ -820,22 +825,34 @@ mod tests {
         kv.delete("b").unwrap(); // compaction physically removes "b"
 
         let stats = kv.get_stats().unwrap();
-        assert_eq!(stats.total_entries, 2, "deleted entry is physically compacted away");
-        assert_eq!(stats.deleted_entries, 0, "no tombstones remain after compaction");
+        assert_eq!(
+            stats.total_entries, 2,
+            "deleted entry is physically compacted away"
+        );
+        assert_eq!(
+            stats.deleted_entries, 0,
+            "no tombstones remain after compaction"
+        );
         assert_eq!(stats.valid_entries, 2);
     }
 
     #[test]
     fn delete_of_missing_key_is_ok() {
         let mut kv = empty_kv();
-        assert!(kv.delete("nope").is_ok(), "deleting a missing key should be idempotent");
+        assert!(
+            kv.delete("nope").is_ok(),
+            "deleting a missing key should be idempotent"
+        );
     }
 
     #[test]
     fn set_rejects_empty_key() {
         let mut kv = empty_kv();
         assert!(
-            matches!(kv.set("", b"v"), Err(AgentError::InputValidationFailed { .. })),
+            matches!(
+                kv.set("", b"v"),
+                Err(AgentError::InputValidationFailed { .. })
+            ),
             "empty key must be rejected so key_len==0 stays unambiguous as end-of-store"
         );
     }
@@ -952,4 +969,3 @@ pub struct KvStoreStats {
     /// Remaining bytes available for new writes (`capacity - used_space`).
     pub free_space: usize,
 }
-

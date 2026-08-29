@@ -26,28 +26,29 @@
 
 #![cfg(feature = "std")]
 
-use magent_core::agent_runner::{AgentState, RealAgentRunner, RunnerConfig, SamplingParams, ToolExecutor};
-use magent_core::real_tools::SimulatorExecutor;
+use magent_core::agent_runner::{
+    AgentState, RealAgentRunner, RunnerConfig, SamplingParams, ToolExecutor,
+};
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
-use magent_core::wear_leveling::{WearLeveler, WearLevelingStrategy};
+use magent_core::config::AgentConfig;
+#[allow(unused_imports)]
+use magent_core::error::AgentError;
+#[allow(unused_imports)]
+use magent_core::nrf52_hal::{
+    BatteryInfo, BleAddress, BleState, EnvData, GpioConfig, HeartRateMeasurement, Nrf52Simulator,
+    PinDirection, PinState, PowerMode as HalPowerMode, SpO2Measurement, StepData,
+};
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 use magent_core::power::PowerManager;
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 use magent_core::power::PowerMode;
-#[allow(unused_imports)]
-use magent_core::error::AgentError;
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
-use magent_core::config::AgentConfig;
+use magent_core::real_tools::SimulatorExecutor;
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 use magent_core::skills::{Skill, SkillsManager};
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
-use magent_core::tools::{ToolRegistry, Tool, ToolType};
-#[allow(unused_imports)]
-use magent_core::nrf52_hal::{
-    Nrf52Simulator, PinState, BleState, PowerMode as HalPowerMode,
-    HeartRateMeasurement, StepData, SpO2Measurement, EnvData,
-    BatteryInfo, GpioConfig, PinDirection, BleAddress,
-};
+use magent_core::tools::{Tool, ToolRegistry, ToolType};
+#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+use magent_core::wear_leveling::{WearLeveler, WearLevelingStrategy};
 
 // ============================================================================
 // Test Executor Setup
@@ -68,7 +69,9 @@ impl TestExecutor {
 
 impl ToolExecutor for TestExecutor {
     fn execute(&mut self, tool: &str, args: &str) -> std::result::Result<String, String> {
-        self.simulator.execute(tool, args).map_err(|e| format!("{:?}", e))
+        self.simulator
+            .execute(tool, args)
+            .map_err(|e| format!("{:?}", e))
     }
 }
 
@@ -127,8 +130,11 @@ mod nrf52_tests {
 
         // All readings should be within reasonable range
         for temp in &temps {
-            assert!(*temp > 20.0 && *temp < 30.0,
-                "Temperature {} out of expected range", temp);
+            assert!(
+                *temp > 20.0 && *temp < 30.0,
+                "Temperature {} out of expected range",
+                temp
+            );
         }
     }
 
@@ -144,8 +150,11 @@ mod nrf52_tests {
         let (x, y, z) = sim.accelerometer.read();
 
         // Z should be close to 9.8 (gravity when watch is flat)
-        assert!(z > 9.0 && z < 11.0,
-            "Z-axis {} unexpected for stationary watch", z);
+        assert!(
+            z > 9.0 && z < 11.0,
+            "Z-axis {} unexpected for stationary watch",
+            z
+        );
 
         // X and Y should be close to 0
         assert!(x.abs() < 2.0, "X-axis {} unexpected", x);
@@ -163,8 +172,11 @@ mod nrf52_tests {
         let hr: HeartRateMeasurement = sim.heart_rate_sensor.read();
 
         // Heart rate should be in physiological range
-        assert!(hr.rate >= 50 && hr.rate <= 180,
-            "Heart rate {} out of physiological range", hr.rate);
+        assert!(
+            hr.rate >= 50 && hr.rate <= 180,
+            "Heart rate {} out of physiological range",
+            hr.rate
+        );
         assert!(hr.sensor_contact, "Sensor contact should be true");
     }
 
@@ -179,10 +191,16 @@ mod nrf52_tests {
         let spo2: SpO2Measurement = sim.spo2_sensor.read();
 
         // SpO2 should be in healthy range
-        assert!(spo2.saturation >= 90.0 && spo2.saturation <= 100.0,
-            "SpO2 {} out of healthy range", spo2.saturation);
-        assert!(spo2.confidence >= 80,
-            "Confidence {} too low", spo2.confidence);
+        assert!(
+            spo2.saturation >= 90.0 && spo2.saturation <= 100.0,
+            "SpO2 {} out of healthy range",
+            spo2.saturation
+        );
+        assert!(
+            spo2.confidence >= 80,
+            "Confidence {} too low",
+            spo2.confidence
+        );
     }
 
     #[test]
@@ -564,7 +582,8 @@ Think step by step. When done, respond with {"result": "..."}"#
                 max_tool_calls: 8,
                 sampling: SamplingParams::default(),
                 probe_ollama_on_run: true,
-                system_prompt: r#"You are mAgent, an aerospace-grade AI agent running on a smartwatch.
+                system_prompt:
+                    r#"You are mAgent, an aerospace-grade AI agent running on a smartwatch.
 
 You have sensors:
 - Heart rate monitor
@@ -579,7 +598,7 @@ You can:
 - Send alerts via BLE
 
 Always prioritize user safety."#
-                    .to_string(),
+                        .to_string(),
                 ..Default::default()
             },
         );
@@ -800,7 +819,8 @@ mod skills_tests {
             "A test skill",
             "testing",
             "This is test content",
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(manager.add(skill).is_ok());
         assert_eq!(manager.count(), 1);
@@ -815,7 +835,8 @@ mod skills_tests {
             "Monitor temperature sensors",
             "sensors",
             "Read temperature from sensors",
-        ).unwrap();
+        )
+        .unwrap();
 
         manager.add(skill).unwrap();
 
@@ -832,14 +853,16 @@ mod skills_tests {
             "Temperature sensor reader",
             "sensors",
             "Read temperature",
-        ).unwrap();
+        )
+        .unwrap();
 
         let skill2 = Skill::new(
             "heart_monitor",
             "Heart rate monitor",
             "health",
             "Read heart rate",
-        ).unwrap();
+        )
+        .unwrap();
 
         manager.add(skill1).unwrap();
         manager.add(skill2).unwrap();
@@ -852,12 +875,7 @@ mod skills_tests {
     fn test_remove_skill() {
         let mut manager = SkillsManager::new(10);
 
-        let skill = Skill::new(
-            "to_remove",
-            "A skill to remove",
-            "test",
-            "Content",
-        ).unwrap();
+        let skill = Skill::new("to_remove", "A skill to remove", "test", "Content").unwrap();
 
         manager.add(skill).unwrap();
         assert_eq!(manager.count(), 1);
@@ -871,12 +889,7 @@ mod skills_tests {
         let mut manager = SkillsManager::new(10);
 
         for i in 0..5 {
-            let skill = Skill::new(
-                &format!("skill_{}", i),
-                "A skill",
-                "test",
-                "Content",
-            ).unwrap();
+            let skill = Skill::new(&format!("skill_{}", i), "A skill", "test", "Content").unwrap();
             manager.add(skill).unwrap();
         }
 
@@ -981,7 +994,8 @@ Your task is to monitor user health and send alerts if needed."#
             },
         );
 
-        let scenario = "Good morning! Read all vital signs, log them to flash, and send a summary via BLE.";
+        let scenario =
+            "Good morning! Read all vital signs, log them to flash, and send a summary via BLE.";
         let result = runner.run(scenario);
         assert!(result.is_ok());
     }

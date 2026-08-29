@@ -22,7 +22,7 @@ to a gap or feature in the **Source** column.
 | REQ-FW-001 | Firmware | 固件构建可在 `riscv32imac-unknown-none-elf`(`esp32c61`) 目标上通过 | `cargo build -p magent-esp32-app` | GAP-001 / GAP-016 |
 | REQ-FW-002 | Firmware | 启动到 Wi-Fi STA 连通 ≤ 5 s | 实机测试 | GAP-012 |
 | REQ-FW-003 | Firmware | 主任务栈 ≤ 8 KiB,其余任务 ≤ 4 KiB | `sdkconfig.defaults` + 启动打印 | esp-idf 默认 |
-| REQ-FW-004 | Firmware | 默认启用 Secure Boot v2 与 Flash Encryption | `espsecure.py` 烧录脚本 | GAP-014 |
+| REQ-FW-004 | Firmware | 启用 Secure Boot v2 与 Flash Encryption(生产路径: `sdkconfig.prod.defaults` + `flash-secure.sh`, 待 Tier-6 真机验证) | `flash-secure.sh` / `sdkconfig.prod.defaults` | GAP-014 (已提供工具) |
 | REQ-FW-005 | Firmware | OTA 升级失败回滚到上一分区 | ESP-IDF bootloader rollback | GAP-015 |
 | REQ-NET-001 | Network | 区块链 RPC 必须使用 mbedTLS(走 ESP-IDF 内部) | `sdkconfig.defaults` + 单测 | GAP-009 |
 | REQ-NET-002 | Network | RPC 失败必须返回 `Err`,禁止"假装成功" | 单测 + clippy lint | GAP-003 (已修) |

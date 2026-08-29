@@ -569,14 +569,15 @@ impl SleepManager {
 
         // Based on recent sleep quality
         // HARDENING (audit-2026-08 unwrap sweep): the four `String::try_from`
-            // calls below operate on compile-time Chinese literals that
-            // are well within the 128-byte capacity, but using
-            // `try_heapless` keeps the recommendation pipeline panic-free
-            // if a future contributor translates/extends the strings.
-            if let Some(avg_score) = self.average_sleep_score(5) {
+        // calls below operate on compile-time Chinese literals that
+        // are well within the 128-byte capacity, but using
+        // `try_heapless` keeps the recommendation pipeline panic-free
+        // if a future contributor translates/extends the strings.
+        if let Some(avg_score) = self.average_sleep_score(5) {
             if avg_score < 60.0 {
-                let _ = recommendations
-                    .push(try_heapless::<128>("最近睡眠质量较差，建议睡前减少屏幕使用"));
+                let _ = recommendations.push(try_heapless::<128>(
+                    "最近睡眠质量较差，建议睡前减少屏幕使用",
+                ));
             }
         }
 
@@ -588,16 +589,16 @@ impl SleepManager {
                 ));
             }
             CircadianPhase::AlertPhase => {
-                let _ = recommendations
-                    .push(try_heapless::<128>("现在是警觉期，适合处理复杂任务"));
+                let _ = recommendations.push(try_heapless::<128>("现在是警觉期，适合处理复杂任务"));
             }
             _ => {}
         }
 
         // Default recommendations
         if recommendations.is_empty() {
-            let _ = recommendations
-                .push(try_heapless::<128>("保持良好的睡眠习惯：固定作息，适度运动"));
+            let _ = recommendations.push(try_heapless::<128>(
+                "保持良好的睡眠习惯：固定作息，适度运动",
+            ));
         }
 
         recommendations
@@ -777,16 +778,35 @@ mod tests {
 
     #[test]
     fn recommended_meditation_maps_stress_level() {
-        assert_eq!(MeditationType::recommended_for_stress(StressLevel::Low), MeditationType::QuickBreath);
-        assert_eq!(MeditationType::recommended_for_stress(StressLevel::Moderate), MeditationType::BodyScan);
-        assert_eq!(MeditationType::recommended_for_stress(StressLevel::High), MeditationType::GuidedRelaxation);
-        assert_eq!(MeditationType::recommended_for_stress(StressLevel::VeryHigh), MeditationType::EmergencyCalm);
+        assert_eq!(
+            MeditationType::recommended_for_stress(StressLevel::Low),
+            MeditationType::QuickBreath
+        );
+        assert_eq!(
+            MeditationType::recommended_for_stress(StressLevel::Moderate),
+            MeditationType::BodyScan
+        );
+        assert_eq!(
+            MeditationType::recommended_for_stress(StressLevel::High),
+            MeditationType::GuidedRelaxation
+        );
+        assert_eq!(
+            MeditationType::recommended_for_stress(StressLevel::VeryHigh),
+            MeditationType::EmergencyCalm
+        );
     }
 
     #[test]
     fn meditation_scripts_are_non_empty_for_all_types() {
         use MeditationType::*;
-        for t in [QuickBreath, BodyScan, GuidedRelaxation, DeepMeditation, SleepPrep, EmergencyCalm] {
+        for t in [
+            QuickBreath,
+            BodyScan,
+            GuidedRelaxation,
+            DeepMeditation,
+            SleepPrep,
+            EmergencyCalm,
+        ] {
             assert!(!SleepManager::get_meditation_script(t).is_empty());
             assert!(!t.name().is_empty());
             assert!(!t.description().is_empty());
@@ -876,12 +896,16 @@ mod tests {
     fn sleep_history_caps_at_max_entries() {
         let mut m = SleepManager::new();
         for i in 0..(MAX_SLEEP_HISTORY + 5) {
-            m.add_sleep_record(make_record(i as u32, 6 * 60 + 30)).unwrap();
+            m.add_sleep_record(make_record(i as u32, 6 * 60 + 30))
+                .unwrap();
         }
         assert_eq!(m.sleep_history().len(), MAX_SLEEP_HISTORY);
         // The oldest 5 entries were evicted.
         assert_eq!(m.sleep_history()[0].day_index, 5);
-        assert_eq!(m.latest_sleep().unwrap().day_index as usize, MAX_SLEEP_HISTORY + 4);
+        assert_eq!(
+            m.latest_sleep().unwrap().day_index as usize,
+            MAX_SLEEP_HISTORY + 4
+        );
     }
 
     #[test]
@@ -891,10 +915,14 @@ mod tests {
         // *below* the clamped threshold and must NOT fire...
         let mut clamped = SleepManager::new();
         clamped.set_stress_threshold(200);
-        assert!(clamped.check_stress_intervention(10.0, 160, 1_000_000).is_none());
+        assert!(clamped
+            .check_stress_intervention(10.0, 160, 1_000_000)
+            .is_none());
 
         // ...whereas the same input fires under the default threshold of 70.
         let mut default = SleepManager::new();
-        assert!(default.check_stress_intervention(10.0, 160, 1_000_000).is_some());
+        assert!(default
+            .check_stress_intervention(10.0, 160, 1_000_000)
+            .is_some());
     }
 }

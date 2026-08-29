@@ -192,12 +192,8 @@ impl<P: EnvelopePayload> Envelope<P> {
         // Build the canonical bytes — domain-separation prefix
         // + cross-cutting fields + payload, in declaration
         // order. See [`Self::canonical_bytes_for`] for the design.
-        let canonical = Self::canonical_bytes_for(
-            &payload,
-            issued_at_unix,
-            not_before_unix,
-            not_after_unix,
-        )?;
+        let canonical =
+            Self::canonical_bytes_for(&payload, issued_at_unix, not_before_unix, not_after_unix)?;
 
         // Sign the canonical bytes directly. We use
         // `Identity::sign` for the Ed25519-R signing itself,
@@ -259,10 +255,7 @@ impl<P: EnvelopePayload> Envelope<P> {
         if let Some(end) = self.not_after_unix {
             if now_secs > end {
                 return Err(Web3ErrorKind::InvalidDid {
-                    raw: format!(
-                        "envelope expired: now={} > not_after={}",
-                        now_secs, end
-                    ),
+                    raw: format!("envelope expired: now={} > not_after={}", now_secs, end),
                 });
             }
         }
@@ -281,11 +274,7 @@ impl<P: EnvelopePayload> Envelope<P> {
         let signer_did = core_web3::DidKey::from_string(&self.signer)?;
         let pk_bytes = signer_did.ed25519_public_key()?;
         let pk = core_web3::PublicKey::from_bytes(pk_bytes)?;
-        core_web3::verify_signature_detailed(
-            &pk,
-            &self.signature_hex,
-            &canonical,
-        )?;
+        core_web3::verify_signature_detailed(&pk, &self.signature_hex, &canonical)?;
         Ok(())
     }
 
@@ -299,8 +288,7 @@ impl<P: EnvelopePayload> Envelope<P> {
     /// modulo whitespace — verifiers MUST use the compact form
     /// (`to_json`) for signature comparison.
     pub fn to_json_pretty(&self) -> String {
-        serde_json::to_string_pretty(self)
-            .expect("Envelope<P> is always serialisable")
+        serde_json::to_string_pretty(self).expect("Envelope<P> is always serialisable")
     }
 
     /// Deserialise from JSON. **Does NOT verify** the signature —
@@ -416,11 +404,9 @@ impl<P: EnvelopePayload> Envelope<P> {
         };
         let mut out = Vec::with_capacity(64 + 256);
         out.extend_from_slice(P::DOMAIN_PREFIX.as_bytes());
-        let json = serde_json::to_vec(&form).map_err(|e| {
-            Web3ErrorKind::Parse {
-                kind: ParseFailureKind::SchemaMismatch,
-                message: format!("canonical serialise: {}", e),
-            }
+        let json = serde_json::to_vec(&form).map_err(|e| Web3ErrorKind::Parse {
+            kind: ParseFailureKind::SchemaMismatch,
+            message: format!("canonical serialise: {}", e),
         })?;
         out.extend_from_slice(&json);
         Ok(out)
@@ -464,9 +450,15 @@ mod tests {
 
     fn sample_envelope() -> (Identity, TinyEnvelope) {
         let id = Identity::from_secret_bytes(&[42u8; 32]).unwrap();
-        let env = TinyEnvelope::sign(&id, 1_700_000_000, None, None, TinyPayload {
-            message: "hello".to_string(),
-        })
+        let env = TinyEnvelope::sign(
+            &id,
+            1_700_000_000,
+            None,
+            None,
+            TinyPayload {
+                message: "hello".to_string(),
+            },
+        )
         .unwrap();
         (id, env)
     }
@@ -515,9 +507,15 @@ mod tests {
     #[test]
     fn verify_rejects_pre_window_now() {
         let id = Identity::from_secret_bytes(&[42u8; 32]).unwrap();
-        let env = TinyEnvelope::sign(&id, 1_700_000_000, Some(1_700_000_500), None, TinyPayload {
-            message: "later".to_string(),
-        })
+        let env = TinyEnvelope::sign(
+            &id,
+            1_700_000_000,
+            Some(1_700_000_500),
+            None,
+            TinyPayload {
+                message: "later".to_string(),
+            },
+        )
         .unwrap();
         let err = env.verify(1_700_000_100).unwrap_err();
         let msg = format!("{:?}", err);
@@ -527,9 +525,15 @@ mod tests {
     #[test]
     fn verify_rejects_post_window_now() {
         let id = Identity::from_secret_bytes(&[42u8; 32]).unwrap();
-        let env = TinyEnvelope::sign(&id, 1_700_000_000, None, Some(1_700_000_500), TinyPayload {
-            message: "sooner".to_string(),
-        })
+        let env = TinyEnvelope::sign(
+            &id,
+            1_700_000_000,
+            None,
+            Some(1_700_000_500),
+            TinyPayload {
+                message: "sooner".to_string(),
+            },
+        )
         .unwrap();
         let err = env.verify(1_700_000_600).unwrap_err();
         let msg = format!("{:?}", err);
@@ -591,13 +595,25 @@ mod tests {
         // produce the same signature on every call (Ed25519-R
         // is deterministic).
         let id = Identity::from_secret_bytes(&[42u8; 32]).unwrap();
-        let env1 = TinyEnvelope::sign(&id, 1, None, None, TinyPayload {
-            message: "deterministic".to_string(),
-        })
+        let env1 = TinyEnvelope::sign(
+            &id,
+            1,
+            None,
+            None,
+            TinyPayload {
+                message: "deterministic".to_string(),
+            },
+        )
         .unwrap();
-        let env2 = TinyEnvelope::sign(&id, 1, None, None, TinyPayload {
-            message: "deterministic".to_string(),
-        })
+        let env2 = TinyEnvelope::sign(
+            &id,
+            1,
+            None,
+            None,
+            TinyPayload {
+                message: "deterministic".to_string(),
+            },
+        )
         .unwrap();
         assert_eq!(env1, env2);
         assert_eq!(env1.signature_hex, env2.signature_hex);

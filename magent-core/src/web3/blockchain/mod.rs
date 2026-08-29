@@ -54,9 +54,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::Web3ErrorKind;
 
 pub mod client;
+pub mod events;
 pub mod identity_binding;
 pub mod transaction;
-pub mod events;
 
 // JSON-RPC types for HTTP client
 pub mod http_types;
@@ -81,17 +81,15 @@ pub mod agent_tools;
 #[cfg(feature = "web3")]
 pub mod secp256k1;
 
-pub use client::{ChainClient, BlockchainResult, ChainId};
-pub use identity_binding::{IdentityBinding, BindingProof, BindingStatus};
-pub use transaction::{Transaction, TransactionRequest, TransactionReceipt};
+pub use client::{BlockchainResult, ChainClient, ChainId};
 pub use events::{EventFilter, EventLog};
+pub use identity_binding::{BindingProof, BindingStatus, IdentityBinding};
+pub use transaction::{Transaction, TransactionReceipt, TransactionRequest};
 
 // Re-export agent-facing helper types from agent_tools so callers can
 // `use magent_core::web3::blockchain::BlockchainManager` etc.
 #[cfg(feature = "web3")]
-pub use agent_tools::{
-    BlockchainManager, BlockchainToolResult, execute_blockchain_tool,
-};
+pub use agent_tools::{execute_blockchain_tool, BlockchainManager, BlockchainToolResult};
 
 // ChainConfig, Chain, KnownChain are defined in this module (mod.rs) and
 // already accessible without re-exporting them.
@@ -103,15 +101,14 @@ pub use http_client::HttpRpcClient;
 // Secp256k1 signing types
 #[cfg(feature = "web3")]
 pub use secp256k1::{
-    EthereumSignature, Secp256k1Keypair, Secp256k1PublicKey, Secp256k1SecretKey,
-    TransactionSigner,
+    EthereumSignature, Secp256k1Keypair, Secp256k1PublicKey, Secp256k1SecretKey, TransactionSigner,
 };
 
 // Re-export ESP32 types when feature enabled
 #[cfg(feature = "esp32")]
-pub use esp32_client::{Esp32BlockchainClient, BlockchainState, BlockchainPollResult};
+pub use esp32_client::{BlockchainPollResult, BlockchainState, Esp32BlockchainClient};
 #[cfg(feature = "esp32")]
-pub use esp32_http::{EspHttpClient, HttpClientConfig, TransactionPoller, PollStatus};
+pub use esp32_http::{EspHttpClient, HttpClientConfig, PollStatus, TransactionPoller};
 
 // ============================================================================
 // Chain Configuration
@@ -250,14 +247,9 @@ impl Chain {
 
     /// Get the RPC URL, returning an error if not configured.
     pub fn rpc_url(&self) -> Result<&str, Web3ErrorKind> {
-        self.config
-            .rpc_url
-            .as_deref()
-            .ok_or_else(|| {
-                Web3ErrorKind::BlockchainError(
-                    "RPC URL not configured for this chain".to_string(),
-                )
-            })
+        self.config.rpc_url.as_deref().ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("RPC URL not configured for this chain".to_string())
+        })
     }
 }
 
@@ -390,12 +382,8 @@ impl Address {
             // Recompute the canonical EIP-55 form and require an
             // exact byte-for-byte match on the input characters.
             let canonical = parsed.to_checksum();
-            let canonical_no_prefix = canonical
-                .strip_prefix("0x")
-                .unwrap_or(canonical.as_str());
-            if !canonical_no_prefix.eq_ignore_ascii_case(s)
-                || canonical_no_prefix != s
-            {
+            let canonical_no_prefix = canonical.strip_prefix("0x").unwrap_or(canonical.as_str());
+            if !canonical_no_prefix.eq_ignore_ascii_case(s) || canonical_no_prefix != s {
                 return Err(Web3ErrorKind::BlockchainError(format!(
                     "EIP-55 checksum mismatch: expected {}",
                     canonical
@@ -417,9 +405,7 @@ impl Address {
         // The canonical form is always mixed-case (since `web3` is
         // enabled). If it doesn't match the canonical shape, the
         // caller must be calling us in an unsupported build.
-        let canonical_hex = canonical
-            .strip_prefix("0x")
-            .unwrap_or(canonical.as_str());
+        let canonical_hex = canonical.strip_prefix("0x").unwrap_or(canonical.as_str());
         // The only way this can fail is if the underlying keccak
         // implementation produces different output than expected —
         // which would itself be a critical bug. We don't try to
@@ -799,10 +785,7 @@ mod tests {
     fn test_address_from_hex() {
         let addr = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
         // to_hex() returns the lowercased hex form.
-        assert_eq!(
-            addr.to_hex(),
-            "0x742d35cc6634c0532925a3b844bc9e7595f8be21"
-        );
+        assert_eq!(addr.to_hex(), "0x742d35cc6634c0532925a3b844bc9e7595f8be21");
     }
 
     #[test]
@@ -819,8 +802,7 @@ mod tests {
         // positions 4, 38, and 41. The implementation is correct;
         // the test fixture was the bug.
         assert_eq!(
-            checksum,
-            "0x742d35cC6634C0532925a3b844Bc9E7595F8bE21",
+            checksum, "0x742d35cC6634C0532925a3b844Bc9E7595F8bE21",
             "EIP-55 round-trip matches the canonical mixed-case form"
         );
     }
@@ -831,7 +813,10 @@ mod tests {
         // EIP-55 form.
         let s = "0x742d35cC6634C0532925a3b844Bc9E7595F8bE21";
         let addr = Address::from_checksummed_hex(s).unwrap();
-        assert_eq!(addr.to_hex().to_lowercase(), "0x742d35cc6634c0532925a3b844bc9e7595f8be21");
+        assert_eq!(
+            addr.to_hex().to_lowercase(),
+            "0x742d35cc6634c0532925a3b844bc9e7595f8be21"
+        );
     }
 
     #[test]
@@ -854,7 +839,9 @@ mod tests {
     #[test]
     fn test_from_checksummed_hex_rejects_wrong_length() {
         assert!(Address::from_checksummed_hex("0xdeadbeef").is_err());
-        assert!(Address::from_checksummed_hex("0x742d35cC6634C0532925a3b844Bc9E7595F8bE2").is_err());
+        assert!(
+            Address::from_checksummed_hex("0x742d35cC6634C0532925a3b844Bc9E7595F8bE2").is_err()
+        );
     }
 
     /// EIP-55 official test vectors (from the EIP-55 spec). These pin the
@@ -864,30 +851,45 @@ mod tests {
     fn test_eip55_known_vectors() {
         let cases: &[(&str, &str)] = &[
             // All-caps and all-lower input forms.
-            ("0x52908400098527886e0f7030069857d2e4169ee7",
-             "0x52908400098527886E0F7030069857D2E4169EE7"),
-            ("0x8617e340b3d01fa5f11f306f4090fd50e238070d",
-             "0x8617E340B3D01FA5F11F306F4090FD50E238070D"),
-            ("0xde709f2102306220921060314715629080e2fb77",
-             "0xde709f2102306220921060314715629080e2fb77"),
-            ("0x27b1fdb04752bbc536007a920d24acb045561c26",
-             "0x27b1fdb04752bbc536007a920d24acb045561c26"),
+            (
+                "0x52908400098527886e0f7030069857d2e4169ee7",
+                "0x52908400098527886E0F7030069857D2E4169EE7",
+            ),
+            (
+                "0x8617e340b3d01fa5f11f306f4090fd50e238070d",
+                "0x8617E340B3D01FA5F11F306F4090FD50E238070D",
+            ),
+            (
+                "0xde709f2102306220921060314715629080e2fb77",
+                "0xde709f2102306220921060314715629080e2fb77",
+            ),
+            (
+                "0x27b1fdb04752bbc536007a920d24acb045561c26",
+                "0x27b1fdb04752bbc536007a920d24acb045561c26",
+            ),
             // Mixed-case examples from the spec.
-            ("0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
-             "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"),
-            ("0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359",
-             "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359"),
-            ("0xdbf03b407c01e7cd3cbea99509d93f8dddc8c6fb",
-             "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB"),
-            ("0xd1220a0cf47c7b9be7a2e6ba89f429762e7b9adb",
-             "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb"),
+            (
+                "0x5aaeb6053f3e94c9b9a09f33669435e7ef1beaed",
+                "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+            ),
+            (
+                "0xfb6916095ca1df60bb79ce92ce3ea74c37c5d359",
+                "0xfB6916095ca1df60bB79Ce92cE3Ea74c37c5d359",
+            ),
+            (
+                "0xdbf03b407c01e7cd3cbea99509d93f8dddc8c6fb",
+                "0xdbF03B407c01E7cD3CBea99509d93f8DDDC8C6FB",
+            ),
+            (
+                "0xd1220a0cf47c7b9be7a2e6ba89f429762e7b9adb",
+                "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb",
+            ),
         ];
         for (input, expected) in cases {
             let addr = Address::from_hex(input).unwrap();
             assert_eq!(addr.to_checksum(), *expected, "EIP-55 for {input}");
         }
     }
-
 
     #[test]
     fn test_wei_conversions() {

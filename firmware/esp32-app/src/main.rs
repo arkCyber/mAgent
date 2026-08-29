@@ -44,7 +44,13 @@ mod local_tools;
 mod web_admin;
 mod at_dispatch;
 mod device_key;
+mod blockchain_transport;
+mod ota;
+mod ping;
+#[cfg(feature = "board-s3")]
 mod llm;
+#[cfg(feature = "lua")]
+mod lua_task;
 #[cfg(feature = "ble")]
 mod ble_config;
 #[cfg(feature = "ble")]
@@ -53,9 +59,6 @@ mod ble_at;
 mod ble_wallet;
 #[cfg(feature = "wifi")]
 mod sntp_sync;
-
-#[cfg(feature = "ble")]
-use crate::ble_config::BleServer;
 
 use core::convert::TryFrom;
 use core::time::Duration;
@@ -207,8 +210,8 @@ const NVS_KEY_WIFI_SSID: &str = "wifi_ssid";
 const NVS_KEY_WIFI_PASS: &str = "wifi_pass";
 /// NVS keys for the LLM backend parameters (in the `mag_at` namespace,
 /// read/written by `AT+LLMCFG`).
-const NVS_KEY_LLM_MODEL: &str = "mag_at:llm_model";
-const NVS_KEY_LLM_API_KEY: &str = "mag_at:llm_api_key";
+pub(crate) const NVS_KEY_LLM_MODEL: &str = "mag_at:llm_model";
+pub(crate) const NVS_KEY_LLM_API_KEY: &str = "mag_at:llm_api_key";
 
 /// Shared, long-lived default NVS partition handle.
 ///
@@ -310,7 +313,7 @@ pub(crate) fn default_nvs() -> Option<EspDefaultNvsPartition> {
 /// the `mag_at` namespace) can be addressed without spreading a
 /// second wrapper everywhere. Plain keys (no colon) default to the
 /// existing `magent` namespace so callers stay one-line.
-fn nvs_load_string(key: &str) -> Option<String> {
+pub(crate) fn nvs_load_string(key: &str) -> Option<String> {
     let (ns, key) = split_ns_key(key);
     let partition = default_nvs()?;
     let nvs = EspDefaultNvs::new(partition, ns, true).ok()?;
@@ -1975,15 +1978,15 @@ fn configure_psram_thread_stacks() {
 fn main() {
     init_logging();
 
-    // STABILITY (stability-2026-08): route worker-thread stacks to PSRAM.
-    // On this RAM-limited C61 (~134 KiB internal DRAM), the agent/ingress/
-    // supervisor thread stacks (32+24+8+8 KiB) are allocated from internal
-    // SRAM by default (esp-pthread's stack_alloc_caps defaults to
-    // MALLOC_CAP_INTERNAL). After Wi-Fi + BLE bring-up there is not enough
-    // internal DRAM left, so thread spawns fail (`os error 12`) and the agent
-    // never runs. Setting stack_alloc_caps to MALLOC_CAP_SPIRAM moves the
-    // stacks onto the 2 MiB PSRAM, freeing internal DRAM so Wi-Fi + BLE +
-    // agent can coexist. (Only the small task TCB stays in internal RAM.)
+    // STABILITY (stability-2026-08): worker-thread stacks intentionally stay
+    // in internal DRAM (SRAM). We previously tried routing them to PSRAM
+    // (`stack_alloc_caps = MALLOC_CAP_SPIRAM`) to free internal RAM, but a
+    // PSRAM task stack running while Wi-Fi is active triggers a `CPU_LOCKUP`
+    // on the C61 regardless of free memory. `configure_psram_thread_stacks()`
+    // is therefore a documented no-op. The large per-thread *heap* buffers
+    // (MiniAgent conversation, LLM context, and — once wired — the Lua VM's
+    // heap) already land on PSRAM via the `std::alloc`/`heap_caps` backing;
+    // only small stacks stay in SRAM. Keep it this way.
     configure_psram_thread_stacks();
 
     // HARDENING (audit-2026-08 M-WDT01): log the reset reason at the very
@@ -2013,6 +2016,12 @@ fn main() {
     // other NVS use (identity, provisioning) and EspWifi so the AT
     // dispatcher can still read/write config after boot.
     init_default_nvs();
+
+    // Install the real esp-idf blockchain RPC transport as the process-wide
+    // default, so every `EspHttpClient` the agent constructs (via
+    // `execute_blockchain_tool`) actually talks to an RPC endpoint over the
+    // radio instead of returning a placeholder error. No-op on re-entry.
+    blockchain_transport::EspIdfTransport::install_default();
 
     // Load / generate device identity.
     let identity = load_or_create_identity();
@@ -2245,6 +2254,41 @@ fn main() {
         log::error!("[agent] thread spawn failed — continuing without agent");
     }
 
+    // Boot-time AT self-test: exercise the AT engine on-device and log each
+    // reply (visible over the USB-CDC console), validating parse + dispatch
+    // without needing a physical UART0 line.
+    {
+        let now = now_ms();
+        let mut force = false;
+        for line in [
+            "AT+GMR",
+            "AT+IDENT?",
+            "AT+SYSRAM?",
+            "AT+HEAP?",
+            "AT+UPTIME?",
+            "AT+CWSTATE?",
+        ] {
+            if let Ok(cmd) = magent_core::at::parse_line(line.as_bytes()) {
+                let outcome = at_dispatch::dispatch(
+                    &cmd,
+                    now,
+                    safe_mode,
+                    Some(&wifi_status),
+                    Some(&time_sync_for_dispatch),
+                    &mut force,
+                );
+                let mut buf = at_dispatch::ResponseBuf::new();
+                if at_dispatch::render_outcome(&outcome, &mut buf).is_ok() {
+                    log::info!(
+                        "[at-self-test] {} => {}",
+                        line.trim(),
+                        String::from_utf8_lossy(buf.as_slice()).trim()
+                    );
+                }
+            }
+        }
+    }
+
     let ingress_handle = thread::Builder::new()
         .name("ingress-thread".into())
         // PATCHED (MicroAgent): keep this modest. `AT+HTTPGET` runs its TLS
@@ -2268,6 +2312,23 @@ fn main() {
         .ok();
     if ingress_handle.is_none() {
         log::error!("[ingress] thread spawn failed — continuing without ingress");
+    }
+
+    // OTA anti-rollback confirmation (REQ-FW-005): once the agent thread is
+    // running, the freshly-OTA'd firmware is considered healthy, so confirm it
+    // here to stop the bootloader rolling it back on the next boot. No-op when
+    // anti-rollback is disabled (dev builds).
+    if agent_handle.is_some() {
+        // SAFETY: `esp_ota_mark_app_valid_cancel_rollback` takes no pointers.
+        unsafe { esp_idf_sys::esp_ota_mark_app_valid_cancel_rollback() };
+    }
+
+    // Lua application runtime on the ESP32-S3. Gated behind the `lua` feature
+    // (OFF by default) because `mlua`'s vendored Lua C does not yet build for
+    // Xtensa. Removed entirely from the C61 and default S3 builds.
+    #[cfg(feature = "lua")]
+    {
+        crate::lua_task::start_lua_task();
     }
 
     // PATCHED (MicroAgent): SNTP supervisor thread. SNTP needs lwIP, which is

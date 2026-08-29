@@ -9,8 +9,8 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::Web3ErrorKind;
 use super::{Address, Block, Chain, Hash, Wei};
+use crate::error::Web3ErrorKind;
 
 /// Chain identifier type.
 pub type ChainId = u64;
@@ -48,7 +48,10 @@ pub trait ChainClient {
     fn get_code(&self, address: &Address) -> BlockchainResult<Vec<u8>>;
 
     /// Get transaction receipt.
-    fn get_transaction_receipt(&self, tx_hash: &Hash) -> BlockchainResult<Option<TransactionReceipt>>;
+    fn get_transaction_receipt(
+        &self,
+        tx_hash: &Hash,
+    ) -> BlockchainResult<Option<TransactionReceipt>>;
 
     /// Get block by number.
     fn get_block(&self, block_number: u64) -> BlockchainResult<Option<Block>>;
@@ -96,10 +99,10 @@ impl JsonRpcRequest {
     pub fn new(method: impl Into<String>, params: Vec<Value>) -> Self {
         // `AtomicU64` is unavailable on 32-bit targets (e.g. RISC-V ESP32-C6/C61).
         // Fall back to `AtomicU32` — more than enough unique IDs per process lifetime.
-        #[cfg(target_pointer_width = "64")]
-        use core::sync::atomic::{AtomicU64, Ordering};
         #[cfg(target_pointer_width = "32")]
         use core::sync::atomic::{AtomicU32 as AtomicU64, Ordering};
+        #[cfg(target_pointer_width = "64")]
+        use core::sync::atomic::{AtomicU64, Ordering};
 
         static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
         // `fetch_add` returns the underlying integer type (u32 on 32-bit
@@ -228,20 +231,18 @@ impl EvmRpcClient {
             Web3ErrorKind::BlockchainError("expected string for number".to_string())
         })?;
         let s = s.strip_prefix("0x").unwrap_or(s);
-        u64::from_str_radix(s, 16).map_err(|e| {
-            Web3ErrorKind::BlockchainError(format!("failed to parse u64: {}", e))
-        })
+        u64::from_str_radix(s, 16)
+            .map_err(|e| Web3ErrorKind::BlockchainError(format!("failed to parse u64: {}", e)))
     }
 
     /// Parse Wei from JSON.
     fn parse_wei(&self, v: &Value) -> BlockchainResult<Wei> {
-        let s = v.as_str().ok_or_else(|| {
-            Web3ErrorKind::BlockchainError("expected string for wei".to_string())
-        })?;
+        let s = v
+            .as_str()
+            .ok_or_else(|| Web3ErrorKind::BlockchainError("expected string for wei".to_string()))?;
         let s = s.strip_prefix("0x").unwrap_or(s);
-        let wei = u128::from_str_radix(s, 16).map_err(|e| {
-            Web3ErrorKind::BlockchainError(format!("failed to parse wei: {}", e))
-        })?;
+        let wei = u128::from_str_radix(s, 16)
+            .map_err(|e| Web3ErrorKind::BlockchainError(format!("failed to parse wei: {}", e)))?;
         Ok(Wei(wei))
     }
 }
@@ -288,7 +289,10 @@ impl ChainClient for EvmRpcClient {
         self.parse_hex(result.as_str().unwrap_or("0x"))
     }
 
-    fn get_transaction_receipt(&self, tx_hash: &Hash) -> BlockchainResult<Option<TransactionReceipt>> {
+    fn get_transaction_receipt(
+        &self,
+        tx_hash: &Hash,
+    ) -> BlockchainResult<Option<TransactionReceipt>> {
         let params = vec![serde_json::json![tx_hash.to_hex()]];
         let result: Value = self.raw_call("eth_getTransactionReceipt", params)?;
 
@@ -363,7 +367,8 @@ impl EvmRpcClient {
         let logs: Vec<crate::web3::blockchain::events::EventLog> =
             serde_json::from_value(v["logs"].clone()).unwrap_or_default();
 
-        let effective_gas_price = v.get("effectiveGasPrice")
+        let effective_gas_price = v
+            .get("effectiveGasPrice")
             .and_then(|x| x.as_str())
             .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
             .map(crate::web3::blockchain::Wei);
@@ -425,13 +430,21 @@ fn hex_decode(s: &str) -> BlockchainResult<Vec<u8>> {
             b'0'..=b'9' => chunk[0] - b'0',
             b'a'..=b'f' => chunk[0] - b'a' + 10,
             b'A'..=b'F' => chunk[0] - b'A' + 10,
-            _ => return Err(Web3ErrorKind::BlockchainError("invalid hex digit".to_string())),
+            _ => {
+                return Err(Web3ErrorKind::BlockchainError(
+                    "invalid hex digit".to_string(),
+                ))
+            }
         };
         let lo = match chunk[1] {
             b'0'..=b'9' => chunk[1] - b'0',
             b'a'..=b'f' => chunk[1] - b'a' + 10,
             b'A'..=b'F' => chunk[1] - b'A' + 10,
-            _ => return Err(Web3ErrorKind::BlockchainError("invalid hex digit".to_string())),
+            _ => {
+                return Err(Web3ErrorKind::BlockchainError(
+                    "invalid hex digit".to_string(),
+                ))
+            }
         };
         out.push((hi << 4) | lo);
     }
@@ -449,8 +462,7 @@ mod tests {
     #[test]
     fn test_event_filter_builder() {
         let contract = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
-        let filter = EventFilter::new(contract)
-            .with_block_range(1000000, 2000000);
+        let filter = EventFilter::new(contract).with_block_range(1000000, 2000000);
 
         assert!(filter.address.is_some());
         assert_eq!(filter.from_block, 1000000);
@@ -462,7 +474,7 @@ mod tests {
         let chain = Chain::from_known(super::super::KnownChain::Ethereum);
         let client = EvmRpcClient::new(&chain);
         // Will fail because RPC is not actually called, but creation works
-        assert!(client.is_ok() || matches!(client, Err(_)));
+        assert!(client.is_ok() || client.is_err());
     }
 
     #[test]

@@ -38,6 +38,8 @@ pub enum ErrorCategory {
     Timeout = 6,
     /// Unknown/unclassified errors
     Unknown = 7,
+    /// Cryptographic / authentication errors
+    Security = 8,
 }
 
 /// Recovery strategy for error handling
@@ -183,6 +185,46 @@ pub enum AgentError {
         /// matched against the foreign library's header.
         code: u32,
     },
+    /// Local crypto / AEAD failure (key derivation, GCM authentication
+    /// mismatch, …). Distinct from the network-layer `EncryptionFailed`
+    /// variant above, which fires when a remote TLS handshake fails.
+    CryptoError {
+        /// Specific reason the cryptographic operation failed.
+        reason: EncryptionError,
+    },
+}
+
+/// Local-cryptography error reasons. Distinct from `NetworkError::EncryptionFailed`
+/// (which fires when a *remote* TLS handshake fails): these are produced
+/// entirely by local primitives such as AES-GCM / HMAC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionError {
+    /// The underlying AEAD primitive returned an error (e.g. invalid key
+    /// length, allocation failure).
+    CipherError,
+    /// The ciphertext failed authentication (GCM tag mismatch). Almost
+    /// always indicates tampering or a nonce reuse.
+    AuthenticationFailed,
+    /// Ciphertext was too short to contain a nonce + tag header.
+    InvalidCiphertext,
+    /// The supplied key was the wrong length for the chosen cipher.
+    InvalidKey,
+}
+
+#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+impl defmt::Format for EncryptionError {
+    fn format(&self, f: defmt::Formatter) {
+        match self {
+            EncryptionError::CipherError => defmt::write!(f, "cipher primitive error"),
+            EncryptionError::AuthenticationFailed => {
+                defmt::write!(f, "authentication failed (tag mismatch)")
+            }
+            EncryptionError::InvalidCiphertext => {
+                defmt::write!(f, "ciphertext too short (missing nonce/tag)")
+            }
+            EncryptionError::InvalidKey => defmt::write!(f, "invalid key length"),
+        }
+    }
 }
 
 /// Network-specific errors
@@ -440,13 +482,25 @@ impl fmt::Display for Web3ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Web3ErrorKind::InvalidSecretKeyLength { actual } => {
-                write!(f, "invalid Ed25519 secret key: expected 32 bytes, got {}", actual)
+                write!(
+                    f,
+                    "invalid Ed25519 secret key: expected 32 bytes, got {}",
+                    actual
+                )
             }
             Web3ErrorKind::InvalidPublicKey { actual_len } => {
-                write!(f, "invalid Ed25519 public key: expected 32 bytes, got {}", actual_len)
+                write!(
+                    f,
+                    "invalid Ed25519 public key: expected 32 bytes, got {}",
+                    actual_len
+                )
             }
             Web3ErrorKind::InvalidSignature { actual_len } => {
-                write!(f, "invalid Ed25519 signature: expected 64 bytes, got {}", actual_len)
+                write!(
+                    f,
+                    "invalid Ed25519 signature: expected 64 bytes, got {}",
+                    actual_len
+                )
             }
             Web3ErrorKind::InvalidDid { raw } => {
                 write!(f, "invalid did:key identifier: '{}'", raw)
@@ -475,7 +529,11 @@ impl fmt::Display for Web3ErrorKind {
                 write!(f, "signature verification failed")
             }
             Web3ErrorKind::DidKeyMismatch { did } => {
-                write!(f, "did:key embedded key does not match expected key: '{}'", did)
+                write!(
+                    f,
+                    "did:key embedded key does not match expected key: '{}'",
+                    did
+                )
             }
             Web3ErrorKind::BlockchainError(msg) => {
                 write!(f, "blockchain error: {}", msg)
@@ -493,17 +551,21 @@ impl AgentError {
             | AgentError::StackOverflow { .. }
             | AgentError::MemoryBudgetExhausted { .. } => ErrorCategory::Memory,
 
-            AgentError::NetworkConnectionFailed { .. }
-            | AgentError::NetworkTimeout { .. } => ErrorCategory::Network,
+            AgentError::NetworkConnectionFailed { .. } | AgentError::NetworkTimeout { .. } => {
+                ErrorCategory::Network
+            }
 
-            AgentError::StorageWriteFailed { .. }
-            | AgentError::StorageReadFailed { .. } => ErrorCategory::Storage,
+            AgentError::StorageWriteFailed { .. } | AgentError::StorageReadFailed { .. } => {
+                ErrorCategory::Storage
+            }
 
-            AgentError::SensorReadFailed { .. }
-            | AgentError::GpioOperationFailed { .. } => ErrorCategory::Hardware,
+            AgentError::SensorReadFailed { .. } | AgentError::GpioOperationFailed { .. } => {
+                ErrorCategory::Hardware
+            }
 
-            AgentError::InputValidationFailed { .. }
-            | AgentError::ConfigurationError { .. } => ErrorCategory::Validation,
+            AgentError::InputValidationFailed { .. } | AgentError::ConfigurationError { .. } => {
+                ErrorCategory::Validation
+            }
 
             #[cfg(feature = "web3")]
             AgentError::Web3Error { .. } => ErrorCategory::Validation,
@@ -512,29 +574,36 @@ impl AgentError {
 
             AgentError::OperationTimeout { .. } => ErrorCategory::Timeout,
 
-            AgentError::InvalidStateTransition { .. }
-            | AgentError::Unknown { .. } => ErrorCategory::Unknown,
+            AgentError::InvalidStateTransition { .. } | AgentError::Unknown { .. } => {
+                ErrorCategory::Unknown
+            }
+
+            AgentError::CryptoError { .. } => ErrorCategory::Security,
         }
     }
 
     /// Get recommended recovery strategy
     pub fn recovery_strategy(&self) -> RecoveryStrategy {
         match self {
-            AgentError::NetworkConnectionFailed { .. }
-            | AgentError::NetworkTimeout { .. } => RecoveryStrategy::RetryBackoff,
+            AgentError::NetworkConnectionFailed { .. } | AgentError::NetworkTimeout { .. } => {
+                RecoveryStrategy::RetryBackoff
+            }
 
-            AgentError::StorageWriteFailed { .. }
-            | AgentError::StorageReadFailed { .. } => RecoveryStrategy::RetryImmediate,
+            AgentError::StorageWriteFailed { .. } | AgentError::StorageReadFailed { .. } => {
+                RecoveryStrategy::RetryImmediate
+            }
 
-            AgentError::SensorReadFailed { .. }
-            | AgentError::GpioOperationFailed { .. } => RecoveryStrategy::Degrade,
+            AgentError::SensorReadFailed { .. } | AgentError::GpioOperationFailed { .. } => {
+                RecoveryStrategy::Degrade
+            }
 
             AgentError::IterationBudgetExhausted { .. }
             | AgentError::MemoryBudgetExhausted { .. }
             | AgentError::OperationTimeout { .. } => RecoveryStrategy::Fatal,
 
-            AgentError::InputValidationFailed { .. }
-            | AgentError::ConfigurationError { .. } => RecoveryStrategy::Skip,
+            AgentError::InputValidationFailed { .. } | AgentError::ConfigurationError { .. } => {
+                RecoveryStrategy::Skip
+            }
 
             #[cfg(feature = "web3")]
             AgentError::Web3Error { .. } => RecoveryStrategy::Skip,
@@ -543,42 +612,73 @@ impl AgentError {
             | AgentError::BufferOverflow { .. }
             | AgentError::StackOverflow { .. }
             | AgentError::InvalidStateTransition { .. }
-            | AgentError::Unknown { .. } => RecoveryStrategy::Fatal,
+            | AgentError::Unknown { .. }
+            | AgentError::CryptoError { .. } => RecoveryStrategy::Fatal,
         }
     }
 
     /// Check if error is fatal (requires reset)
     pub fn is_fatal(&self) -> bool {
-        matches!(
-            self.recovery_strategy(),
-            RecoveryStrategy::Fatal
-        )
+        matches!(self.recovery_strategy(), RecoveryStrategy::Fatal)
     }
 }
 
 impl fmt::Display for AgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AgentError::MemoryAllocationFailed { requested, available } => {
-                write!(f, "Memory allocation failed: requested {} bytes, available {} bytes", requested, available)
+            AgentError::MemoryAllocationFailed {
+                requested,
+                available,
+            } => {
+                write!(
+                    f,
+                    "Memory allocation failed: requested {} bytes, available {} bytes",
+                    requested, available
+                )
             }
-            AgentError::BufferOverflow { capacity, attempted } => {
-                write!(f, "Buffer overflow: capacity {} bytes, attempted {} bytes", capacity, attempted)
+            AgentError::BufferOverflow {
+                capacity,
+                attempted,
+            } => {
+                write!(
+                    f,
+                    "Buffer overflow: capacity {} bytes, attempted {} bytes",
+                    capacity, attempted
+                )
             }
             AgentError::StackOverflow { used, limit } => {
-                write!(f, "Stack overflow: used {} bytes, limit {} bytes", used, limit)
+                write!(
+                    f,
+                    "Stack overflow: used {} bytes, limit {} bytes",
+                    used, limit
+                )
             }
             AgentError::NetworkConnectionFailed { reason } => {
                 write!(f, "Network connection failed: {:?}", reason)
             }
-            AgentError::NetworkTimeout { operation, duration_ms } => {
-                write!(f, "Network timeout: operation '{}' after {}ms", operation, duration_ms)
+            AgentError::NetworkTimeout {
+                operation,
+                duration_ms,
+            } => {
+                write!(
+                    f,
+                    "Network timeout: operation '{}' after {}ms",
+                    operation, duration_ms
+                )
             }
             AgentError::StorageWriteFailed { address, reason } => {
-                write!(f, "Storage write failed at address 0x{:08X}: {:?}", address, reason)
+                write!(
+                    f,
+                    "Storage write failed at address 0x{:08X}: {:?}",
+                    address, reason
+                )
             }
             AgentError::StorageReadFailed { address, reason } => {
-                write!(f, "Storage read failed at address 0x{:08X}: {:?}", address, reason)
+                write!(
+                    f,
+                    "Storage read failed at address 0x{:08X}: {:?}",
+                    address, reason
+                )
             }
             AgentError::SensorReadFailed { sensor, reason } => {
                 write!(f, "Sensor read failed for '{}': {:?}", sensor, reason)
@@ -587,16 +687,35 @@ impl fmt::Display for AgentError {
                 write!(f, "GPIO operation failed on pin {}: {:?}", pin, operation)
             }
             AgentError::InputValidationFailed { field, reason } => {
-                write!(f, "Input validation failed for field '{}': {:?}", field, reason)
+                write!(
+                    f,
+                    "Input validation failed for field '{}': {:?}",
+                    field, reason
+                )
             }
             AgentError::IterationBudgetExhausted { used, limit } => {
-                write!(f, "Iteration budget exhausted: used {}, limit {}", used, limit)
+                write!(
+                    f,
+                    "Iteration budget exhausted: used {}, limit {}",
+                    used, limit
+                )
             }
             AgentError::MemoryBudgetExhausted { used, limit } => {
-                write!(f, "Memory budget exhausted: used {} bytes, limit {} bytes", used, limit)
+                write!(
+                    f,
+                    "Memory budget exhausted: used {} bytes, limit {} bytes",
+                    used, limit
+                )
             }
-            AgentError::OperationTimeout { operation, timeout_ms } => {
-                write!(f, "Operation timeout: '{}' after {}ms", operation, timeout_ms)
+            AgentError::OperationTimeout {
+                operation,
+                timeout_ms,
+            } => {
+                write!(
+                    f,
+                    "Operation timeout: '{}' after {}ms",
+                    operation, timeout_ms
+                )
             }
             AgentError::InvalidStateTransition { from, to } => {
                 write!(f, "Invalid state transition: from '{}' to '{}'", from, to)
@@ -606,6 +725,9 @@ impl fmt::Display for AgentError {
             }
             #[cfg(feature = "web3")]
             AgentError::Web3Error { kind } => fmt::Display::fmt(kind, f),
+            AgentError::CryptoError { reason } => {
+                write!(f, "Crypto error: {:?}", reason)
+            }
             AgentError::Unknown { code } => {
                 write!(f, "Unknown error with code: {}", code)
             }
@@ -617,11 +739,27 @@ impl fmt::Display for AgentError {
 impl defmt::Format for AgentError {
     fn format(&self, f: defmt::Formatter) {
         match self {
-            AgentError::MemoryAllocationFailed { requested, available } => {
-                defmt::write!(f, "Memory allocation failed: requested={} available={}", requested, available)
+            AgentError::MemoryAllocationFailed {
+                requested,
+                available,
+            } => {
+                defmt::write!(
+                    f,
+                    "Memory allocation failed: requested={} available={}",
+                    requested,
+                    available
+                )
             }
-            AgentError::BufferOverflow { capacity, attempted } => {
-                defmt::write!(f, "Buffer overflow: capacity={} attempted={}", capacity, attempted)
+            AgentError::BufferOverflow {
+                capacity,
+                attempted,
+            } => {
+                defmt::write!(
+                    f,
+                    "Buffer overflow: capacity={} attempted={}",
+                    capacity,
+                    attempted
+                )
             }
             AgentError::StackOverflow { used, limit } => {
                 defmt::write!(f, "Stack overflow: used={} limit={}", used, limit)
@@ -629,8 +767,16 @@ impl defmt::Format for AgentError {
             AgentError::NetworkConnectionFailed { .. } => {
                 defmt::write!(f, "Network connection failed")
             }
-            AgentError::NetworkTimeout { operation, duration_ms } => {
-                defmt::write!(f, "Network timeout: operation={} duration_ms={}", operation, duration_ms)
+            AgentError::NetworkTimeout {
+                operation,
+                duration_ms,
+            } => {
+                defmt::write!(
+                    f,
+                    "Network timeout: operation={} duration_ms={}",
+                    operation,
+                    duration_ms
+                )
             }
             AgentError::StorageWriteFailed { address, .. } => {
                 defmt::write!(f, "Storage write failed: address={:#x}", address)
@@ -648,13 +794,26 @@ impl defmt::Format for AgentError {
                 defmt::write!(f, "Input validation failed: field={}", field)
             }
             AgentError::IterationBudgetExhausted { used, limit } => {
-                defmt::write!(f, "Iteration budget exhausted: used={} limit={}", used, limit)
+                defmt::write!(
+                    f,
+                    "Iteration budget exhausted: used={} limit={}",
+                    used,
+                    limit
+                )
             }
             AgentError::MemoryBudgetExhausted { used, limit } => {
                 defmt::write!(f, "Memory budget exhausted: used={} limit={}", used, limit)
             }
-            AgentError::OperationTimeout { operation, timeout_ms } => {
-                defmt::write!(f, "Operation timeout: operation={} timeout_ms={}", operation, timeout_ms)
+            AgentError::OperationTimeout {
+                operation,
+                timeout_ms,
+            } => {
+                defmt::write!(
+                    f,
+                    "Operation timeout: operation={} timeout_ms={}",
+                    operation,
+                    timeout_ms
+                )
             }
             AgentError::InvalidStateTransition { from, to } => {
                 defmt::write!(f, "Invalid state transition: from={} to={}", from, to)
@@ -665,6 +824,9 @@ impl defmt::Format for AgentError {
             #[cfg(feature = "web3")]
             AgentError::Web3Error { .. } => {
                 defmt::write!(f, "Web3 error")
+            }
+            AgentError::CryptoError { reason } => {
+                defmt::write!(f, "Crypto error: reason={}", reason)
             }
             AgentError::Unknown { code } => {
                 defmt::write!(f, "Unknown error: code={}", code)
@@ -797,7 +959,10 @@ impl<const N: usize> TryHeapless<N> {
         if s.len() < N {
             let mut value: heapless::String<N> = heapless::String::new();
             let _ = value.push_str(s);
-            Self { value, truncated: false }
+            Self {
+                value,
+                truncated: false,
+            }
         } else {
             // Scan from min(s.len(), N) to find the last valid UTF-8 boundary.
             let mut end = s.len().min(N);
@@ -807,7 +972,10 @@ impl<const N: usize> TryHeapless<N> {
             let mut value: heapless::String<N> = heapless::String::new();
             let _ = value.push_str(&s[..end]);
             // truncated when the full input couldn't be stored
-            Self { value, truncated: s.len() > N }
+            Self {
+                value,
+                truncated: s.len() > N,
+            }
         }
     }
 
@@ -1080,3 +1248,93 @@ mod heapless_tests {
     }
 }
 
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn agent_error_display_is_informative_for_all_variants() {
+        // Use `format!` (not `to_string`) so it works under no_std.
+        let s = |e: &AgentError| format!("{e}");
+        assert!(s(&AgentError::MemoryAllocationFailed {
+            requested: 1,
+            available: 0,
+        })
+        .contains("Memory allocation failed"));
+        assert!(s(&AgentError::BufferOverflow {
+            capacity: 1,
+            attempted: 2,
+        })
+        .contains("Buffer overflow"));
+        assert!(s(&AgentError::StackOverflow { used: 1, limit: 0 }).contains("Stack overflow"));
+        assert!(s(&AgentError::NetworkConnectionFailed {
+            reason: NetworkError::Timeout,
+        })
+        .contains("Network connection failed"));
+        assert!(s(&AgentError::NetworkTimeout {
+            operation: "fetch",
+            duration_ms: 1,
+        })
+        .contains("Network timeout"));
+        assert!(s(&AgentError::StorageWriteFailed {
+            address: 0,
+            reason: StorageError::WriteProtected,
+        })
+        .contains("Storage write failed"));
+        assert!(s(&AgentError::StorageReadFailed {
+            address: 0,
+            reason: StorageError::ReadError,
+        })
+        .contains("Storage read failed"));
+        assert!(s(&AgentError::SensorReadFailed {
+            sensor: "hr",
+            reason: SensorError::Timeout,
+        })
+        .contains("Sensor read failed"));
+        assert!(s(&AgentError::GpioOperationFailed {
+            pin: 1,
+            operation: GpioOperation::Read,
+        })
+        .contains("GPIO operation failed"));
+        assert!(s(&AgentError::InputValidationFailed {
+            field: "task",
+            reason: ValidationError::TooLong,
+        })
+        .contains("Input validation failed"));
+        assert!(
+            s(&AgentError::IterationBudgetExhausted { used: 1, limit: 0 })
+                .contains("Iteration budget exhausted")
+        );
+        assert!(s(&AgentError::MemoryBudgetExhausted { used: 1, limit: 0 })
+            .contains("Memory budget exhausted"));
+        assert!(s(&AgentError::OperationTimeout {
+            operation: "op",
+            timeout_ms: 1,
+        })
+        .contains("Operation timeout"));
+        assert!(
+            s(&AgentError::InvalidStateTransition { from: "a", to: "b" })
+                .contains("Invalid state transition")
+        );
+        assert!(s(&AgentError::ConfigurationError {
+            field: "f",
+            reason: ConfigError::InvalidValue,
+        })
+        .contains("Configuration error"));
+        assert!(s(&AgentError::Unknown { code: 1 }).contains("Unknown error"));
+
+        #[cfg(feature = "web3")]
+        assert!(s(&AgentError::Web3Error {
+            kind: Web3ErrorKind::InvalidDid {
+                raw: "did:key:bad".into(),
+            },
+        })
+        .contains("invalid did"));
+    }
+
+    #[test]
+    fn agent_error_never_renders_empty() {
+        let e = AgentError::Unknown { code: 0 };
+        assert!(!format!("{e}").is_empty());
+    }
+}

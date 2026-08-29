@@ -169,24 +169,18 @@ impl fmt::Display for SummaryError {
             SummaryError::InvalidMetadata(msg) => {
                 write!(f, "invalid summary metadata: {}", msg)
             }
-            SummaryError::SummaryTooLarge { size, max } => write!(
-                f,
-                "llm_summary is {} bytes; max is {}",
-                size, max
-            ),
-            SummaryError::RecordTooLarge { size, max } => write!(
-                f,
-                "serialised summary is {} bytes; max is {}",
-                size, max
-            ),
+            SummaryError::SummaryTooLarge { size, max } => {
+                write!(f, "llm_summary is {} bytes; max is {}", size, max)
+            }
+            SummaryError::RecordTooLarge { size, max } => {
+                write!(f, "serialised summary is {} bytes; max is {}", size, max)
+            }
             SummaryError::DirIo { path, source } => {
                 write!(f, "summaries directory {}: {}", path, source)
             }
-            SummaryError::Parse { path, source } => write!(
-                f,
-                "could not parse {} as a summary: {}",
-                path, source
-            ),
+            SummaryError::Parse { path, source } => {
+                write!(f, "could not parse {} as a summary: {}", path, source)
+            }
             SummaryError::UnsupportedSchema {
                 path,
                 found,
@@ -532,7 +526,9 @@ impl SummaryRecord {
     /// host store to enforce [`MAX_RECORD_BYTES`] without paying
     /// for an extra string allocation.
     pub fn serialised_size(&self) -> usize {
-        serde_json::to_vec(self).map(|v| v.len()).unwrap_or(usize::MAX)
+        serde_json::to_vec(self)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX)
     }
 
     /// Validate the record's data invariants. The storage layer
@@ -857,7 +853,10 @@ mod tests {
         assert_eq!(rec.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(rec.topic, "weekly-health");
         assert_eq!(rec.head_tail_window.len(), window.len());
-        assert_eq!(rec.llm_summary.as_deref(), Some("User slept 6h avg last week"));
+        assert_eq!(
+            rec.llm_summary.as_deref(),
+            Some("User slept 6h avg last week")
+        );
 
         let json = serde_json::to_string(&rec).unwrap();
         let parsed: SummaryRecord = serde_json::from_str(&json).unwrap();
@@ -871,10 +870,7 @@ mod tests {
             .unwrap()
             .with_llm_summary(huge)
             .build();
-        assert!(matches!(
-            r,
-            Err(SummaryError::SummaryTooLarge { .. })
-        ));
+        assert!(matches!(r, Err(SummaryError::SummaryTooLarge { .. })));
     }
 
     // ---------- MessageDto ----------
@@ -943,21 +939,14 @@ mod tests {
         let d = MessageDto::from_message(&m);
         assert!(d.had_tool_call);
         let json = serde_json::to_string(&d).unwrap();
-        assert!(
-            json.contains("\"had_tool_call\":true"),
-            "json was {}",
-            json
-        );
+        assert!(json.contains("\"had_tool_call\":true"), "json was {}", json);
     }
 
     // ---------- validate() ----------
 
     #[test]
     fn validate_rejects_history_overflow() {
-        let mut rec = SummaryBuilder::new("x")
-            .unwrap()
-            .build()
-            .unwrap();
+        let mut rec = SummaryBuilder::new("x").unwrap().build().unwrap();
         rec.history = (0..(HISTORY_MAX + 1))
             .map(|i| HistoryEntry {
                 updated_at: i as u64,
@@ -979,10 +968,7 @@ mod tests {
         let mut b = a.clone();
         b.schema_version = CURRENT_SCHEMA_VERSION + 1;
         let r = a.compatible_with(&b);
-        assert!(matches!(
-            r,
-            Err(SummaryError::SchemaMismatch { .. })
-        ));
+        assert!(matches!(r, Err(SummaryError::SchemaMismatch { .. })));
     }
 
     #[test]
@@ -1021,10 +1007,7 @@ mod tests {
         let e = SummaryError::NotFound("ghost".into());
         assert!(e.to_string().contains("ghost"));
 
-        let e = SummaryError::SummaryTooLarge {
-            size: 99,
-            max: 10,
-        };
+        let e = SummaryError::SummaryTooLarge { size: 99, max: 10 };
         assert!(e.to_string().contains("99"));
         assert!(e.to_string().contains("10"));
 
@@ -1036,8 +1019,8 @@ mod tests {
         assert!(e.to_string().contains("500"));
 
         let e = SummaryError::SchemaMismatch { lhs: 1, rhs: 2 };
-        assert!(e.to_string().contains("1"));
-        assert!(e.to_string().contains("2"));
+        assert!(e.to_string().contains('1'));
+        assert!(e.to_string().contains('2'));
 
         let e = SummaryError::AlreadyExists("dup".into());
         let s = e.to_string();

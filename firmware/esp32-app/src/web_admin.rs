@@ -86,6 +86,6 @@ fn reason_label(reason: u32) -> &'static str {
         202 => "auth-fail (wrong password?)",
         203 => "assoc-fail",
         204 => "handshake-timeout",
-        other => "unknown",
+        _ => "unknown",
     }
 }

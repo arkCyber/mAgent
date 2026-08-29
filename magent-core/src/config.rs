@@ -195,8 +195,8 @@ impl AgentConfig {
         // `heapless 0.7` dep). Specify `N` explicitly so the
         // compiler doesn't have to infer it, then copy into our
         // `heapless 0.9` `Vec`.
-        let buf = postcard::to_vec::<Self, 256>(self)
-            .map_err(|_| AgentError::ConfigurationError {
+        let buf =
+            postcard::to_vec::<Self, 256>(self).map_err(|_| AgentError::ConfigurationError {
                 field: "serialization",
                 reason: ConfigError::TypeMismatch,
             })?;
@@ -226,9 +226,7 @@ mod tests {
         // The ESP32-C61 N8R2 has 2 MB PSRAM; the configurable budget must
         // permit a 512 KiB budget (what the firmware requests) and the 1 MiB
         // ceiling. It must still reject absurd values.
-        assert!(AgentConfig::default()
-            .with_max_memory(512 * 1024)
-            .is_ok());
+        assert!(AgentConfig::default().with_max_memory(512 * 1024).is_ok());
         assert!(AgentConfig::default()
             .with_max_memory(MAX_CONFIGURABLE_MEMORY)
             .is_ok());
@@ -238,4 +236,3 @@ mod tests {
         assert!(AgentConfig::default().with_max_memory(0).is_err());
     }
 }
-

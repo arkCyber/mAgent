@@ -58,10 +58,12 @@ impl SkillsManager {
         // Validate skill
         skill.validate()?;
 
-        self.skills.push(skill).map_err(|_| AgentError::MemoryAllocationFailed {
-            requested: 1,
-            available: 0,
-        })?;
+        self.skills
+            .push(skill)
+            .map_err(|_| AgentError::MemoryAllocationFailed {
+                requested: 1,
+                available: 0,
+            })?;
 
         Ok(())
     }
@@ -99,14 +101,12 @@ impl SkillsManager {
 
     /// Remove skill by name
     pub fn remove(&mut self, name: &str) -> Result<()> {
-        let pos = self
-            .skills
-            .iter()
-            .position(|s| s.name == name)
-            .ok_or(AgentError::ConfigurationError {
+        let pos = self.skills.iter().position(|s| s.name == name).ok_or(
+            AgentError::ConfigurationError {
                 field: "skill",
                 reason: crate::error::ConfigError::MissingField,
-            })?;
+            },
+        )?;
 
         self.skills.remove(pos);
         Ok(())
@@ -294,17 +294,15 @@ impl Skill {
     // runtime input length and incorrectly flags these as
     // infallible; suppress it locally.
     #[allow(clippy::unnecessary_fallible_conversions)]
-    pub fn new(
-        name: &str,
-        description: &str,
-        category: &str,
-        content: &str,
-    ) -> Result<Self> {
+    pub fn new(name: &str, description: &str, category: &str, content: &str) -> Result<Self> {
         let skill = Self {
             name: heapless::String::try_from(name).unwrap_or_else(|_| heapless::String::new()),
-            description: heapless::String::try_from(description).unwrap_or_else(|_| heapless::String::new()),
-            category: heapless::String::try_from(category).unwrap_or_else(|_| heapless::String::new()),
-            content: heapless::String::try_from(content).unwrap_or_else(|_| heapless::String::new()),
+            description: heapless::String::try_from(description)
+                .unwrap_or_else(|_| heapless::String::new()),
+            category: heapless::String::try_from(category)
+                .unwrap_or_else(|_| heapless::String::new()),
+            content: heapless::String::try_from(content)
+                .unwrap_or_else(|_| heapless::String::new()),
             usage_count: 0,
             success_rate: 100,
         };
@@ -375,8 +373,10 @@ mod tests {
     #[test]
     fn names_returns_zero_copy_references() {
         let mut mgr = SkillsManager::new(4);
-        mgr.add(Skill::new("read_sensor", "Read a sensor", "device", "x").unwrap()).unwrap();
-        mgr.add(Skill::new("write_gpio", "Set a GPIO", "device", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("read_sensor", "Read a sensor", "device", "x").unwrap())
+            .unwrap();
+        mgr.add(Skill::new("write_gpio", "Set a GPIO", "device", "x").unwrap())
+            .unwrap();
         let names = mgr.names();
         assert_eq!(names.as_slice(), &["read_sensor", "write_gpio"]);
     }
@@ -384,15 +384,20 @@ mod tests {
     #[test]
     fn count_by_category_groups_and_renames_empty() {
         let mut mgr = SkillsManager::new(4);
-        mgr.add(Skill::new("a", "x", "device", "x").unwrap()).unwrap();
-        mgr.add(Skill::new("b", "x", "voice", "x").unwrap()).unwrap();
-        mgr.add(Skill::new("c", "x", "voice", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("a", "x", "device", "x").unwrap())
+            .unwrap();
+        mgr.add(Skill::new("b", "x", "voice", "x").unwrap())
+            .unwrap();
+        mgr.add(Skill::new("c", "x", "voice", "x").unwrap())
+            .unwrap();
         mgr.add(Skill::new("d", "x", "", "x").unwrap()).unwrap(); // → uncategorized
         let cats = mgr.count_by_category();
         // Find each bucket by linear scan rather than a map, to
         // avoid pulling in a `HashMap` for the test.
         fn find(cats: &Vec<(heapless::String<32>, u16), 8>, cat: &str) -> Option<u16> {
-            cats.iter().find(|(c, _)| c.as_str() == cat).map(|(_, n)| *n)
+            cats.iter()
+                .find(|(c, _)| c.as_str() == cat)
+                .map(|(_, n)| *n)
         }
         assert_eq!(find(&cats, "device"), Some(1));
         assert_eq!(find(&cats, "voice"), Some(2));
@@ -422,8 +427,10 @@ mod tests {
     #[test]
     fn summary_is_stable_format() {
         let mut mgr = SkillsManager::new(4);
-        mgr.add(Skill::new("a", "x", "voice", "x").unwrap()).unwrap();
-        mgr.add(Skill::new("b", "x", "voice", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("a", "x", "voice", "x").unwrap())
+            .unwrap();
+        mgr.add(Skill::new("b", "x", "voice", "x").unwrap())
+            .unwrap();
         let s = mgr.summary();
         assert!(s.as_str().starts_with("skills=2/"));
         assert!(s.as_str().contains("voice:2"));
@@ -432,10 +439,13 @@ mod tests {
     #[test]
     fn add_rejects_duplicate_name() {
         let mut mgr = SkillsManager::new(4);
-        mgr.add(Skill::new("dup", "first", "c", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("dup", "first", "c", "x").unwrap())
+            .unwrap();
         // Same name, different content — must be rejected so `get`/`remove`
         // never have to disambiguate two skills sharing a key.
-        let err = mgr.add(Skill::new("dup", "second", "c", "y").unwrap()).unwrap_err();
+        let err = mgr
+            .add(Skill::new("dup", "second", "c", "y").unwrap())
+            .unwrap_err();
         assert!(matches!(
             err,
             AgentError::InputValidationFailed {
@@ -462,8 +472,10 @@ mod tests {
     #[test]
     fn search_matches_name_and_description() {
         let mut mgr = SkillsManager::new(4);
-        mgr.add(Skill::new("read_sensor", "Read ambient temperature", "c", "x").unwrap()).unwrap();
-        mgr.add(Skill::new("write_gpio", "Set a pin", "c", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("read_sensor", "Read ambient temperature", "c", "x").unwrap())
+            .unwrap();
+        mgr.add(Skill::new("write_gpio", "Set a pin", "c", "x").unwrap())
+            .unwrap();
         // Matches by name.
         assert_eq!(mgr.search("sensor")[0].name.as_str(), "read_sensor");
         // Matches by description substring.
@@ -475,4 +487,110 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod extra_tests {
+    use super::*;
 
+    #[test]
+    fn add_rejects_when_at_max_capacity() {
+        let mut mgr = SkillsManager::new(2);
+        mgr.add(Skill::new("a", "x", "c", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("b", "x", "c", "x").unwrap()).unwrap();
+        let err = mgr
+            .add(Skill::new("c", "x", "c", "x").unwrap())
+            .unwrap_err();
+        assert!(matches!(err, AgentError::MemoryAllocationFailed { .. }));
+        assert_eq!(mgr.count(), 2);
+    }
+
+    #[test]
+    fn add_rejects_invalid_skill_via_validate() {
+        let mut mgr = SkillsManager::new(4);
+        let bad = Skill {
+            name: String::new(),
+            description: String::try_from("d").unwrap(),
+            category: String::try_from("c").unwrap(),
+            content: String::try_from("x").unwrap(),
+            usage_count: 0,
+            success_rate: 100,
+        };
+        let err = mgr.add(bad).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::InputValidationFailed {
+                field: "skill.name",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn skill_new_rejects_empty_fields() {
+        assert!(Skill::new("", "d", "c", "x").is_err()); // empty name
+        assert!(Skill::new("n", "", "c", "x").is_err()); // empty description
+        assert!(Skill::new("n", "d", "c", "").is_err()); // empty content
+                                                         // Category is allowed empty (→ uncategorized bucket).
+        assert!(Skill::new("n", "d", "", "x").is_ok());
+    }
+
+    #[test]
+    fn skill_new_too_long_truncates_then_rejects() {
+        // Name > MAX_SKILL_NAME -> try_from fails -> empty -> validate rejects.
+        assert!(Skill::new(&"x".repeat(40), "d", "c", "x").is_err());
+    }
+
+    #[test]
+    fn get_all_all_mut_and_clear() {
+        let mut mgr = SkillsManager::new(4);
+        mgr.add(Skill::new("a", "x", "c", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("b", "x", "c", "x").unwrap()).unwrap();
+        assert_eq!(mgr.get("a").unwrap().name.as_str(), "a");
+        assert!(mgr.get("missing").is_none());
+        assert_eq!(mgr.all().len(), 2);
+        mgr.all_mut()[0].usage_count = 7;
+        assert_eq!(mgr.get("a").unwrap().usage_count, 7);
+        mgr.clear();
+        assert_eq!(mgr.count(), 0);
+        assert!(mgr.all().is_empty());
+    }
+
+    #[test]
+    fn remove_ok_and_error_for_missing() {
+        let mut mgr = SkillsManager::new(4);
+        mgr.add(Skill::new("a", "x", "c", "x").unwrap()).unwrap();
+        mgr.remove("a").unwrap();
+        assert_eq!(mgr.count(), 0);
+        let err = mgr.remove("a").unwrap_err();
+        assert!(matches!(err, AgentError::ConfigurationError { .. }));
+    }
+
+    #[test]
+    fn usage_and_success_rate_saturate() {
+        let mut s = Skill::new("a", "d", "c", "x").unwrap();
+        s.increment_usage();
+        assert_eq!(s.usage_count, 1);
+        s.usage_count = u16::MAX;
+        s.increment_usage();
+        assert_eq!(s.usage_count, u16::MAX);
+
+        s.success_rate = 100;
+        s.update_success_rate(true);
+        assert_eq!(s.success_rate, 100); // capped at 100
+        s.update_success_rate(false);
+        assert_eq!(s.success_rate, 99);
+        s.success_rate = 0;
+        s.update_success_rate(false);
+        assert_eq!(s.success_rate, 0); // floored at 0
+        s.update_success_rate(true);
+        assert_eq!(s.success_rate, 1);
+    }
+
+    #[test]
+    fn to_injection_string_formats_skill() {
+        let s = Skill::new("read_sensor", "Read a sensor", "device", "returns temp").unwrap();
+        let out = s.to_injection_string();
+        assert!(out.as_str().contains("# read_sensor"));
+        assert!(out.as_str().contains("## Read a sensor"));
+        assert!(out.as_str().contains("returns temp"));
+    }
+}

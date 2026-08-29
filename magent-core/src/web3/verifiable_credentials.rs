@@ -134,7 +134,10 @@ impl VerifiableCredential {
                 "credential type cannot be empty".to_string(),
             ));
         }
-        if !self.credential_type.contains(&"VerifiableCredential".to_string()) {
+        if !self
+            .credential_type
+            .contains(&"VerifiableCredential".to_string())
+        {
             return Err(Web3ErrorKind::BlockchainError(
                 "credential type must include VerifiableCredential".to_string(),
             ));
@@ -352,19 +355,14 @@ pub struct VerifiablePresentation {
 
 impl VerifiablePresentation {
     /// Create a new presentation.
-    pub fn new(
-        holder: impl Into<String>,
-        credentials: Vec<VerifiableCredential>,
-    ) -> Self {
+    pub fn new(holder: impl Into<String>, credentials: Vec<VerifiableCredential>) -> Self {
         Self {
             context: vec![
                 CREDENTIALS_V1_CONTEXT.to_string(),
                 CREDENTIALS_V2_CONTEXT.to_string(),
             ],
             id: format!("urn:uuid:{}", uuid_v4()),
-            presentation_type: vec![
-                "VerifiablePresentation".to_string(),
-            ],
+            presentation_type: vec!["VerifiablePresentation".to_string()],
             holder: holder.into(),
             verifiable_credential: credentials,
             created: iso8601_timestamp(),
@@ -699,13 +697,19 @@ mod time_tests {
     fn arbitrary_unix_matches_chrono_known_vector() {
         // 2024-01-15T13:05:30Z = 1705323930 — independent reference
         // from Python: `datetime.fromtimestamp(1705323930, tz=timezone.utc)`.
-        assert_eq!(format_unix_to_iso8601(1_705_323_930), "2024-01-15T13:05:30Z");
+        assert_eq!(
+            format_unix_to_iso8601(1_705_323_930),
+            "2024-01-15T13:05:30Z"
+        );
     }
 
     #[test]
     fn leap_year_handling() {
         // 2020-02-29T00:00:00Z = 1582934400.
-        assert_eq!(format_unix_to_iso8601(1_582_934_400), "2020-02-29T00:00:00Z");
+        assert_eq!(
+            format_unix_to_iso8601(1_582_934_400),
+            "2020-02-29T00:00:00Z"
+        );
     }
 
     #[test]
@@ -725,9 +729,10 @@ mod tests {
 
     #[test]
     fn test_credential_creation() {
-        let subject = CredentialSubject::new("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK")
-            .with_claim("name", &"Alice")
-            .with_claim("age", &30);
+        let subject =
+            CredentialSubject::new("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK")
+                .with_claim("name", &"Alice")
+                .with_claim("age", &30);
 
         let vc = VerifiableCredential::new(
             "urn:uuid:12345678-1234-1234-1234-123456789012",
@@ -777,10 +782,7 @@ mod tests {
             subject,
         );
 
-        let vp = VerifiablePresentation::new(
-            "did:key:z6Mkholder",
-            vec![vc],
-        );
+        let vp = VerifiablePresentation::new("did:key:z6Mkholder", vec![vc]);
 
         assert!(vp.validate().is_ok());
     }
@@ -803,10 +805,7 @@ mod tests {
 
     #[test]
     fn test_credential_status() {
-        let status = CredentialStatus::new(
-            "https://example.com/status/123",
-            "RevocationList2023",
-        );
+        let status = CredentialStatus::new("https://example.com/status/123", "RevocationList2023");
 
         assert_eq!(status.purpose, "revocation");
 

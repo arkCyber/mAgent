@@ -74,9 +74,7 @@ impl LinkAdapter for ManualAdapter {
         let _ = write!(io::stdout(), "magent> ");
         let _ = io::stdout().flush();
         let mut line = String::new();
-        let n = handle
-            .read_line(&mut line)
-            .map_err(ManualError::Io)?;
+        let n = handle.read_line(&mut line).map_err(ManualError::Io)?;
         if n == 0 {
             // EOF on stdin — surface as zero-byte so the gateway
             // moves on rather than treating it as an error.

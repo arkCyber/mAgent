@@ -12,5 +12,4 @@
 fn test_blockchain_feature_available() {
     // The blockchain feature flag is tested through successful compilation.
     // Real integration tests require RPC endpoints which are configured at runtime.
-    assert!(true);
 }

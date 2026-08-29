@@ -62,10 +62,10 @@ use core::fmt::Debug;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Web3ErrorKind;
-use super::{Address, Hash, Wei};
 #[allow(unused_imports)]
 use super::client::{ChainClient, TransactionReceipt};
+use super::{Address, Hash, Wei};
+use crate::error::Web3ErrorKind;
 
 /// Maximum retry attempts before giving up
 pub const MAX_POLL_ATTEMPTS: usize = 60;
@@ -183,7 +183,7 @@ impl Esp32BlockchainClient {
 
     /// Get the current state
     pub fn state(&self) -> BlockchainState {
-        self.state.clone()
+        self.state
     }
 
     /// Check if client is idle
@@ -219,12 +219,17 @@ impl Esp32BlockchainClient {
     fn current_time_ms(&self) -> u64 {
         // `AtomicU64` is unavailable on 32-bit targets (e.g. RISC-V ESP32-C6/C61).
         // The stub returns a counter, so `AtomicU32` is sufficient.
-        #[cfg(target_pointer_width = "64")]
-        use core::sync::atomic::{AtomicU64, Ordering};
         #[cfg(target_pointer_width = "32")]
         use core::sync::atomic::{AtomicU32 as AtomicU64, Ordering};
+        #[cfg(target_pointer_width = "64")]
+        use core::sync::atomic::{AtomicU64, Ordering};
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
+        // `into()` is a real widening conversion on 32-bit targets (AtomicU32 →
+        // u64) but a no-op on 64-bit targets. clippy only sees the *current*
+        // target, so it flags the 64-bit case as useless; allow the lint here
+        // rather than forking the body per `cfg` (both are correct).
+        #[allow(clippy::useless_conversion)]
         COUNTER.fetch_add(100, Ordering::Relaxed).into()
     }
 
@@ -238,7 +243,11 @@ impl Esp32BlockchainClient {
                 self.result = Some(BlockchainPollResult::Idle);
                 return BlockchainPollResult::Idle;
             }
-            BlockchainState::WaitingForConfirmation { tx_hash: _, poll_count, .. } => {
+            BlockchainState::WaitingForConfirmation {
+                tx_hash: _,
+                poll_count,
+                ..
+            } => {
                 if *poll_count >= MAX_POLL_ATTEMPTS {
                     self.state = BlockchainState::Failed;
                     let err = Web3ErrorKind::BlockchainError(
@@ -303,7 +312,8 @@ impl Esp32BlockchainClient {
                     };
 
                     // Exponential backoff with cap
-                    let next_interval = self.poll_interval_ms
+                    let next_interval = self
+                        .poll_interval_ms
                         .saturating_mul(1 << (new_count.min(3) / 2))
                         .min(MAX_POLL_INTERVAL_MS);
 
@@ -453,10 +463,11 @@ pub struct RpcError {
 /// Parse hex string to bytes
 pub fn parse_hex(s: &str) -> Result<Vec<u8>, Web3ErrorKind> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() % 2 != 0 {
-        return Err(Web3ErrorKind::BlockchainError(
-            "odd hex length".to_string(),
-        ));
+    // Parity check via bitwise AND (not `%`), so it also passes the
+    // `manual_is_multiple_of` clippy lint without requiring `is_multiple_of`
+    // (which needs a newer MSRV than the crate's declared 1.85).
+    if (s.len() & 1) != 0 {
+        return Err(Web3ErrorKind::BlockchainError("odd hex length".to_string()));
     }
     let mut out = Vec::with_capacity(s.len() / 2);
     for chunk in s.as_bytes().chunks(2) {
@@ -504,7 +515,10 @@ mod tests {
         let tx_hash = Hash::zero();
         client.watch_transaction(tx_hash, None, None);
         assert!(!client.is_idle());
-        assert!(matches!(client.state(), BlockchainState::WaitingForConfirmation { .. }));
+        assert!(matches!(
+            client.state(),
+            BlockchainState::WaitingForConfirmation { .. }
+        ));
     }
 
     #[test]
@@ -535,22 +549,22 @@ mod tests {
 
     #[test]
     fn test_poll_interval() {
-        let client = Esp32BlockchainClient::new("https://eth.llamarpc.com", 1)
-            .with_poll_interval(10000);
+        let client =
+            Esp32BlockchainClient::new("https://eth.llamarpc.com", 1).with_poll_interval(10000);
         assert_eq!(client.poll_interval_ms, 10000);
     }
 
     #[test]
     fn test_poll_interval_capped() {
-        let client = Esp32BlockchainClient::new("https://eth.llamarpc.com", 1)
-            .with_poll_interval(100000);
+        let client =
+            Esp32BlockchainClient::new("https://eth.llamarpc.com", 1).with_poll_interval(100000);
         assert_eq!(client.poll_interval_ms, MAX_POLL_INTERVAL_MS);
     }
 
     #[test]
     fn test_poll_interval_zero() {
-        let client = Esp32BlockchainClient::new("https://eth.llamarpc.com", 1)
-            .with_poll_interval(0);
+        let client =
+            Esp32BlockchainClient::new("https://eth.llamarpc.com", 1).with_poll_interval(0);
         assert_eq!(client.poll_interval_ms, 0);
     }
 
@@ -603,10 +617,7 @@ mod tests {
 
     #[test]
     fn test_rpc_request_with_params() {
-        let params = vec![
-            serde_json::json!("0x1234"),
-            serde_json::json!("latest"),
-        ];
+        let params = vec![serde_json::json!("0x1234"), serde_json::json!("latest")];
         let req = RpcRequest::new("eth_getBalance", params);
         assert_eq!(req.params.len(), 2);
     }
@@ -726,8 +737,12 @@ mod tests {
     fn test_multiple_watch_overwrites_previous() {
         let mut client = Esp32BlockchainClient::new("https://eth.llamarpc.com", 1);
 
-        let hash1 = Hash::from_hex("0x1111111111111111111111111111111111111111111111111111111111111111").unwrap();
-        let hash2 = Hash::from_hex("0x2222222222222222222222222222222222222222222222222222222222222222").unwrap();
+        let hash1 =
+            Hash::from_hex("0x1111111111111111111111111111111111111111111111111111111111111111")
+                .unwrap();
+        let hash2 =
+            Hash::from_hex("0x2222222222222222222222222222222222222222222222222222222222222222")
+                .unwrap();
 
         client.watch_transaction(hash1, None, None);
 
@@ -791,7 +806,8 @@ mod tests {
 
     #[test]
     fn test_rpc_response_error_deserialize() {
-        let json = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
+        let json =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#;
         let response: RpcResponse<String> = serde_json::from_str(json).unwrap();
         match response.result {
             RpcResult::Success { .. } => panic!("expected error"),
@@ -808,7 +824,11 @@ mod tests {
             attempts: 5,
             next_poll_in_ms: 10000,
         };
-        if let BlockchainPollResult::Waiting { attempts, next_poll_in_ms } = result {
+        if let BlockchainPollResult::Waiting {
+            attempts,
+            next_poll_in_ms,
+        } = result
+        {
             assert_eq!(attempts, 5);
             assert_eq!(next_poll_in_ms, 10000);
         } else {
@@ -818,9 +838,9 @@ mod tests {
 
     #[test]
     fn test_poll_result_error_contains_message() {
-        let result = BlockchainPollResult::<Hash>::Error(
-            Web3ErrorKind::BlockchainError("test error".to_string())
-        );
+        let result = BlockchainPollResult::<Hash>::Error(Web3ErrorKind::BlockchainError(
+            "test error".to_string(),
+        ));
         if let BlockchainPollResult::Error(e) = &result {
             match e {
                 Web3ErrorKind::BlockchainError(msg) => {

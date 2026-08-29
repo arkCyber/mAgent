@@ -42,7 +42,9 @@ impl core::fmt::Display for WalletError {
             WalletError::InvalidMnemonic(s) => write!(f, "invalid mnemonic: {}", s),
             WalletError::InvalidWord(s) => write!(f, "invalid word: {}", s),
             WalletError::InvalidChecksum => write!(f, "mnemonic checksum verification failed"),
-            WalletError::InvalidEntropyLength(n) => write!(f, "invalid entropy length: {} bits", n * 8),
+            WalletError::InvalidEntropyLength(n) => {
+                write!(f, "invalid entropy length: {} bits", n * 8)
+            }
             WalletError::InvalidDerivationPath(p) => write!(f, "invalid derivation path: {}", p),
             WalletError::DerivationFailed(s) => write!(f, "key derivation failed: {}", s),
             WalletError::KeystoreError(s) => write!(f, "keystore error: {}", s),
@@ -77,10 +79,7 @@ mod tests {
     fn keystore_error_carries_arbitrary_substring_verbatim() {
         let e = WalletError::KeystoreError("wallet index corrupted: bad byte 17".into());
         let s = format!("{e}");
-        assert!(
-            s.contains("corrupted"),
-            "expected 'corrupted' in {s}"
-        );
+        assert!(s.contains("corrupted"), "expected 'corrupted' in {s}");
         assert!(
             s.contains("bad byte 17"),
             "inner message must be preserved verbatim in {s}"

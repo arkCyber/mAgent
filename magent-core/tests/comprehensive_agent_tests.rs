@@ -40,11 +40,23 @@ mod test_helpers {
         pub fn read(&mut self, sensor: &str) -> String {
             self.iteration += 1;
             match sensor {
-                "temperature" => format!("{:.1}°C", self.base_temp + ((self.iteration as f64 * 0.1).sin() * 2.0)),
-                "humidity" => format!("{:.1}%", self.base_humidity + ((self.iteration as f64 * 0.05).sin() * 5.0)),
-                "pressure" => format!("{:.1} hPa", self.base_pressure + ((self.iteration as f64 * 0.02).sin() * 2.0)),
+                "temperature" => format!(
+                    "{:.1}°C",
+                    self.base_temp + ((self.iteration as f64 * 0.1).sin() * 2.0)
+                ),
+                "humidity" => format!(
+                    "{:.1}%",
+                    self.base_humidity + ((self.iteration as f64 * 0.05).sin() * 5.0)
+                ),
+                "pressure" => format!(
+                    "{:.1} hPa",
+                    self.base_pressure + ((self.iteration as f64 * 0.02).sin() * 2.0)
+                ),
                 "accelerometer" => "X=0.1 Y=0.2 Z=9.8".to_string(),
-                "light" => format!("{:.1} lux", 500.0 + ((self.iteration as f64 * 0.01).sin() * 100.0)),
+                "light" => format!(
+                    "{:.1} lux",
+                    500.0 + ((self.iteration as f64 * 0.01).sin() * 100.0)
+                ),
                 _ => format!("Unknown sensor: {}", sensor),
             }
         }
@@ -56,7 +68,9 @@ mod test_helpers {
 
     impl TestGpio {
         pub fn new(num_pins: usize) -> Self {
-            Self { pins: vec![false; num_pins] }
+            Self {
+                pins: vec![false; num_pins],
+            }
         }
 
         pub fn set(&mut self, pin: usize, state: bool) -> Result<(), String> {
@@ -158,35 +172,55 @@ mod test_helpers {
 fn test_sensor_read_temperature() {
     let mut sensors = test_helpers::TestSensors::new();
     let reading = sensors.read("temperature");
-    assert!(reading.contains("°C"), "Temperature should contain °C unit: {}", reading);
+    assert!(
+        reading.contains("°C"),
+        "Temperature should contain °C unit: {}",
+        reading
+    );
 }
 
 #[test]
 fn test_sensor_read_humidity() {
     let mut sensors = test_helpers::TestSensors::new();
     let reading = sensors.read("humidity");
-    assert!(reading.contains("%"), "Humidity should contain % unit: {}", reading);
+    assert!(
+        reading.contains('%'),
+        "Humidity should contain % unit: {}",
+        reading
+    );
 }
 
 #[test]
 fn test_sensor_read_pressure() {
     let mut sensors = test_helpers::TestSensors::new();
     let reading = sensors.read("pressure");
-    assert!(reading.contains("hPa"), "Pressure should contain hPa unit: {}", reading);
+    assert!(
+        reading.contains("hPa"),
+        "Pressure should contain hPa unit: {}",
+        reading
+    );
 }
 
 #[test]
 fn test_sensor_read_accelerometer() {
     let mut sensors = test_helpers::TestSensors::new();
     let reading = sensors.read("accelerometer");
-    assert!(reading.contains("X="), "Accelerometer should contain X value: {}", reading);
+    assert!(
+        reading.contains("X="),
+        "Accelerometer should contain X value: {}",
+        reading
+    );
 }
 
 #[test]
 fn test_sensor_unknown() {
     let mut sensors = test_helpers::TestSensors::new();
     let reading = sensors.read("unknown");
-    assert!(reading.contains("Unknown"), "Unknown sensor should return error: {}", reading);
+    assert!(
+        reading.contains("Unknown"),
+        "Unknown sensor should return error: {}",
+        reading
+    );
 }
 
 #[test]
@@ -283,7 +317,10 @@ fn test_parse_tool_call_standard_format() {
 fn test_parse_result_string() {
     let json = r#"{"result": "Task completed successfully"}"#;
     let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
-    assert_eq!(parsed["result"].as_str().unwrap(), "Task completed successfully");
+    assert_eq!(
+        parsed["result"].as_str().unwrap(),
+        "Task completed successfully"
+    );
 }
 
 #[test]
@@ -305,7 +342,10 @@ fn test_parse_result_object() {
 fn test_parse_tool_call_alternative_format() {
     let json = r#"{"read_sensor": {"args": {"sensor": "temperature"}}}"#;
     let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
-    assert!(parsed.get("read_sensor").is_some(), "Should have read_sensor key");
+    assert!(
+        parsed.get("read_sensor").is_some(),
+        "Should have read_sensor key"
+    );
 }
 
 // ============================================================================
@@ -323,6 +363,7 @@ enum AgentState {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)] // state-machine smoke test
 fn test_state_transitions() {
     // Test valid transitions
     let states = vec![
@@ -415,6 +456,7 @@ struct TestMessage {
 }
 
 #[test]
+#[allow(clippy::vec_init_then_push)] // builds a realistic message sequence
 fn test_conversation_messages() {
     let mut messages: Vec<TestMessage> = Vec::new();
 
@@ -499,8 +541,14 @@ fn test_iteration_budget() {
         current_iteration += 1;
     }
 
-    assert_eq!(current_iteration, max_iterations, "Should reach max iterations");
-    assert!(current_iteration <= max_iterations, "Should not exceed budget");
+    assert_eq!(
+        current_iteration, max_iterations,
+        "Should reach max iterations"
+    );
+    assert!(
+        current_iteration <= max_iterations,
+        "Should not exceed budget"
+    );
 }
 
 #[test]
@@ -513,7 +561,10 @@ fn test_tool_call_budget() {
         tool_call_count += 1;
     }
 
-    assert_eq!(tool_call_count, max_tool_calls, "Should reach max tool calls");
+    assert_eq!(
+        tool_call_count, max_tool_calls,
+        "Should reach max tool calls"
+    );
 }
 
 // ============================================================================
@@ -539,9 +590,18 @@ Rules:
     // Verify prompt contains required elements
     assert!(system_prompt.contains("mAgent"), "Should mention mAgent");
     assert!(system_prompt.contains("tools"), "Should mention tools");
-    assert!(system_prompt.contains("read_sensor"), "Should mention read_sensor");
-    assert!(system_prompt.contains("write_gpio"), "Should mention write_gpio");
-    assert!(system_prompt.contains("ble_send"), "Should mention ble_send");
+    assert!(
+        system_prompt.contains("read_sensor"),
+        "Should mention read_sensor"
+    );
+    assert!(
+        system_prompt.contains("write_gpio"),
+        "Should mention write_gpio"
+    );
+    assert!(
+        system_prompt.contains("ble_send"),
+        "Should mention ble_send"
+    );
     assert!(system_prompt.contains("JSON"), "Should mention JSON format");
 }
 

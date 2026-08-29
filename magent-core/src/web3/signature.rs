@@ -216,10 +216,7 @@ impl SignedMessage {
     /// Returns `Err(())` if `out` is too small (no partial write is left
     /// behind — the buffer is cleared first).
     #[allow(clippy::result_unit_err)] // `()` is an intentional marker: the caller maps it to its own error code.
-    pub fn to_json_into<const N: usize>(
-        &self,
-        out: &mut heapless::String<N>,
-    ) -> Result<(), ()> {
+    pub fn to_json_into<const N: usize>(&self, out: &mut heapless::String<N>) -> Result<(), ()> {
         use core::fmt::Write as _;
         out.clear();
         out.push_str("{\"signer\":\"").map_err(|_| ())?;
@@ -358,7 +355,10 @@ mod tests {
 
     #[test]
     fn hex_decode_strips_0x_prefix() {
-        assert_eq!(hex_decode("0xdeadbeef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            hex_decode("0xdeadbeef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
     }
 
     #[test]

@@ -7,7 +7,9 @@
 
 #![cfg(feature = "std")]
 
-use magent_core::agent_runner::{AgentState, RealAgentRunner, RunnerConfig, SamplingParams, ToolExecutor};
+use magent_core::agent_runner::{
+    AgentState, RealAgentRunner, RunnerConfig, SamplingParams, ToolExecutor,
+};
 use magent_core::real_tools::SimulatorExecutor;
 
 /// Test executor that wraps the simulator
@@ -297,7 +299,9 @@ fn test_health_check() {
         },
     );
 
-    let result = runner.run("Perform a system health check: verify all sensors are working and send status via BLE");
+    let result = runner.run(
+        "Perform a system health check: verify all sensors are working and send status via BLE",
+    );
     assert!(result.is_ok());
 
     let output = result.unwrap();

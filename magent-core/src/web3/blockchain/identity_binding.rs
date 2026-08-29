@@ -39,8 +39,8 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Web3ErrorKind;
 use super::Address;
+use crate::error::Web3ErrorKind;
 
 /// The status of a DID-to-address binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,7 +144,12 @@ impl IdentityBinding {
     /// Used for log lines; full re-encoding lives in the JSON
     /// (de)serialisers.
     pub fn display_short(&self) -> String {
-        let mut s = format!("{} @ {} (chain {})", self.did, self.address.to_hex(), self.chain_id);
+        let mut s = format!(
+            "{} @ {} (chain {})",
+            self.did,
+            self.address.to_hex(),
+            self.chain_id
+        );
         if let Some(exp) = self.expires_at {
             s.push_str(&format!(" [expires {}]", exp));
         }
@@ -233,10 +238,7 @@ impl BindingProof {
         // both via the prefix-strip in `verify_crypto`, so
         // the format check must mirror that.
         let sig_len = self.signature.len();
-        let sig_stripped = self
-            .signature
-            .strip_prefix("0x")
-            .unwrap_or(&self.signature);
+        let sig_stripped = self.signature.strip_prefix("0x").unwrap_or(&self.signature);
         // Two valid forms: a 64-byte signature (128 hex chars) or a
         // 65-byte signature with `v` (130 hex chars). Either form may be
         // `0x`-prefixed (adds 2 to the char count) — but the stripped
@@ -275,10 +277,7 @@ impl BindingProof {
         use sha3::{Digest, Keccak256};
 
         // Decode signature bytes (strip `0x` prefix if present).
-        let sig_hex = self
-            .signature
-            .strip_prefix("0x")
-            .unwrap_or(&self.signature);
+        let sig_hex = self.signature.strip_prefix("0x").unwrap_or(&self.signature);
         let sig_bytes = match hex_decode(sig_hex) {
             Ok(b) if b.len() == 65 => b,
             Ok(_) => {
@@ -558,12 +557,12 @@ impl BindingBuilder {
 
     /// Build the binding.
     pub fn build(self) -> Result<IdentityBinding, Web3ErrorKind> {
-        let did = self.did.ok_or_else(|| {
-            Web3ErrorKind::BlockchainError("DID is required".to_string())
-        })?;
-        let address = self.address.ok_or_else(|| {
-            Web3ErrorKind::BlockchainError("address is required".to_string())
-        })?;
+        let did = self
+            .did
+            .ok_or_else(|| Web3ErrorKind::BlockchainError("DID is required".to_string()))?;
+        let address = self
+            .address
+            .ok_or_else(|| Web3ErrorKind::BlockchainError("address is required".to_string()))?;
 
         Ok(IdentityBinding {
             did,
@@ -618,13 +617,21 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, Web3ErrorKind> {
             b'0'..=b'9' => chunk[0] - b'0',
             b'a'..=b'f' => chunk[0] - b'a' + 10,
             b'A'..=b'F' => chunk[0] - b'A' + 10,
-            _ => return Err(Web3ErrorKind::BlockchainError("invalid hex digit".to_string())),
+            _ => {
+                return Err(Web3ErrorKind::BlockchainError(
+                    "invalid hex digit".to_string(),
+                ))
+            }
         };
         let lo = match chunk[1] {
             b'0'..=b'9' => chunk[1] - b'0',
             b'a'..=b'f' => chunk[1] - b'a' + 10,
             b'A'..=b'F' => chunk[1] - b'A' + 10,
-            _ => return Err(Web3ErrorKind::BlockchainError("invalid hex digit".to_string())),
+            _ => {
+                return Err(Web3ErrorKind::BlockchainError(
+                    "invalid hex digit".to_string(),
+                ))
+            }
         };
         out.push((hi << 4) | lo);
     }
@@ -758,8 +765,13 @@ mod tests {
     #[test]
     fn test_signature_bytes_with_and_without_prefix() {
         let address = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
-        let with_prefix =
-            BindingProof::new("did:key:z6Mktest", address, 1, "0x".to_string() + &"a".repeat(128), "m");
+        let with_prefix = BindingProof::new(
+            "did:key:z6Mktest",
+            address,
+            1,
+            "0x".to_string() + &"a".repeat(128),
+            "m",
+        );
         let without_prefix =
             BindingProof::new("did:key:z6Mktest", address, 1, "a".repeat(128), "m");
 
@@ -795,11 +807,9 @@ mod tests {
         let keypair = Secp256k1Keypair::generate_test();
         let real_addr = *keypair.address();
         // Sign something different from what we put in the proof.
-        let real_sig = TransactionSigner::sign_personal_message(
-            keypair.secret_key(),
-            b"different message",
-        )
-        .unwrap();
+        let real_sig =
+            TransactionSigner::sign_personal_message(keypair.secret_key(), b"different message")
+                .unwrap();
         let proof = BindingProof::new(
             "did:key:z6Mktest",
             real_addr,
@@ -833,13 +843,7 @@ mod tests {
         // Empty DID should fail at the validate() step, not at the
         // crypto step.
         let address = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
-        let proof = BindingProof::new(
-            "",
-            address,
-            1,
-            "0x".to_string() + &"a".repeat(128),
-            "hi",
-        );
+        let proof = BindingProof::new("", address, 1, "0x".to_string() + &"a".repeat(128), "hi");
         assert!(proof.verify().is_err());
     }
 
@@ -856,16 +860,10 @@ mod tests {
         let keypair = Secp256k1Keypair::generate_test();
         let addr = *keypair.address();
         let msg = "I am the owner of this address";
-        let sig = TransactionSigner::sign_personal_message(keypair.secret_key(), msg.as_bytes())
-            .unwrap();
+        let sig =
+            TransactionSigner::sign_personal_message(keypair.secret_key(), msg.as_bytes()).unwrap();
 
-        let proof = BindingProof::new(
-            "did:key:z6Mktest",
-            addr,
-            1,
-            sig.to_hex(),
-            msg,
-        );
+        let proof = BindingProof::new("did:key:z6Mktest", addr, 1, sig.to_hex(), msg);
         assert!(proof.verify_crypto().unwrap());
     }
 }

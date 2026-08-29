@@ -104,7 +104,9 @@ fn sign_then_verify() {
         &signed.signature_hex,
         payload
     ));
-    assert!(magent_core::web3::identity::verify_signed_message(&signed, payload));
+    assert!(magent_core::web3::identity::verify_signed_message(
+        &signed, payload
+    ));
 }
 
 #[test]
@@ -145,7 +147,9 @@ fn verify_rejects_truncated_signature() {
     // Truncate the hex signature by removing the last two chars
     // (one byte). Verification must fail; we never want to
     // accept a partial signature.
-    signed.signature_hex.truncate(signed.signature_hex.len() - 2);
+    signed
+        .signature_hex
+        .truncate(signed.signature_hex.len() - 2);
     assert!(!alice.verify(&signed, b"payload"));
 }
 
@@ -236,8 +240,8 @@ fn signed_message_rejects_garbage_json() {
     );
 
     // JSON but missing the `signer` field → SchemaMismatch.
-    let err = SignedMessage::from_json("{\"payload_hex\":\"00\",\"signature_hex\":\"00\"}")
-        .unwrap_err();
+    let err =
+        SignedMessage::from_json("{\"payload_hex\":\"00\",\"signature_hex\":\"00\"}").unwrap_err();
     assert!(
         matches!(
             err,
@@ -495,17 +499,10 @@ fn verify_signature_detailed_reports_invalid_signature_length() {
     // content. We use 64 chars of `ff` which decodes to 32 bytes.
     let alice = Identity::generate().unwrap();
     let bad_hex = "ff".repeat(32); // 32 bytes, not 64
-    let err = magent_core::web3::verify_signature_detailed(
-        alice.public_key(),
-        &bad_hex,
-        b"x",
-    )
-    .unwrap_err();
+    let err = magent_core::web3::verify_signature_detailed(alice.public_key(), &bad_hex, b"x")
+        .unwrap_err();
     assert!(
-        matches!(
-            err,
-            Web3ErrorKind::InvalidSignature { actual_len: 32 }
-        ),
+        matches!(err, Web3ErrorKind::InvalidSignature { actual_len: 32 }),
         "expected InvalidSignature{{actual_len:32}}, got {err:?}"
     );
 }
@@ -665,10 +662,7 @@ fn secret_key_debug_redacts_material() {
     // sure it doesn't appear in the Debug output. The Identity
     // debug format uses "<redacted>" instead.
     let sk_hex = id.secret_key().to_hex();
-    assert!(
-        !dbg_id.contains(&sk_hex),
-        "Debug leaked the secret key hex"
-    );
+    assert!(!dbg_id.contains(&sk_hex), "Debug leaked the secret key hex");
     assert!(
         dbg_id.contains("<redacted>"),
         "Debug should mark the secret key as redacted"
@@ -708,8 +702,9 @@ fn hex_decode_error_message_includes_offending_digit() {
     // path. A bad digit should produce a HexDecode error whose
     // message names the offending character so the user can
     // spot the typo.
-    let err = PublicKey::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
-        .unwrap_err();
+    let err =
+        PublicKey::from_hex("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+            .unwrap_err();
     let msg = format!("{err:?}");
     assert!(
         msg.contains("'z'") || msg.contains("'Z'"),
@@ -917,11 +912,8 @@ fn cross_crate_public_api_is_stable() {
 
         // Free-function verifiers.
         let signed = id.sign(b"").unwrap();
-        let _: bool = magent_core::web3::verify_signature(
-            id.public_key(),
-            &signed.signature_hex,
-            b"",
-        );
+        let _: bool =
+            magent_core::web3::verify_signature(id.public_key(), &signed.signature_hex, b"");
         let _: bool = magent_core::web3::verify_signed_message(&signed, b"");
 
         // JSON envelope round-trip (the CLI uses `to_json` /
@@ -995,8 +987,7 @@ fn verify_rejects_signature_field_wrong_length() {
         alice.did_key().as_str()
     );
     let signed = SignedMessage::from_json(&envelope_json).unwrap();
-    let err = magent_core::web3::verify_signed_message_detailed(&signed, b"")
-        .unwrap_err();
+    let err = magent_core::web3::verify_signed_message_detailed(&signed, b"").unwrap_err();
     assert!(
         matches!(err, Web3ErrorKind::InvalidSignature { actual_len: 4 }),
         "expected InvalidSignature {{ actual_len: 4 }}, got {err:?}"
@@ -1015,8 +1006,7 @@ fn verify_rejects_signature_field_non_hex() {
         "z".repeat(128)
     );
     let signed = SignedMessage::from_json(&envelope_json).unwrap();
-    let err = magent_core::web3::verify_signed_message_detailed(&signed, b"")
-        .unwrap_err();
+    let err = magent_core::web3::verify_signed_message_detailed(&signed, b"").unwrap_err();
     assert!(
         matches!(err, Web3ErrorKind::HexDecode(_)),
         "expected HexDecode, got {err:?}"
@@ -1036,8 +1026,7 @@ fn verify_rejects_signer_with_wrong_multibase() {
         "0".repeat(128)
     );
     let signed = SignedMessage::from_json(&envelope_json).unwrap();
-    let err = magent_core::web3::verify_signed_message_detailed(&signed, b"")
-        .unwrap_err();
+    let err = magent_core::web3::verify_signed_message_detailed(&signed, b"").unwrap_err();
     assert!(
         matches!(err, Web3ErrorKind::InvalidDid { .. }),
         "expected InvalidDid for non-'z' multibase, got {err:?}"
@@ -1056,8 +1045,7 @@ fn verify_rejects_odd_length_signature_hex() {
         "0".repeat(127)
     );
     let signed = SignedMessage::from_json(&envelope_json).unwrap();
-    let err = magent_core::web3::verify_signed_message_detailed(&signed, b"")
-        .unwrap_err();
+    let err = magent_core::web3::verify_signed_message_detailed(&signed, b"").unwrap_err();
     assert!(
         matches!(err, Web3ErrorKind::HexDecode(_)),
         "expected HexDecode for odd-length signature hex, got {err:?}"
@@ -1165,10 +1153,7 @@ fn verify_signed_message_detailed_two_party() {
     // Anyone (here: the test) can verify Alice's sig using only
     // the envelope. The detailed path returns Ok(()); the bool
     // path returns true.
-    assert!(magent_core::web3::verify_signed_message_detailed(
-        &signed, payload
-    )
-    .is_ok());
+    assert!(magent_core::web3::verify_signed_message_detailed(&signed, payload).is_ok());
 
     // Tamper with the signature bytes — detailed path must
     // surface `SignatureVerificationFailed` (crypto failure),

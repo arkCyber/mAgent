@@ -6,11 +6,11 @@
 //! - Flash storage
 //! - BLE communication
 
-use crate::error::{AgentError, Result};
 use crate::agent::{ToolCall, ToolResult};
+use crate::error::{AgentError, Result};
+use core::str::FromStr;
 use heapless::{String, Vec};
 use serde::{Deserialize, Serialize};
-use core::str::FromStr;
 
 /// Maximum number of tools
 const MAX_TOOLS: usize = 16;
@@ -83,7 +83,11 @@ pub(crate) fn parse_args(args: &str) -> Vec<(&str, &str), 8> {
 
 /// Pull the value for `key` from a parsed `Vec<(&str, &str)>`.
 /// Returns `default` if the key is absent or the value is empty.
-pub(crate) fn arg<'a>(args: &'a Vec<(&'a str, &'a str), 8>, key: &str, default: &'a str) -> &'a str {
+pub(crate) fn arg<'a>(
+    args: &'a Vec<(&'a str, &'a str), 8>,
+    key: &str,
+    default: &'a str,
+) -> &'a str {
     for &(k, v) in args.iter() {
         if k == key {
             return if v.is_empty() { default } else { v };
@@ -121,29 +125,116 @@ fn normalize_sensor(name: &str) -> &str {
 /// the embedded build needs to avoid the `format!` allocator path.
 fn pin_to_str(pin: u32) -> &'static str {
     match pin {
-        0 => "0", 1 => "1", 2 => "2", 3 => "3", 4 => "4",
-        5 => "5", 6 => "6", 7 => "7", 8 => "8", 9 => "9",
-        10 => "10", 11 => "11", 12 => "12", 13 => "13", 14 => "14",
-        15 => "15", 16 => "16", 17 => "17", 18 => "18", 19 => "19",
-        20 => "20", 21 => "21", 22 => "22", 23 => "23", 24 => "24",
-        25 => "25", 26 => "26", 27 => "27", 28 => "28", 29 => "29",
-        30 => "30", 31 => "31", 32 => "32", 33 => "33", 34 => "34",
-        35 => "35", 36 => "36", 37 => "37", 38 => "38", 39 => "39",
-        40 => "40", 41 => "41", 42 => "42", 43 => "43", 44 => "44",
-        45 => "45", 46 => "46", 47 => "47", 48 => "48", 49 => "49",
-        50 => "50", 51 => "51", 52 => "52", 53 => "53", 54 => "54",
-        55 => "55", 56 => "56", 57 => "57", 58 => "58", 59 => "59",
-        60 => "60", 61 => "61", 62 => "62", 63 => "63", 64 => "64",
-        65 => "65", 66 => "66", 67 => "67", 68 => "68", 69 => "69",
-        70 => "70", 71 => "71", 72 => "72", 73 => "73", 74 => "74",
-        75 => "75", 76 => "76", 77 => "77", 78 => "78", 79 => "79",
-        80 => "80", 81 => "81", 82 => "82", 83 => "83", 84 => "84",
-        85 => "85", 86 => "86", 87 => "87", 88 => "88", 89 => "89",
-        90 => "90", 91 => "91", 92 => "92", 93 => "93", 94 => "94",
-        95 => "95", 96 => "96", 97 => "97", 98 => "98", 99 => "99",
-        100 => "100", 200 => "200", 256 => "256", 512 => "512",
-        1000 => "1000", 1024 => "1024", 2048 => "2048", 4096 => "4096",
-        8192 => "8192", 9999 => "9999",
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        10 => "10",
+        11 => "11",
+        12 => "12",
+        13 => "13",
+        14 => "14",
+        15 => "15",
+        16 => "16",
+        17 => "17",
+        18 => "18",
+        19 => "19",
+        20 => "20",
+        21 => "21",
+        22 => "22",
+        23 => "23",
+        24 => "24",
+        25 => "25",
+        26 => "26",
+        27 => "27",
+        28 => "28",
+        29 => "29",
+        30 => "30",
+        31 => "31",
+        32 => "32",
+        33 => "33",
+        34 => "34",
+        35 => "35",
+        36 => "36",
+        37 => "37",
+        38 => "38",
+        39 => "39",
+        40 => "40",
+        41 => "41",
+        42 => "42",
+        43 => "43",
+        44 => "44",
+        45 => "45",
+        46 => "46",
+        47 => "47",
+        48 => "48",
+        49 => "49",
+        50 => "50",
+        51 => "51",
+        52 => "52",
+        53 => "53",
+        54 => "54",
+        55 => "55",
+        56 => "56",
+        57 => "57",
+        58 => "58",
+        59 => "59",
+        60 => "60",
+        61 => "61",
+        62 => "62",
+        63 => "63",
+        64 => "64",
+        65 => "65",
+        66 => "66",
+        67 => "67",
+        68 => "68",
+        69 => "69",
+        70 => "70",
+        71 => "71",
+        72 => "72",
+        73 => "73",
+        74 => "74",
+        75 => "75",
+        76 => "76",
+        77 => "77",
+        78 => "78",
+        79 => "79",
+        80 => "80",
+        81 => "81",
+        82 => "82",
+        83 => "83",
+        84 => "84",
+        85 => "85",
+        86 => "86",
+        87 => "87",
+        88 => "88",
+        89 => "89",
+        90 => "90",
+        91 => "91",
+        92 => "92",
+        93 => "93",
+        94 => "94",
+        95 => "95",
+        96 => "96",
+        97 => "97",
+        98 => "98",
+        99 => "99",
+        100 => "100",
+        200 => "200",
+        256 => "256",
+        512 => "512",
+        1000 => "1000",
+        1024 => "1024",
+        2048 => "2048",
+        4096 => "4096",
+        8192 => "8192",
+        9999 => "9999",
         _ => ">9999",
     }
 }
@@ -187,10 +278,12 @@ impl ToolRegistry {
                 available: 0,
             });
         }
-        self.tools.push(tool).map_err(|_| AgentError::MemoryAllocationFailed {
-            requested: 1,
-            available: 0,
-        })?;
+        self.tools
+            .push(tool)
+            .map_err(|_| AgentError::MemoryAllocationFailed {
+                requested: 1,
+                available: 0,
+            })?;
         Ok(())
     }
 
@@ -205,14 +298,12 @@ impl ToolRegistry {
         }
 
         // Find tool
-        let tool = self
-            .tools
-            .iter()
-            .find(|t| t.name == call.name)
-            .ok_or(AgentError::ConfigurationError {
+        let tool = self.tools.iter().find(|t| t.name == call.name).ok_or(
+            AgentError::ConfigurationError {
                 field: "tool",
                 reason: crate::error::ConfigError::MissingField,
-            })?;
+            },
+        )?;
 
         // Execute based on tool type
         match tool.tool_type {
@@ -645,7 +736,6 @@ pub enum ToolType {
     SendNotification = 9,
 }
 
-
 /// Sensor type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SensorType {
@@ -698,11 +788,27 @@ mod tests {
         let entries: &[(&str, &str, ToolType)] = &[
             ("read_sensor", "Read a sensor value", ToolType::ReadSensor),
             ("write_gpio", "Set a GPIO pin high/low", ToolType::WriteGpio),
-            ("flash_read", "Read bytes from internal flash", ToolType::FlashRead),
-            ("flash_write", "Write bytes to internal flash", ToolType::FlashWrite),
+            (
+                "flash_read",
+                "Read bytes from internal flash",
+                ToolType::FlashRead,
+            ),
+            (
+                "flash_write",
+                "Write bytes to internal flash",
+                ToolType::FlashWrite,
+            ),
             ("ble_send", "Send a payload over BLE", ToolType::BleSend),
-            ("voice_output", "Queue a text-to-speech utterance", ToolType::VoiceOutput),
-            ("send_notification", "Send a smartwatch notification", ToolType::SendNotification),
+            (
+                "voice_output",
+                "Queue a text-to-speech utterance",
+                ToolType::VoiceOutput,
+            ),
+            (
+                "send_notification",
+                "Send a smartwatch notification",
+                ToolType::SendNotification,
+            ),
         ];
         for (name, desc, ty) in entries {
             // HARDENING (audit-2026-08 unwrap sweep): the previous
@@ -801,11 +907,19 @@ mod tests {
         let r = populated_registry();
         let desc = r.describe();
         assert!(desc.as_str().contains("read_sensor: Read a sensor value"));
-        assert!(desc.as_str().contains("write_gpio: Set a GPIO pin high/low"));
-        assert!(desc.as_str().contains("flash_read: Read bytes from internal flash"));
+        assert!(desc
+            .as_str()
+            .contains("write_gpio: Set a GPIO pin high/low"));
+        assert!(desc
+            .as_str()
+            .contains("flash_read: Read bytes from internal flash"));
         assert!(desc.as_str().contains("ble_send: Send a payload over BLE"));
-        assert!(desc.as_str().contains("voice_output: Queue a text-to-speech utterance"));
-        assert!(desc.as_str().contains("send_notification: Send a smartwatch notification"));
+        assert!(desc
+            .as_str()
+            .contains("voice_output: Queue a text-to-speech utterance"));
+        assert!(desc
+            .as_str()
+            .contains("send_notification: Send a smartwatch notification"));
         // Newline separated. We have 7 entries.
         let line_count = desc.as_str().matches('\n').count() + 1;
         assert_eq!(line_count, 7);
@@ -914,10 +1028,9 @@ mod tests {
     #[test]
     fn execute_voice_output_includes_text_and_priority() {
         let r = populated_registry();
-        let out = run_async(
-            r.execute(&make_call("voice_output", "text=Drink water,priority=high")),
-        )
-        .unwrap();
+        let out =
+            run_async(r.execute(&make_call("voice_output", "text=Drink water,priority=high")))
+                .unwrap();
         assert!(out.success);
         assert!(out.data.as_str().contains("high"));
         assert!(out.data.as_str().contains("Drink water"));
@@ -931,9 +1044,10 @@ mod tests {
     #[test]
     fn execute_send_notification_includes_text_and_priority() {
         let r = populated_registry();
-        let out = run_async(
-            r.execute(&make_call("send_notification", "text=Time to stand,priority=low")),
-        )
+        let out = run_async(r.execute(&make_call(
+            "send_notification",
+            "text=Time to stand,priority=low",
+        )))
         .unwrap();
         assert!(out.success);
         assert!(out.data.as_str().contains("low"));
@@ -966,7 +1080,10 @@ mod tests {
         assert!(out.success);
         // The buffer must not have overflowed — it just truncates.
         assert!(out.data.len() <= 256);
-        assert!(out.data.as_str().starts_with("Voice queued (priority=urgent): "));
+        assert!(out
+            .data
+            .as_str()
+            .starts_with("Voice queued (priority=urgent): "));
         // The truncated text shows up in the result.
         assert!(out.data.as_str().contains("xxx"));
     }
@@ -982,9 +1099,10 @@ mod tests {
     #[test]
     fn execute_ble_send_parses_data_and_characteristic() {
         let r = populated_registry();
-        let out = run_async(
-            r.execute(&make_call("ble_send", "data=hello,characteristic=heart_rate")),
-        )
+        let out = run_async(r.execute(&make_call(
+            "ble_send",
+            "data=hello,characteristic=heart_rate",
+        )))
         .unwrap();
         assert!(out.success);
         assert_eq!(out.data.as_str(), "Sent 5 bytes via BLE to heart_rate");
@@ -993,7 +1111,8 @@ mod tests {
     #[test]
     fn execute_flash_write_parses_address_and_data() {
         let r = populated_registry();
-        let out = run_async(r.execute(&make_call("flash_write", "address=2048,data=hello"))).unwrap();
+        let out =
+            run_async(r.execute(&make_call("flash_write", "address=2048,data=hello"))).unwrap();
         assert!(out.success);
         assert_eq!(out.data.as_str(), "Wrote 5 bytes to address 2048");
     }
@@ -1040,4 +1159,3 @@ mod tests {
         assert_eq!(normalize_sensor(""), "");
     }
 }
-

@@ -18,6 +18,10 @@
 //! | 0x2A02 | WalletData | Write/Read | Command parameters / response data |
 //! | 0x2A03 | WalletStatus | Notify | Async status updates |
 
+// The wallet GATT service is a reserved feature not yet wired into the active
+// `ble_config` command dispatch; it is intentionally kept for future wiring.
+#![allow(dead_code)]
+
 use heapless::{String as HeaplessString, Vec};
 
 /// Wallet BLE Service UUID

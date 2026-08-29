@@ -1555,7 +1555,7 @@ impl<'a> ConfigCmd<'a> {
             // `metadata_set` validator was trying to block.
             // Strip them so the error message is safe to print.
             ConfigError::TypeMismatch {
-                expected, got: _, ..
+                expected, ..
             } => ConfigError::TypeMismatch {
                 key: key.to_string(),
                 expected,

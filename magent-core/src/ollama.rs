@@ -135,17 +135,25 @@ impl OllamaClient {
     }
 
     /// Add a message to the request
-    pub fn add_message(&mut self, request: &mut OllamaRequest, role: &str, content: &str) -> Result<()> {
+    pub fn add_message(
+        &mut self,
+        request: &mut OllamaRequest,
+        role: &str,
+        content: &str,
+    ) -> Result<()> {
         let msg = OllamaMessage {
             role: try_heapless::<16>(role),
             content: try_heapless::<2048>(content),
             tool_calls: None,
         };
 
-        request.messages.push(msg).map_err(|_| AgentError::BufferOverflow {
-            capacity: 8,
-            attempted: request.messages.len() + 1,
-        })?;
+        request
+            .messages
+            .push(msg)
+            .map_err(|_| AgentError::BufferOverflow {
+                capacity: 8,
+                attempted: request.messages.len() + 1,
+            })?;
 
         Ok(())
     }
@@ -155,33 +163,41 @@ impl OllamaClient {
         self.add_message(request, "system", content)
     }
 
-/// Add tool definitions
-///
-/// HARDENING (audit-2026-08 H7): every `heapless::String::try_from(..).unwrap()`
-/// on a caller-provided `&str` was replaced with `try_heapless` — a
-/// wrapper that truncates at a UTF-8 boundary instead of panicking
-/// when the input exceeds the buffer. A long tool name or parameter
-/// description (e.g. a typo with thousands of bytes) now yields a
-/// silent truncation rather than a worker-thread panic.
-pub fn add_tools(&mut self, request: &mut OllamaRequest, tools: &[(&str, &str, &[(&str, &str, &str)])]) -> Result<()> {
-    let mut tool_defs: heapless::Vec<ToolDefinition, 8> = heapless::Vec::new();
+    /// Add tool definitions
+    ///
+    /// HARDENING (audit-2026-08 H7): every `heapless::String::try_from(..).unwrap()`
+    /// on a caller-provided `&str` was replaced with `try_heapless` — a
+    /// wrapper that truncates at a UTF-8 boundary instead of panicking
+    /// when the input exceeds the buffer. A long tool name or parameter
+    /// description (e.g. a typo with thousands of bytes) now yields a
+    /// silent truncation rather than a worker-thread panic.
+    // TRACE: the `tools` tuple is intentionally a `(&str, &str, &[..])` nesting to
+    // stay `no_std`/heapless; `type_complexity` is a readability lint, and the
+    // alias would leak a private tuple name into this `pub` signature.
+    #[allow(clippy::type_complexity)]
+    pub fn add_tools(
+        &mut self,
+        request: &mut OllamaRequest,
+        tools: &[(&str, &str, &[(&str, &str, &str)])],
+    ) -> Result<()> {
+        let mut tool_defs: heapless::Vec<ToolDefinition, 8> = heapless::Vec::new();
 
-    for (name, description, params) in tools {
-        let mut required: heapless::Vec<heapless::String<16>, 4> = heapless::Vec::new();
-        let mut properties: heapless::Vec<ParameterProperty, 4> = heapless::Vec::new();
+        for (name, description, params) in tools {
+            let mut required: heapless::Vec<heapless::String<16>, 4> = heapless::Vec::new();
+            let mut properties: heapless::Vec<ParameterProperty, 4> = heapless::Vec::new();
 
-        for (param_name, param_type, param_desc) in *params {
-            let _ = required.push(try_heapless::<16>(param_name));
+            for (param_name, param_type, param_desc) in *params {
+                let _ = required.push(try_heapless::<16>(param_name));
 
-            let prop = ParameterProperty {
-                name: try_heapless::<16>(param_name),
-                param_type: try_heapless::<16>(param_type),
-                description: try_heapless::<64>(param_desc),
-            };
-            let _ = properties.push(prop);
-        }
+                let prop = ParameterProperty {
+                    name: try_heapless::<16>(param_name),
+                    param_type: try_heapless::<16>(param_type),
+                    description: try_heapless::<64>(param_desc),
+                };
+                let _ = properties.push(prop);
+            }
 
-// HARDENING (audit-2026-08 unwrap sweep): replace compile-time
+            // HARDENING (audit-2026-08 unwrap sweep): replace compile-time
             // constant string `try_from(...).unwrap()` with `try_heapless`
             // so a future schema rename (e.g. "function" → "tool") can't
             // accidentally introduce a panic.
@@ -200,15 +216,17 @@ pub fn add_tools(&mut self, request: &mut OllamaRequest, tools: &[(&str, &str, &
                 function: func_def,
             };
 
-        tool_defs.push(tool_def).map_err(|_| AgentError::BufferOverflow {
-            capacity: 8,
-            attempted: tool_defs.len() + 1,
-        })?;
-    }
+            tool_defs
+                .push(tool_def)
+                .map_err(|_| AgentError::BufferOverflow {
+                    capacity: 8,
+                    attempted: tool_defs.len() + 1,
+                })?;
+        }
 
-    request.tools = Some(tool_defs);
-    Ok(())
-}
+        request.tools = Some(tool_defs);
+        Ok(())
+    }
 
     /// Serialize request to JSON (simplified for embedded)
     pub fn serialize_request(&self, request: &OllamaRequest) -> heapless::String<2048> {
@@ -274,7 +292,7 @@ pub fn add_tools(&mut self, request: &mut OllamaRequest, tools: &[(&str, &str, &
             let mut search_pos = 0;
             while let Some(func_start) = json[search_pos..].find("\"function\":{\"name\":\"") {
                 let actual_pos = search_pos + func_start + 17;
-                if let Some(func_end) = json[actual_pos..].find("\"") {
+                if let Some(func_end) = json[actual_pos..].find('"') {
                     let func_name = &json[actual_pos..actual_pos + func_end];
 
                     let tool_call = ToolCallSpec {
@@ -302,7 +320,11 @@ pub fn add_tools(&mut self, request: &mut OllamaRequest, tools: &[(&str, &str, &
             // to make arbitrarily long. `try_heapless` truncates
             // at the buffer's UTF-8 boundary instead of panicking.
             content: try_heapless::<2048>(content),
-            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
         };
 
         Ok(OllamaResponse {
@@ -347,19 +369,30 @@ You must:
 Respond with a JSON object containing your response and any tool calls."#;
 
 /// Tool definition tuple type
-pub type ToolDef = (&'static str, &'static str, &'static [(&'static str, &'static str, &'static str)]);
+pub type ToolDef = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str, &'static str)],
+);
 
 /// Tool definitions for the agent
 pub const TOOL_DEFINITIONS: [ToolDef; 5] = [
     (
         "read_sensor",
         "Read sensor data",
-        &[("sensor", "string", "Sensor type: temperature, accelerometer, humidity, pressure")],
+        &[(
+            "sensor",
+            "string",
+            "Sensor type: temperature, accelerometer, humidity, pressure",
+        )],
     ),
     (
         "write_gpio",
         "Control GPIO pin",
-        &[("pin", "integer", "GPIO pin number"), ("state", "string", "Pin state: high or low")],
+        &[
+            ("pin", "integer", "GPIO pin number"),
+            ("state", "string", "Pin state: high or low"),
+        ],
     ),
     (
         "flash_read",
@@ -369,7 +402,10 @@ pub const TOOL_DEFINITIONS: [ToolDef; 5] = [
     (
         "flash_write",
         "Write to flash storage",
-        &[("address", "integer", "Flash address to write to"), ("data", "string", "Data to write")],
+        &[
+            ("address", "integer", "Flash address to write to"),
+            ("data", "string", "Data to write"),
+        ],
     ),
     (
         "ble_send",

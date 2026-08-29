@@ -33,8 +33,8 @@ use core::fmt::Write as _;
 use heapless::String as HString;
 use magent_core::time_sync::{
     format_iso8601_for_test, unix_to_calendar, Source, TimeSync, TimeSyncError,
-    DEFAULT_RESYNC_INTERVAL_S, MAX_DRIFT_PPM, PERSIST_KEY, PERSIST_PREFIX, TZ_KEY,
-    TZ_MAX_MINUTES, TZ_MIN_MINUTES,
+    DEFAULT_RESYNC_INTERVAL_S, MAX_DRIFT_PPM, PERSIST_KEY, PERSIST_PREFIX, TZ_KEY, TZ_MAX_MINUTES,
+    TZ_MIN_MINUTES,
 };
 
 #[test]
@@ -89,7 +89,8 @@ fn manual_override_resets_drift() {
     // Drift may be 0 if the implementation ignores back-to-back
     // samples that are too close in time; what we really want is
     // to verify the operator pinning path zeroes the field.
-    t.record(1_700_000_001, 0, 1_001_000, Source::Operator).unwrap();
+    t.record(1_700_000_001, 0, 1_001_000, Source::Operator)
+        .unwrap();
     assert_eq!(t.drift_ppm(), 0);
     // Sanity: the operator tag overrode the source.
     assert_eq!(t.source(), Source::Operator);
@@ -106,8 +107,14 @@ fn initial_state_returns_none_for_now() {
 #[test]
 fn set_tz_offset_rejects_out_of_range() {
     let mut t = TimeSync::default();
-    assert_eq!(t.set_tz_offset_minutes(TZ_MIN_MINUTES - 1), Err(TimeSyncError::TzOutOfRange));
-    assert_eq!(t.set_tz_offset_minutes(TZ_MAX_MINUTES + 1), Err(TimeSyncError::TzOutOfRange));
+    assert_eq!(
+        t.set_tz_offset_minutes(TZ_MIN_MINUTES - 1),
+        Err(TimeSyncError::TzOutOfRange)
+    );
+    assert_eq!(
+        t.set_tz_offset_minutes(TZ_MAX_MINUTES + 1),
+        Err(TimeSyncError::TzOutOfRange)
+    );
     assert_eq!(t.set_tz_offset_minutes(TZ_MIN_MINUTES), Ok(()));
     assert_eq!(t.set_tz_offset_minutes(TZ_MAX_MINUTES), Ok(()));
     assert_eq!(t.set_tz_offset_minutes(0), Ok(()));
@@ -146,14 +153,8 @@ fn iso8601_handles_midnight_rollover() {
 
 #[test]
 fn calendar_conversion_known_dates() {
-    assert_eq!(
-        unix_to_calendar(0).unwrap(),
-        (1970, 1, 1, 0, 0, 0)
-    );
-    assert_eq!(
-        unix_to_calendar(86_400).unwrap(),
-        (1970, 1, 2, 0, 0, 0)
-    );
+    assert_eq!(unix_to_calendar(0).unwrap(), (1970, 1, 1, 0, 0, 0));
+    assert_eq!(unix_to_calendar(86_400).unwrap(), (1970, 1, 2, 0, 0, 0));
     assert_eq!(
         unix_to_calendar(1_700_000_000).unwrap(),
         (2023, 11, 14, 22, 13, 20)

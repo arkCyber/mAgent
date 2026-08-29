@@ -29,7 +29,7 @@ impl I2cSensor {
         // 1. Configure I2C bus
         // 2. Send initialization commands to sensor
         // 3. Verify sensor response
-        
+
         self.initialized = true;
         Ok(())
     }
@@ -37,29 +37,35 @@ impl I2cSensor {
     /// Read sensor data
     pub fn read(&self, register: u8) -> Result<Vec<u8, 8>> {
         if !self.initialized {
-            return Err(AgentError::SensorReadFailed { sensor: "I2C", reason: crate::error::SensorError::NotInitialized });
+            return Err(AgentError::SensorReadFailed {
+                sensor: "I2C",
+                reason: crate::error::SensorError::NotInitialized,
+            });
         }
 
         // In real implementation, this would:
         // 1. Send register address via I2C
         // 2. Read data from sensor
         // 3. Return parsed data
-        
+
         // Simulate reading temperature sensor
         let mut data = Vec::new();
         if register == 0x00 {
             // Temperature register
             let _ = data.push(25); // 25°C
-            let _ = data.push(5);  // 0.5°C
+            let _ = data.push(5); // 0.5°C
         }
-        
+
         Ok(data)
     }
 
     /// Write to sensor register
     pub fn write(&self, _register: u8, _value: u8) -> Result<()> {
         if !self.initialized {
-            return Err(AgentError::SensorReadFailed { sensor: "I2C", reason: crate::error::SensorError::NotInitialized });
+            return Err(AgentError::SensorReadFailed {
+                sensor: "I2C",
+                reason: crate::error::SensorError::NotInitialized,
+            });
         }
 
         // In real implementation, this would:
@@ -92,7 +98,7 @@ impl SpiSensor {
         // 1. Configure SPI bus
         // 2. Configure CS pin
         // 3. Send initialization commands
-        
+
         self.initialized = true;
         Ok(())
     }
@@ -100,7 +106,10 @@ impl SpiSensor {
     /// Read sensor data
     pub fn read(&self, register: u8) -> Result<Vec<u8, 8>> {
         if !self.initialized {
-            return Err(AgentError::SensorReadFailed { sensor: "I2C", reason: crate::error::SensorError::NotInitialized });
+            return Err(AgentError::SensorReadFailed {
+                sensor: "I2C",
+                reason: crate::error::SensorError::NotInitialized,
+            });
         }
 
         // In real implementation, this would:
@@ -108,7 +117,7 @@ impl SpiSensor {
         // 2. Send register address via SPI
         // 3. Read data via SPI
         // 4. Deassert CS pin
-        
+
         // Simulate reading accelerometer
         let mut data = Vec::new();
         if register == 0x01 {
@@ -116,14 +125,17 @@ impl SpiSensor {
             let _ = data.push(0x01);
             let _ = data.push(0x00);
         }
-        
+
         Ok(data)
     }
 
     /// Write to sensor register
     pub fn write(&self, _register: u8, _value: u8) -> Result<()> {
         if !self.initialized {
-            return Err(AgentError::SensorReadFailed { sensor: "I2C", reason: crate::error::SensorError::NotInitialized });
+            return Err(AgentError::SensorReadFailed {
+                sensor: "I2C",
+                reason: crate::error::SensorError::NotInitialized,
+            });
         }
 
         // In real implementation, this would:
@@ -183,7 +195,7 @@ impl GpioPin {
         // In real implementation, this would:
         // 1. Configure pin as output
         // 2. Set pin level using embedded-hal
-        
+
         self.state = state;
         Ok(())
     }
@@ -193,7 +205,7 @@ impl GpioPin {
         // In real implementation, this would:
         // 1. Configure pin as input
         // 2. Read pin level using embedded-hal
-        
+
         Ok(self.state)
     }
 
@@ -228,7 +240,7 @@ impl TemperatureSensor {
     /// Read temperature in Celsius
     pub fn read_temperature(&self) -> Result<f32> {
         let data = self.i2c.read(0x00)?;
-        
+
         // Parse temperature data (format depends on sensor)
         // For simulation, parse the data from I2C read
         if data.len() >= 2 {
@@ -264,7 +276,7 @@ impl Accelerometer {
         let x_data = self.spi.read(0x01)?;
         let y_data = self.spi.read(0x02)?;
         let z_data = self.spi.read(0x03)?;
-        
+
         // Parse acceleration data (format depends on sensor)
         // For simulation, parse the data from SPI read
         let x = if x_data.len() >= 2 {
@@ -273,21 +285,21 @@ impl Accelerometer {
         } else {
             0.1
         };
-        
+
         let y = if y_data.len() >= 2 {
             let raw = (y_data[0] as i16) << 8 | y_data[1] as i16;
             raw as f32 / 16384.0
         } else {
             0.2
         };
-        
+
         let z = if z_data.len() >= 2 {
             let raw = (z_data[0] as i16) << 8 | z_data[1] as i16;
             raw as f32 / 16384.0
         } else {
             9.8
         };
-        
+
         Ok((x, y, z))
     }
 }
@@ -313,9 +325,9 @@ impl HumiditySensor {
     /// Read humidity percentage
     pub fn read_humidity(&self) -> Result<f32> {
         let data = self.i2c.read(0x01)?;
-        
+
         // Parse humidity data
-        if data.len() >= 1 {
+        if !data.is_empty() {
             Ok(data[0] as f32)
         } else {
             Ok(65.0)
@@ -344,7 +356,7 @@ impl PressureSensor {
     /// Read pressure in hPa
     pub fn read_pressure(&self) -> Result<f32> {
         let data = self.i2c.read(0x02)?;
-        
+
         // Parse pressure data (24-bit value)
         if data.len() >= 2 {
             let pressure = (data[0] as u32) << 8 | data[1] as u32;
