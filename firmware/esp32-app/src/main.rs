@@ -1800,6 +1800,10 @@ fn run_agent_loop(
         // Reliability: wrap the run in `catch_unwind` so a panic inside a
         // tool handler or the ReAct loop (e.g. a bad GPIO op) does NOT kill
         // the agent thread — we log it and keep serving the next command.
+        // NOTE (audit): under `[profile.release] panic = "abort"` (the shipped
+        // firmware) `catch_unwind` is a NO-OP — any panic aborts the whole
+        // board (fail-fast). It only actually catches in debug / unwind
+        // builds, so the `Err(_)` arm below is reachable in dev only.
         // P3: measure the per-task ReAct execution time (tool calls + LLM).
         let t_task = latency_metrics::now_us();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
