@@ -1002,6 +1002,7 @@ impl<'a> RunCmd<'a> {
             state: "Finished".to_string(),
             final_messages: runner.messages().len(),
             approx_tokens: runner.approx_total_tokens(),
+            approx_bytes: runner.approx_total_bytes(),
         })
     }
 }
@@ -1048,6 +1049,7 @@ fn finalize_report<E: ToolExecutor>(
         // the caller exactly how heavy the conversation got.
         final_messages: runner.messages().len(),
         approx_tokens: runner.approx_total_tokens(),
+        approx_bytes: runner.approx_total_bytes(),
     };
     out.final_answer(result)?;
     out.write_json(report.to_json())?;
@@ -1291,6 +1293,9 @@ fn verify_signed_report(path: &Path, out: &mut Output) -> Result<RunReport, RunE
         state: env.payload.state.clone(),
         final_messages: env.payload.final_messages,
         approx_tokens: env.payload.approx_tokens,
+        // The signed-envelope schema predates `approx_bytes`; the byte
+        // footprint isn't part of the signed payload, so report 0 here.
+        approx_bytes: 0,
     })
 }
 
@@ -1485,6 +1490,11 @@ pub struct RunReport {
     /// (sum of `len(s) / 4` over every message + tool args). Cheap,
     /// good enough for a budget guardrail.
     pub approx_tokens: usize,
+    /// Estimated dynamic heap footprint (bytes) of the conversation at the
+    /// end of the run — the figure the REQ-SCHED-001 / mem-3 byte-GC bounds to
+    /// `MAX_DYNAMIC_CONTEXT_BYTES`. Lets callers confirm the context cache
+    /// stayed within budget.
+    pub approx_bytes: usize,
 }
 
 impl RunReport {
@@ -1504,6 +1514,7 @@ impl RunReport {
             "state": self.state,
             "final_messages": self.final_messages,
             "approx_tokens": self.approx_tokens,
+            "approx_bytes": self.approx_bytes,
         })
     }
 }
@@ -1707,6 +1718,7 @@ mod tests {
             state: "Finished".to_string(),
             final_messages: 7,
             approx_tokens: 42,
+            approx_bytes: 2048,
         };
         let v = r.to_json();
         assert_eq!(v["iterations"], serde_json::json!(3));
@@ -1716,6 +1728,7 @@ mod tests {
         assert_eq!(v["state"], serde_json::json!("Finished"));
         assert_eq!(v["final_messages"], serde_json::json!(7));
         assert_eq!(v["approx_tokens"], serde_json::json!(42));
+        assert_eq!(v["approx_bytes"], serde_json::json!(2048));
     }
 
     #[test]
@@ -1732,6 +1745,7 @@ mod tests {
             state: "Finished".to_string(),
             final_messages: 0,
             approx_tokens: 0,
+            approx_bytes: 0,
         };
         let v = r.to_json();
         assert_eq!(v["provider"], serde_json::json!("mock"));
@@ -1749,6 +1763,7 @@ mod tests {
             state: "Finished".to_string(),
             final_messages: 2,
             approx_tokens: 5,
+            approx_bytes: 128,
         };
         let v = r.to_json();
         assert_eq!(v["provider"], serde_json::json!("deepseek"));

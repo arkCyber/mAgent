@@ -2316,10 +2316,25 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         if self.config.compression.max_messages > 0
             || self.config.compression.tool_content_max_chars > 0
         {
-            let stats = crate::conversation::compress_messages(
+            let mut stats = crate::conversation::compress_messages(
                 &mut self.messages,
                 &self.config.compression,
             );
+            // REQ-SCHED-001 / mem-3 (byte-GC): additionally bound the *dynamic
+            // byte* footprint of the live context cache — serde_json and long
+            // tool dumps can be far larger than the message count suggests, so
+            // a byte budget is the real heap-blast guard. `gc_to_budget` drops
+            // the oldest non-system messages until under
+            // `MAX_DYNAMIC_CONTEXT_BYTES` (512 KiB on the C61 / host, 2 MiB on
+            // the S3 8 MB octal PSRAM profile), preserving the system prompt
+            // and the current turn. A zero budget is a no-op, so this stays
+            // inside the same "compression active" gate.
+            let byte_stats = crate::conversation::gc_to_budget(
+                &mut self.messages,
+                crate::MAX_DYNAMIC_CONTEXT_BYTES,
+            );
+            stats.dropped += byte_stats.dropped;
+            stats.kept = self.messages.len();
             self.emit_trace(TraceEvent::CompressionApplied {
                 kept: stats.kept,
                 dropped: stats.dropped,
@@ -2791,12 +2806,31 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         crate::conversation::approx_total_tokens(&self.messages)
     }
 
+    /// Estimated dynamic heap footprint (bytes) of the current conversation
+    /// history. Mirrors `conversation::estimate_bytes`; this is the figure the
+    /// REQ-SCHED-001 / mem-3 byte-GC (`gc_to_budget`) bounds to
+    /// `MAX_DYNAMIC_CONTEXT_BYTES`. Exposed for diagnostics so callers can see
+    /// the live context-cache footprint.
+    pub fn approx_total_bytes(&self) -> usize {
+        crate::conversation::estimate_bytes(&self.messages)
+    }
+
     /// Apply the configured `CompressionPolicy` to the live
     /// conversation history and return the resulting counters.
     /// Exposed for tests and CLI tooling that want to inspect / report
     /// the compression stats without running the full ReAct loop.
     pub fn compress_now(&mut self) -> crate::conversation::CompressionStats {
-        crate::conversation::compress_messages(&mut self.messages, &self.config.compression)
+        let mut stats =
+            crate::conversation::compress_messages(&mut self.messages, &self.config.compression);
+        // REQ-SCHED-001 / mem-3: mirror the think()-path byte-GC so this
+        // diagnostic path sees the same bounded footprint.
+        let byte_stats = crate::conversation::gc_to_budget(
+            &mut self.messages,
+            crate::MAX_DYNAMIC_CONTEXT_BYTES,
+        );
+        stats.dropped += byte_stats.dropped;
+        stats.kept = self.messages.len();
+        stats
     }
 
     /// Immutable view of the runner configuration.
@@ -3258,6 +3292,27 @@ mod compression_tests {
         runner.messages.push(Message::user("abcd")); // 1 token
         runner.messages.push(Message::assistant_text("efghijkl")); // 2 tokens
         assert_eq!(runner.approx_total_tokens(), 3);
+    }
+
+    #[test]
+    fn compress_now_bounds_byte_footprint() {
+        // REQ-SCHED-001 / mem-3: a conversation whose *byte* footprint exceeds
+        // MAX_DYNAMIC_CONTEXT_BYTES must be GC'd down below it, while the most
+        // recent turn is preserved. Use a disabled message-count policy so this
+        // isolates the byte-GC step.
+        let mut runner = runner_with_policy(CompressionPolicy::disabled());
+        // 6 × 200 KiB assistant messages ≈ 1.2 MiB total.
+        for _ in 0..6 {
+            runner
+                .messages
+                .push(Message::assistant_text(&"x".repeat(200 * 1024)));
+        }
+        assert!(crate::conversation::estimate_bytes(&runner.messages) > crate::MAX_DYNAMIC_CONTEXT_BYTES);
+        let stats = runner.compress_now();
+        assert!(stats.dropped > 0);
+        assert!(crate::conversation::estimate_bytes(&runner.messages) <= crate::MAX_DYNAMIC_CONTEXT_BYTES);
+        // The most recent turn is never dropped.
+        assert_eq!(runner.messages.last().map(|m| m.content.len()), Some(200 * 1024));
     }
 
     #[test]

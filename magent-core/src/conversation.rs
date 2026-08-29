@@ -319,22 +319,24 @@ pub fn approx_total_tokens(messages: &[Message]) -> usize {
 /// policy for preventing a long session from exhausting the pool.
 pub fn estimate_bytes(messages: &[Message]) -> usize {
     const PER_MSG_OVERHEAD: usize = 64;
-    messages
-        .iter()
-        .map(|m| {
-            let mut bytes = m.content.len() + PER_MSG_OVERHEAD;
-            if let Some(id) = &m.tool_call_id {
-                bytes += id.len() + 16;
+    // Saturating arithmetic so a pathological conversation can never wrap the
+    // usize counter (release) or panic (debug) on a 32-bit target.
+    messages.iter().fold(0usize, |acc, m| {
+        let mut bytes = m.content.len().saturating_add(PER_MSG_OVERHEAD);
+        if let Some(id) = &m.tool_call_id {
+            bytes = bytes.saturating_add(id.len()).saturating_add(16);
+        }
+        if let Some(ref tc) = m.tool_call {
+            bytes = bytes.saturating_add(tc.name.len()).saturating_add(32);
+            for (k, v) in &tc.arguments {
+                bytes = bytes
+                    .saturating_add(k.len())
+                    .saturating_add(v.to_string().len())
+                    .saturating_add(16);
             }
-            if let Some(ref tc) = m.tool_call {
-                bytes += tc.name.len() + 32;
-                for (k, v) in &tc.arguments {
-                    bytes += k.len() + v.to_string().len() + 16;
-                }
-            }
-            bytes
-        })
-        .sum()
+        }
+        acc.saturating_add(bytes)
+    })
 }
 
 /// Garbage-collect a conversation slice down to a **byte** budget by dropping
