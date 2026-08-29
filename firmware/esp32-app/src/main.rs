@@ -1403,6 +1403,12 @@ fn run_ingress(
     log::info!("[ingress] gateway ready");
     dtrace("ingress:gateway-ready");
 
+    // P3 / mem-3: timestamp of the last command routed to the agent
+    // (natural-language / AT+AGENT). Set when the ingress feeds the agent;
+    // consumed when the agent's reply is drained back, to measure the
+    // agent-routed end-to-end latency. `None` when no agent command is in flight.
+    let mut agent_cmd_at: Option<u64> = None;
+
     loop {
         heartbeat.beat();
         rt_watchdog::feed();
@@ -1415,6 +1421,13 @@ fn run_ingress(
                 match gw.send_to_adapter(0, reply.as_bytes()) {
                     Ok(()) => log::info!("[ingress] reply sent to host: {reply}"),
                     Err(e) => log::warn!("[ingress] reply send failed: {e}"),
+                }
+                // P3 / mem-3: if this reply answers a command that was routed to
+                // the agent (natural-language / AT+AGENT), record the full
+                // agent-routed E2E latency.
+                if let Some(t) = agent_cmd_at.take() {
+                    latency_metrics::e2e_agent()
+                        .record(latency_metrics::now_us().wrapping_sub(t));
                 }
             }
         }
@@ -1474,6 +1487,10 @@ fn run_ingress(
                                                     );
                                                     *guard = Some(s.to_string());
                                                 }
+                                                // P3 / mem-3: start the agent-routed
+                                                // E2E measurement.
+                                                agent_cmd_at =
+                                                    Some(latency_metrics::now_us());
                                             }
                                         }
                                         // Reply plain `OK\r\n` so scripts know
@@ -1562,6 +1579,8 @@ fn run_ingress(
                             if let Ok(mut guard) = task_handle.lock() {
                                 log::info!("[ingress] feeding agent command: {line}");
                                 *guard = Some(line.to_string());
+                                // P3 / mem-3: start the agent-routed E2E measurement.
+                                agent_cmd_at = Some(latency_metrics::now_us());
                             }
                         }
                     }

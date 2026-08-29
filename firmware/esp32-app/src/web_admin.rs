@@ -87,10 +87,11 @@ fn latency_json() -> String {
         )
     };
     format!(
-        r#"{{"llm_rt":{},"at_dispatch":{},"e2e_reply":{},"agent_task":{}}}"#,
+        r#"{{"llm_rt":{},"at_dispatch":{},"e2e_reply":{},"e2e_agent":{},"agent_task":{}}}"#,
         ch(m::llm_rt().sample()),
         ch(m::at_dispatch().sample()),
         ch(m::e2e_reply().sample()),
+        ch(m::e2e_agent().sample()),
         ch(m::agent_task().sample()),
     )
 }

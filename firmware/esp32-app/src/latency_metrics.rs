@@ -149,8 +149,12 @@ pub struct Metrics {
     pub llm_rt_us: TimingChannel,
     /// Ingress AT parse + dispatch + render (the real-time command path on Core 1).
     pub at_dispatch_us: TimingChannel,
-    /// End-to-end: command received at the UART → reply placed in the outbox.
+    /// End-to-end: command received at the UART → reply placed in the outbox
+    /// (the direct AT command path).
     pub e2e_reply_us: TimingChannel,
+    /// End-to-end: a command routed to the agent (natural-language / AT+AGENT)
+    /// → the agent's reply drained back out — the LLM/ReAct-dominated path.
+    pub e2e_agent_us: TimingChannel,
     /// One ReAct task execution on the agent thread (tool calls + LLM + decision).
     pub agent_task_us: TimingChannel,
 }
@@ -161,6 +165,7 @@ impl Metrics {
             llm_rt_us: TimingChannel::new(),
             at_dispatch_us: TimingChannel::new(),
             e2e_reply_us: TimingChannel::new(),
+            e2e_agent_us: TimingChannel::new(),
             agent_task_us: TimingChannel::new(),
         }
     }
@@ -182,6 +187,9 @@ pub fn at_dispatch() -> &'static TimingChannel {
 pub fn e2e_reply() -> &'static TimingChannel {
     &METRICS.e2e_reply_us
 }
+pub fn e2e_agent() -> &'static TimingChannel {
+    &METRICS.e2e_agent_us
+}
 pub fn agent_task() -> &'static TimingChannel {
     &METRICS.agent_task_us
 }
@@ -192,6 +200,7 @@ pub fn report() -> String {
         llm_rt().report("llm_rt"),
         at_dispatch().report("at_dispatch"),
         e2e_reply().report("e2e_reply"),
+        e2e_agent().report("e2e_agent"),
         agent_task().report("agent_task"),
     ]
     .join(" | ")
