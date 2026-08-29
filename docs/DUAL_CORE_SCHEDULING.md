@@ -117,3 +117,33 @@ never feeds — subscribing it would false-trip on any long-running script).
   RT blocking (~12s).
 - All scheduling code is S3-gated; the C61 build is unchanged and clean.
 
+## PSRAM & memory hardening (REQ-SCHED-001 / mem-1..3)
+
+For the ESP32-S3-WROOM-1-N8R8 (8 MB Octal PSRAM) target:
+
+- **Budget ceilings** (`magent-core` `s3-8mb-psram` feature, enabled by the
+  firmware's `board-s3`): `MAX_CONFIGURABLE_MEMORY` 1 MiB → 4 MiB and
+  `MAX_DYNAMIC_CONTEXT_BYTES` 512 KiB → 2 MiB — raised but still bounded vs the
+  8 MB pool so a runaway LLM reply / long context cannot exhaust PSRAM.
+- **Byte-budget GC** (`conversation::gc_to_budget`): the host `RealAgentRunner`
+  bounds the live `Vec<Message>` context cache to `MAX_DYNAMIC_CONTEXT_BYTES`,
+  **unconditionally** (independent of `CompressionPolicy`) — heap-blast
+  protection is not optional. Dropped counts fold into the compression stats /
+  trace / summary; the live footprint is exposed as `RunReport.approx_bytes`.
+- **Firmware heap guard** (`Esp32DeepSeekBackend`): refuses to parse the LLM
+  JSON into a `serde_json::Value` when free heap < 64 KiB, returning a clean
+  error instead of an OOM abort.
+- **Stack protection**: `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=n` forces all
+  task stacks into internal SRAM (matches `configure_psram_thread_stacks()`).
+- **Observability**: WCET / latency channels (llm_rt / at_dispatch / e2e_reply /
+  agent_task) are exposed on the web-admin `/api/status` JSON and the HTML
+  dashboard, plus the periodic serial `[latency]` log.
+
+> **N8R8 Octal build path.** `build-s3.sh` uses `sdkconfig.defaults` (a quad
+> 2 MB profile). For the 8 MB Octal PSRAM N8R8, merge the base with the Octal
+> overlay so the full pool is used:
+> `ESP_IDF_SDKCONFIG_DEFAULTS=".../sdkconfig.defaults:.../sdkconfig.s3.defaults"`
+> (the overlay sets `CONFIG_SPIRAM_MODE_OCT=y` + the stack protection). The
+> merged build compiles; validate on hardware before production.
+
+
