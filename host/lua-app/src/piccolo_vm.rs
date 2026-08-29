@@ -666,7 +666,7 @@ fn do_string_format(fmt: &str, args: &[String]) -> String {
 fn v_to_owned_string(v: piccolo::Value<'_>) -> String {
     match v {
         piccolo::Value::String(s) => std::str::from_utf8(s.as_bytes())
-            .map(|s| s.to_owned())
+            .map(std::borrow::ToOwned::to_owned)
             .unwrap_or_default(),
         piccolo::Value::Integer(i) => i.to_string(),
         piccolo::Value::Number(n) => n.to_string(),
@@ -715,6 +715,10 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
         tok: Class,
         quant: Quant,
         capture: bool,
+        // `inner` holds nested instruction groups; kept (and cloned) for the
+        // parser but not read by the current matcher. Silence the dead-code
+        // lint rather than remove it so future group-capture work can use it.
+        #[allow(dead_code)]
         inner: Vec<Inst>,
     }
 
@@ -913,7 +917,7 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
                 if gs < ge && ge <= sb.len() {
                     return Some(
                         std::str::from_utf8(&sb[gs..ge])
-                            .map(|s| s.to_owned())
+                            .map(std::borrow::ToOwned::to_owned)
                             .unwrap_or_default(),
                     );
                 }
@@ -922,7 +926,7 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
             if len >= pos {
                 return Some(
                     std::str::from_utf8(&sb[pos..len])
-                        .map(|s| s.to_owned())
+                        .map(std::borrow::ToOwned::to_owned)
                         .unwrap_or_default(),
                 );
             }
