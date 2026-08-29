@@ -62,7 +62,7 @@ fn render_index(wifi_status: &WifiStatusHandle) -> String {
     let ip = html_escape(&s.ip);
     let ssid = html_escape(&s.ssid);
     let reason = html_escape(reason_label(s.reason));
-    format!("<!DOCTYPE html><html><head><title>mAgent v{0}</title></head><body><h1>mAgent v{0}</h1><table><tr><td>version</td><td>{0}</td></tr><tr><td>state</td><td>{1}</td></tr><tr><td>ip</td><td>{2}</td></tr><tr><td>ssid</td><td>{3}</td></tr><tr><td>rssi</td><td>{4} dBm</td></tr><tr><td>wifi reason</td><td>{7} ({8})</td></tr><tr><td>heap</td><td>{5} B</td></tr><tr><td>uptime</td><td>{6} ms</td></tr><tr><td>latency</td><td>{9}</td></tr></table><p><a href=/api/status>JSON status</a></p></body></html>", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, free_heap(), now_ms(), reason, s.reason, crate::latency_metrics::report())
+    format!("<!DOCTYPE html><html><head><title>mAgent v{0}</title></head><body><h1>mAgent v{0}</h1><table><tr><td>version</td><td>{0}</td></tr><tr><td>state</td><td>{1}</td></tr><tr><td>ip</td><td>{2}</td></tr><tr><td>ssid</td><td>{3}</td></tr><tr><td>rssi</td><td>{4} dBm</td></tr><tr><td>wifi reason</td><td>{7} ({8})</td></tr><tr><td>heap</td><td>{5} B</td></tr><tr><td>heap low-water</td><td>{10} B</td></tr><tr><td>uptime</td><td>{6} ms</td></tr><tr><td>latency</td><td>{9}</td></tr></table><p><a href=/api/status>JSON status</a></p></body></html>", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, free_heap(), now_ms(), reason, s.reason, crate::latency_metrics::report(), crate::heap_low_water())
 }
 
 fn render_status(wifi_status: &WifiStatusHandle) -> String {
@@ -70,7 +70,10 @@ fn render_status(wifi_status: &WifiStatusHandle) -> String {
     let ip = json_escape(&s.ip);
     let ssid = json_escape(&s.ssid);
     let reason_lbl = json_escape(reason_label(s.reason));
-    format!("{{\"version\":\"{}\",\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"wifi_reason\":{},\"wifi_reason_label\":\"{}\",\"free_heap_b\":{},\"uptime_ms\":{},\"latency\":{}}}", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, s.reason, reason_lbl, free_heap(), now_ms(), latency_json())
+    // Refresh the low-water mark opportunistically so the status endpoint is
+    // accurate even if the agent health log hasn't run yet.
+    crate::update_heap_low_water();
+    format!("{{\"version\":\"{}\",\"wifi_state\":{},\"ip\":\"{}\",\"ssid\":\"{}\",\"rssi_dbm\":{},\"wifi_reason\":{},\"wifi_reason_label\":\"{}\",\"free_heap_b\":{},\"heap_low_water_b\":{},\"uptime_ms\":{},\"latency\":{}}}", env!("CARGO_PKG_VERSION"), s.state, ip, ssid, s.rssi, s.reason, reason_lbl, free_heap(), crate::heap_low_water(), now_ms(), latency_json())
 }
 
 /// JSON object of the P3 WCET / latency channels for the `/api/status`

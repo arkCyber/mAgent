@@ -133,6 +133,36 @@ fn free_heap() -> u32 {
     unsafe { esp_idf_sys::esp_get_free_heap_size() }
 }
 
+/// Running low-water mark (bytes) of the free heap — the smallest free-heap
+/// value observed so far. Lets an operator detect a slow memory leak or a
+/// pressure spike over time, complementing the instantaneous `free_heap()`.
+/// (REQ-SCHED-001 / mem-3 observability.)
+static HEAP_LOW_WATER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Update the low-water mark with the current free heap. Cheap; call from the
+/// periodic health log (and the web-admin status path).
+fn update_heap_low_water() {
+    use std::sync::atomic::Ordering;
+    let free = free_heap();
+    let mut cur = HEAP_LOW_WATER.load(Ordering::Relaxed);
+    while free < cur {
+        match HEAP_LOW_WATER.compare_exchange_weak(
+            cur,
+            free,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Lowest free heap (bytes) observed so far. `u32::MAX` if never sampled.
+fn heap_low_water() -> u32 {
+    HEAP_LOW_WATER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Shared heartbeat used to detect a hung (stalled, non-panicking) thread.
 ///
 /// Each worker thread calls [`Heartbeat::beat`] on every loop iteration; the
@@ -1786,12 +1816,14 @@ fn run_agent_loop(
 
         // Periodic health metrics + low-memory warning.
         let heap = free_heap();
+        update_heap_low_water();
         if heap < LOW_HEAP_WARN {
             log::warn!("[health] LOW FREE HEAP: {heap} B (uptime {elapsed_ms} ms)");
         }
         if now_ms().saturating_sub(last_health_log) >= 60_000 {
             log::info!(
-                "[health] agent alive — uptime {elapsed_ms} ms, free_heap {heap} B, iterations in current task ok"
+                "[health] agent alive — uptime {elapsed_ms} ms, free_heap {heap} B (low-water {} B), iterations in current task ok",
+                heap_low_water()
             );
             // P3: periodic latency / WCET benchmark report.
             log::info!("[latency] {}", latency_metrics::report());
