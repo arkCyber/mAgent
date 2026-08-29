@@ -1323,6 +1323,26 @@ mod tests {
     }
 
     #[test]
+    fn conversation_is_bounded_at_max_messages() {
+        // The embedded conversation is a heapless
+        // `Vec<Message, MAX_CONVERSATION_MESSAGES>` (cap 20). Adding beyond it
+        // must fail with `BufferOverflow`, so the firmware memory footprint
+        // stays bounded — a long session cannot grow the conversation
+        // unboundedly on the S3's PSRAM (REQ-SCHED-001 / mem-3).
+        let mut agent = MiniAgent::new(make_cfg()).expect("agent");
+        for i in 0..MAX_CONVERSATION_MESSAGES {
+            agent
+                .add_message("user", &format!("m{i}"))
+                .expect("fill to cap");
+        }
+        assert_eq!(agent.conversation.len(), MAX_CONVERSATION_MESSAGES);
+        let err = agent
+            .add_message("user", "overflow")
+            .expect_err("cap exceeded");
+        assert!(matches!(err, AgentError::BufferOverflow { .. }));
+    }
+
+    #[test]
     fn pick_tool_routes_led_to_write_gpio() {
         let agent = MiniAgent::new(make_cfg()).expect("agent");
         let (name, _) = agent.pick_tool("Turn on the LED");
