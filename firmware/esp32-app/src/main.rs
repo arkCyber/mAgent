@@ -1583,7 +1583,12 @@ fn run_agent_loop(
     let config = AgentConfig::new()
         .with_name(agent_name)
         .and_then(|c| c.with_max_iterations(20))
-        .and_then(|c| c.with_max_memory(512 * 1024))
+        // REQ-SCHED-001 / mem-1: the memory budget scales with the board. The
+        // C61 (2 MB PSRAM) stays at 512 KiB; the S3 (8 MB octal, via the
+        // `s3-8mb-psram` feature) uses the larger 2 MiB dynamic-context budget.
+        // (The embedded MiniAgent is heapless-bounded, so this is a headroom
+        // ceiling — not a request for the agent to actually consume it.)
+        .and_then(|c| c.with_max_memory(magent_core::MAX_DYNAMIC_CONTEXT_BYTES as u32))
         .ok();
     let Some(config) = config else {
         // Config is compile-time constants — unreachable in practice.
