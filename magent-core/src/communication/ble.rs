@@ -234,3 +234,139 @@ impl BleMessage {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+
+    #[test]
+    fn client_new_and_with_defaults() {
+        let c = BleClient::new(5000);
+        assert_eq!(c.timeout_ms, 5000);
+        assert!(!c.is_connected());
+        assert_eq!(BleClient::with_defaults().timeout_ms, 30000);
+    }
+
+    #[test]
+    fn connect_and_disconnect_flip_state() {
+        let mut c = BleClient::new(1000);
+        assert!(!c.is_connected());
+        assert!(block_on(c.connect()).is_ok());
+        assert!(c.is_connected());
+        assert!(block_on(c.disconnect()).is_ok());
+        assert!(!c.is_connected());
+    }
+
+    #[test]
+    fn send_request_fails_when_disconnected() {
+        let c = BleClient::new(1000);
+        let err = block_on(c.send_request("temperature")).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::NetworkConnectionFailed {
+                reason: NetworkError::ConnectionRefused
+            }
+        ));
+    }
+
+    #[test]
+    fn send_request_returns_keyword_responses() {
+        let mut c = BleClient::new(1000);
+        assert!(block_on(c.connect()).is_ok());
+        assert_eq!(
+            block_on(c.send_request("what is temperature"))
+                .unwrap()
+                .as_str(),
+            "The current temperature is 25.5°C"
+        );
+        assert_eq!(
+            block_on(c.send_request("turn LED on")).unwrap().as_str(),
+            "LED has been turned on"
+        );
+        assert_eq!(
+            block_on(c.send_request("read flash")).unwrap().as_str(),
+            "Configuration read from flash successfully"
+        );
+        assert_eq!(
+            block_on(c.send_request("hello")).unwrap().as_str(),
+            "Task completed successfully"
+        );
+    }
+
+    #[test]
+    fn send_request_rejects_overlong_prompt() {
+        let mut c = BleClient::new(1000);
+        assert!(block_on(c.connect()).is_ok());
+        let long = "x".repeat(MAX_MESSAGE_SIZE + 1);
+        let err = block_on(c.send_request(&long)).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::InputValidationFailed {
+                field: "prompt",
+                reason: crate::error::ValidationError::TooLong
+            }
+        ));
+    }
+
+    #[test]
+    fn send_tool_result_requires_connection() {
+        let result = ToolResult {
+            tool_name: heapless::String::try_from("noop").unwrap(),
+            data: heapless::String::try_from("ok").unwrap(),
+            success: true,
+            error: None,
+        };
+        let c = BleClient::new(1000);
+        assert!(block_on(c.send_tool_result(&result)).is_err());
+
+        let mut c2 = BleClient::new(1000);
+        assert!(block_on(c2.connect()).is_ok());
+        assert!(block_on(c2.send_tool_result(&result)).is_ok());
+    }
+
+    #[test]
+    fn receive_response_returns_llm_response() {
+        let mut c = BleClient::new(1000);
+        assert!(block_on(c.connect()).is_ok());
+        let resp = block_on(c.receive_response()).unwrap();
+        assert_eq!(resp.content.as_str(), "Response content");
+        assert!(resp.tool_calls.is_empty());
+        assert_eq!(resp.finish_reason.as_str(), "stop");
+    }
+
+    #[test]
+    fn ble_message_new_validates_payload_length() {
+        assert!(BleMessage::new(MessageType::LlmRequest, 1, "hi").is_ok());
+        let long = "y".repeat(MAX_MESSAGE_SIZE + 1);
+        let err = BleMessage::new(MessageType::LlmRequest, 1, &long).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::InputValidationFailed {
+                field: "payload",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ble_message_bytes_round_trip() {
+        let msg = BleMessage::new(MessageType::ToolResult, 42, "payload").unwrap();
+        let bytes = msg.to_bytes().unwrap();
+        let back = BleMessage::from_bytes(&bytes).unwrap();
+        assert_eq!(back.message_type, MessageType::ToolResult);
+        assert_eq!(back.message_id, 42);
+        assert_eq!(back.payload.as_str(), "payload");
+    }
+
+    #[test]
+    fn ble_message_from_bytes_rejects_garbage() {
+        assert!(BleMessage::from_bytes(&[0xff, 0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn message_type_is_stable() {
+        assert_eq!(MessageType::LlmRequest as u8, 0);
+        assert_eq!(MessageType::Error as u8, 5);
+    }
+}

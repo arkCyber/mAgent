@@ -247,7 +247,9 @@ mod tests {
         // The S3 8 MB octal PSRAM profile raises the budget ceiling to 4 MiB
         // but still rejects anything above it (heap-blast guard) and zero.
         assert_eq!(MAX_CONFIGURABLE_MEMORY, 4 * 1024 * 1024);
-        assert!(AgentConfig::default().with_max_memory(4 * 1024 * 1024).is_ok());
+        assert!(AgentConfig::default()
+            .with_max_memory(4 * 1024 * 1024)
+            .is_ok());
         assert!(AgentConfig::default()
             .with_max_memory(4 * 1024 * 1024 + 1)
             .is_err());
@@ -260,5 +262,164 @@ mod tests {
         // Without the S3 large-heap profile (C61 / host), the ceiling stays
         // at the C61's 2 MB PSRAM budget of 1 MiB.
         assert_eq!(MAX_CONFIGURABLE_MEMORY, 1024 * 1024);
+    }
+
+    #[test]
+    fn validate_rejects_empty_name() {
+        let err = AgentConfig {
+            name: heapless::String::new(),
+            ..AgentConfig::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::ConfigurationError {
+                field: "name",
+                reason: ConfigError::Empty
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_bad_ranges() {
+        // max_iterations
+        assert!(matches!(
+            AgentConfig {
+                max_iterations: 0,
+                ..AgentConfig::default()
+            }
+            .validate(),
+            Err(AgentError::ConfigurationError {
+                field: "max_iterations",
+                ..
+            })
+        ));
+        assert!(matches!(
+            AgentConfig {
+                max_iterations: 1001,
+                ..AgentConfig::default()
+            }
+            .validate(),
+            Err(AgentError::ConfigurationError {
+                field: "max_iterations",
+                ..
+            })
+        ));
+
+        // max_memory
+        assert!(matches!(
+            AgentConfig {
+                max_memory: 0,
+                ..AgentConfig::default()
+            }
+            .validate(),
+            Err(AgentError::ConfigurationError {
+                field: "max_memory",
+                ..
+            })
+        ));
+        assert!(matches!(
+            AgentConfig {
+                max_memory: MAX_CONFIGURABLE_MEMORY + 1,
+                ..AgentConfig::default()
+            }
+            .validate(),
+            Err(AgentError::ConfigurationError {
+                field: "max_memory",
+                ..
+            })
+        ));
+
+        // watchdog (upper bound)
+        assert!(matches!(
+            AgentConfig {
+                watchdog_timeout_secs: 61,
+                ..AgentConfig::default()
+            }
+            .validate(),
+            Err(AgentError::ConfigurationError {
+                field: "watchdog_timeout_secs",
+                ..
+            })
+        ));
+
+        // ble (upper bound)
+        assert!(matches!(
+            AgentConfig {
+                ble_timeout_secs: 121,
+                ..AgentConfig::default()
+            }
+            .validate(),
+            Err(AgentError::ConfigurationError {
+                field: "ble_timeout_secs",
+                ..
+            })
+        ));
+
+        // max_skills (lower + upper)
+        assert!(matches!(
+            AgentConfig {
+                max_skills: 0,
+                ..AgentConfig::default()
+            }
+            .validate(),
+            Err(AgentError::ConfigurationError {
+                field: "max_skills",
+                ..
+            })
+        ));
+        assert!(matches!(
+            AgentConfig {
+                max_skills: 51,
+                ..AgentConfig::default()
+            }
+            .validate(),
+            Err(AgentError::ConfigurationError {
+                field: "max_skills",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_defaults() {
+        assert!(AgentConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn builder_with_name_validates_length() {
+        let ok = AgentConfig::default().with_name("assistant").unwrap();
+        assert_eq!(ok.name.as_str(), "assistant");
+        assert!(AgentConfig::default().with_name(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn builder_with_max_iterations_validates() {
+        assert_eq!(
+            AgentConfig::default()
+                .with_max_iterations(50)
+                .unwrap()
+                .max_iterations,
+            50
+        );
+        assert!(AgentConfig::default().with_max_iterations(0).is_err());
+        assert!(AgentConfig::default().with_max_iterations(1001).is_err());
+    }
+
+    #[test]
+    fn bytes_round_trip() {
+        let c = AgentConfig::default()
+            .with_name("prod-agent")
+            .unwrap()
+            .with_max_iterations(42)
+            .unwrap();
+        let bytes = c.to_bytes().unwrap();
+        let back = AgentConfig::from_bytes(&bytes).unwrap();
+        assert_eq!(back.name, c.name);
+        assert_eq!(back.max_iterations, c.max_iterations);
+        assert_eq!(back.max_memory, c.max_memory);
+        // Malformed bytes must be rejected as an error, never panic.
+        assert!(AgentConfig::from_bytes(&[0xff, 0xff, 0xff, 0xff]).is_err());
     }
 }

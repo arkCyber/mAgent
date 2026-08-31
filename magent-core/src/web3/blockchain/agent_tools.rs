@@ -423,8 +423,12 @@ pub fn wei_to_eth(wei: u128) -> f64 {
 pub fn wei_to_eth_string(wei: u128) -> String {
     let whole = wei / 1_000_000_000_000_000_000;
     let frac = wei % 1_000_000_000_000_000_000;
-    // 6 decimal places of the fractional part.
-    let frac6 = frac / 1_000_000_000_000_000;
+    // 6 decimal places of the fractional part. 1 ETH = 1e18 wei, and the
+    // 6th decimal place is 1e12 wei, so the 6-digit fractional part is
+    // `frac / 1e12`. (HARDENING: previously this divided by 1e15, which
+    // yielded only the thousands-place digit — e.g. 0.123456 ETH rendered
+    // as "0.000123 ETH".)
+    let frac6 = frac / 1_000_000_000_000;
     alloc::format!("{}.{:06} ETH", whole, frac6)
 }
 
@@ -1509,13 +1513,18 @@ mod tests {
 
     #[test]
     fn test_wei_to_eth_string_uses_integer_arithmetic() {
-        // 1_234_567_000_000_000_000 wei = 1.234567 ETH. Integer
-        // math yields `whole=1`, `frac=234_567_000_000_000_000`,
-        // `frac6 = frac/10^15 = 234`. So the last decimal drops
-        // off — verified to ensure no hidden f64 rounding sneaks in.
-        assert_eq!(wei_to_eth_string(1_234_567_000_000_000_000), "1.000234 ETH");
+        // 1_234_567_000_000_000_000 wei = 1.234567 ETH. Integer math
+        // yields `whole=1`, `frac=234_567_000_000_000_000`, and
+        // `frac6 = frac/10^12 = 234567` — the correct six decimal
+        // places, verified to ensure no hidden f64 rounding sneaks in.
+        // (Regression: the fractional divisor used to be 10^15, which
+        // dropped the last three decimals — 1.234567 ETH rendered as
+        // "1.000234 ETH".)
+        assert_eq!(wei_to_eth_string(1_234_567_000_000_000_000), "1.234567 ETH");
         assert_eq!(wei_to_eth_string(WEI_PER_ETH), "1.000000 ETH");
         assert_eq!(wei_to_eth_string(0), "0.000000 ETH");
+        // A pure-fraction value also rounds to six correct decimals.
+        assert_eq!(wei_to_eth_string(123_456_789_000_000_000), "0.123456 ETH");
     }
 
     #[test]
@@ -1582,5 +1591,122 @@ mod tests {
         assert!(m.get_pending_status().is_none());
         m.switch_chain("http://polygon", 137).unwrap();
         assert!(m.get_pending_status().is_none());
+    }
+
+    #[test]
+    fn test_wei_eth_conversions() {
+        assert_eq!(wei_to_eth(WEI_PER_ETH), 1.0);
+        assert_eq!(wei_to_eth(0), 0.0);
+        assert_eq!(wei_to_eth_string(123_456_789_000_000_000), "0.123456 ETH");
+        assert_eq!(wei_to_eth_string(0), "0.000000 ETH");
+        assert_eq!(wei_to_eth_string(WEI_PER_ETH), "1.000000 ETH");
+        // gwei <-> wei
+        assert_eq!(gwei_to_wei(1), GWEI_PER_ETH);
+        assert_eq!(gwei_to_wei(0), 0);
+        assert_eq!(wei_to_gwei(GWEI_PER_ETH), 1);
+        assert_eq!(wei_to_gwei(999), 0); // truncates fractional gwei
+    }
+
+    #[test]
+    fn test_sign_and_verify_message() {
+        use crate::web3::Identity;
+        let identity = Identity::from_secret_bytes(&[42u8; 32]).unwrap();
+        let msg = "hello world";
+        let res = sign_message(&identity, msg);
+        assert!(res.success);
+        // Extract the 128-char hex signature from the success payload.
+        let sig = res
+            .data
+            .split("Signature: ")
+            .nth(1)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(sig.len(), 128);
+        // Correct signature over the same message verifies.
+        assert!(verify_signature(&identity, msg, &sig).success);
+        // Tampered message fails verification.
+        assert!(!verify_signature(&identity, "tampered", &sig).success);
+        // Malformed hex is rejected up front.
+        assert!(!verify_signature(&identity, msg, "zz").success);
+    }
+
+    #[test]
+    fn test_create_blockchain_tools_returns_eight() {
+        let tools = create_blockchain_tools();
+        assert_eq!(tools.len(), 8);
+        let names = tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<std::vec::Vec<_>>();
+        for expected in [
+            "get_balance",
+            "get_nonce",
+            "get_gas_price",
+            "get_block_number",
+            "send_transaction",
+            "poll_transaction",
+            "blockchain_status",
+            "sign_message",
+        ] {
+            assert!(names.contains(&expected), "missing tool {expected}");
+        }
+    }
+
+    #[test]
+    fn test_register_blockchain_tools_only_populates_registry() {
+        let mut registry = crate::tools::ToolRegistry::new();
+        let n = register_blockchain_tools_only(&mut registry);
+        assert_eq!(n, 8);
+        assert_eq!(registry.count(), 8);
+        assert!(registry.has_tool("get_balance"));
+        assert!(registry.has_tool("sign_message"));
+    }
+
+    #[test]
+    fn test_run_blockchain_tool_dispatches() {
+        let mut manager = BlockchainManager::new("https://eth.llamarpc.com", 1);
+        let unknown = run_blockchain_tool(&mut manager, "bogus", "{}");
+        assert!(!unknown.success);
+        assert!(unknown.error.unwrap().contains("Unknown blockchain tool"));
+        // get_balance on an uninitialised manager fails gracefully.
+        let balance = run_blockchain_tool(&mut manager, "get_balance", "{}");
+        assert!(!balance.success);
+    }
+
+    #[test]
+    fn test_manager_switch_chain_reset_and_getters() {
+        let mut manager = BlockchainManager::new("https://eth.llamarpc.com", 1)
+            .with_poll_interval(10_000)
+            .with_max_attempts(120);
+        assert_eq!(manager.rpc_url(), "https://eth.llamarpc.com");
+        assert_eq!(manager.poll_interval_ms(), 10_000);
+        assert_eq!(manager.max_attempts(), 120);
+        assert_eq!(manager.chain_id(), 1);
+
+        // switch_chain is pure field-update + re-init (no network I/O).
+        manager
+            .switch_chain("https://polygon-rpc.com", 137)
+            .unwrap();
+        assert_eq!(manager.chain_id(), 137);
+        assert_eq!(manager.rpc_url(), "https://polygon-rpc.com");
+        assert!(manager.is_initialized());
+
+        manager.reset();
+        assert!(!manager.is_initialized());
+    }
+
+    #[test]
+    fn test_blockchain_manager_holder() {
+        let holder = BlockchainManagerHolder::new();
+        assert_eq!(holder.chain_id(), 1);
+        assert_eq!(
+            holder.blockchain_manager().rpc_url(),
+            "https://eth.llamarpc.com"
+        );
+
+        let custom = BlockchainManagerHolder::with_rpc("https://polygon-rpc.com", 137);
+        assert_eq!(custom.chain_id(), 137);
+        assert_eq!(BlockchainManagerHolder::default().chain_id(), 1);
     }
 }

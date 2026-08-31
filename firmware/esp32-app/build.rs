@@ -30,6 +30,16 @@
 use std::env;
 use std::path::Path;
 
+/// True when compiling for the RISC-V (C61) target, where `sysenv_stubs.c`
+/// is needed by stable Rust's Unix PAL. False for the Xtensa (S3) target,
+/// where the ESP-IDF std provides the same symbols and the RISC-V stub
+/// archive would be the wrong ELF format (EM 243) on the Xtensa linker.
+fn is_riscv_target() -> bool {
+    env::var("TARGET")
+        .map(|t| t.starts_with("riscv") || t.contains("esp32c"))
+        .unwrap_or(false)
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=sdkconfig.defaults");
     println!("cargo:rerun-if-changed=build.rs");
@@ -54,6 +64,12 @@ fn main() {
         }
     }
 
+    // sysenv_stubs.c is a RISC-V (C61) std/PAL shim, compiled with the
+    // RISC-V cross GCC (below). The Xtensa (S3) build must NOT link it: the
+    // ESP-IDF std on Xtensa provides these symbols itself, and the RISC-V
+    // object is the wrong-format (EM 243) for the Xtensa linker. Only
+    // compile+link it for RISC-V targets.
+    if is_riscv_target() {
     // Compile the POSIX-syscall stub library for stable Rust's
     // Unix PAL. ESP-IDF's libc extensions provide real
     // implementations on nightly Rust, but on stable we have to
@@ -133,6 +149,7 @@ fn main() {
         // Fallback: emit `-l` form (works in most setups).
         println!("cargo:rustc-link-lib=static=sysenv_stubs");
     }
+    } // end if is_riscv_target()
 
     // PATCHED (MicroAgent): patch sections.ld to convert hard ASSERT
     // statements into comments. The defmt crate emits `.defmt.end`
@@ -142,6 +159,15 @@ fn main() {
     // "The gap between .flash.rodata and .flash.init_array must not exist".
     // See the `patch_sections_ld()` function for the search strategy.
     patch_sections_ld();
+
+    // Detect whether the effective ESP-IDF build enables the Task Watchdog
+    // (`CONFIG_ESP_TASK_WDT_EN=y`) and, if so, emit `cargo:rustc-cfg=rt_wdt`.
+    // `rt_watchdog.rs` then compiles its `esp_task_wdt_*` calls (armed RT
+    // watchdog) on builds that enable it, and degrades to a no-op on builds
+    // that don't (e.g. the S3, where `sdkconfig.s3.defaults` sets it =n) —
+    // keeping the firmware linkable in both cases.
+    println!("cargo:rustc-check-cfg=cfg(rt_wdt)");
+    detect_rt_wdt();
 }
 
 /// Split a space-separated argument list while respecting single
@@ -166,6 +192,74 @@ fn split_args(s: &str) -> Vec<String> {
         out.push(current);
     }
     out
+}
+
+/// Detect whether the effective ESP-IDF build has the Task Watchdog enabled
+/// (`CONFIG_ESP_TASK_WDT_EN=y`). If so, emit `cargo:rustc-cfg=rt_wdt` so
+/// `rt_watchdog.rs` compiles its `esp_task_wdt_*` calls; otherwise leave the
+/// cfg unset and `rt_watchdog` degrades to a no-op.
+///
+/// This keeps the firmware linkable on builds where the task WDT is disabled
+/// (notably the ESP32-S3: `sdkconfig.s3.defaults` sets
+/// `CONFIG_ESP_TASK_WDT_EN=n`, so `esp_task_wdt.c` is not compiled and the
+/// symbols are absent), while still arming the RT watchdog on builds that do
+/// enable it. **Best-effort**: any failure here simply leaves `rt_wdt` unset
+/// (watchdog off), never breaks the build.
+fn detect_rt_wdt() {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // Prefer paths derived from the esp-idf-sys link args (`-L <base>` where
+    // `<base>/esp-idf` is the PlatformIO project dir hosting the sdkconfig).
+    if let Ok(args) = env::var("DEP_ESP_IDF_EMBUILD_LINK_ARGS") {
+        for arg in split_args(&args) {
+            if let Some(dir) = arg.strip_prefix("-L") {
+                let base = dir.trim_end_matches('/');
+                for profile in ["release", "debug"] {
+                    candidates.push(Path::new(base)
+                        .join(format!(".pio/build/{profile}/config/sdkconfig.json")));
+                    candidates.push(Path::new(base)
+                        .join(format!("esp-idf/.pio/build/{profile}/config/sdkconfig.json")));
+                }
+            }
+        }
+    }
+
+    // Fallback: walk the target tree for any esp-idf-sys generated sdkconfig.
+    if let Ok(out_dir) = env::var("OUT_DIR") {
+        let mut cur = Path::new(&out_dir).to_path_buf();
+        for _ in 0..20 {
+            match cur.parent() {
+                Some(p) => cur = p.to_path_buf(),
+                None => break,
+            }
+            if cur.file_name().map_or(false, |n| n == "target") {
+                if let Ok(entries) = std::fs::read_dir(&cur) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_dir()
+                            && p.file_name().map_or(false, |n| {
+                                n.to_string_lossy().starts_with("esp-idf-sys-")
+                            })
+                        {
+                            candidates.push(p.join(
+                                "out/esp-idf/.pio/build/release/config/sdkconfig.json",
+                            ));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    for c in candidates {
+        if let Ok(text) = std::fs::read_to_string(&c) {
+            if text.contains("\"ESP_TASK_WDT_EN\": true") {
+                println!("cargo:rustc-cfg=rt_wdt");
+                return;
+            }
+        }
+    }
 }
 
 /// Locate and patch the esp-idf-sys-generated `sections.ld` linker script.

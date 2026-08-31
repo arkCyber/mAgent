@@ -230,17 +230,28 @@ pub fn persist_to_nvs(handle: &TimeSyncHandle, save_fn: impl FnOnce(&str) -> boo
 /// progress / log if it doesn't see a sync.
 pub fn wait_for_first_sync(sntp: &EspSntp<'_>, timeout_ms: u64) -> bool {
     let start = monotonic_ms();
-    let mut last_log = start;
+    // Progress log with exponential backoff so a long wait on a network with
+    // no NTP access (e.g. a phone hotspot) doesn't spam the console once per
+    // second for the whole timeout. First log at ~1s, then doubling up to a
+    // 60s cap.
+    let mut next_log = start.saturating_add(1000);
+    let mut backoff_ms: u64 = 1000;
+    const MAX_BACKOFF_MS: u64 = 60_000;
     loop {
         if sntp.get_sync_status() == SyncStatus::Completed {
             return true;
         }
-        if monotonic_ms().saturating_sub(start) > timeout_ms {
+        let now = monotonic_ms();
+        if now.saturating_sub(start) > timeout_ms {
             return false;
         }
-        if monotonic_ms().saturating_sub(last_log) > 1000 {
-            log::info!("[sntp] still waiting for first sync...");
-            last_log = monotonic_ms();
+        if now >= next_log {
+            log::info!(
+                "[sntp] still waiting for first sync ({}s elapsed)...",
+                now.saturating_sub(start) / 1000
+            );
+            backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+            next_log = now.saturating_add(backoff_ms);
         }
         std::thread::sleep(Duration::from_millis(100));
     }

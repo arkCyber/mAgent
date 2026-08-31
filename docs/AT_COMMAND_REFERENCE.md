@@ -156,7 +156,7 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
-| `AT+BLE?` / `AT+BLE=` | `+CMDER:9` `ERROR` | Query / control BLE advertising state. | Parser + syntax validation implemented; the actual `BleServer` control op is still a placeholder pending shared-server wiring. |
+| `AT+BLE?` / `AT+BLE=<ON\|OFF\|STATE>` | `+BLE:<state>` / `OK` | Query / control BLE advertising state (`ON` start, `OFF` stop, `STATE`/`?` report). | Runs on the process-wide shared `BleServer` (`ble_config::shared_ble_server`) initialised at boot; `OFF` calls `esp_ble_gap_stop_advertising`. Built without `ble` feature → `+CMDER:9`. |
 | `AT+HTTPGET=<url>` | `OK` / body | Issue an HTTP GET to verify outbound reachability. | TLS via mbedTLS + CA certificate bundle (worker thread). |
 | `AT+LLMCFG=<model>,<api_key>` | `OK` | Set / query the LLM backend parameters (DeepSeek). | NVS-backed (`mag_at:llm_model` / `mag_at:llm_api_key`). |
 | `AT+LUAAPP=<b64>` | `OK` | Upload the Lua app source (base64) for the S3 Lua host; `AT+LUAAPP?` reports length. | `lua` feature (S3 only). |

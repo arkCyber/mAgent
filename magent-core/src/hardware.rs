@@ -366,3 +366,106 @@ impl PressureSensor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::SensorError;
+
+    #[test]
+    fn i2c_sensor_read_fails_before_init() {
+        let s = I2cSensor::new(0x40);
+        let err = s.read(0x00).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::SensorReadFailed {
+                sensor: "I2C",
+                reason: SensorError::NotInitialized
+            }
+        ));
+        assert!(s.write(0x01, 0xFF).is_err());
+    }
+
+    #[test]
+    fn i2c_sensor_init_then_read_and_write() {
+        let mut s = I2cSensor::new(0x40);
+        assert!(s.init().is_ok());
+        let data = s.read(0x00).unwrap();
+        assert_eq!(&data[..], &[25, 5]); // 25.0°C + 0.5°C fraction
+                                         // Unknown register returns an empty (but successful) read.
+        assert!(s.read(0x7F).unwrap().is_empty());
+        assert!(s.write(0x01, 0xFF).is_ok());
+    }
+
+    #[test]
+    fn spi_sensor_read_fails_before_init() {
+        let s = SpiSensor::new(5);
+        assert!(s.read(0x01).is_err());
+    }
+
+    #[test]
+    fn spi_sensor_init_then_read_axis() {
+        let mut s = SpiSensor::new(5);
+        assert!(s.init().is_ok());
+        let data = s.read(0x01).unwrap();
+        assert_eq!(&data[..], &[0x01, 0x00]); // X-axis raw
+        assert!(s.write(0x00, 0x00).is_ok());
+    }
+
+    #[test]
+    fn gpio_input_pin_rejects_set() {
+        let mut pin = GpioPin::new(2, GpioDirection::Input);
+        let err = pin.set(GpioState::High).unwrap_err();
+        assert!(matches!(err, AgentError::ConfigurationError { .. }));
+        // Reads work regardless of direction.
+        assert_eq!(pin.read().unwrap(), GpioState::Low);
+    }
+
+    #[test]
+    fn gpio_output_set_read_toggle() {
+        let mut pin = GpioPin::new(2, GpioDirection::Output);
+        assert_eq!(pin.read().unwrap(), GpioState::Low);
+        assert!(pin.set(GpioState::High).is_ok());
+        assert_eq!(pin.read().unwrap(), GpioState::High);
+        assert!(pin.toggle().is_ok());
+        assert_eq!(pin.read().unwrap(), GpioState::Low);
+        assert!(pin.toggle().is_ok());
+        assert_eq!(pin.read().unwrap(), GpioState::High);
+    }
+
+    #[test]
+    fn temperature_sensor_reports_celsius() {
+        let mut t = TemperatureSensor::new(0x48);
+        assert!(t.init().is_ok());
+        let temp = t.read_temperature().unwrap();
+        assert!((temp - 25.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn accelerometer_reports_axis_values() {
+        let mut a = Accelerometer::new(4);
+        assert!(a.init().is_ok());
+        let (x, y, z) = a.read_acceleration().unwrap();
+        // X-axis raw 0x0100 = 256 → 256/16384 g.
+        assert!((x - (256.0 / 16384.0)).abs() < 1e-6);
+        // Y/Z registers are not simulated → fallback values.
+        assert_eq!(y, 0.2);
+        assert_eq!(z, 9.8);
+    }
+
+    #[test]
+    fn humidity_sensor_reports_default() {
+        let mut h = HumiditySensor::new(0x27);
+        assert!(h.init().is_ok());
+        // Register 0x01 isn't filled by the I2C stub → fallback 65.0.
+        assert_eq!(h.read_humidity().unwrap(), 65.0);
+    }
+
+    #[test]
+    fn pressure_sensor_reports_default() {
+        let mut p = PressureSensor::new(0x76);
+        assert!(p.init().is_ok());
+        // Register 0x02 isn't filled by the I2C stub → fallback 1013.0.
+        assert_eq!(p.read_pressure().unwrap(), 1013.0);
+    }
+}

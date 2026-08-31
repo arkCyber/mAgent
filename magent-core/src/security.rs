@@ -494,3 +494,252 @@ impl Default for SecurityManager {
         Self::new()
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+/// Simulation-path tests: build with `std` but NOT `web3`, so `encrypt` /
+/// `decrypt` route through the XOR placeholder and `generate_auth_tag`
+/// through the simulator hash.
+#[cfg(all(test, feature = "std", not(feature = "web3")))]
+mod std_tests {
+    use super::*;
+
+    #[test]
+    fn new_defaults_are_secure() {
+        let sm = SecurityManager::new();
+        assert_eq!(sm.encryption_mode(), EncryptionMode::Aes128Ccm);
+        assert_eq!(sm.security_level(), SecurityLevel::High);
+        assert!(sm.is_encryption_enabled());
+        assert_eq!(
+            SecurityManager::default().security_level(),
+            SecurityLevel::High
+        );
+    }
+
+    #[test]
+    fn xor_encrypt_decrypt_round_trip() {
+        let sm = SecurityManager::new();
+        let ct = sm.encrypt(b"hello").unwrap();
+        assert_ne!(&ct[..], b"hello"); // actually transformed
+        let pt = sm.decrypt(&ct).unwrap();
+        assert_eq!(&pt[..], b"hello");
+    }
+
+    #[test]
+    fn disabled_encryption_is_passthrough() {
+        let mut sm = SecurityManager::new();
+        sm.disable_encryption();
+        assert!(!sm.is_encryption_enabled());
+        let ct = sm.encrypt(b"data").unwrap();
+        assert_eq!(&ct[..], b"data");
+        assert_eq!(sm.decrypt(b"data").unwrap().as_slice(), b"data");
+    }
+
+    #[test]
+    fn set_mode_and_level() {
+        let mut sm = SecurityManager::new();
+        sm.set_encryption_mode(EncryptionMode::Aes256Ccm).unwrap();
+        assert_eq!(sm.encryption_mode(), EncryptionMode::Aes256Ccm);
+        sm.set_security_level(SecurityLevel::Low).unwrap();
+        assert_eq!(sm.security_level(), SecurityLevel::Low);
+    }
+
+    #[test]
+    fn auth_tag_round_trip() {
+        let sm = SecurityManager::new();
+        let tag = sm.generate_auth_tag(b"payload").unwrap();
+        assert!(!tag.as_str().is_empty());
+        assert!(sm.verify_auth_tag(b"payload", tag.as_str()).unwrap());
+        assert!(!sm.verify_auth_tag(b"tampered", tag.as_str()).unwrap());
+    }
+}
+
+/// Real-crypto tests: build with `web3`, so `encrypt` / `decrypt` use real
+/// AES-128-GCM and `generate_auth_tag` uses HMAC-SHA-256.
+#[cfg(all(test, feature = "web3"))]
+mod web3_tests {
+    use super::*;
+
+    #[test]
+    fn aes_gcm_encrypt_decrypt_round_trip() {
+        let sm = SecurityManager::new();
+        let ct = sm.encrypt(b"hello world").unwrap();
+        // Layout: 12-byte nonce + (plaintext + 16-byte tag).
+        assert_eq!(ct.len(), 12 + b"hello world".len() + 16);
+        let pt = sm.decrypt(&ct).unwrap();
+        assert_eq!(&pt[..], b"hello world");
+    }
+
+    #[test]
+    fn distinct_encrypts_yield_distinct_ciphertexts() {
+        // Monotonic counter ⇒ distinct nonces ⇒ distinct ciphertexts for the
+        // same plaintext (GCM nonce-misuse-resistance).
+        let sm = SecurityManager::new();
+        let a = sm.encrypt(b"same").unwrap();
+        let b = sm.encrypt(b"same").unwrap();
+        assert_ne!(&a[..], &b[..]);
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails_authentication() {
+        let sm = SecurityManager::new();
+        let mut ct = sm.encrypt(b"secret").unwrap();
+        // Flip a byte inside the payload (past the 12-byte nonce).
+        let idx = ct.len() - 5;
+        ct[idx] ^= 0x01;
+        let err = sm.decrypt(&ct).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::CryptoError {
+                reason: crate::error::EncryptionError::AuthenticationFailed
+            }
+        ));
+    }
+
+    #[test]
+    fn disabled_encryption_is_passthrough() {
+        let mut sm = SecurityManager::new();
+        sm.disable_encryption();
+        assert_eq!(sm.encrypt(b"data").unwrap().as_slice(), b"data");
+    }
+
+    #[test]
+    fn auth_tag_round_trip_and_rejects_tamper() {
+        let sm = SecurityManager::new();
+        let tag = sm.generate_auth_tag(b"authenticated").unwrap();
+        assert_eq!(tag.len(), 16); // 16 hex chars
+        assert!(sm.verify_auth_tag(b"authenticated", tag.as_str()).unwrap());
+        assert!(!sm.verify_auth_tag(b"authenticated!", tag.as_str()).unwrap());
+    }
+
+    #[test]
+    fn direct_encrypt_aes_gcm_round_trip() {
+        let ct = real_crypto::encrypt_aes_gcm(7, b"direct").unwrap();
+        assert_eq!(ct.len(), 12 + b"direct".len() + 16);
+        let pt = real_crypto::decrypt_aes_gcm(&ct).unwrap();
+        assert_eq!(&pt[..], b"direct");
+    }
+
+    #[test]
+    fn direct_encrypt_aes_gcm_rejects_oversized_plaintext() {
+        let big = [0u8; 485]; // > 512 - 12 - 16 = 484
+        let err = real_crypto::encrypt_aes_gcm(0, &big).unwrap_err();
+        assert!(matches!(err, AgentError::BufferOverflow { .. }));
+    }
+
+    #[test]
+    fn direct_decrypt_aes_gcm_rejects_short_ciphertext() {
+        let short = [0u8; 20]; // < nonce(12) + tag(16)
+        let err = real_crypto::decrypt_aes_gcm(&short).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::CryptoError {
+                reason: crate::error::EncryptionError::InvalidCiphertext
+            }
+        ));
+    }
+
+    #[test]
+    fn hmac_sha256_tag_is_16_hex_chars() {
+        let tag = real_crypto::hmac_sha256_tag(b"data").unwrap();
+        assert_eq!(tag.len(), 16);
+        assert!(tag.as_str().chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn nonce_varies_with_counter_and_length() {
+        // `real_crypto::nonce_for` is a private helper; we assert its
+        // contract indirectly through distinct ciphertexts in
+        // `distinct_encrypts_yield_distinct_ciphertexts` and by checking
+        // the direct encrypt/decrypt round-trip is length-stable.
+        let ct = real_crypto::encrypt_aes_gcm(1, b"abc").unwrap();
+        let ct2 = real_crypto::encrypt_aes_gcm(2, b"abc").unwrap();
+        assert_ne!(&ct[..], &ct2[..]);
+        assert_eq!(ct.len(), ct2.len());
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_length_mismatch() {
+        assert!(crate::security::constant_time_eq(b"abc", b"abc"));
+        assert!(!crate::security::constant_time_eq(b"abc", b"abcd"));
+        assert!(!crate::security::constant_time_eq(b"abc", b"abd"));
+    }
+
+    #[test]
+    fn aes_gcm_matches_nist_kat() {
+        // NIST GCM spec (McGrew & Viega) AES-128-GCM, Test Case 2.
+        // Encrypting P with K/IV must yield exactly C || T — a published
+        // reference answer that pins our wiring of the `aes-gcm` crate
+        // (key sizing, IV length, tag placement) to a known-good vector.
+        // (Vector re-derived and cross-checked against the `cryptography`
+        //  library: C = 0388dace60b6a392f328c2b971b2fe78,
+        //              T = ab6e47d42cec13bdf53a67b21257bddf.)
+        use aead::{Aead, KeyInit};
+        use aes_gcm::{Aes128Gcm, Key, Nonce};
+
+        const K: [u8; 16] = [0u8; 16];
+        const IV: [u8; 12] = [0u8; 12];
+        const P: &[u8] = &[0u8; 16];
+        const EXPECTED_CT_TAG: &[u8] = &[
+            0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92, 0xf3, 0x28, 0xc2, 0xb9, 0x71, 0xb2,
+            0xfe, 0x78, // ciphertext
+            0xab, 0x6e, 0x47, 0xd4, 0x2c, 0xec, 0x13, 0xbd, 0xf5, 0x3a, 0x67, 0xb2, 0x12, 0x57,
+            0xbd, 0xdf, // tag
+        ];
+
+        let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&K));
+        let nonce = Nonce::from_slice(&IV);
+
+        let out = cipher
+            .encrypt(nonce, P)
+            .expect("NIST KAT encrypt must succeed");
+        assert_eq!(
+            &out[..],
+            EXPECTED_CT_TAG,
+            "AES-128-GCM output must match the published NIST vector"
+        );
+
+        let plain = cipher
+            .decrypt(nonce, &*out)
+            .expect("NIST KAT decrypt must verify");
+        assert_eq!(&plain[..], P, "decrypt(encrypt(P)) must recover P");
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_kat() {
+        // RFC 4231 Test Case 1: 20 × 0x0b key over "Hi There". The full
+        // HMAC-SHA-256 is b0344c61d8db38535ca8afceaf0bf12b…; we render the
+        // first 8 bytes (16 hex chars), which is exactly the truncation
+        // `real_crypto::hmac_sha256_tag` uses on the wire.
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        const KEY: [u8; 20] = [0x0b; 20];
+        let mut mac =
+            <Hmac<Sha256> as Mac>::new_from_slice(&KEY).expect("valid 20-byte key");
+        mac.update(b"Hi There");
+        let bytes = mac.finalize().into_bytes();
+
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut got: heapless::String<16> = heapless::String::new();
+        for &b in bytes.iter().take(8) {
+            let _ = got.push(HEX[(b >> 4) as usize] as char);
+            let _ = got.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        assert_eq!(&got[..], "b0344c61d8db3853", "RFC 4231 TC1 HMAC-SHA-256");
+    }
+
+    #[test]
+    fn encrypt_nonce_prefix_encodes_counter() {
+        // `real_crypto` lays the 4-byte big-endian counter into the first 4
+        // bytes of the 12-byte nonce. Assert the wire prefix reflects the
+        // counter so nonce uniqueness is observable and regressions in the
+        // nonce derivation are caught.
+        let ct = real_crypto::encrypt_aes_gcm(0x0102_0304, b"x").unwrap();
+        assert_eq!(&ct[..4], &[0x01, 0x02, 0x03, 0x04]);
+        // Nonce length is 12 bytes regardless of message length.
+        assert_eq!(ct.len(), 12 + b"x".len() + 16);
+    }
+}

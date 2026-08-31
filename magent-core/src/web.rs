@@ -1366,4 +1366,68 @@ mod tests {
         let err = read_capped(std::io::Cursor::new(data), 10).unwrap_err();
         assert!(err.contains("size limit"));
     }
+
+    #[test]
+    fn wmo_description_covers_all_codes() {
+        assert_eq!(wmo_description(0), "Clear");
+        assert_eq!(wmo_description(1), "Mostly clear");
+        assert_eq!(wmo_description(2), "Partly cloudy");
+        assert_eq!(wmo_description(3), "Overcast");
+        assert_eq!(wmo_description(45), "Fog");
+        assert_eq!(wmo_description(48), "Fog");
+        assert_eq!(wmo_description(51), "Drizzle");
+        assert_eq!(wmo_description(55), "Drizzle");
+        assert_eq!(wmo_description(56), "Freezing drizzle");
+        assert_eq!(wmo_description(61), "Rain");
+        assert_eq!(wmo_description(66), "Freezing rain");
+        assert_eq!(wmo_description(71), "Snow");
+        assert_eq!(wmo_description(77), "Snow grains");
+        assert_eq!(wmo_description(80), "Rain showers");
+        assert_eq!(wmo_description(85), "Snow showers");
+        assert_eq!(wmo_description(95), "Thunderstorm");
+        assert_eq!(wmo_description(96), "Thunderstorm with hail");
+        // Anything else falls through to a safe default.
+        assert_eq!(wmo_description(999), "Unknown");
+    }
+
+    #[test]
+    fn web_search_missing_query_is_error_before_network() {
+        assert!(web_search("").unwrap_err().contains("missing 'query'"));
+        assert!(web_search("query=   ").unwrap_err().contains("empty query"));
+    }
+
+    #[test]
+    fn fetch_url_missing_url_is_error_before_network() {
+        assert!(fetch_url("").unwrap_err().contains("missing 'url'"));
+    }
+
+    #[test]
+    fn fetch_url_rejects_ssrf_target_before_network() {
+        // A private/loopback URL is refused by `validate_fetch_url` before
+        // any HTTP request is made — no network required.
+        let err = fetch_url("url=http://127.0.0.1/admin").unwrap_err();
+        assert!(
+            err.contains("non-public") || err.contains("loopback"),
+            "got: {err}"
+        );
+        let err2 = fetch_url("url=http://169.254.169.254/latest/meta-data").unwrap_err();
+        assert!(err2.contains("non-public"), "got: {err2}");
+    }
+
+    #[test]
+    fn fetch_url_rejects_non_http_scheme_before_network() {
+        let err = fetch_url("url=ftp://example.com/file").unwrap_err();
+        assert!(err.contains("non-http(s)"), "got: {err}");
+    }
+
+    #[test]
+    fn webpage_summary_missing_url_is_error_before_network() {
+        assert!(webpage_summary("").unwrap_err().contains("missing 'url'"));
+    }
+
+    #[test]
+    fn get_weather_missing_or_empty_city_is_error_before_network() {
+        assert!(get_weather("").unwrap_err().contains("missing 'city'"));
+        assert!(get_weather("city=   ").unwrap_err().contains("empty city"));
+    }
 }

@@ -761,4 +761,104 @@ mod tests {
         let body = result.unwrap();
         assert!(body.contains("error: get_weather failed"));
     }
+
+    #[test]
+    fn sim_flash_storage_read_write_erase() {
+        let mut flash = SimFlashStorage::new();
+        assert_eq!(flash.write_count(), 0);
+        // Initial state is all 0xFF.
+        assert_eq!(flash.read(0, 4).unwrap(), vec![0xFF, 0xFF, 0xFF, 0xFF]);
+        // Write and read back.
+        flash.write(0, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(flash.write_count(), 1);
+        assert_eq!(flash.read(0, 4).unwrap(), vec![1, 2, 3, 4]);
+        // Overlapping write.
+        flash.write(2, &[9, 9]).unwrap();
+        assert_eq!(flash.read(0, 4).unwrap(), vec![1, 2, 9, 9]);
+        // Erase resets a sector to 0xFF.
+        flash.erase_sector(0).unwrap();
+        assert_eq!(flash.read(0, 4).unwrap(), vec![0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn sim_flash_storage_rejects_out_of_bounds() {
+        let mut flash = SimFlashStorage::new();
+        // Read past the end → StorageReadFailed.
+        assert!(matches!(
+            flash.read(65530, 10),
+            Err(AgentError::StorageReadFailed { .. })
+        ));
+        // Write past the end → StorageWriteFailed.
+        assert!(matches!(
+            flash.write(65534, &[1, 2, 3]),
+            Err(AgentError::StorageWriteFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn sim_gpio_controller_set_get_toggle() {
+        let mut gpio = SimGpioController::new();
+        assert_eq!(gpio.get_pin(0).unwrap(), GpioPinState::Low);
+        gpio.set_pin(5, GpioPinState::High).unwrap();
+        assert_eq!(gpio.get_pin(5).unwrap(), GpioPinState::High);
+        gpio.toggle_pin(5).unwrap();
+        assert_eq!(gpio.get_pin(5).unwrap(), GpioPinState::Low);
+        gpio.toggle_pin(5).unwrap();
+        assert_eq!(gpio.get_pin(5).unwrap(), GpioPinState::High);
+        // Out-of-range pins are rejected for read and write.
+        assert!(matches!(
+            gpio.get_pin(32),
+            Err(AgentError::GpioOperationFailed { .. })
+        ));
+        assert!(matches!(
+            gpio.set_pin(32, GpioPinState::High),
+            Err(AgentError::GpioOperationFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn sim_ble_interface_connect_send() {
+        let mut ble = SimBleInterface::new();
+        assert!(!ble.is_connected());
+        // Send before connect is refused.
+        assert!(matches!(
+            ble.send("hi"),
+            Err(AgentError::NetworkConnectionFailed { .. })
+        ));
+        ble.connect().unwrap();
+        assert!(ble.is_connected());
+        ble.send("hello").unwrap();
+        ble.send("world").unwrap();
+        assert_eq!(ble.message_count(), 2);
+        assert_eq!(ble.last_message(), Some("world"));
+        ble.disconnect();
+        assert!(!ble.is_connected());
+        // Send after disconnect is refused again.
+        assert!(ble.send("late").is_err());
+    }
+
+    #[test]
+    fn sim_sensor_manager_reads_realistic_values() {
+        let mut s = SimSensorManager::new();
+        // Temperature near base (23.5) with small bounded variation.
+        let t = s.read_temperature();
+        assert!((18.0..=29.0).contains(&t), "temp {t}");
+        // Humidity near base (55).
+        let h = s.read_humidity();
+        assert!((45.0..=65.0).contains(&h), "humidity {h}");
+        // Pressure near base (1013).
+        let p = s.read_pressure();
+        assert!((1000.0..=1020.0).contains(&p), "pressure {p}");
+        // Accelerometer: z ≈ 9.8 with small noise, x/y ≈ 0.
+        let (x, y, z) = s.read_accelerometer();
+        assert!((z - 9.8).abs() < 0.1, "z {z}");
+        assert!(x.abs() < 0.1);
+        assert!(y.abs() < 0.1);
+        // Light within its cycle range.
+        let l = s.read_light();
+        assert!((10.0..=1000.0).contains(&l), "light {l}");
+        // Readings vary across iterations rather than being constant.
+        let t2 = s.read_temperature();
+        assert!(t != t2, "temperature should vary between reads");
+    }
 }

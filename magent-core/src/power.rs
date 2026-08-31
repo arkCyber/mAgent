@@ -169,10 +169,151 @@ impl PowerManager {
         let battery = self.read_battery_status();
         battery.voltage_mv < self.battery_threshold.get()
     }
+
+    /// Map a battery charge percentage to the power mode the firmware should
+    /// drop into, mirroring the nRF52840 `power.rs` model:
+    ///
+    /// * `0..=10` → [`PowerMode::DeepSleep`] (critical — preserve the last of
+    ///   the charge and wait for a charge source).
+    /// * `11..=25` → [`PowerMode::LowPower`] (economy — throttled peripherals,
+    ///   reduced sensor cadence).
+    /// * anything else → [`PowerMode::Active`] (full performance).
+    ///
+    /// The input is clamped to `0..=100` so a corrupt ADC reading can never
+    /// select an unintended mode.
+    pub fn optimize_for_battery(battery_level: u8) -> PowerMode {
+        let level = battery_level.min(100);
+        match level {
+            0..=10 => PowerMode::DeepSleep,
+            11..=25 => PowerMode::LowPower,
+            _ => PowerMode::Active,
+        }
+    }
 }
 
 impl Default for PowerManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_defaults_to_active_with_3300mv_threshold() {
+        let pm = PowerManager::new();
+        assert_eq!(pm.current_mode(), PowerMode::Active);
+        assert_eq!(pm.battery_threshold(), 3300);
+        assert_eq!(PowerManager::default().current_mode(), PowerMode::Active);
+    }
+
+    #[test]
+    fn set_mode_allows_permissive_downward_sequence() {
+        // Active → Idle → LowPower → DeepSleep → Active is the canonical
+        // sleep-orchestration sequence and must succeed end-to-end.
+        let pm = PowerManager::new();
+        assert!(pm.set_mode(PowerMode::Idle).is_ok());
+        assert_eq!(pm.current_mode(), PowerMode::Idle);
+        assert!(pm.set_mode(PowerMode::LowPower).is_ok());
+        assert_eq!(pm.current_mode(), PowerMode::LowPower);
+        assert!(pm.set_mode(PowerMode::DeepSleep).is_ok());
+        assert_eq!(pm.current_mode(), PowerMode::DeepSleep);
+        assert!(pm.set_mode(PowerMode::Active).is_ok());
+        assert_eq!(pm.current_mode(), PowerMode::Active);
+    }
+
+    #[test]
+    fn noop_transition_is_allowed() {
+        let pm = PowerManager::new();
+        assert!(pm.set_mode(PowerMode::Active).is_ok());
+        assert_eq!(pm.current_mode(), PowerMode::Active);
+    }
+
+    #[test]
+    fn set_mode_rejects_upward_step_without_active() {
+        // DeepSleep → Idle is an "up" step that must round-trip through
+        // Active; the state machine rejects it.
+        let pm = PowerManager::new();
+        pm.set_mode(PowerMode::DeepSleep).unwrap();
+        let err = pm.set_mode(PowerMode::Idle).unwrap_err();
+        assert!(matches!(err, AgentError::InvalidStateTransition { .. }));
+    }
+
+    #[test]
+    fn invalid_transition_carries_from_and_to_names() {
+        let pm = PowerManager::new();
+        pm.set_mode(PowerMode::LowPower).unwrap();
+        let err = pm.set_mode(PowerMode::Idle).unwrap_err();
+        match err {
+            AgentError::InvalidStateTransition { from, to } => {
+                assert_eq!(from, "LowPower");
+                assert_eq!(to, "Idle");
+            }
+            other => panic!("expected InvalidStateTransition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convenience_entry_methods() {
+        let pm = PowerManager::new();
+        assert!(pm.enter_idle().is_ok());
+        assert_eq!(pm.current_mode(), PowerMode::Idle);
+        assert!(pm.enter_low_power().is_ok());
+        assert_eq!(pm.current_mode(), PowerMode::LowPower);
+        assert!(pm.enter_deep_sleep().is_ok());
+        assert_eq!(pm.current_mode(), PowerMode::DeepSleep);
+        assert!(pm.wake_up().is_ok());
+        assert_eq!(pm.current_mode(), PowerMode::Active);
+    }
+
+    #[test]
+    fn battery_threshold_get_set() {
+        let pm = PowerManager::new();
+        assert_eq!(pm.battery_threshold(), 3300);
+        pm.set_battery_threshold(3000);
+        assert_eq!(pm.battery_threshold(), 3000);
+    }
+
+    #[test]
+    fn should_enter_low_power_respects_threshold() {
+        let pm = PowerManager::new();
+        // Simulated battery reads 3700 mV; default threshold is 3300 mV.
+        assert!(!pm.should_enter_low_power());
+        // Raise the threshold above the simulated reading → low power.
+        pm.set_battery_threshold(4000);
+        assert!(pm.should_enter_low_power());
+    }
+
+    #[test]
+    fn read_battery_status_defaults() {
+        let pm = PowerManager::new();
+        let s = pm.read_battery_status();
+        assert_eq!(s.voltage_mv, 3700);
+        assert_eq!(s.percentage, 85);
+        assert!(!s.charging);
+        assert!(!s.low_battery);
+    }
+
+    #[test]
+    fn optimize_for_battery_maps_percent_to_mode() {
+        // Mirrors the nRF52840 firmware power model.
+        assert_eq!(PowerManager::optimize_for_battery(0), PowerMode::DeepSleep);
+        assert_eq!(PowerManager::optimize_for_battery(5), PowerMode::DeepSleep);
+        assert_eq!(PowerManager::optimize_for_battery(10), PowerMode::DeepSleep);
+        assert_eq!(PowerManager::optimize_for_battery(11), PowerMode::LowPower);
+        assert_eq!(PowerManager::optimize_for_battery(25), PowerMode::LowPower);
+        assert_eq!(PowerManager::optimize_for_battery(26), PowerMode::Active);
+        assert_eq!(PowerManager::optimize_for_battery(50), PowerMode::Active);
+        assert_eq!(PowerManager::optimize_for_battery(100), PowerMode::Active);
+    }
+
+    #[test]
+    fn optimize_for_battery_clamps_overflow() {
+        // A corrupt ADC reading above 100 must clamp to Active (never
+        // underflow / wrap into a lower-power band).
+        assert_eq!(PowerManager::optimize_for_battery(101), PowerMode::Active);
+        assert_eq!(PowerManager::optimize_for_battery(255), PowerMode::Active);
     }
 }

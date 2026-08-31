@@ -733,8 +733,20 @@ fn connect_wifi(
     // radio. We now propagate the overflow as a clear error so the AT
     // surface can return `+CMDER:7` ("password too long") instead of
     // silently flipping to a 0-byte credential.
-    let ssid_typed: HeaplessString<32> = HeaplessString::try_from(ssid)
-        .unwrap_or_else(|_| HeaplessString::try_from("invalid").unwrap());
+    let ssid_typed: HeaplessString<32> = match HeaplessString::try_from(ssid) {
+        Ok(s) => s,
+        Err(_) => {
+            // Consistent with the password check below: an over-long SSID is
+            // rejected with a clear error (+CMDER-style reason) instead of
+            // silently degrading to an opaque association failure.
+            log::error!(
+                "[wifi] SSID longer than 31 bytes (got {}); refusing to attempt association",
+                ssid.len()
+            );
+            publish_wifi_state(status, ssid, 7, None, 0, 0, now_ms());
+            return;
+        }
+    };
     let password_typed: HeaplessString<64> = match HeaplessString::try_from(password) {
         Ok(p) => p,
         Err(_) => {
@@ -1402,6 +1414,11 @@ fn run_ingress(
 
     log::info!("[ingress] gateway ready");
     dtrace("ingress:gateway-ready");
+    log::info!(
+        "[ingress] post-setup, internal_free={} B, total_free={} B",
+        unsafe { esp_idf_sys::esp_get_free_internal_heap_size() },
+        unsafe { esp_idf_sys::esp_get_free_heap_size() }
+    );
 
     // P3 / mem-3: timestamp of the last command routed to the agent
     // (natural-language / AT+AGENT). Set when the ingress feeds the agent;
@@ -1812,9 +1829,30 @@ fn run_agent_loop(
         // builds, so the `Err(_)` arm below is reachable in dev only.
         // P3: measure the per-task ReAct execution time (tool calls + LLM).
         let t_task = latency_metrics::now_us();
+        // PATCHED (MicroAgent): `Box::pin` the MiniAgent ReAct future so its
+        // async state machine lives on the heap (keeps `poll`'s stack frame
+        // small). The agent thread's stack is internal DRAM (PSRAM stacks are
+        // not viable on the S3 — see `esp_task_stack_is_sane_cache_disabled`).
+        // The ReAct loop's execution needs ~68 KiB of stack, so the thread is
+        // sized at 96 KiB (64 KiB overflowed with "stack overflow in task
+        // pthread").
+        //
+        // DIAGNOSTIC: measure the stack high-water before/after each run so we
+        // can see how much stack the ReAct loop actually uses — the target for
+        // reducing the agent's internal-DRAM footprint.
+        let hw_before =
+            unsafe { esp_idf_sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            futures::executor::block_on(agent.run(&task))
+            futures::executor::block_on(std::boxed::Box::pin(agent.run(&task)))
         }));
+        let hw_after =
+            unsafe { esp_idf_sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) };
+        if hw_after < hw_before {
+            log::info!(
+                "[agent] run stack used: {} B (hw {hw_before}->{hw_after})",
+                hw_before.saturating_sub(hw_after)
+            );
+        }
         latency_metrics::agent_task()
             .record(latency_metrics::now_us().wrapping_sub(t_task));
         match outcome {
@@ -2205,10 +2243,15 @@ fn main() {
     // remaining DRAM is too tight (setup_platform returns None).
     #[cfg(feature = "ble")]
     {
-        use crate::ble_config::BleServer;
+        use crate::ble_config::shared_ble_server;
 
         log::info!("[ble] Creating BLE server...");
-        let mut ble_server = BleServer::new();
+        // Use the process-wide shared server so the AT dispatcher
+        // (`AT+BLE=ON/OFF/STATE`) can reach the *same* instance and drive
+        // advertising state live. This replaces the previous local
+        // `BleServer::new()` that the AT path could never touch.
+        let server = shared_ble_server();
+        let mut ble_server = server.lock().unwrap_or_else(|e| e.into_inner());
         log::info!("[ble] BLE server created, device name: {}", ble_server.device_name());
 
         log::info!("[ble] Calling init()...");
@@ -2359,6 +2402,7 @@ fn main() {
     let mut agent_restarts: u32 = 0;
     #[allow(unused_assignments)]
     let mut agent_handle: Option<std::thread::JoinHandle<()>> = None;
+
     {
         // Clone outside the `move` closure so main still holds the originals
         // and can re-clone for a later restart.
@@ -2427,7 +2471,7 @@ fn main() {
 
     let ingress_handle = core_affinity::spawn_thread(
         "ingress-thread",
-        24 * 1024,
+        32 * 1024,
         core_affinity::ThreadProfile::REALTIME_INGRESS,
         move || {
             run_ingress(
@@ -2457,9 +2501,14 @@ fn main() {
         unsafe { esp_idf_sys::esp_ota_mark_app_valid_cancel_rollback() };
     }
 
-    // Lua application runtime on the ESP32-S3. Gated behind the `lua` feature
-    // (OFF by default) because `mlua`'s vendored Lua C does not yet build for
-    // Xtensa. Removed entirely from the C61 and default S3 builds.
+    // Lua application runtime on the ESP32-S3. Gated behind the `lua` feature.
+    // Spawned AFTER the agent + ingress: the internal-DRAM budget on this S3
+    // can't host the Lua thread (32 KiB stack) alongside the agent (96 KiB) +
+    // ingress (32 KiB) + Wi-Fi, so `lua-thread` fails to spawn with ENOMEM and
+    // the board stays stable (agent + ingress + Wi-Fi run). Running the full
+    // Lua app would also overflow its 32 KiB stack because `agent.reason`
+    // drives a MiniAgent ReAct loop that needs ~68 KiB. Enable only on a board
+    // with enough internal DRAM (or reduce the Lua app to avoid `agent.reason`).
     #[cfg(feature = "lua")]
     {
         crate::lua_task::start_lua_task();
@@ -2539,7 +2588,7 @@ fn main() {
         // thread holds non-recreatable singletons (NVS partition / UART), so
         // it can only be reported, not restarted.
         const MAX_AGENT_RESTARTS: u32 = 5;
-        if agent_handle.as_ref().map_or(false, |h| h.is_finished()) {
+        if agent_handle.as_ref().is_some_and(|h| h.is_finished()) {
             agent_restarts += 1;
             log::error!("[magent] agent-thread exited (restart #{agent_restarts})");
             if agent_restarts < MAX_AGENT_RESTARTS {

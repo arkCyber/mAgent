@@ -113,3 +113,112 @@ pub fn parse_err(kind: ParseFailureKind, message: impl Into<String>) -> Web3Erro
         message: message.into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{AgentError, ParseFailureKind, Web3ErrorKind};
+    use alloc::vec::Vec;
+
+    #[test]
+    fn into_agent_wraps_ok_value() {
+        let r: Result<u32, Web3ErrorKind> = Ok(42);
+        assert_eq!(r.into_agent().unwrap(), 42);
+    }
+
+    #[test]
+    fn into_agent_wraps_error_in_web3_error() {
+        let r: Result<(), Web3ErrorKind> = Err(Web3ErrorKind::RngError("boom".into()));
+        let err = r.into_agent().unwrap_err();
+        assert!(
+            matches!(err, AgentError::Web3Error { kind: Web3ErrorKind::RngError(ref m) } if m == "boom")
+        );
+    }
+
+    #[test]
+    fn with_did_passthrough_ok() {
+        let r: Result<Vec<u8>, Web3ErrorKind> = Ok(vec![1, 2, 3]);
+        assert_eq!(r.with_did("did:key:z6Mkx").unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn with_did_retags_did_key_mismatch() {
+        let r: Result<(), Web3ErrorKind> = Err(Web3ErrorKind::DidKeyMismatch { did: "old".into() });
+        let err = r.with_did("did:key:z6Mknew").unwrap_err();
+        match err {
+            AgentError::Web3Error {
+                kind: Web3ErrorKind::DidKeyMismatch { did },
+            } => assert_eq!(did, "did:key:z6Mknew"),
+            other => panic!("expected DidKeyMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_did_keeps_other_variants_unchanged() {
+        // A non-DidKeyMismatch variant must keep its original cause —
+        // the DID is only embedded where the variant has a slot for it.
+        let r: Result<(), Web3ErrorKind> = Err(Web3ErrorKind::HexDecode("bad digit".into()));
+        let err = r.with_did("did:key:z6Mkx").unwrap_err();
+        assert!(
+            matches!(err, AgentError::Web3Error { kind: Web3ErrorKind::HexDecode(ref m) } if m == "bad digit")
+        );
+    }
+
+    #[test]
+    fn from_web3_error_kind_converts() {
+        let err: AgentError = Web3ErrorKind::SignatureVerificationFailed.into();
+        assert!(matches!(
+            err,
+            AgentError::Web3Error {
+                kind: Web3ErrorKind::SignatureVerificationFailed
+            }
+        ));
+    }
+
+    #[test]
+    fn helper_constructors_build_expected_variants() {
+        assert!(
+            matches!(invalid_did("z6Mkfoo"), Web3ErrorKind::InvalidDid { raw } if raw == "z6Mkfoo")
+        );
+        assert!(matches!(base58_err("decode"), Web3ErrorKind::Base58Decode(m) if m == "decode"));
+        assert!(matches!(hex_err("odd"), Web3ErrorKind::HexDecode(m) if m == "odd"));
+        assert!(matches!(rng_err("rng"), Web3ErrorKind::RngError(m) if m == "rng"));
+        assert!(matches!(
+            invalid_pk(31),
+            Web3ErrorKind::InvalidPublicKey { actual_len: 31 }
+        ));
+        assert!(matches!(
+            invalid_sig(63),
+            Web3ErrorKind::InvalidSignature { actual_len: 63 }
+        ));
+        assert!(matches!(
+            invalid_sk(16),
+            Web3ErrorKind::InvalidSecretKeyLength { actual: 16 }
+        ));
+        assert!(matches!(
+            parse_err(ParseFailureKind::InvalidJson, "x"),
+            Web3ErrorKind::Parse { kind: ParseFailureKind::InvalidJson, message } if message == "x"
+        ));
+    }
+
+    #[test]
+    fn helpers_accept_owned_strings() {
+        // The `impl Into<String>` helpers must accept both &str and String.
+        assert!(
+            matches!(base58_err(String::from("owned")), Web3ErrorKind::Base58Decode(m) if m == "owned")
+        );
+        assert!(
+            matches!(hex_err(String::from("owned")), Web3ErrorKind::HexDecode(m) if m == "owned")
+        );
+        assert!(
+            matches!(rng_err(String::from("owned")), Web3ErrorKind::RngError(m) if m == "owned")
+        );
+        assert!(matches!(
+            parse_err(ParseFailureKind::SchemaMismatch, String::from("owned")),
+            Web3ErrorKind::Parse {
+                kind: ParseFailureKind::SchemaMismatch,
+                ..
+            }
+        ));
+    }
+}

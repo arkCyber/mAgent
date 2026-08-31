@@ -184,13 +184,28 @@ pub mod voice_notification;
 // so they only compile when a real chip is selected. Pure host tests
 // (`--features std`) can still pull them in via the `embedded` alias
 // (which expands to `nrf52`) for backward compatibility.
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
 pub mod config;
 
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
 pub mod safety;
 
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
 pub mod power;
 
 #[cfg(any(
@@ -202,16 +217,36 @@ pub mod power;
 ))]
 pub mod security;
 
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
 pub mod wear_leveling;
 
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
 pub mod hardware;
 
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
 pub mod monitoring;
 
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
 pub mod ollama;
 
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
@@ -230,6 +265,7 @@ pub mod storage;
     feature = "esp32",
     feature = "embedded",
     feature = "link_adapters",
+    feature = "std",
 ))]
 pub mod communication;
 
@@ -315,10 +351,21 @@ pub mod nrf52_hal {
 // Re-exports of commonly-used chip-agnostic types
 // ===========================================================================
 
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
 pub use config::AgentConfig;
 
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std",
+    feature = "web3"
+))]
 pub use security::{EncryptionMode, SecurityLevel, SecurityManager};
 
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]

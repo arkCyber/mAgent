@@ -1337,4 +1337,240 @@ mod display_tests {
         let e = AgentError::Unknown { code: 0 };
         assert!(!format!("{e}").is_empty());
     }
+    #[test]
+    fn error_category_classifies_all_variants() {
+        let c = |e: &AgentError| e.category();
+        assert_eq!(
+            c(&AgentError::MemoryAllocationFailed {
+                requested: 0,
+                available: 0
+            }),
+            ErrorCategory::Memory
+        );
+        assert_eq!(
+            c(&AgentError::BufferOverflow {
+                capacity: 0,
+                attempted: 0
+            }),
+            ErrorCategory::Memory
+        );
+        assert_eq!(
+            c(&AgentError::StackOverflow { used: 0, limit: 0 }),
+            ErrorCategory::Memory
+        );
+        assert_eq!(
+            c(&AgentError::MemoryBudgetExhausted { used: 0, limit: 0 }),
+            ErrorCategory::Memory
+        );
+        assert_eq!(
+            c(&AgentError::NetworkConnectionFailed {
+                reason: NetworkError::Timeout
+            }),
+            ErrorCategory::Network
+        );
+        assert_eq!(
+            c(&AgentError::NetworkTimeout {
+                operation: "o",
+                duration_ms: 0
+            }),
+            ErrorCategory::Network
+        );
+        assert_eq!(
+            c(&AgentError::StorageWriteFailed {
+                address: 0,
+                reason: StorageError::WriteError
+            }),
+            ErrorCategory::Storage
+        );
+        assert_eq!(
+            c(&AgentError::StorageReadFailed {
+                address: 0,
+                reason: StorageError::ReadError
+            }),
+            ErrorCategory::Storage
+        );
+        assert_eq!(
+            c(&AgentError::SensorReadFailed {
+                sensor: "s",
+                reason: SensorError::Timeout
+            }),
+            ErrorCategory::Hardware
+        );
+        assert_eq!(
+            c(&AgentError::GpioOperationFailed {
+                pin: 0,
+                operation: GpioOperation::Read
+            }),
+            ErrorCategory::Hardware
+        );
+        assert_eq!(
+            c(&AgentError::InputValidationFailed {
+                field: "f",
+                reason: ValidationError::TooLong
+            }),
+            ErrorCategory::Validation
+        );
+        assert_eq!(
+            c(&AgentError::ConfigurationError {
+                field: "f",
+                reason: ConfigError::InvalidValue
+            }),
+            ErrorCategory::Validation
+        );
+        assert_eq!(
+            c(&AgentError::IterationBudgetExhausted { used: 0, limit: 0 }),
+            ErrorCategory::Budget
+        );
+        assert_eq!(
+            c(&AgentError::OperationTimeout {
+                operation: "o",
+                timeout_ms: 0
+            }),
+            ErrorCategory::Timeout
+        );
+        assert_eq!(
+            c(&AgentError::InvalidStateTransition { from: "a", to: "b" }),
+            ErrorCategory::Unknown
+        );
+        assert_eq!(c(&AgentError::Unknown { code: 0 }), ErrorCategory::Unknown);
+        assert_eq!(
+            c(&AgentError::CryptoError {
+                reason: EncryptionError::CipherError
+            }),
+            ErrorCategory::Security
+        );
+        #[cfg(feature = "web3")]
+        assert_eq!(
+            c(&AgentError::Web3Error {
+                kind: Web3ErrorKind::RngError("x".into()),
+            }),
+            ErrorCategory::Validation
+        );
+    }
+
+    #[test]
+    fn recovery_strategy_classifies_all_variants() {
+        let r = |e: &AgentError| e.recovery_strategy();
+        assert_eq!(
+            r(&AgentError::NetworkConnectionFailed {
+                reason: NetworkError::Timeout
+            }),
+            RecoveryStrategy::RetryBackoff
+        );
+        assert_eq!(
+            r(&AgentError::NetworkTimeout {
+                operation: "o",
+                duration_ms: 0
+            }),
+            RecoveryStrategy::RetryBackoff
+        );
+        assert_eq!(
+            r(&AgentError::StorageWriteFailed {
+                address: 0,
+                reason: StorageError::WriteError
+            }),
+            RecoveryStrategy::RetryImmediate
+        );
+        assert_eq!(
+            r(&AgentError::StorageReadFailed {
+                address: 0,
+                reason: StorageError::ReadError
+            }),
+            RecoveryStrategy::RetryImmediate
+        );
+        assert_eq!(
+            r(&AgentError::SensorReadFailed {
+                sensor: "s",
+                reason: SensorError::Timeout
+            }),
+            RecoveryStrategy::Degrade
+        );
+        assert_eq!(
+            r(&AgentError::GpioOperationFailed {
+                pin: 0,
+                operation: GpioOperation::Read
+            }),
+            RecoveryStrategy::Degrade
+        );
+        assert_eq!(
+            r(&AgentError::IterationBudgetExhausted { used: 0, limit: 0 }),
+            RecoveryStrategy::Fatal
+        );
+        assert_eq!(
+            r(&AgentError::MemoryBudgetExhausted { used: 0, limit: 0 }),
+            RecoveryStrategy::Fatal
+        );
+        assert_eq!(
+            r(&AgentError::OperationTimeout {
+                operation: "o",
+                timeout_ms: 0
+            }),
+            RecoveryStrategy::Fatal
+        );
+        assert_eq!(
+            r(&AgentError::InputValidationFailed {
+                field: "f",
+                reason: ValidationError::TooLong
+            }),
+            RecoveryStrategy::Skip
+        );
+        assert_eq!(
+            r(&AgentError::ConfigurationError {
+                field: "f",
+                reason: ConfigError::InvalidValue
+            }),
+            RecoveryStrategy::Skip
+        );
+        assert_eq!(
+            r(&AgentError::MemoryAllocationFailed {
+                requested: 0,
+                available: 0
+            }),
+            RecoveryStrategy::Fatal
+        );
+        assert_eq!(
+            r(&AgentError::BufferOverflow {
+                capacity: 0,
+                attempted: 0
+            }),
+            RecoveryStrategy::Fatal
+        );
+        assert_eq!(
+            r(&AgentError::StackOverflow { used: 0, limit: 0 }),
+            RecoveryStrategy::Fatal
+        );
+        assert_eq!(
+            r(&AgentError::InvalidStateTransition { from: "a", to: "b" }),
+            RecoveryStrategy::Fatal
+        );
+        assert_eq!(r(&AgentError::Unknown { code: 0 }), RecoveryStrategy::Fatal);
+        assert_eq!(
+            r(&AgentError::CryptoError {
+                reason: EncryptionError::CipherError
+            }),
+            RecoveryStrategy::Fatal
+        );
+        #[cfg(feature = "web3")]
+        assert_eq!(
+            r(&AgentError::Web3Error {
+                kind: Web3ErrorKind::RngError("x".into()),
+            }),
+            RecoveryStrategy::Skip
+        );
+    }
+
+    #[test]
+    fn is_fatal_consistent_with_recovery_strategy() {
+        assert!(AgentError::Unknown { code: 0 }.is_fatal());
+        assert!(AgentError::StackOverflow { used: 1, limit: 0 }.is_fatal());
+        assert!(!AgentError::SensorReadFailed {
+            sensor: "s",
+            reason: SensorError::Timeout
+        }
+        .is_fatal());
+        assert!(!AgentError::NetworkConnectionFailed {
+            reason: NetworkError::Timeout
+        }
+        .is_fatal());
+    }
 }

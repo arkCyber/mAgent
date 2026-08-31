@@ -2333,10 +2333,8 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         // until under `MAX_DYNAMIC_CONTEXT_BYTES` (512 KiB on the C61 / host,
         // 2 MiB on the S3 8 MB octal PSRAM profile), preserving the system
         // prompt and the current turn.
-        let byte_stats = crate::conversation::gc_to_budget(
-            &mut self.messages,
-            crate::MAX_DYNAMIC_CONTEXT_BYTES,
-        );
+        let byte_stats =
+            crate::conversation::gc_to_budget(&mut self.messages, crate::MAX_DYNAMIC_CONTEXT_BYTES);
         stats.dropped += byte_stats.dropped;
         stats.kept = self.messages.len();
         self.emit_trace(TraceEvent::CompressionApplied {
@@ -2827,10 +2825,8 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
             crate::conversation::compress_messages(&mut self.messages, &self.config.compression);
         // REQ-SCHED-001 / mem-3: mirror the think()-path byte-GC so this
         // diagnostic path sees the same bounded footprint.
-        let byte_stats = crate::conversation::gc_to_budget(
-            &mut self.messages,
-            crate::MAX_DYNAMIC_CONTEXT_BYTES,
-        );
+        let byte_stats =
+            crate::conversation::gc_to_budget(&mut self.messages, crate::MAX_DYNAMIC_CONTEXT_BYTES);
         stats.dropped += byte_stats.dropped;
         stats.kept = self.messages.len();
         stats
@@ -3310,12 +3306,21 @@ mod compression_tests {
                 .messages
                 .push(Message::assistant_text(&"x".repeat(200 * 1024)));
         }
-        assert!(crate::conversation::estimate_bytes(&runner.messages) > crate::MAX_DYNAMIC_CONTEXT_BYTES);
+        assert!(
+            crate::conversation::estimate_bytes(&runner.messages)
+                > crate::MAX_DYNAMIC_CONTEXT_BYTES
+        );
         let stats = runner.compress_now();
         assert!(stats.dropped > 0);
-        assert!(crate::conversation::estimate_bytes(&runner.messages) <= crate::MAX_DYNAMIC_CONTEXT_BYTES);
+        assert!(
+            crate::conversation::estimate_bytes(&runner.messages)
+                <= crate::MAX_DYNAMIC_CONTEXT_BYTES
+        );
         // The most recent turn is never dropped.
-        assert_eq!(runner.messages.last().map(|m| m.content.len()), Some(200 * 1024));
+        assert_eq!(
+            runner.messages.last().map(|m| m.content.len()),
+            Some(200 * 1024)
+        );
     }
 
     #[test]
@@ -3498,7 +3503,11 @@ mod trace_sink_tests {
             }
         });
         assert_eq!(*captured_a.lock().unwrap(), 1, "first sink got the event");
-        assert_eq!(*captured_b.lock().unwrap(), 1, "second sink got the event too");
+        assert_eq!(
+            *captured_b.lock().unwrap(),
+            1,
+            "second sink got the event too"
+        );
     }
 
     #[test]
@@ -3582,5 +3591,342 @@ mod trace_sink_tests {
         let mut runner = runner_with_sink_and_policy(CompressionPolicy::disabled());
         runner.set_verbose(false);
         assert!(runner.run("noop").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod parse_tolerance_tests {
+    use super::*;
+    use crate::real_tools::SimulatorExecutor;
+
+    fn runner() -> RealAgentRunner<SimulatorExecutor> {
+        RealAgentRunner::new(SimulatorExecutor::new())
+    }
+
+    #[test]
+    fn parse_tool_call_json_object() {
+        let r = runner();
+        let (name, args) = r
+            .parse_tool_call(r#"{"tool":"read_sensor","args":{"sensor":"temp"}}"#)
+            .expect("parse tool call");
+        assert_eq!(name, "read_sensor");
+        assert_eq!(args.get("sensor").and_then(|v| v.as_str()), Some("temp"));
+    }
+
+    #[test]
+    fn parse_tool_call_wrapped_in_fence_and_prose() {
+        // A model wrapped the tool call in a fenced code block and prose.
+        let r = runner();
+        let resp = "Here is the call:\n```json\n{\"tool\":\"get_balance\",\"args\":{\"address\":\"0xabc\"}}\n```\n";
+        let (name, args) = r.parse_tool_call(resp).expect("recover wrapped call");
+        assert_eq!(name, "get_balance");
+        assert!(args.contains_key("address"));
+    }
+
+    #[test]
+    fn parse_tool_call_anthropic_format() {
+        let r = runner();
+        let resp = r#"<antml:invoke name="fetch_url"><antml:parameter name="url">https://x</antml:parameter></antml:invoke>"#;
+        let (name, args) = r.parse_tool_call(resp).expect("anthropic call");
+        assert_eq!(name, "fetch_url");
+        assert_eq!(args.get("url").and_then(|v| v.as_str()), Some("https://x"));
+    }
+
+    #[test]
+    fn parse_tool_call_returns_none_for_plain_answer() {
+        let r = runner();
+        assert!(r
+            .parse_tool_call("The temperature is 25 degrees.")
+            .is_none());
+    }
+
+    #[test]
+    fn parse_result_json_envelope() {
+        let r = runner();
+        assert_eq!(r.parse_result(r#"{"result":"42"}"#).as_deref(), Some("42"));
+        assert_eq!(r.parse_result(r#"{"result":42}"#).as_deref(), Some("42"));
+        assert_eq!(
+            r.parse_result(r#"{"result":true}"#).as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn parse_result_fenced_block() {
+        let r = runner();
+        let out = r.parse_result("```\nlet x = 1;\n```").unwrap();
+        assert!(out.contains("let x = 1;"));
+    }
+
+    #[test]
+    fn parse_result_embedded_json_in_prose() {
+        let r = runner();
+        let out = r
+            .parse_result("The answer is {\"result\":\"7\"} if that helps.")
+            .unwrap();
+        assert_eq!(out, "7");
+    }
+
+    #[test]
+    fn parse_result_plain_prose_answer() {
+        let r = runner();
+        let out = r
+            .parse_result("The final temperature reading is 25.5 degrees Celsius.")
+            .unwrap();
+        assert!(out.contains("25.5"));
+    }
+
+    #[test]
+    fn parse_result_rejects_short_chatter() {
+        let r = runner();
+        assert!(r.parse_result("ok").is_none());
+        assert!(r.parse_result("Let me check").is_none());
+        assert!(r.parse_result("").is_none());
+        // Chatter prefixes are filtered even when long enough.
+        assert!(r
+            .parse_result("Now I will compute the result for you.")
+            .is_none());
+    }
+
+    #[test]
+    fn find_json_object_skips_braces_in_strings() {
+        // A `}` inside a JSON string value must not terminate the object.
+        let s = r#"prefix {"tool":"a","note":"has } brace"}"#;
+        let obj = find_json_object(s).expect("balanced object");
+        assert!(obj.contains("\"note\":\"has } brace\""));
+    }
+
+    #[test]
+    fn ensure_system_prompt_noop_when_matching() {
+        let mut r = runner();
+        r.messages.push(Message::system("SYS"));
+        r.ensure_system_prompt("SYS");
+        assert_eq!(r.messages().len(), 1);
+        assert_eq!(r.messages()[0].content, "SYS");
+    }
+
+    #[test]
+    fn ensure_system_prompt_replaces_stale_prompt() {
+        let mut r = runner();
+        r.messages.push(Message::system("old"));
+        r.messages.push(Message::user("task"));
+        r.ensure_system_prompt("new prompt");
+        assert_eq!(r.messages().len(), 2, "must replace in place, not append");
+        assert_eq!(r.messages()[0].content, "new prompt");
+        assert_eq!(r.messages()[1].role, Role::User);
+    }
+
+    #[test]
+    fn ensure_system_prompt_inserts_when_missing() {
+        let mut r = runner();
+        r.messages.push(Message::user("task"));
+        r.ensure_system_prompt("SYS");
+        assert_eq!(r.messages()[0].role, Role::System);
+        assert_eq!(r.messages()[0].content, "SYS");
+        assert_eq!(r.messages()[1].role, Role::User);
+    }
+
+    #[test]
+    fn first_user_message_returns_first_user() {
+        let mut r = runner();
+        r.messages.push(Message::system("SYS"));
+        r.messages.push(Message::user("first"));
+        r.messages.push(Message::assistant_text("hi"));
+        r.messages.push(Message::user("second"));
+        assert_eq!(r.first_user_message(), "first");
+        // No user message at all → empty string.
+        let mut r2 = runner();
+        r2.messages.push(Message::system("SYS"));
+        assert_eq!(r2.first_user_message(), "");
+    }
+
+    #[test]
+    fn message_constructors_set_roles_and_ids() {
+        let call = ToolCall {
+            name: "read_sensor".to_string(),
+            arguments: HashMap::new(),
+        };
+
+        let user = Message::user("hi");
+        assert_eq!(user.role, Role::User);
+        assert_eq!(user.content, "hi");
+        assert!(user.tool_call.is_none());
+
+        let sys = Message::system("prompt");
+        assert_eq!(sys.role, Role::System);
+
+        let asst = Message::assistant_text("answer");
+        assert_eq!(asst.role, Role::Assistant);
+        assert!(asst.tool_call.is_none());
+
+        let tc = Message::assistant_tool_call(call.clone());
+        assert_eq!(tc.role, Role::Assistant);
+        assert_eq!(tc.tool_call.as_ref().unwrap().name, "read_sensor");
+        assert!(tc.tool_call_id.is_none());
+
+        // The variant that carries a matching tool_call_id.
+        let tc_id = Message::assistant_tool_call_id(call.clone(), "call_1");
+        assert_eq!(tc_id.tool_call_id.as_deref(), Some("call_1"));
+
+        // The follow-up tool-result message links back by id.
+        let t = Message::tool("call_1", "result");
+        assert_eq!(t.role, Role::Tool);
+        assert_eq!(t.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(t.content, "result");
+    }
+
+    #[test]
+    fn tool_result_success_and_error() {
+        let ok = ToolResult::success("read_sensor", "25.5");
+        assert!(ok.success);
+        assert_eq!(ok.tool_name, "read_sensor");
+        assert_eq!(ok.content, "25.5");
+
+        let err = ToolResult::error("read_sensor", "sensor offline");
+        assert!(!err.success);
+        assert_eq!(err.content, "sensor offline");
+    }
+}
+
+// ============================================================================
+// Full ReAct loop integration tests (mock LLM backend)
+// ============================================================================
+//
+// These drive `RealAgentRunner::run()` end-to-end through a canned
+// [`LlmBackend`] that returns scripted tool-call / result / chatter
+// responses. They exercise the entire ReAct loop — system-prompt seed,
+// backend chat, tool execution, result parsing, and iteration budgeting —
+// without touching the network.
+
+#[cfg(test)]
+mod run_react_loop_tests {
+    use super::*;
+    use crate::real_tools::SimulatorExecutor;
+
+    /// A canned [`LlmBackend`] that hands back a scripted list of responses,
+    /// one per `chat_with_messages` call, while counting calls.
+    struct MockLlm {
+        responses: Vec<String>,
+        idx: usize,
+        calls: usize,
+    }
+
+    impl MockLlm {
+        fn new(responses: Vec<String>) -> Self {
+            Self {
+                responses,
+                idx: 0,
+                calls: 0,
+            }
+        }
+    }
+
+    impl LlmBackend for MockLlm {
+        fn check_connection(&self) -> bool {
+            true
+        }
+
+        fn chat_with_messages(
+            &mut self,
+            _messages: &[Message],
+            _sampling: SamplingParams,
+        ) -> std::result::Result<String, String> {
+            self.calls += 1;
+            let r = self
+                .responses
+                .get(self.idx)
+                .cloned()
+                .unwrap_or_else(|| r#"{"result":"done"}"#.to_string());
+            self.idx += 1;
+            Ok(r)
+        }
+
+        fn provider(&self) -> LlmProvider {
+            LlmProvider::Ollama
+        }
+
+        fn model(&self) -> &str {
+            "mock"
+        }
+
+        fn base_url(&self) -> &str {
+            "mock://llm"
+        }
+    }
+
+    /// Build a runner wired to a `MockLlm` and force the backend on, so
+    /// `run()` routes every chat through the mock (no auto-probe, no
+    /// simulated fallback).
+    fn runner_with_mock(responses: Vec<String>) -> RealAgentRunner<SimulatorExecutor> {
+        let mut runner = RealAgentRunner::new(SimulatorExecutor::new());
+        runner.set_backend(MockLlm::new(responses));
+        runner.force_enable_backend();
+        runner
+    }
+
+    #[test]
+    fn run_completes_full_react_loop_with_mock_backend() {
+        let mut runner = runner_with_mock(vec![
+            r#"{"tool":"read_sensor","args":{"sensor":"temperature"}}"#.to_string(),
+            r#"{"result":"MOCK_FINAL_ANSWER_42"}"#.to_string(),
+        ]);
+
+        let result = runner.run("what is the temperature?").unwrap();
+        // The mock's terminal result is surfaced verbatim — proof the mock
+        // backend (not the simulated fallback) produced it.
+        assert_eq!(result, "MOCK_FINAL_ANSWER_42");
+        assert_eq!(runner.tool_call_count, 1);
+        assert!(runner.iteration >= 2);
+
+        // The tool was actually executed by SimulatorExecutor.
+        let msgs = runner.messages();
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == Role::Tool && m.content.contains("Temperature")),
+            "expected a read_sensor tool result in the conversation"
+        );
+        // The final result was recorded as an assistant message.
+        assert!(msgs
+            .iter()
+            .any(|m| m.role == Role::Assistant && m.content.contains("MOCK_FINAL_ANSWER_42")));
+    }
+
+    #[test]
+    fn run_recovers_from_tool_failure() {
+        // First the mock asks for a sensor the executor can't resolve
+        // (arg string without a recognised sensor keyword → tool error);
+        // then it returns a terminal result. The ReAct loop must survive
+        // the tool failure and keep going.
+        let mut runner = runner_with_mock(vec![
+            r#"{"tool":"read_sensor","args":{"sensor":"bogus"}}"#.to_string(),
+            r#"{"result":"MOCK_RECOVERED"}"#.to_string(),
+        ]);
+
+        let result = runner.run("check the sensor").unwrap();
+        assert_eq!(result, "MOCK_RECOVERED");
+
+        // The failed tool surfaced as an Error tool message.
+        let msgs = runner.messages();
+        assert!(
+            msgs.iter()
+                .any(|m| m.role == Role::Tool && m.content.contains("Error")),
+            "expected the failing tool result to be surfaced as an error"
+        );
+    }
+
+    #[test]
+    fn run_exhausts_iteration_budget_on_chatter() {
+        // If the mock never returns a tool call or a terminal result, the
+        // loop treats each reply as chatter and iterates until the budget
+        // is exhausted, then returns gracefully. A terse reply (< the
+        // `MIN_PROSE_RESULT_LEN` threshold) is not parsed as a final result.
+        let mut runner = runner_with_mock(vec!["ok".to_string(); 20]);
+
+        let result = runner.run("keep going forever").unwrap();
+        // Budget is exhausted after max_iterations (default 10).
+        assert_eq!(runner.iteration, 10);
+        assert_eq!(runner.tool_call_count, 0);
+        // It still returns a usable string rather than an error.
+        assert_eq!(result, "ok");
     }
 }

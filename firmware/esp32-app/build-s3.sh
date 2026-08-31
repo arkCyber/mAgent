@@ -14,13 +14,18 @@ CFG="/Users/arksong/MicroAgent/firmware/esp32-app/.cargo/config.toml"
 
 echo "=== mAgent ESP32-S3 build (${PROFILE}) ==="
 echo "  target:   ${TARGET}"
-echo "  features: board-s3,wifi,uart,ble,lua (BLE + Lua app host on the S3)"
+echo "  features: board-s3,wifi,uart (BLE off; Lua off — Lua crashes Core0 even after I2C pin fix)"
 
 cd /Users/arksong/MicroAgent/firmware/esp32-app
 
 # Override the C61-specific cargo-config env (real shell env takes precedence
 # over cargo config `[env]` unless `force = true`).
 export MCU="ESP32S3"
+# The connected S3 board is the QUAD-PSRAM dev board (4 MB flash, quad PSRAM
+# per eFuse), which is exactly the profile `sdkconfig.defaults` targets
+# ("ESP32-S3 (quad-PSRAM dev board)"). `sdkconfig.s3.defaults` is for the
+# different N8R8 module (8 MB octal PSRAM) — do NOT use it here or the BLE
+# bindgen output regresses and PSRAM mode mismatches this board.
 export ESP_IDF_SDKCONFIG_DEFAULTS="/Users/arksong/MicroAgent/firmware/esp32-app/sdkconfig.defaults"
 # Xtensa bindgen: the esp-clang defaults to RISC-V; force the matching
 # Xtensa target so __XTENSA__ is defined (fixes riscv/csr.h + l32r asm).
@@ -33,7 +38,7 @@ export MAGENT_WIFI_SSID="arkSong@iPhone"
 export MAGENT_WIFI_PASS="Ark314159"
 export CXX="/Users/arksong/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-g++"
 
-RUSTC_BOOTSTRAP=1 cargo +esp build --target "${TARGET}" --no-default-features --features board-s3,wifi,uart,ble,lua --"${PROFILE}"
+RUSTC_BOOTSTRAP=1 cargo +esp build --target "${TARGET}" --no-default-features --features board-s3,wifi,uart --"${PROFILE}"
 
 echo ""
 echo "Build complete!"

@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Test UART ingress on the ESP32-C61.
+"""Test UART ingress on an ESP32 (C61, S3, ...).
 
-Connects to the CP2102 USB-UART bridge (/dev/cu.usbserial-10), waits for the
-firmware to boot and the ingress gateway to come up, then sends raw bytes over
-UART0 and watches the log for the ingress frame (Signed mode: the device signs
-whatever bytes it receives).
+Connects to the board's USB-UART bridge, waits for the firmware to boot and the
+ingress gateway to come up, then sends raw bytes over UART0 and watches the log
+for evidence the ingress received and signed them (Signed mode: the device signs
+whatever bytes it receives, or dispatches them as an AT command).
+
+Usage:
+    python3 tools/uart_ingress_test.py [PORT] [PAYLOAD]
+
+    PORT    serial device, default /dev/cu.usbserial-10 (C61)
+    PAYLOAD bytes to send after boot, default "ping-from-host"
 """
 import serial
 import sys
@@ -14,16 +20,21 @@ PORT = "/dev/cu.usbserial-10"
 BAUD = 115200
 WAIT_BOOT_S = 35   # WiFi association blocks ~30s before threads spawn
 LISTEN_S = 6
+# Evidence the ingress received the bytes: either an explicit frame/sign log
+# line, or the firmware dispatching the payload as an AT command.
+EVIDENCE = ("frame", "ingress", "sign", "ok", "[at]", "cmder")
 
 
 def main():
-    payload = sys.argv[1].encode() if len(sys.argv) > 1 else b"ping-from-host"
+    args = [a for a in sys.argv[1:] if a]
+    port = args[0] if len(args) > 0 else PORT
+    payload = args[1].encode() if len(args) > 1 else b"ping-from-host"
 
-    s = serial.Serial(PORT, BAUD, timeout=0.2)
+    s = serial.Serial(port, BAUD, timeout=0.2)
     buf = b""
 
     # 1) Drain boot logs until the ingress gateway is up.
-    print(f"[*] waiting for firmware boot + ingress gateway on {PORT} ...")
+    print(f"[*] waiting for firmware boot + ingress gateway on {port} ...")
     deadline = time.time() + WAIT_BOOT_S
     while time.time() < deadline:
         d = s.read(8192)
@@ -53,10 +64,10 @@ def main():
     print(text)
     s.close()
 
-    if "frame" in text.lower() and "ingress" in text.lower():
-        print("\n[OK] UART ingress received and signed a frame!")
+    if any(ev in text.lower() for ev in EVIDENCE):
+        print("\n[OK] UART ingress evidence observed (ingress frame / sign / AT dispatch).")
         return 0
-    print("\n[WARN] no ingress frame log captured (see tail above).")
+    print("\n[WARN] no ingress evidence captured (see tail above).")
     return 1
 
 

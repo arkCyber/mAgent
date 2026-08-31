@@ -14,6 +14,118 @@ here. Dates use `YYYY-MM-DD` and follow ISO 8601. Versions follow
 ## [Unreleased]
 
 ### Added
+- **Feature-gated modules made host-testable + tested** (`magent-core/src/lib.rs`):
+  the pure-logic embedded modules (`power`, `hardware`, `monitoring`, `ollama`,
+  `communication`, plus `config`/`safety`/`wear_leveling`/`security`) are now
+  compiled under the `std` feature (matching the existing `security` gate), so
+  their unit tests actually run on the host instead of being skipped behind the
+  `nrf52`/`esp32`/`embedded` chip features. `storage` stays chip-gated (it needs
+  `embedded_storage`). CI's default-feature `cargo clippy -p magent-core
+  --all-targets -- -D warnings` stays clean.
+- **`power.rs` tests** (8): `PowerManager` state-machine transitions (the
+  permissive `Active → Idle → LowPower → DeepSleep → Active` sequence, no-op and
+  invalid upward steps, `InvalidStateTransition` `from`/`to` names), battery
+  threshold get/set, `should_enter_low_power` against the threshold, and
+  `read_battery_status`. Coverage 0% → 96%.
+- **`hardware.rs` tests** (11): `I2cSensor`/`SpiSensor` init/read/write and
+  not-initialised error, `GpioPin` input-rejects-set + output set/read/toggle,
+  and `TemperatureSensor`/`Accelerometer`/`HumiditySensor`/`PressureSensor`
+  reads (incl. register fallbacks). Coverage 0% → 93%.
+- **`ollama.rs` tests** (12): client construction, `build_request`,
+  `add_message` (incl. overflow), `add_tools`, `serialize_request`,
+  `parse_response` content + tool-call extraction + error path, tool-definition
+  constant, and system-prompt sanity. Coverage 0% → 98%.
+- **`communication/ble.rs` tests** (12): `BleClient` connect/disconnect,
+  `send_request` keyword responses + disconnected/overlong errors,
+  `send_tool_result`, `receive_response`, and `BleMessage` new/to_bytes/
+  from_bytes round-trip + garbage rejection. Coverage 0% → 98%.
+- **`security.rs` tests** (16): a `std`-only suite (XOR encrypt/decrypt, auth-tag
+  round-trip, encryption toggle) and a `web3` suite (real AES-128-GCM
+  encrypt/decrypt round-trip, nonce-uniqueness, tamper → `AuthenticationFailed`,
+  short-ciphertext → `InvalidCiphertext`, HMAC-SHA-256 16-hex-char tag, oversized
+  plaintext → `BufferOverflow`, `constant_time_eq`). Coverage 0% → 90%.
+- **Full ReAct-loop tests** (`magent-core/src/agent_runner.rs`): a
+  `run_react_loop_tests` module drives `RealAgentRunner::run()` end-to-end
+  through a canned `LlmBackend` (tool call → tool execution → terminal result;
+  tool-failure recovery; iteration-budget exhaustion on chatter) without any
+  network. `agent_runner.rs` line coverage ~68% → 72%.
+- **`agent_tools.rs` tests** (+5): `create_blockchain_tools` (8 tools),
+  `register_blockchain_tools_only` populates a registry, `run_blockchain_tool`
+  dispatch, `switch_chain`/`reset`/getters, and `BlockchainManagerHolder`.
+  Coverage 73%.
+- **`web.rs` top-level tool validation tests** (+6): `web_search` / `fetch_url` /
+  `webpage_summary` / `get_weather` argument-validation and SSRF-refusal error
+  paths that return before any network I/O.
+
+- **Web3 error-adaptation tests** (`magent-core/src/web3/error.rs`): 8 unit tests
+  covering every `Web3ErrorKind` helper constructor, the `Web3ErrorExt`
+  trait (`into_agent` / `with_did`, including `DidKeyMismatch` re-tagging),
+  and the `From<Web3ErrorKind> for AgentError` conversion. Line coverage
+  39% → 96%.
+- **Web3 identity security tests** (`magent-core/src/web3/identity.rs`): 13
+  unit tests for the Ed25519 signing/verification surface — sign/verify
+  round-trip, tampered-payload and wrong-signer rejection
+  (`SignatureVerificationFailed` vs `DidKeyMismatch`), `verify_signature*` /
+  `verify_signed_message*` error paths, key hex/base58 serialisation, and
+  `Debug` redaction of secret-key material. Line coverage 54% → 94%.
+- **AgentError classification tests** (`magent-core/src/error.rs`): 3 unit
+  tests pinning `AgentError::category()` / `recovery_strategy()` /
+  `is_fatal()` for every variant. Line coverage 58% → 66%.
+- **`magent-core` line coverage raised to ≥ 80%** (REQ-VFY-006). Full
+  workspace lib + integration suites stay green (~1391 lib + ~1287 core
+  integration tests), `cargo clippy -p magent-core --all-targets -- -D
+  warnings` clean.
+- **`wei_to_eth_string` decimal bug fixed** (`magent-core/src/web3/blockchain/
+  agent_tools.rs`): the 6-digit fractional part was computed by dividing the
+  wei remainder by `1e15` instead of `1e12`, so e.g. `0.123456 ETH` rendered
+  as `"0.000123 ETH"` (and the last three decimals dropped). Now uses
+  `frac / 1e12`; the existing test that pinned the wrong output was updated.
+- **Blockchain RPC client tests** (`client.rs`): `parse_address` / `parse_hash` /
+  `parse_wei` / `parse_transaction_receipt` / `hex_encode`/`hex_decode` error
+  paths and JSON-RPC error deserialisation. Coverage 41% → 63%.
+- **Tool registry + executor tests** (`tools.rs`): registry query methods
+  (`has_tool`/`count`/`names`/`describe`/`all_tools`), register overflow, and
+  `read_sensor` across all simulated sensor types. Coverage 56% → 60%.
+- **Safety mechanisms tests** (`safety.rs`): `BudgetEnforcer` / `Watchdog` /
+  `StackMonitor` / `MemoryGuard` / `FaultDetector` budgets, thresholds,
+  overflow rejection and reset. Coverage 21% → 95%.
+- **Agent config tests** (`config.rs`): `validate()` boundary checks for every
+  field, builder validation, and `to_bytes`/`from_bytes` round-trip. Coverage
+  28% → 67%.
+- **Event parsing tests** (`events.rs`): `topic_as_address`/`u256`/`u64`/
+  `bytes32`, `data_as_u64`, and `EventFilter` `from`/`to`/`with_block_param`.
+  Coverage 64% → 76%.
+- **HTTP client + agent-tool tests** (`http_client.rs`, `agent_tools.rs`):
+  `with_timeout`/`with_backoff`/`from_chain`, wei↔ETH conversions, and
+  sign/verify tool round-trips.
+- **Simulator tests** (`simulator.rs`): `SimFlashStorage` read/write/erase
+  (incl. out-of-bounds), `SimGpioController` set/get/toggle, `SimBleInterface`
+  connect/send/disconnect. Coverage 31% → 56%.
+- **Wear-leveling tests** (`wear_leveling.rs`): `None` strategy pinning,
+  `is_sector_worn`, `get_most_worn_sector`, and `reset_stats`. Coverage 79%.
+- **ReAct runner tolerance + state tests** (`agent_runner.rs`): a new
+  `parse_tolerance_tests` module covering `parse_tool_call` (JSON, fenced/
+  prose-wrapped, Anthropic `<invoke>`/`<antml:invoke>`), `parse_result`
+  (envelope, fenced block, embedded-in-prose, plain prose vs chatter),
+  `find_json_object` brace-in-string handling, `ensure_system_prompt`
+  (no-op / replace / insert), `first_user_message`, `Message` constructors,
+  and `ToolResult` success/error. Coverage 61% → 68%.
+- **`magent-core` line coverage now 81.2%** (REQ-VFY-006 ≥ 80% exceeded).
+  Full workspace lib (~1416) + core integration (~1312) suites stay green,
+  `cargo clippy -p magent-core --all-targets -- -D warnings` clean.
+- **Web3 signed-message tests** (`web3/signature.rs`): `signature()` /
+  `signer_did()` decoding, `from_json` error-path categorisation
+  (InvalidJson / SchemaMismatch / HexDecode), `to_json_into` (canonical
+  equivalence + small-buffer error), and `Signature` Debug redaction.
+  Coverage 81% → 93%.
+- **Simulator sensor tests** (`simulator.rs`): `SimSensorManager` returns
+  realistic bounded values (temp/humidity/pressure/accel/light) that vary
+  across reads. Coverage 57% → 64%.
+- **Web tool tests** (`web.rs`): `wmo_description` mapping across every WMO
+  weather code. Coverage 80% → 82%.
+- **Tool executor priority tests** (`tools.rs`): `voice_output` /
+  `send_notification` accept low/high/urgent and normalise unknown priorities.
+
 - **OTA firmware update** (`AT+OTA=<url>`, `firmware/esp32-app/src/ota.rs`):
   streams an image into the inactive OTA slot, verifies it via `esp_ota_end`,
   marks the next boot target, and reboots; every failure path aborts the OTA
@@ -484,6 +596,13 @@ here. Dates use `YYYY-MM-DD` and follow ISO 8601. Versions follow
   are documentation-only and are not themselves CVEs.
 
 ### Fixed
+- **`magent-core/src/ollama.rs` `parse_response` off-by-one** — the legacy
+  embedded `OllamaClient::parse_response` used `pos + 10` to skip the
+  `"content":"` key, but that key is **11** chars long, so every parsed
+  `content` started with a spurious leading `"`. The tool-call name extraction
+  used `pos + 17` against the 20-char `"function":{"name":"` pattern, so tool
+  names parsed as empty. Both offsets corrected (`+ 11` / `+ 20`); new unit
+  tests pin the correct values.
 - **`magent-core` `property_tests` target would not compile** — it uses
   `web3::wallet::Keystore`, so its `required-features` now includes `wallet`
   (previously only `std` + `web3`, so `cargo test -p magent-core` failed to

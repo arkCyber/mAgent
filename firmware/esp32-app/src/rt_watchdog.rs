@@ -26,13 +26,20 @@
 /// call bound. Long waits re-feed every second (llm.rs / at_dispatch.rs), and
 /// `fetch_web` feeds at entry, so a legitimate wait never trips it while a
 /// real hang is still caught within ~18s.
-#[cfg(feature = "board-s3")]
+///
+/// `rt_wdt` is a `cargo:rustc-cfg` emitted by `build.rs` when the effective
+/// ESP-IDF build has `CONFIG_ESP_TASK_WDT_EN=y`. When the target disables the
+/// task watchdog (e.g. the ESP32-S3 `sdkconfig.s3.defaults` sets it =n, so
+/// `esp_task_wdt.c` is not compiled and the symbols are absent), the `rt_wdt`
+/// cfg is unset and this module degrades to a no-op — matching the config and
+/// keeping the firmware linkable.
+#[cfg(all(feature = "board-s3", rt_wdt))]
 const RT_WDT_TIMEOUT_MS: u32 = 18_000;
 
 /// Arm the RT watchdog once at boot. Fail-open: if the subsystem can't start,
 /// we log and run without it (never risk a boot that immediately watchdog-
 /// resets). Returns `true` if armed.
-#[cfg(feature = "board-s3")]
+#[cfg(all(feature = "board-s3", rt_wdt))]
 pub fn arm() -> bool {
     use esp_idf_sys::*;
     let config = esp_task_wdt_config_t {
@@ -55,15 +62,16 @@ pub fn arm() -> bool {
     }
 }
 
-/// No-op on single-core C61 (watchdog stays disabled).
-#[cfg(not(feature = "board-s3"))]
+/// No-op when the board isn't the S3, or when the S3 build doesn't enable the
+/// task watchdog (`ESP_TASK_WDT_EN=n` — see module docs).
+#[cfg(not(all(feature = "board-s3", rt_wdt)))]
 pub fn arm() -> bool {
     false
 }
 
 /// Subscribe the *current* task to the RT watchdog. Call at the top of each RT
 /// thread so the WDT monitors it. Best-effort.
-#[cfg(feature = "board-s3")]
+#[cfg(all(feature = "board-s3", rt_wdt))]
 pub fn subscribe_current() {
     use esp_idf_sys::*;
     let rc = unsafe { esp_task_wdt_add(core::ptr::null_mut()) };
@@ -72,18 +80,18 @@ pub fn subscribe_current() {
     }
 }
 
-/// No-op on single-core C61.
-#[cfg(not(feature = "board-s3"))]
+/// No-op when the task watchdog isn't compiled in.
+#[cfg(not(all(feature = "board-s3", rt_wdt)))]
 pub fn subscribe_current() {}
 
 /// Reset (feed) the RT watchdog for the current task. Call on every RT loop
 /// iteration and during long blocking waits (e.g. the LLM channel wait) so a
 /// *designed* wait never looks like a hang.
-#[cfg(feature = "board-s3")]
+#[cfg(all(feature = "board-s3", rt_wdt))]
 pub fn feed() {
     unsafe { esp_idf_sys::esp_task_wdt_reset() };
 }
 
-/// No-op on single-core C61.
-#[cfg(not(feature = "board-s3"))]
+/// No-op when the task watchdog isn't compiled in.
+#[cfg(not(all(feature = "board-s3", rt_wdt)))]
 pub fn feed() {}

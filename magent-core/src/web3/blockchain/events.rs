@@ -907,4 +907,106 @@ mod tests {
         let other_topic = Hash::from_hex(ERC20_APPROVAL_SIGNATURE).unwrap();
         assert!(!event.matches_topic(&other_topic));
     }
+
+    #[test]
+    fn test_topic_as_address_paths() {
+        let contract = Address::ZERO;
+        let weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+        let mut topic = [0u8; 32];
+        topic[12..32].copy_from_slice(Address::from_hex(weth).unwrap().as_bytes());
+        let event = Event::new(
+            Hash::zero(),
+            contract,
+            vec![Hash::from_bytes(topic)],
+            vec![],
+            0,
+            Hash::zero(),
+            Hash::zero(),
+            0,
+        );
+        let addr = event.topic_as_address(0).unwrap();
+        assert_eq!(addr.to_hex(), weth.to_lowercase());
+        // Out-of-range index → None.
+        assert!(event.topic_as_address(5).is_none());
+        // No topics at all → None.
+        let empty = Event::new(
+            Hash::zero(),
+            contract,
+            vec![],
+            vec![],
+            0,
+            Hash::zero(),
+            Hash::zero(),
+            0,
+        );
+        assert!(empty.topic_as_address(0).is_none());
+    }
+
+    #[test]
+    fn test_topic_as_u256_and_u64() {
+        let mut topic = [0u8; 32];
+        topic[31] = 42;
+        let event = Event::new(
+            Hash::zero(),
+            Address::ZERO,
+            vec![Hash::from_bytes(topic)],
+            vec![],
+            0,
+            Hash::zero(),
+            Hash::zero(),
+            0,
+        );
+        assert_eq!(event.topic_as_u256(0), Some(42));
+        assert_eq!(event.topic_as_u64(0), Some(42));
+        assert!(event.topic_as_u256(3).is_none());
+        assert!(event.topic_as_u64(3).is_none());
+    }
+
+    #[test]
+    fn test_topic_as_bytes32() {
+        let topic = [0xabu8; 32];
+        let event = Event::new(
+            Hash::zero(),
+            Address::ZERO,
+            vec![Hash::from_bytes(topic)],
+            vec![],
+            0,
+            Hash::zero(),
+            Hash::zero(),
+            0,
+        );
+        assert_eq!(event.topic_as_bytes32(0).unwrap(), topic.to_vec());
+        assert!(event.topic_as_bytes32(1).is_none());
+    }
+
+    #[test]
+    fn test_data_as_u64() {
+        let mut data = [0u8; 32];
+        data[31] = 7;
+        let event = Event::new(
+            Hash::zero(),
+            Address::ZERO,
+            vec![],
+            data.to_vec(),
+            0,
+            Hash::zero(),
+            Hash::zero(),
+            0,
+        );
+        assert_eq!(event.data_as_u64(), Some(7));
+    }
+
+    #[test]
+    fn test_event_filter_from_to_and_block_param() {
+        let f = EventFilter::new(Address::ZERO)
+            .from(10)
+            .to(20)
+            .with_block_param(BlockParam::Earliest)
+            // Index 4 is out of range (max 4 topics) and must be ignored.
+            .with_topic(4, Hash::zero());
+        assert_eq!(f.from_block, 10);
+        assert_eq!(f.to_block, 20);
+        assert!(matches!(f.block, BlockParam::Earliest));
+        assert!(f.topics[3].is_none());
+    }
 }

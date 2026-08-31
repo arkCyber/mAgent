@@ -706,4 +706,27 @@ mod tests {
         assert_eq!(client.max_retries(), 3);
         assert_eq!(client.timeout_secs(), 30);
     }
+
+    #[test]
+    fn test_with_timeout_and_backoff() {
+        let client = HttpRpcClient::new("http://x", 1)
+            .with_timeout(15)
+            .with_backoff(50, 500);
+        assert_eq!(client.timeout_secs(), 15);
+        assert_eq!(client.base_backoff_ms(), 50);
+        assert_eq!(client.max_backoff_ms(), 500);
+    }
+
+    #[test]
+    fn test_from_chain_uses_rpc_url_and_defaults() {
+        use crate::web3::blockchain::ChainConfig;
+        let mut c = ChainConfig::new(1, "Ethereum");
+        c.rpc_url = Some("https://rpc.example.com".into());
+        let client = HttpRpcClient::from_chain(c);
+        assert_eq!(client.chain_id(), 1);
+        // Missing URL must not panic.
+        let c2 = ChainConfig::new(2, "Polygon");
+        let client2 = HttpRpcClient::from_chain(c2);
+        assert_eq!(client2.chain_id(), 2);
+    }
 }

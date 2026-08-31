@@ -419,4 +419,42 @@ mod tests {
         let wear = wl.calculate_wear_level();
         assert!((0.0..=1.0).contains(&wear));
     }
+
+    #[test]
+    fn test_none_strategy_pins_current_sector() {
+        let mut wl = WearLeveler::new(4, 2);
+        wl.set_strategy(WearLevelingStrategy::None);
+        // None never rotates: get_next_sector always returns the current one.
+        assert_eq!(wl.get_next_sector().unwrap(), 0);
+        wl.increment_write_count();
+        wl.increment_write_count();
+        assert_eq!(wl.get_next_sector().unwrap(), 0);
+        assert_eq!(wl.current_sector(), 0);
+    }
+
+    #[test]
+    fn test_is_sector_worn_and_most_worn() {
+        let wl = WearLeveler::new(4, 3);
+        // Fill the current (sector 0) write count past its threshold.
+        wl.increment_write_count();
+        wl.increment_write_count();
+        wl.increment_write_count();
+        wl.increment_write_count();
+        assert!(wl.is_sector_worn(0));
+        assert!(!wl.is_sector_worn(1));
+        assert!(wl.is_worn_out());
+        assert_eq!(wl.get_most_worn_sector(), 0);
+    }
+
+    #[test]
+    fn test_reset_stats_clears_everything() {
+        let wl = WearLeveler::new(4, 2);
+        wl.increment_write_count();
+        wl.increment_write_count();
+        assert!(wl.write_count() > 0);
+        wl.reset_stats();
+        assert_eq!(wl.write_count(), 0);
+        assert_eq!(wl.current_sector(), 0);
+        assert!(!wl.is_worn_out());
+    }
 }

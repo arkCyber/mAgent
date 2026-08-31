@@ -465,4 +465,84 @@ mod tests {
         assert!(dbg.contains("payload_hex"));
         assert!(dbg.contains("signature_hex"));
     }
+
+    #[test]
+    fn signed_message_signature_and_signer_did_decode() {
+        let sk_bytes = [5u8; 32];
+        let did = DidKey::from_ed25519_secret_key(&sk_bytes).unwrap();
+        let sig = Signature::from_bytes(&[6u8; SIGNATURE_LEN]).unwrap();
+        let msg = SignedMessage::new(did.clone(), b"payload".to_vec(), sig);
+        // `signature()` decodes the hex form back to raw bytes.
+        assert_eq!(msg.signature().unwrap().to_bytes(), sig.to_bytes());
+        // `signer_did()` round-trips the embedded did:key.
+        assert_eq!(msg.signer_did().unwrap(), did);
+    }
+
+    #[test]
+    fn signed_message_from_json_error_paths() {
+        // Not JSON at all → InvalidJson.
+        let err = SignedMessage::from_json("not json").unwrap_err();
+        assert!(matches!(
+            err,
+            Web3ErrorKind::Parse {
+                kind: ParseFailureKind::InvalidJson,
+                ..
+            }
+        ));
+
+        // JSON but wrong schema (missing field) → SchemaMismatch.
+        let err = SignedMessage::from_json(r#"{"signer":"did:key:z"}"#).unwrap_err();
+        assert!(matches!(
+            err,
+            Web3ErrorKind::Parse {
+                kind: ParseFailureKind::SchemaMismatch,
+                ..
+            }
+        ));
+
+        // Valid schema but non-hex payload → HexDecode.
+        let sk = [7u8; 32];
+        let did = DidKey::from_ed25519_secret_key(&sk).unwrap();
+        let sig = Signature::from_bytes(&[0u8; SIGNATURE_LEN]).unwrap();
+        let msg = SignedMessage::new(did, b"x".to_vec(), sig);
+        let mut json = msg.to_json();
+        // Corrupt the payload_hex field.
+        json = json.replace("\"payload_hex\":\"", "\"payload_hex\":\"zz");
+        let err = SignedMessage::from_json(&json).unwrap_err();
+        assert!(matches!(err, Web3ErrorKind::HexDecode(_)));
+    }
+
+    #[test]
+    fn signed_message_to_json_into_matches_to_json() {
+        let sk = [8u8; 32];
+        let did = DidKey::from_ed25519_secret_key(&sk).unwrap();
+        let sig = Signature::from_bytes(&[0u8; SIGNATURE_LEN]).unwrap();
+        let msg = SignedMessage::new(did, b"hello".to_vec(), sig);
+        let mut buf = heapless::String::<1024>::new();
+        msg.to_json_into(&mut buf).unwrap();
+        assert_eq!(buf.as_str(), msg.to_json());
+        // Round-trips identically.
+        let parsed = SignedMessage::from_json(buf.as_str()).unwrap();
+        assert_eq!(parsed.payload_bytes(), b"hello");
+    }
+
+    #[test]
+    fn signed_message_to_json_into_escapes_and_reports_small_buffer() {
+        let sk = [9u8; 32];
+        let did = DidKey::from_ed25519_secret_key(&sk).unwrap();
+        let sig = Signature::from_bytes(&[0u8; SIGNATURE_LEN]).unwrap();
+        let msg = SignedMessage::new(did, b"hello".to_vec(), sig);
+        let mut tiny = heapless::String::<8>::new();
+        assert!(msg.to_json_into(&mut tiny).is_err(), "buffer too small");
+    }
+
+    #[test]
+    fn signature_debug_prefixes_but_truncates() {
+        let sig = Signature::from_bytes(&[0xAB; SIGNATURE_LEN]).unwrap();
+        let dbg = format!("{:?}", sig);
+        assert!(dbg.starts_with("Signature("));
+        // "Signature(" + 8 hex + "…"(3-byte UTF-8) + ")" ≈ 22 bytes —
+        // never the full 128 hex chars.
+        assert!(dbg.len() < 30, "Debug must not dump 128 hex chars");
+    }
 }

@@ -834,7 +834,14 @@ mod tests {
     fn test_config_from_url_malformed_no_panic() {
         // Malformed / hostile URLs must never panic (REQ-NET-003): the parser
         // returns sensible defaults instead.
-        for bad in ["", "://", "http://", "not a url", "http://:9999/", "ftp://h/"] {
+        for bad in [
+            "",
+            "://",
+            "http://",
+            "not a url",
+            "http://:9999/",
+            "ftp://h/",
+        ] {
             let cfg = HttpClientConfig::from_url(bad);
             // Host may be empty, but port must stay a valid u16 and use_tls sane.
             assert!(cfg.port > 0);
@@ -1150,7 +1157,9 @@ mod tests {
 
     #[test]
     fn test_rpc_propagates_transport_timeout() {
-        let t: SharedTransport = Arc::new(ErrTransport { err: HttpError::Timeout });
+        let t: SharedTransport = Arc::new(ErrTransport {
+            err: HttpError::Timeout,
+        });
         let mut client = EspHttpClient::with_transport(
             HttpClientConfig::from_url("https://eth.llamarpc.com"),
             t,
@@ -1189,8 +1198,9 @@ mod tests {
         // Installing a process-wide default makes `EspHttpClient::new` /
         // `from_url` pick it up automatically (the firmware boot path uses
         // this to inject the real esp-idf transport once).
-        let t: SharedTransport =
-            Arc::new(StaticTransport::posting(r#"{"jsonrpc":"2.0","id":0,"result":"0x1"}"#));
+        let t: SharedTransport = Arc::new(StaticTransport::posting(
+            r#"{"jsonrpc":"2.0","id":0,"result":"0x1"}"#,
+        ));
         let _ = set_default_transport(t);
         let mut client = EspHttpClient::from_url("https://eth.llamarpc.com");
         assert!(client.get_block_number().is_ok());

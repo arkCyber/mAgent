@@ -547,4 +547,111 @@ mod tests {
         assert_eq!(bytes.len(), 20);
         assert_eq!(bytes[0], 0x74);
     }
+
+    #[test]
+    fn test_parse_address_paths() {
+        let client = EvmRpcClient::with_rpc("https://x", 1);
+        // null → None
+        assert!(client
+            .parse_address(&serde_json::json!(null))
+            .unwrap()
+            .is_none());
+        // non-string → error
+        assert!(client.parse_address(&serde_json::json!(123)).is_err());
+        // valid → Some
+        let addr = client
+            .parse_address(&serde_json::json!(
+                "0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21"
+            ))
+            .unwrap();
+        assert!(addr.is_some());
+        // Address::to_hex() includes the `0x` prefix (40 hex chars + 2).
+        assert_eq!(addr.unwrap().to_hex().len(), 42);
+    }
+
+    #[test]
+    fn test_parse_hash_paths() {
+        let client = EvmRpcClient::with_rpc("https://x", 1);
+        let h = client
+            .parse_hash(&serde_json::json!(
+                "0x742d35cc6634c0532925a3b844bc9e7595f8be21000000000000000000000000"
+            ))
+            .unwrap();
+        // Hash::to_hex() includes the `0x` prefix (64 hex chars + 2).
+        assert_eq!(h.to_hex().len(), 66);
+        // non-string → error
+        assert!(client.parse_hash(&serde_json::json!(42)).is_err());
+    }
+
+    #[test]
+    fn test_parse_wei_paths() {
+        let client = EvmRpcClient::with_rpc("https://x", 1);
+        let w = client
+            .parse_wei(&serde_json::json!("0xde0b6b3a7640000"))
+            .unwrap();
+        assert_eq!(w.as_wei(), 1_000_000_000_000_000_000u128);
+        // non-string → error
+        assert!(client.parse_wei(&serde_json::json!(1)).is_err());
+        // bad hex → error
+        assert!(client.parse_wei(&serde_json::json!("0xzz")).is_err());
+    }
+
+    #[test]
+    fn test_parse_transaction_receipt_success() {
+        let client = EvmRpcClient::with_rpc("https://x", 1);
+        let v = serde_json::json!({
+            "transactionHash": "0x742d35cc6634c0532925a3b844bc9e7595f8be21000000000000000000000000",
+            "blockNumber": "0x10",
+            "blockHash": "0x742d35cc6634c0532925a3b844bc9e7595f8be21000000000000000000000000",
+            "transactionIndex": "0x0",
+            "from": "0x0000000000000000000000000000000000000000",
+            "to": null,
+            "gasUsed": "0x5208",
+            "cumulativeGasUsed": "0x5208",
+            "contractAddress": null,
+            "status": "0x1",
+            "logs": []
+        });
+        let receipt = client.parse_transaction_receipt(&v).unwrap();
+        assert_eq!(receipt.status, 1);
+        assert!(receipt.to.is_none());
+        assert_eq!(receipt.gas_used, 21000);
+        assert_eq!(receipt.block_number, 16);
+    }
+
+    #[test]
+    fn test_hex_encode_decode_round_trip() {
+        let bytes = [0xdeu8, 0xad, 0xbe, 0xef];
+        let enc = hex_encode(&bytes);
+        assert_eq!(enc, "deadbeef");
+        assert_eq!(hex_decode(&enc).unwrap(), bytes);
+        // with 0x prefix
+        assert_eq!(hex_decode("0xdeadbeef").unwrap(), bytes);
+        // uppercase accepted
+        assert_eq!(hex_decode("DEADBEEF").unwrap(), bytes);
+    }
+
+    #[test]
+    fn test_hex_decode_error_paths() {
+        // odd length
+        assert!(hex_decode("abc").is_err());
+        // invalid hex digit
+        assert!(hex_decode("0xzz").is_err());
+        assert!(matches!(
+            hex_decode("abc"),
+            Err(Web3ErrorKind::BlockchainError(_))
+        ));
+    }
+
+    #[test]
+    fn test_json_rpc_error_deserializes() {
+        let v: JsonRpcError = serde_json::from_value(serde_json::json!({
+            "code": -32601,
+            "message": "method not found",
+        }))
+        .unwrap();
+        assert_eq!(v.code, -32601);
+        assert_eq!(v.message, "method not found");
+        assert!(v.data.is_none());
+    }
 }

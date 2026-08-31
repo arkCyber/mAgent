@@ -645,4 +645,164 @@ mod tests {
         // destructor is a no-op, so we don't need to drop it
         // explicitly.
     }
+
+    // -------------------------------------------------------------------------
+    // Core signing / verification paths — the security-critical surface.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn sign_verify_round_trip_succeeds() {
+        let alice = Identity::from_secret_bytes(&[10u8; SECRET_KEY_LEN]).unwrap();
+        let signed = alice.sign(b"hello bob").unwrap();
+        // The signer confirms their own envelope.
+        assert!(alice.verify(&signed, b"hello bob"));
+        // Detailed variant returns Ok on the happy path.
+        assert!(alice.verify_detailed(&signed, b"hello bob").is_ok());
+        // The envelope is self-contained: remote verification via the
+        // embedded DID's public key succeeds too.
+        assert!(verify_signed_message(&signed, b"hello bob"));
+        assert!(verify_signed_message_detailed(&signed, b"hello bob").is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_tampered_payload() {
+        let alice = Identity::from_secret_bytes(&[11u8; SECRET_KEY_LEN]).unwrap();
+        let signed = alice.sign(b"original").unwrap();
+        assert!(!alice.verify(&signed, b"tampered"));
+        // The failure cause must be a cryptographic mismatch, not a DID
+        // parse problem.
+        assert!(matches!(
+            alice.verify_detailed(&signed, b"tampered"),
+            Err(Web3ErrorKind::SignatureVerificationFailed)
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_signer() {
+        let alice = Identity::from_secret_bytes(&[12u8; SECRET_KEY_LEN]).unwrap();
+        let bob = Identity::from_secret_bytes(&[13u8; SECRET_KEY_LEN]).unwrap();
+        let signed = alice.sign(b"hello").unwrap();
+        // Bob did NOT sign this — verify_detailed must surface DidKeyMismatch,
+        // distinct from a bad signature.
+        assert!(!bob.verify(&signed, b"hello"));
+        assert!(matches!(
+            bob.verify_detailed(&signed, b"hello"),
+            Err(Web3ErrorKind::DidKeyMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_signature_detailed_paths() {
+        let alice = Identity::from_secret_bytes(&[14u8; SECRET_KEY_LEN]).unwrap();
+        let signed = alice.sign(b"payload").unwrap();
+        let pk = alice.public_key();
+
+        // Good signature over the right payload verifies.
+        assert!(verify_signature(pk, &signed.signature_hex, b"payload"));
+        assert!(verify_signature_detailed(pk, &signed.signature_hex, b"payload").is_ok());
+
+        // Wrong payload → cryptographic failure.
+        assert!(!verify_signature(pk, &signed.signature_hex, b"other"));
+        assert!(matches!(
+            verify_signature_detailed(pk, &signed.signature_hex, b"other"),
+            Err(Web3ErrorKind::SignatureVerificationFailed)
+        ));
+
+        // Malformed signature hex → parse error, not a crypto failure.
+        assert!(matches!(
+            verify_signature_detailed(pk, "zz", b"payload"),
+            Err(Web3ErrorKind::HexDecode(_))
+        ));
+        assert!(matches!(
+            verify_signature_detailed(pk, &"00".repeat(32), b"payload"),
+            Err(Web3ErrorKind::InvalidSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_signed_message_detailed_rejects_bad_signer() {
+        // A signed message whose `signer` field does not decode to a
+        // valid did:key must surface a parse/DID error, not panic.
+        let alice = Identity::from_secret_bytes(&[15u8; SECRET_KEY_LEN]).unwrap();
+        let mut signed = alice.sign(b"payload").unwrap();
+        signed.signer = "not-a-did".into();
+        assert!(verify_signed_message_detailed(&signed, b"payload").is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Key serialisation & debug redaction.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn public_key_hex_round_trip() {
+        let alice = Identity::from_secret_bytes(&[16u8; SECRET_KEY_LEN]).unwrap();
+        let pk = alice.public_key();
+        let hex = pk.to_hex();
+        assert_eq!(hex.len(), PUBLIC_KEY_LEN * 2);
+        let reparsed = PublicKey::from_hex(&format!("0x{}", hex.to_uppercase())).unwrap();
+        assert_eq!(reparsed.as_bytes(), pk.as_bytes());
+        // The did:key form must round-trip and carry the same key.
+        let did = pk.did_key();
+        assert_eq!(did.ed25519_public_key().unwrap(), pk.as_bytes());
+    }
+
+    #[test]
+    fn public_key_from_hex_rejects_bad_length() {
+        assert!(matches!(
+            PublicKey::from_hex(&"ab".repeat(16)),
+            Err(Web3ErrorKind::InvalidPublicKey { actual_len: 16 })
+        ));
+    }
+
+    #[test]
+    fn identity_from_secret_hex_round_trip() {
+        let seed = [17u8; SECRET_KEY_LEN];
+        let a = Identity::from_secret_bytes(&seed).unwrap();
+        let hex = a.secret_key().to_hex();
+        let b = Identity::from_secret_hex(&hex).unwrap();
+        assert_eq!(a.public_key().as_bytes(), b.public_key().as_bytes());
+    }
+
+    #[test]
+    fn identity_debug_redacts_secret_key() {
+        let alice = Identity::from_secret_bytes(&[18u8; SECRET_KEY_LEN]).unwrap();
+        let dbg = format!("{:?}", alice);
+        let secret_hex = alice.secret_key().to_hex();
+        assert!(
+            !dbg.contains(&secret_hex),
+            "Identity Debug leaked the secret key material: {dbg}"
+        );
+        assert!(dbg.contains("did"));
+        assert!(dbg.contains("<redacted>"));
+    }
+
+    #[test]
+    fn secret_key_debug_redacts_material() {
+        let sk = SecretKey::from_bytes(&[19u8; SECRET_KEY_LEN]).unwrap();
+        let dbg = format!("{:?}", sk);
+        assert_eq!(dbg, "SecretKey(<redacted>)");
+    }
+
+    #[test]
+    fn public_key_debug_redacts_but_prefixes() {
+        let pk = PublicKey::from_bytes(&[0xAB; PUBLIC_KEY_LEN]).unwrap();
+        let dbg = format!("{:?}", pk);
+        assert!(dbg.starts_with("PublicKey("));
+        // Must not dump the full 64-char hex.
+        assert!(dbg.len() < 32);
+    }
+
+    #[test]
+    fn base58_round_trip() {
+        let bytes = b"some-bytes-to-encode";
+        let enc = base58_encode(bytes);
+        let dec = base58_decode(&enc).unwrap();
+        assert_eq!(dec, bytes);
+    }
+
+    #[test]
+    fn base58_decode_rejects_garbage() {
+        // `0`/`O`/`l`/`I` are not in the base58btc alphabet.
+        assert!(base58_decode("0OIl").is_err());
+    }
 }

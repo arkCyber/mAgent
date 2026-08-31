@@ -263,10 +263,15 @@ fn adc_read_pin(pin: u8) -> Result<f64, String> {
 // ---------------------------------------------------------------------------
 // Register-style master on I2C_NUM_0: `i2c_read` does a write(reg) then read
 // (repeated start); `i2c_write` sends reg followed by payload. SDA/SCL pins are
-// a board-wiring choice — adjust to match the hardware (defaults target the
-// ESP32-S3-DevKitC-1 header pair GPIO8=SCL / GPIO9=SDA).
-pub(crate) const I2C_SCL_PIN: u8 = 8;
-pub(crate) const I2C_SDA_PIN: u8 = 9;
+// a board-wiring choice — adjust to match the hardware.
+//
+// PATCHED (MicroAgent): moved from GPIO8=SCL / GPIO9=SDA to GPIO4=SCL /
+// GPIO5=SDA. GPIO8 is a strapping / SPI-flash-related pin on the ESP32-S3;
+// reconfiguring it as I2C and driving it while flash is accessed can fault
+// (candidate for the Lua `Core 0 StoreProhibited`). GPIO4/GPIO5 are plain
+// general-purpose pins, safe for I2C on the S3 devkit.
+pub(crate) const I2C_SCL_PIN: u8 = 4;
+pub(crate) const I2C_SDA_PIN: u8 = 5;
 const I2C_TIMEOUT_TICKS: u32 = 1000; // ~1 s at the default 1 kHz tick
 
 static I2C_READY: OnceLock<()> = OnceLock::new();
@@ -708,7 +713,7 @@ impl HardwareBackend for Esp32Hardware {
 /// `Send` values and `std::thread` accepts it. Everything is created on the
 /// new thread and never moved across it.
 pub fn start_lua_task() {
-    let _ = crate::core_affinity::spawn_thread(
+    let r = crate::core_affinity::spawn_thread(
         "lua-thread",
         32 * 1024,
         crate::core_affinity::ThreadProfile::REALTIME_AGENT,
@@ -797,5 +802,10 @@ pub fn start_lua_task() {
             // OTA/reboot). Per-tick errors are contained by the runtime.
             app.run_until_stop(Duration::from_millis(50), None);
             log::info!("[lua] loop stopped");
-        });
+        },
+    );
+    match r {
+        Ok(_) => log::info!("[lua] thread started"),
+        Err(e) => log::error!("[lua] thread spawn failed: {e}"),
+    }
 }

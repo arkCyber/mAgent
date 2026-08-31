@@ -177,8 +177,14 @@ fn fetch_url_strips_html() {
             // example.com's body is a single short paragraph — the HTML
             // stripper should leave a near-empty document. We just assert
             // it doesn't contain raw `<html>` or `<body>` tags.
-            assert!(!s.contains("<html>"), "html tags leaked through stripper: {s}");
-            assert!(!s.contains("<body>"), "html tags leaked through stripper: {s}");
+            assert!(
+                !s.contains("<html>"),
+                "html tags leaked through stripper: {s}"
+            );
+            assert!(
+                !s.contains("<body>"),
+                "html tags leaked through stripper: {s}"
+            );
         }
         Err(e) => panic!("fetch_url live test failed: {e}"),
     }

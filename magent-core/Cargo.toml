@@ -457,6 +457,27 @@ blockchain = [
 embedded = ["nrf52"]
 
 # ---------------------------------------------------------------------------
+# Test / integration feature flags for the security & power surfaces.
+#
+# `security` is a first-class, explicit alias for enabling the real
+# cryptographic path: it flips `SecurityManager` (security.rs) from the
+# historical XOR placeholder onto real AES-128-GCM authenticated
+# encryption + HMAC-SHA-256 message authentication (both NIST-approved).
+# It is a thin alias of `web3`, which provides `aes-gcm` / `aes` / `aead` /
+# `hmac` / `sha2`. Enabling it is what the `security_tests` suite and the
+# AES/HMAC known-answer tests need to exercise the real AEAD primitives.
+security = ["web3"]
+
+# `power` is a first-class, opt-in marker for the power-management surface
+# (power.rs / sleep_manager.rs) and its dedicated test target. The modules
+# themselves are always compiled (they are `no_std`-clean and tiny), so this
+# feature exists so host/firmware consumers and CI can *select* the power
+# suite explicitly without pulling in the heavy `web3`/`std` graph. Enable it
+# alongside `std` to run `cargo test -p magent-core --features std,power
+# --test power_tests`.
+power = []
+
+# ---------------------------------------------------------------------------
 # Dev profile
 # ---------------------------------------------------------------------------
 [dev-dependencies]
@@ -487,6 +508,31 @@ required-features = ["std"]
 [[test]]
 name = "comprehensive_agent_tests"
 path = "tests/comprehensive_agent_tests.rs"
+required-features = ["std"]
+
+# Power-management integration tests. Requires `std` (uses the public
+# `PowerManager` API + `optimize_for_battery`) and the `power` feature
+# marker so the suite is explicitly selectable. Exercises the full mode
+# state-machine, battery-threshold/low-power decision, and the battery→mode
+# map that mirrors the nRF52840 firmware power model.
+[[test]]
+name = "power_tests"
+path = "tests/power_tests.rs"
+required-features = ["std", "power"]
+
+# End-to-end ReAct-loop test over a *real* mock HTTP server.
+#
+# This is the network-carrying counterpart to the in-process `MockLlm` unit
+# tests: it binds a local TCP listener that speaks the Ollama `/api/chat`
+# wire format and points a real `OllamaClient` (blocking `reqwest`) at it,
+# then drives `RealAgentRunner::run()` through a tool-call → final-result
+# ReAct cycle over actual HTTP. This exercises the real JSON body builder,
+# the HTTP round-trip, response parsing, and the tool-execution loop — not
+# a canned in-process backend. Requires `std` (for `real_tools`,
+# `agent_runner`, and the TCP listener).
+[[test]]
+name = "ollama_react_e2e"
+path = "tests/ollama_react_e2e.rs"
 required-features = ["std"]
 
 [[test]]

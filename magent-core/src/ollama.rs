@@ -268,7 +268,7 @@ impl OllamaClient {
         // Simplified JSON parsing - in production, use a proper JSON parser
         // Look for "content" field
         let content_start = match json.find("\"content\":\"") {
-            Some(pos) => pos + 10,
+            Some(pos) => pos + 11,
             None => {
                 return Err(AgentError::ConfigurationError {
                     field: "response",
@@ -291,7 +291,7 @@ impl OllamaClient {
             // Parse tool calls (simplified)
             let mut search_pos = 0;
             while let Some(func_start) = json[search_pos..].find("\"function\":{\"name\":\"") {
-                let actual_pos = search_pos + func_start + 17;
+                let actual_pos = search_pos + func_start + 20;
                 if let Some(func_end) = json[actual_pos..].find('"') {
                     let func_name = &json[actual_pos..actual_pos + func_end];
 
@@ -417,4 +417,146 @@ pub const TOOL_DEFINITIONS: [ToolDef; 5] = [
 /// Get tool definitions
 pub const fn get_tool_definitions() -> [ToolDef; 5] {
     TOOL_DEFINITIONS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_and_with_defaults_expose_fields() {
+        let c = OllamaClient::new("http://localhost:11434/", "qwen2.5:3b", 5000).unwrap();
+        assert_eq!(c.base_url(), "http://localhost:11434/");
+        assert_eq!(c.model(), "qwen2.5:3b");
+        assert_eq!(c.timeout_ms(), 5000);
+
+        let d = OllamaClient::with_defaults().unwrap();
+        assert_eq!(d.base_url(), "http://localhost:11434");
+        assert_eq!(d.model(), "llama3.2");
+        assert_eq!(d.timeout_ms(), 30000);
+    }
+
+    #[test]
+    fn build_request_starts_empty() {
+        let c = OllamaClient::new("http://h", "m", 1000).unwrap();
+        let req = c.build_request();
+        assert_eq!(req.model.as_str(), "m");
+        assert!(req.messages.is_empty());
+        assert!(!req.stream);
+        assert!(req.tools.is_none());
+    }
+
+    #[test]
+    fn add_message_and_system_message() {
+        let mut c = OllamaClient::new("http://h", "m", 1000).unwrap();
+        let mut req = c.build_request();
+        c.add_message(&mut req, "user", "hello").unwrap();
+        c.add_system_message(&mut req, "be brief").unwrap();
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[0].role.as_str(), "user");
+        assert_eq!(req.messages[0].content.as_str(), "hello");
+        assert_eq!(req.messages[1].role.as_str(), "system");
+        assert_eq!(req.messages[1].content.as_str(), "be brief");
+    }
+
+    #[test]
+    fn add_message_overflows_at_capacity() {
+        let mut c = OllamaClient::new("http://h", "m", 1000).unwrap();
+        let mut req = c.build_request();
+        for _ in 0..8 {
+            assert!(c.add_message(&mut req, "user", "x").is_ok());
+        }
+        let err = c.add_message(&mut req, "user", "x").unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::BufferOverflow { capacity: 8, .. }
+        ));
+    }
+
+    #[test]
+    fn add_tools_builds_definitions() {
+        let mut c = OllamaClient::new("http://h", "m", 1000).unwrap();
+        let mut req = c.build_request();
+        c.add_tools(&mut req, &TOOL_DEFINITIONS).unwrap();
+        let tools = req.tools.as_ref().unwrap();
+        assert_eq!(tools.len(), 5);
+        let first = &tools[0];
+        assert_eq!(first.tool_type.as_str(), "function");
+        assert_eq!(first.function.name.as_str(), "read_sensor");
+        assert_eq!(first.function.description.as_str(), "Read sensor data");
+        assert_eq!(first.function.parameters.schema_type.as_str(), "object");
+        assert_eq!(first.function.parameters.properties.len(), 1);
+        assert_eq!(first.function.parameters.required[0].as_str(), "sensor");
+    }
+
+    #[test]
+    fn add_tools_overflow_errors() {
+        let mut c = OllamaClient::new("http://h", "m", 1000).unwrap();
+        let mut req = c.build_request();
+        // Repeating one tool def 9× overflows the per-request cap of 8.
+        let one: (&str, &str, &[(&str, &str, &str)]) = ("t", "d", &[]);
+        let many = [one; 9];
+        assert!(c.add_tools(&mut req, &many).is_err());
+    }
+
+    #[test]
+    fn serialize_request_emits_expected_shape() {
+        let mut c = OllamaClient::new("http://h", "qwen", 1000).unwrap();
+        let mut req = c.build_request();
+        c.add_message(&mut req, "user", "hi").unwrap();
+        let json = c.serialize_request(&req);
+        let s = json.as_str();
+        assert!(s.contains("\"model\":\"qwen\""));
+        assert!(s.contains("\"stream\":false"));
+        assert!(s.contains("\"role\":\"user\""));
+        assert!(s.contains("\"content\":\"hi\""));
+        assert!(s.ends_with("]}"));
+    }
+
+    #[test]
+    fn parse_response_extracts_content() {
+        let c = OllamaClient::new("http://h", "m", 1000).unwrap();
+        let resp = c
+            .parse_response(r#"{"content":"hello there","done":true}"#)
+            .unwrap();
+        assert_eq!(resp.message.content.as_str(), "hello there");
+        assert_eq!(resp.message.role.as_str(), "assistant");
+        assert!(resp.done);
+        assert!(resp.message.tool_calls.is_none());
+    }
+
+    #[test]
+    fn parse_response_missing_content_is_error() {
+        let c = OllamaClient::new("http://h", "m", 1000).unwrap();
+        assert!(c.parse_response(r#"{"error":"boom"}"#).is_err());
+    }
+
+    #[test]
+    fn parse_response_extracts_tool_calls() {
+        let c = OllamaClient::new("http://h", "m", 1000).unwrap();
+        let resp = c
+            .parse_response(
+                r#"{"content":"","tool_calls":[{"function":{"name":"read_sensor","arguments":{}}},{"function":{"name":"write_gpio"}}],"done":false}"#,
+            )
+            .unwrap();
+        let calls = resp.message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name.as_str(), "read_sensor");
+        assert_eq!(calls[1].name.as_str(), "write_gpio");
+        assert!(!resp.done);
+    }
+
+    #[test]
+    fn tool_definitions_constant_is_stable() {
+        let defs = get_tool_definitions();
+        assert_eq!(defs.len(), 5);
+        assert_eq!(defs[0].0, "read_sensor");
+        assert_eq!(defs[4].0, "ble_send");
+    }
+
+    #[test]
+    fn system_prompt_mentions_agent_identity() {
+        assert!(SYSTEM_PROMPT.contains("mAgent"));
+        assert!(SYSTEM_PROMPT.contains("read_sensor"));
+    }
 }

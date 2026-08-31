@@ -16,19 +16,18 @@
 | Language | Rust |
 |----------|------|
 | Platform | Embedded / Bare-metal |
-| Architecture | ARM Cortex-M4F (nRF52840), RISC-V (ESP32-C61) |
+| Architecture | ARM Cortex-M4F (nRF52840), RISC-V (ESP32-C61), Xtensa LX7 (ESP32-S3) |
 
 Aerospace-grade AI agent for nRF52840 smartwatches and embedded devices. Built
 with Rust: the nRF52840 path uses Embassy (bare-metal, no OS); the ESP32-C61
-path uses `esp-idf-svc` (std) with real Wi-Fi 6, local hardware tools, and a
-bidirectional UART command interface.
+and ESP32-S3 paths use `esp-idf-svc` (std) with real Wi-Fi, local hardware
+tools, and a bidirectional UART command interface.
 
 ## 🚀 Aerospace-Grade Safety Features
 
-- **Bounded Panics**: All runtime error paths use `Result` types; the only
-  remaining `.expect()` calls are on compile-time constants or unreachable
-  hardware paths (hardware TRNG / fixed Ed25519 seed), so no runtime condition
-  can panic the board.
+- **Bounded Panics**: All runtime error paths use `Result` types; the firmware
+  production path has **zero** `.unwrap()`/`.expect()` (only `#[cfg(test)]`
+  code uses them), so no runtime condition can panic the board.
 - **Memory Safety**: Stack depth analysis, heapless data structures, bounded buffers
 - **Resource Limits**: Strict memory, time, and iteration budgets
 - **Input Validation**: All inputs validated with bounds checking
@@ -71,7 +70,7 @@ below 64 KiB.
 | **nRF52840** | ARM Cortex-M4F | ✅ Ready | `cargo build -p magent-nrf52-app --release --target thumbv7em-none-eabihf` | Primary smartwatch platform, BLE 5.3 |
 | **ESP32-C61** | RISC-V 32-bit | ✅ Ready + Verified on HW | `cd firmware/esp32-app && ./build-c61.sh` | Wi-Fi 6 + BLE 5.0, std (esp-idf-svc), real local tools, bidirectional UART |
 | ESP32-C3/C6 | RISC-V 32-bit | 🔄 Compatible | Use ESP32-C61 config | Same architecture |
-| **ESP32-S3** | Xtensa LX7 | ✅ Ready (builds + boots on HW) | `cd firmware/esp32-app && ./build-s3.sh` | 4MB flash; agent/local tools run on real hardware; WiFi/BLE/DeepSeek pending |
+| **ESP32-S3** | Xtensa LX7 | ✅ Verified on HW (stable) | `cd firmware/esp32-app && ./build-s3.sh` | 4MB flash; WiFi + agent + HTTP dashboard verified stable (long-run soak, no leak); TLS T1/T2 (SSL buffers→PSRAM); BLE off (internal-DRAM); Lua off (WiFi PHY esp_timer UAF) |
 
 ## 🏗️ Project Structure
 
@@ -440,12 +439,13 @@ unattended / low-trust environments:
 - **Panic-cascade safety** — the trace-sink and boot-key paths never `panic!`
   inside a `Result`; `#![deny(clippy::panic_in_result_fn)]` is enforced under
   CI to keep it that way.
-- **Test coverage** — `magent-core` ships **737 unit tests** plus **365
-  integration tests** (AT parser, web3/blockchain, ingress gateway, time-sync,
-  property tests, nRF52 sim) across all feature flags; the host crates (`magent`
-  CLI, MCP executors, simulators, `magent-tools`) add another ~460. The whole
-  host test suite runs green with 0 failures, and all three firmware targets
-  (nRF52840, nRF52840 integration-test, ESP32-C61) compile cleanly.
+- **Test coverage** — `magent-core` ships **1200+ tests** (931 unit lib tests plus
+  integration targets: AT parser, web3/blockchain, ingress gateway, time-sync,
+  property tests, nRF52 sim, security, power, mock-HTTP e2e) across all feature
+  flags, all green with 0 failures. The host crates (`magent` CLI, MCP executors,
+  simulators, `magent-tools`) add another ~460. All firmware targets (nRF52840,
+  nRF52840 integration-test, ESP32-C61, ESP32-S3) compile cleanly; the S3 is
+  verified stable on hardware (WiFi + agent + HTTP dashboard, long-run soak).
 
 ## 🤝 Contributing
 

@@ -35,7 +35,11 @@ mod atomic_int {
 }
 use atomic_int::{AtomicUsize, Ordering};
 
-// Re-export critical-section for no_std compatibility
+// Re-export critical-section for no_std compatibility. Only the chip-family
+// features pull in the `critical-section` crate (via their arch deps); a bare
+// host `--features std` build has no such dependency, so the alias is gated
+// out there. It is only a compatibility re-export (unused in this module).
+#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 #[allow(unused_imports)]
 use critical_section::Mutex as CriticalSection;
 
@@ -324,5 +328,128 @@ impl FaultDetector {
     /// Get last error type
     pub fn last_error_type(&self) -> Option<crate::error::ErrorCategory> {
         self.last_error_type.get()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{AgentError, ErrorCategory};
+
+    #[test]
+    fn budget_enforcer_iteration_budget() {
+        let b = BudgetEnforcer::new(3, 100, 1000);
+        assert_eq!(b.iteration_limit(), 3);
+        assert_eq!(b.iteration_usage(), 0);
+        assert!(b.consume_iteration().is_ok());
+        assert!(b.consume_iteration().is_ok());
+        assert!(b.consume_iteration().is_ok());
+        assert_eq!(b.iteration_usage(), 3);
+        // 4th iteration exceeds the limit.
+        let err = b.consume_iteration().unwrap_err();
+        assert!(matches!(err, AgentError::IterationBudgetExhausted { .. }));
+        b.reset_iteration();
+        assert_eq!(b.iteration_usage(), 0);
+    }
+
+    #[test]
+    fn budget_enforcer_memory_budget() {
+        let b = BudgetEnforcer::new(10, 100, 1000);
+        assert_eq!(b.memory_limit(), 100);
+        assert!(b.consume_memory(40).is_ok());
+        assert!(b.consume_memory(40).is_ok());
+        assert_eq!(b.memory_usage(), 80);
+        // Exceeding the limit rejects and does NOT change usage.
+        let err = b.consume_memory(50).unwrap_err();
+        assert!(matches!(err, AgentError::MemoryBudgetExhausted { .. }));
+        assert_eq!(b.memory_usage(), 80);
+        // Release drops usage with saturating semantics.
+        b.release_memory(30);
+        assert_eq!(b.memory_usage(), 50);
+        b.release_memory(1000);
+        assert_eq!(b.memory_usage(), 0);
+        b.reset_memory();
+        assert_eq!(b.memory_usage(), 0);
+    }
+
+    #[test]
+    fn watchdog_feed_and_timeout() {
+        let w = Watchdog::new(500);
+        assert_eq!(w.timeout_ms(), 500);
+        assert!(!w.needs_feed()); // newly created, already fed
+        w.simulate_timeout();
+        assert!(w.needs_feed());
+        w.feed();
+        assert!(!w.needs_feed());
+    }
+
+    #[test]
+    fn stack_monitor_depth_checks() {
+        let m = StackMonitor::new(1000, 100);
+        assert_eq!(m.stack_limit(), 100);
+        // Small depth is fine.
+        assert!(m.check_depth(950).is_ok());
+        assert_eq!(m.current_depth(), 50);
+        // Large depth (low SP) overflows.
+        let err = m.check_depth(500).unwrap_err();
+        assert!(matches!(err, AgentError::StackOverflow { .. }));
+        assert_eq!(m.current_depth(), 500);
+    }
+
+    #[test]
+    fn memory_guard_allocate_free() {
+        let g = MemoryGuard::new(100);
+        assert_eq!(g.capacity(), 100);
+        assert_eq!(g.usage(), 0);
+        assert!(g.allocate(40).is_ok());
+        assert!(g.allocate(40).is_ok());
+        assert_eq!(g.usage(), 80);
+        // Overflow is rejected without mutating usage.
+        let err = g.allocate(50).unwrap_err();
+        assert!(matches!(err, AgentError::BufferOverflow { .. }));
+        assert_eq!(g.usage(), 80);
+        g.free(30);
+        assert_eq!(g.usage(), 50);
+        g.free(1000); // saturating free
+        assert_eq!(g.usage(), 0);
+    }
+
+    #[test]
+    fn fault_detector_counts_and_resets() {
+        // `report_error` compares the *pre-increment* count against the
+        // threshold, so with threshold=2 the first two reports succeed and
+        // the third trips the fault.
+        let d = FaultDetector::new(2);
+        assert_eq!(d.error_count(), 0);
+        assert_eq!(d.last_error_type(), None);
+        assert!(d.report_error(&AgentError::Unknown { code: 0 }).is_ok());
+        assert!(d.report_error(&AgentError::Unknown { code: 0 }).is_ok());
+        assert_eq!(d.error_count(), 2);
+        assert_eq!(d.last_error_type(), Some(ErrorCategory::Unknown));
+        // The 3rd error crosses the threshold and reports a fatal fault.
+        let err = d
+            .report_error(&AgentError::Unknown { code: 0 })
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Unknown { code: 0xDEAD }));
+        assert_eq!(d.error_count(), 3);
+        d.reset();
+        assert_eq!(d.error_count(), 0);
+        assert_eq!(d.last_error_type(), None);
+    }
+
+    #[test]
+    fn safety_components_with_defaults() {
+        let b = BudgetEnforcer::with_defaults();
+        assert_eq!(b.iteration_limit(), crate::MAX_ITERATION_BUDGET);
+        assert_eq!(b.memory_limit(), crate::MAX_MEMORY_BUDGET);
+        let w = Watchdog::with_defaults();
+        assert_eq!(w.timeout_ms(), (crate::WATCHDOG_TIMEOUT_SECS * 1000) as u32);
+        let m = StackMonitor::with_defaults();
+        assert_eq!(m.stack_limit(), crate::AGENT_STACK_SIZE);
+        let d = FaultDetector::with_defaults();
+        assert_eq!(d.error_count(), 0);
+        assert_eq!(d.last_error_type(), None);
+        b.reset_time();
+        assert_eq!(b.iteration_usage(), 0);
     }
 }

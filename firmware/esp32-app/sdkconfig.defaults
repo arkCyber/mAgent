@@ -84,10 +84,16 @@ CONFIG_ESP_TLS_INSECURE=y
 # esp-idf-svc TLS client requires a verification option and INSECURE
 # alone isn't propagated into the mbedTLS client config).
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-# PATCHED (MicroAgent): DYNAMIC_BUFFER / KEEP_PEER_CERTIFICATE were tried to
-# shrink mbedTLS for HTTPS, but they caused the TLS handshake to HANG and
-# left the network stack in a bad state. Reverted — HTTPS on this C61 board
-# fails fast with a memory error instead, and HTTP (non-TLS) works reliably.
+# PATCHED (MicroAgent) T1/T2 (see docs/FIRMWARE_TLS_BLE_GAP_ANALYSIS.md):
+# DYNAMIC_BUFFER / KEEP_PEER_CERTIFICATE were tried earlier to shrink mbedTLS
+# and HANG the handshake (lwIP read-path desync) — they stay OFF. Instead we
+# route the SSL in/out buffers to PSRAM (EXTERNAL_MEM_ALLOC, safe because TLS
+# buffers are not DMA-required) and shrink SSL_IN 16KB->8KB (DeepSeek replies
+# fit), relieving the scarce internal-DRAM pool without the fragile dynamic
+# path. Rebuild + handshake soak (T4) required to validate.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 CONFIG_ESP_HTTP_CLIENT_ALLOW_HTTP_FOR_TESTS=y
 # OTA
 CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
@@ -138,30 +144,19 @@ CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=n
 
 # --------------------------------------------------------------------------
-# Bluetooth / BLE (Bluedroid)
+# Bluetooth / BLE — DISABLED (2026-08-31).
 # --------------------------------------------------------------------------
-# BLE is enabled for the configuration service (mAgent-Man). Classic BT is not
-# used on this S3 build (only the BLE subset of the Bluedroid stack is on).
-CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
-# BLE 5.0 disabled: its extended advertising / 2M PHY / long packets need
-# substantially more BLE-controller DMA internal DRAM, which the S3 can't
-# provide alongside the agent threads (ESP_ERR_NO_MEM 257). The config/GATT
-# service works on BLE 4.2, so we trade BLE-5 features for a bootable BLE.
-CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
-# Enable BLE for configuration service (mAgent-Man)
-CONFIG_BT_ENABLED=y
-# Use Bluedroid stack (required by esp-idf-svc BLE API)
-CONFIG_BT_BLUEDROID_ENABLED=y
-# Allocate Bluedroid host memory from PSRAM first, freeing internal DRAM for
-# the BLE controller. Without this the S3's BLE init hits ESP_ERR_NO_MEM (257)
-# at ~244 KB free internal DRAM.
-CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
+# The Bluedroid BLE controller needs ~244 KB of *contiguous internal-DMA DRAM*,
+# which fails with ESP_ERR_NO_MEM (257) on the S3 when the agent (~68 KB stack)
+# and Wi-Fi (~56 KB) are resident — the 512 KB internal SRAM can't host all
+# three. The product does not use BLE, so we turn the whole BT stack OFF. This
+# frees that internal DRAM for the agent + Wi-Fi, letting the S3 boot stably in
+# normal (Wi-Fi) mode. The Rust `ble` cargo feature is also removed from
+# build-s3.sh; `ble_config.rs`/`ble_at.rs`/`ble_wallet.rs` are excluded by
+# `#[cfg(feature = "ble")]`.
+CONFIG_BT_ENABLED=n
+CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_BT_NIMBLE_ENABLED=n
-CONFIG_BT_BTC_TASK_STACK_SIZE=8192
-# BT controller memory configuration
-CONFIG_BTDM_CTRL_BLE_MAX_CONN=6
-CONFIG_BTDM_BR_BD_ADDR_DUP=1
-CONFIG_BTDM_CTRL_HCI_MODE=1
 # PATCHED (MicroAgent): disable OpenThread / Thread networking. We only
 # use Wi-Fi (REQ-NET-001); Thread adds ~150 KB to the bindgen output and
 # pulls in `esp_openthread.h` from the optional ot-cli component which

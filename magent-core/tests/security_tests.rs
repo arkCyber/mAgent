@@ -86,9 +86,17 @@ fn auth_tags_verify_when_data_is_unchanged() {
     // HMAC-SHA-256 (web3): truncated to 8 bytes = 16 hex chars.
     // XOR placeholder (no web3): produces 8 hex chars.
     #[cfg(feature = "web3")]
-    assert_eq!(tag.len(), 16, "HMAC-SHA-256 tag must be exactly 16 hex chars");
+    assert_eq!(
+        tag.len(),
+        16,
+        "HMAC-SHA-256 tag must be exactly 16 hex chars"
+    );
     #[cfg(not(feature = "web3"))]
-    assert_eq!(tag.len(), 8, "XOR-placeholder tag must be exactly 8 hex chars");
+    assert_eq!(
+        tag.len(),
+        8,
+        "XOR-placeholder tag must be exactly 8 hex chars"
+    );
     assert!(
         tag.chars().all(|c| c.is_ascii_hexdigit()),
         "auth tag must be hex: {tag:?}"
@@ -186,7 +194,11 @@ fn encrypt_max_payload_fits() {
     #[cfg(not(feature = "web3"))]
     {
         // XOR placeholder: output length equals plaintext length.
-        assert_eq!(ct.len(), 484, "XOR placeholder output length equals plaintext");
+        assert_eq!(
+            ct.len(),
+            484,
+            "XOR placeholder output length equals plaintext"
+        );
     }
     // Round-trip must recover the original (works for both paths).
     let pt = mgr.decrypt(&ct);

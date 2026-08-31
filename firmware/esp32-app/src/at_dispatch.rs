@@ -1528,23 +1528,77 @@ fn timezone_dispatch(
 ///
 /// The verb is validated by `magent_core::at_validate::validate_ble_set`
 /// so a malformed `AT+BLE=` line returns a precise `+CMDER:4` / `:7`
-/// instead of falling through.
-///
-/// Routing to [`crate::ble_at::handle_ble_command`] requires a shared
-/// `BleServer` handle, which the dispatcher does not yet hold. Until that
-/// wiring lands (main.rs should pass a `Arc<Mutex<BleServer>>` alongside
-/// `time_sync`), report `+CMDER:9` (unsupported) for a *valid* verb so
-/// the command is never silently swallowed.
+/// instead of falling through. The actual `BleServer` operation is
+/// executed on the process-wide shared server
+/// (`ble_config::shared_ble_server`) that `main.rs` initialises at boot,
+/// so `AT+BLE=ON/OFF/STATE` now actually drives advertising state instead
+/// of returning `+CMDER:9`.
+#[cfg_attr(not(feature = "ble"), allow(unused_variables))] // `cmd` unused when BLE is off
 fn ble_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
-    // Validate the verb *before* touching the BLE stack so a malformed
-    // `AT+BLE=` line yields a precise error (`+CMDER:4`/`:7`) rather than
-    // the generic unsupported code. The actual `BleServer` operation is
-    // still gated on the wiring below.
-    if let Err(outcome) = magent_core::at_validate::validate_ble_set(cmd) {
-        return outcome;
+    #[cfg(not(feature = "ble"))]
+    {
+        // BLE stack isn't compiled into this build — a syntactically-valid
+        // `AT+BLE=` verb is unsupported (never silently swallowed).
+        return AtOutcome::error(9);
     }
-    log::warn!("[at] BLE control not yet wired to a shared BleServer");
-    AtOutcome::error(9)
+    #[cfg(feature = "ble")]
+    {
+        ble_dispatch_impl(cmd)
+    }
+}
+
+/// `AT+BLE` implementation behind the `ble` feature (see [`ble_dispatch`]).
+#[cfg(feature = "ble")]
+fn ble_dispatch_impl(cmd: &AtCommand<'_>) -> AtOutcome {
+    // Query form: `AT+BLE?` → report the current advertising state.
+    if cmd.kind == AtCommandKind::Query {
+        let server = crate::ble_config::shared_ble_server();
+        let guard = server.lock().unwrap_or_else(|e| e.into_inner());
+        return AtOutcome::ok_line(format!("+BLE:{}", ble_state_str(guard.get_state())));
+    }
+
+    let validated = match magent_core::at_validate::validate_ble_set(cmd) {
+        Ok(v) => v,
+        Err(outcome) => return outcome,
+    };
+
+    let server = crate::ble_config::shared_ble_server();
+    let mut guard = server.lock().unwrap_or_else(|e| e.into_inner());
+    use magent_core::at_validate::BleAction;
+    match validated.action {
+        BleAction::Start => {
+            if let Err(e) = guard.init() {
+                log::error!("[ble] AT+BLE=ON init failed: {e:?}");
+                return AtOutcome::error(9);
+            }
+            if let Err(e) = guard.start_advertising() {
+                log::error!("[ble] AT+BLE=ON start_advertising failed: {e:?}");
+                return AtOutcome::error(9);
+            }
+            AtOutcome::ok_line("OK")
+        }
+        BleAction::Stop => {
+            if let Err(e) = guard.stop_advertising() {
+                log::error!("[ble] AT+BLE=OFF stop_advertising failed: {e:?}");
+                return AtOutcome::error(9);
+            }
+            AtOutcome::ok_line(format!("+BLE:{}", ble_state_str(guard.get_state())))
+        }
+        BleAction::State => AtOutcome::ok_line(format!("+BLE:{}", ble_state_str(guard.get_state()))),
+    }
+}
+
+/// Human-readable BLE state string for the `+BLE:` reply line.
+#[cfg(feature = "ble")]
+fn ble_state_str(s: crate::ble_config::BleState) -> &'static str {
+    use crate::ble_config::BleState;
+    match s {
+        BleState::Idle => "idle",
+        BleState::Initializing => "initializing",
+        BleState::Advertising => "advertising",
+        BleState::Connected => "connected",
+        BleState::Error => "error",
+    }
 }
 
 // Suppress dead-code warnings for shared NVS keys that exist but are

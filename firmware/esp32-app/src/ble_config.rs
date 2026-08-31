@@ -7,7 +7,7 @@
 use heapless::String as HeaplessString;
 
 use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const CONFIG_SERVICE_UUID16: u16 = 0x1850;
@@ -38,6 +38,35 @@ const NUM_GATT_CHARS: u16 = 11;
 /// notify/indicate ones, so 11 chars need well over 11 handles. If this is too
 /// small the GATT database silently drops characteristics.
 const SERVICE_HANDLE_COUNT: u16 = 64;
+
+// ---------------------------------------------------------------------------
+// BLE link security (BACKLOG P2: `SYS_CMD` is currently unauthenticated)
+// ---------------------------------------------------------------------------
+/// Whether to require an **encrypted + MITM-authenticated** link before the
+/// sensitive characteristics (`SYS_CMD`, `WIFI_PASS`, `LLM_API_KEY`) accept
+/// writes.
+///
+/// SECURITY: with `false` (default) any connected BLE client can drive the full
+/// AT engine — including `AT+OTA`, `AT+RESTORE`, `AT+MACRAND` — with no
+/// authentication. Set `true` for untrusted environments: the GATT stack then
+/// refuses writes to those characteristics unless the link was established via
+/// Secure-Connection pairing (passkey, MITM-protected).
+///
+/// Default `false` preserves today's behaviour / doesn't break a client that
+/// doesn't pair. The Security Manager is always configured at init (see
+/// `configure_ble_security`), so the peripheral is ready to pair either way.
+pub const BLE_REQUIRE_ENCRYPTION: bool = false;
+
+/// Auth requirement when `BLE_REQUIRE_ENCRYPTION` is set: 0x07 = Secure
+/// Connections + MITM + bond (most secure; central does passkey pairing).
+const BLE_AUTH_REQ_SECURE: u8 = 0x07;
+/// Auth requirement when encryption is NOT required: 0x01 = bond / "Just
+/// Works" (compatible, but no MITM protection).
+const BLE_AUTH_REQ_PERMISSIVE: u8 = 0x01;
+
+/// Link-key masks exchanged during pairing: encryption key + identity key.
+const BLE_SM_KEYS: u8 =
+    (esp_idf_sys::ESP_BLE_ENC_KEY_MASK | esp_idf_sys::ESP_BLE_ID_KEY_MASK) as u8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BleState {
@@ -102,6 +131,60 @@ fn default_adv_params() -> esp_idf_sys::esp_ble_adv_params_t {
     }
 }
 
+// ---------------------------------------------------------------------------
+// BLE Security Manager (pairing / encryption)
+// ---------------------------------------------------------------------------
+
+/// Set a single Bluedroid Security-Manager parameter (1-byte value). Best-effort:
+/// failures are logged, never fatal — a security misconfig must not block boot.
+fn set_sec_param(param: esp_idf_sys::esp_ble_sm_param_t, value: u8) {
+    let ret = unsafe {
+        esp_idf_sys::esp_ble_gap_set_security_param(
+            param,
+            &value as *const u8 as *mut core::ffi::c_void,
+            1,
+        )
+    };
+    if ret != 0 {
+        log::warn!("[ble] set_security_param({}) failed: {ret}", param);
+    }
+}
+
+/// Configure the Bluedroid Security Manager so the peripheral can take part in
+/// pairing / encryption. Called once from `init()` after the GAP callback is
+/// registered.
+///
+/// The auth policy follows [`BLE_REQUIRE_ENCRYPTION`]: secure (SC + MITM +
+/// bond, passkey entry) when required, otherwise permissive (bond / Just
+/// Works). The init/resp keys are encryption + identity; the IO capability is
+/// display-only (the peripheral shows a 6-digit passkey the central enters).
+/// Local privacy is enabled so the peripheral advertises a resolvable address.
+fn configure_ble_security() {
+    let auth_req = if BLE_REQUIRE_ENCRYPTION {
+        BLE_AUTH_REQ_SECURE
+    } else {
+        BLE_AUTH_REQ_PERMISSIVE
+    };
+    set_sec_param(
+        esp_idf_sys::esp_ble_sm_param_t_ESP_BLE_SM_AUTHEN_REQ_MODE,
+        auth_req,
+    );
+    set_sec_param(esp_idf_sys::esp_ble_sm_param_t_ESP_BLE_SM_SET_INIT_KEY, BLE_SM_KEYS);
+    set_sec_param(esp_idf_sys::esp_ble_sm_param_t_ESP_BLE_SM_SET_RSP_KEY, BLE_SM_KEYS);
+    set_sec_param(
+        esp_idf_sys::esp_ble_sm_param_t_ESP_BLE_SM_IOCAP_MODE,
+        esp_idf_sys::ESP_IO_CAP_OUT as u8,
+    );
+    let ret = unsafe { esp_idf_sys::esp_ble_gap_config_local_privacy(true) };
+    if ret != 0 {
+        log::warn!("[ble] config_local_privacy failed: {ret}");
+    }
+    log::info!(
+        "[ble] security configured (require_encryption={})",
+        BLE_REQUIRE_ENCRYPTION
+    );
+}
+
 /// The GAP event handler.
 ///
 /// Advertising data configuration is asynchronous in ESP-IDF: the stack
@@ -110,10 +193,31 @@ fn default_adv_params() -> esp_idf_sys::esp_ble_adv_params_t {
 /// `esp_ble_gap_start_advertising` immediately after
 /// `esp_ble_gap_config_adv_data`, so advertising never actually began —
 /// this handler fixes that so a BLE scanner can finally see "mAgent".
+///
+/// It also services the pairing/encryption flow: accepts a central's security
+/// request (`SEC_REQ`) so encryption can begin, and logs auth completion.
 unsafe extern "C" fn gap_event_handler(
     event: esp_idf_sys::esp_gap_ble_cb_event_t,
     param: *mut esp_idf_sys::esp_ble_gap_cb_param_t,
 ) {
+    // A central requested pairing/encryption — accept it so the link can be
+    // secured (required before writes to encrypted characteristics are allowed).
+    if event == esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_SEC_REQ_EVT {
+        if let Some(p) = param.as_ref() {
+            let bd = &p.ble_security.ble_req.bd_addr as *const u8 as *mut u8;
+            let ret = esp_idf_sys::esp_ble_gap_security_rsp(bd, true);
+            log::info!("[ble] SEC_REQ accepted (security_rsp={ret})");
+        }
+        return;
+    }
+    // Pairing completed (or failed) — log the outcome.
+    if event == esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_AUTH_CMPL_EVT {
+        if let Some(p) = param.as_ref() {
+            let ok = p.ble_security.auth_cmpl.success;
+            log::info!("[ble] auth complete: {}", if ok { "success" } else { "failed" });
+        }
+        return;
+    }
     // Both the structured (`esp_ble_gap_config_adv_data`) and raw
     // (`esp_ble_gap_config_adv_data_raw`) APIs report completion via their own
     // set-complete event. We advertise as soon as either one reports success.
@@ -127,9 +231,9 @@ unsafe extern "C" fn gap_event_handler(
     let ok = if event
         == esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT
     {
-        param.as_ref().map_or(false, |p| p.adv_data_raw_cmpl.status == 0)
+        param.as_ref().is_some_and(|p| p.adv_data_raw_cmpl.status == 0)
     } else {
-        param.as_ref().map_or(false, |p| p.adv_data_cmpl.status == 0)
+        param.as_ref().is_some_and(|p| p.adv_data_cmpl.status == 0)
     };
     if !ok {
         log::error!("[ble] adv-data set failed");
@@ -283,6 +387,16 @@ fn char_index_rev(idx: usize) -> Option<u16> {
     })
 }
 
+/// Write permission for the *sensitive* characteristics (`SYS_CMD`,
+/// `WIFI_PASS`, `LLM_API_KEY`). When [`BLE_REQUIRE_ENCRYPTION`] is set, the
+/// GATT stack refuses writes unless the link is encrypted AND MITM-authenticated
+/// (Secure-Connection pairing). Otherwise it's a plain write (today's behaviour).
+const SENSITIVE_WRITE_PERM: u16 = if BLE_REQUIRE_ENCRYPTION {
+    (esp_idf_sys::ESP_GATT_PERM_WRITE_ENCRYPTED | esp_idf_sys::ESP_GATT_PERM_WRITE_ENC_MITM) as u16
+} else {
+    esp_idf_sys::ESP_GATT_PERM_WRITE as u16
+};
+
 /// (uuid16, permissions, properties) for each config characteristic, in the
 /// fixed order matched by [`char_index`].
 ///
@@ -297,7 +411,7 @@ const CHAR_SPECS: [(u16, u16, u8); NUM_GATT_CHARS as usize] = [
     ),
     (
         WIFI_PASS_UUID16,
-        esp_idf_sys::ESP_GATT_PERM_WRITE as u16,
+        SENSITIVE_WRITE_PERM,
         esp_idf_sys::ESP_GATT_CHAR_PROP_BIT_WRITE as u8,
     ),
     (
@@ -307,7 +421,7 @@ const CHAR_SPECS: [(u16, u16, u8); NUM_GATT_CHARS as usize] = [
     ),
     (
         LLM_API_KEY_UUID16,
-        esp_idf_sys::ESP_GATT_PERM_WRITE as u16,
+        SENSITIVE_WRITE_PERM,
         esp_idf_sys::ESP_GATT_CHAR_PROP_BIT_WRITE as u8,
     ),
     (
@@ -327,7 +441,7 @@ const CHAR_SPECS: [(u16, u16, u8); NUM_GATT_CHARS as usize] = [
     ),
     (
         SYS_CMD_UUID16,
-        esp_idf_sys::ESP_GATT_PERM_WRITE as u16,
+        SENSITIVE_WRITE_PERM,
         esp_idf_sys::ESP_GATT_CHAR_PROP_BIT_WRITE as u8,
     ),
     (
@@ -552,7 +666,7 @@ unsafe extern "C" fn gatts_event_handler(
             // (ESP_GATT_OK == 0). A failed add (e.g. out of handles) still
             // fires this event with a non-zero status and attr_handle 0 —
             // counting it would let the service start with missing chars.
-            let ok = param.as_ref().map_or(false, |p| p.add_char.status == 0);
+            let ok = param.as_ref().is_some_and(|p| p.add_char.status == 0);
             if ok {
                 if let Some(p) = param.as_ref() {
                     let uuid16 = p.add_char.char_uuid.uuid.uuid16;
@@ -608,6 +722,24 @@ pub static BLE_AGENT_TASK: Mutex<Option<String>> = Mutex::new(None);
 /// The on-device agent's reply for a BLE chat payload, written by the agent
 /// thread in `main.rs` and consumed (blocking, bounded) by `agent_reply_for`.
 pub static BLE_AGENT_REPLY: Mutex<Option<String>> = Mutex::new(None);
+
+/// Process-wide shared [`BleServer`]. Both the boot path in `main.rs` and
+/// the `AT+BLE=...` dispatcher in `at_dispatch.rs` operate on this single
+/// instance so advertising / connection state stays coherent across both.
+///
+/// Previously `main.rs` held a *local* `BleServer` that the AT path could
+/// never reach, which is exactly why `AT+BLE=` was still a `+CMDER:9`
+/// placeholder. Routing both sides through this one handle closes that gap.
+pub static BLE_SERVER: OnceLock<Arc<Mutex<BleServer>>> = OnceLock::new();
+
+/// Get (or lazily create) the shared [`BleServer`] handle.
+///
+/// The first caller creates the instance; every subsequent caller shares it.
+/// `main.rs` calls this at boot (then `init()` + `start_advertising()`), and
+/// the AT dispatcher calls it to query / control BLE live over `AT+BLE=`.
+pub fn shared_ble_server() -> &'static Arc<Mutex<BleServer>> {
+    BLE_SERVER.get_or_init(|| Arc::new(Mutex::new(BleServer::new())))
+}
 
 /// Route a chat payload to the on-device agent and wait (bounded) for its
 /// reply. Returns the reply bytes, or an AT-style error line on timeout.
@@ -967,6 +1099,10 @@ impl BleServer {
                 self.state = BleState::Error;
                 return Err(BleError::EspError(ret));
             }
+            // Configure the Security Manager so the peripheral can pair /
+            // encrypt (needed before writes to encrypted characteristics are
+            // allowed). Best-effort; safe to call before GATTS app register.
+            configure_ble_security();
             // Register the GATTS callback so a BLE central can connect and
             // read/write the mAgent config service characteristics.
             let ret = esp_idf_sys::esp_ble_gatts_register_callback(Some(gatts_event_handler));
@@ -1065,7 +1201,6 @@ impl BleServer {
     /// issued synchronously; the GAP completion event is not awaited —
     /// the host only needs the advertising flag cleared and the state
     /// reflected as `Idle`.
-    #[allow(dead_code)] // public `BleServer` API, not yet called on the active path
     pub fn stop_advertising(&mut self) -> Result<(), BleError> {
         if !self.is_advertising {
             return Ok(());

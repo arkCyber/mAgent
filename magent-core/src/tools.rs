@@ -1158,4 +1158,158 @@ mod tests {
         assert_eq!(normalize_sensor("garbage"), "garbage");
         assert_eq!(normalize_sensor(""), "");
     }
+
+    #[test]
+    fn registry_query_methods() {
+        let mut r = ToolRegistry::new();
+        // Empty registry: every query reflects the absence.
+        assert_eq!(r.count(), 0);
+        assert!(!r.has_tool("read_sensor"));
+        assert_eq!(r.names(), "");
+        assert_eq!(r.describe(), "");
+        assert!(r.all_tools().is_empty());
+
+        let tool = Tool {
+            name: try_heapless::<32>("read_sensor"),
+            description: try_heapless::<128>("Read a sensor value"),
+            tool_type: ToolType::ReadSensor,
+        };
+        r.register(tool).unwrap();
+        assert_eq!(r.count(), 1);
+        assert!(r.has_tool("read_sensor"));
+        assert!(!r.has_tool("other"));
+        assert_eq!(r.names(), "read_sensor");
+        assert!(r.describe().contains("read_sensor: Read a sensor value"));
+        assert_eq!(r.all_tools().len(), 1);
+    }
+
+    #[test]
+    fn register_rejects_overflow() {
+        let mut r = ToolRegistry::new();
+        // Fill the registry to its capacity.
+        for i in 0..MAX_TOOLS {
+            let name = format!("tool_{i}");
+            let tool = Tool {
+                name: try_heapless::<32>(&name),
+                description: try_heapless::<128>("d"),
+                tool_type: ToolType::ReadSensor,
+            };
+            r.register(tool).unwrap();
+        }
+        assert_eq!(r.count(), MAX_TOOLS);
+        // The MAX_TOOLS+1th registration must fail loudly, never silently
+        // drop the tool.
+        let extra = Tool {
+            name: try_heapless::<32>("overflow"),
+            description: try_heapless::<128>("d"),
+            tool_type: ToolType::ReadSensor,
+        };
+        let err = r.register(extra).unwrap_err();
+        assert!(matches!(err, AgentError::MemoryAllocationFailed { .. }));
+    }
+
+    #[test]
+    fn describe_skips_empty_description_registry() {
+        // A tool with an empty description is omitted from describe(),
+        // but still counted by count()/has_tool()/names().
+        let mut r = ToolRegistry::new();
+        let tool = Tool {
+            name: try_heapless::<32>("quiet"),
+            description: try_heapless::<128>(""),
+            tool_type: ToolType::ReadSensor,
+        };
+        r.register(tool).unwrap();
+        assert_eq!(r.count(), 1);
+        assert!(r.has_tool("quiet"));
+        assert_eq!(r.names(), "quiet");
+        assert_eq!(r.describe(), "");
+    }
+
+    #[test]
+    fn execute_read_sensor_covers_all_sensor_types() {
+        let r = populated_registry();
+        let cases: &[(&str, &str)] = &[
+            ("temperature", "25.5"),
+            ("accelerometer", "X:0.1"),
+            ("humidity", "65%"),
+            ("pressure", "1013 hPa"),
+            ("light", "500 lux"),
+            ("heart_rate", "BPM"),
+            ("hrv", "55ms"),
+            ("glucose", "mg/dL"),
+            ("ecg", "Rhythm"),
+            ("stress", "Moderate"),
+            ("battery", "3700mV"),
+            ("memory", "free_heap"),
+        ];
+        for (sensor, needle) in cases {
+            let args = format!("sensor={sensor}");
+            let out = run_async(r.execute(&make_call("read_sensor", &args))).unwrap();
+            assert!(out.success, "sensor {sensor} should succeed");
+            assert!(
+                out.data.as_str().contains(needle),
+                "sensor {sensor} produced: {}",
+                out.data.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn execute_read_sensor_unknown_sensor_reports_failure() {
+        let r = populated_registry();
+        let out = run_async(r.execute(&make_call("read_sensor", "sensor=does_not_exist"))).unwrap();
+        assert!(!out.success);
+        assert!(out.data.as_str().contains("Unknown sensor"));
+    }
+
+    #[test]
+    fn execute_write_gpio_numeric_states() {
+        // `state=1`/`state=0` map to high/low, matching the docs.
+        let r = populated_registry();
+        let out = run_async(r.execute(&make_call("write_gpio", "pin=3,state=1"))).unwrap();
+        assert!(out.success);
+        assert_eq!(out.data.as_str(), "Pin 3 set to high");
+        let out = run_async(r.execute(&make_call("write_gpio", "pin=3,state=0"))).unwrap();
+        assert!(out.success);
+        assert_eq!(out.data.as_str(), "Pin 3 set to low");
+    }
+
+    #[test]
+    fn execute_voice_output_priority_variants() {
+        let r = populated_registry();
+        // low and urgent are accepted alongside high/default.
+        for (prio, needle) in [("low", "priority=low"), ("urgent", "priority=urgent")] {
+            let args = format!("text=hi,priority={prio}");
+            let out = run_async(r.execute(&make_call("voice_output", &args))).unwrap();
+            assert!(out.success);
+            assert!(
+                out.data.as_str().contains(needle),
+                "voice {prio}: {}",
+                out.data
+            );
+        }
+        // An unknown priority normalises to "normal".
+        let out =
+            run_async(r.execute(&make_call("voice_output", "text=hi,priority=weird"))).unwrap();
+        assert!(out.data.as_str().contains("priority=normal"));
+    }
+
+    #[test]
+    fn execute_send_notification_priority_variants() {
+        let r = populated_registry();
+        for (prio, needle) in [("high", "priority=high"), ("urgent", "priority=urgent")] {
+            let args = format!("text=hi,priority={prio}");
+            let out = run_async(r.execute(&make_call("send_notification", &args))).unwrap();
+            assert!(out.success);
+            assert!(
+                out.data.as_str().contains(needle),
+                "notify {prio}: {}",
+                out.data
+            );
+        }
+        // Unknown priority normalises to normal.
+        let out = run_async(r.execute(&make_call("send_notification", "text=hi,priority=weird")))
+            .unwrap();
+        assert!(out.data.as_str().contains("priority=normal"));
+    }
 }
