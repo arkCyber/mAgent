@@ -63,6 +63,23 @@ memory budget defaults to 512 KiB and is configurable up to
 Free-heap is logged periodically by the health monitor and triggers a warning
 below 64 KiB.
 
+### ESP32-S3 (Xtensa LX7)
+- **MCU**: ESP32-S3 (dual-core Xtensa LX7, AI acceleration)
+- **Flash**: 4 MB (this board's variant)
+- **PSRAM**: 4 MB quad PSRAM (verified working; free-heap ~2.18 MB after boot)
+- **Wireless**: Wi-Fi 2.4 GHz + BLE 5 (LE); also supports Wi-Fi 6 / BLE 5.3 in higher bins
+- **Status**: ✅ **Verified stable on real hardware** — boot, agent thread, local
+  tools, Wi-Fi STA, and the HTTP admin dashboard all work on the board (long-run
+  soak with no leak). This is the current flagship ESP target.
+
+**Bring-up notes** (see [`docs/ESP32_S3_PORT_SUCCESS.md`](docs/ESP32_S3_PORT_SUCCESS.md)):
+- Built with the ESP-rs toolchain (`cargo +esp`), Xtensa target
+  `xtensa-esp32s3-espidf`, the `board-s3` Cargo feature, and the S3 sdkconfig.
+- BLE is **off** (internal-DRAM constraint) and Lua is **off** (WiFi PHY
+  `esp_timer` use-after-free) on this firmware; DeepSeek cloud LLM, Wi-Fi,
+  the HTTP status dashboard, and bidirectional UART are the working paths.
+- TLS T1/T2 now pass with the SSL buffers moved to PSRAM.
+
 ## ✅ Build Status
 
 | Platform | Architecture | Status | Build Command | Notes |
@@ -70,7 +87,7 @@ below 64 KiB.
 | **nRF52840** | ARM Cortex-M4F | ✅ Ready | `cargo build -p magent-nrf52-app --release --target thumbv7em-none-eabihf` | Primary smartwatch platform, BLE 5.3 |
 | **ESP32-C61** | RISC-V 32-bit | ✅ Ready + Verified on HW | `cd firmware/esp32-app && ./build-c61.sh` | Wi-Fi 6 + BLE 5.0, std (esp-idf-svc), real local tools, bidirectional UART |
 | ESP32-C3/C6 | RISC-V 32-bit | 🔄 Compatible | Use ESP32-C61 config | Same architecture |
-| **ESP32-S3** | Xtensa LX7 | ✅ Verified on HW (stable) | `cd firmware/esp32-app && ./build-s3.sh` | 4MB flash; WiFi + agent + HTTP dashboard verified stable (long-run soak, no leak); TLS T1/T2 (SSL buffers→PSRAM); BLE off (internal-DRAM); Lua off (WiFi PHY esp_timer UAF) |
+| **ESP32-S3** | Xtensa LX7 | ✅ Verified on HW (stable, flagship) | `cd firmware/esp32-app && ./build-s3.sh` | 4MB flash + 4MB quad PSRAM; WiFi STA + DeepSeek cloud LLM + HTTP dashboard verified stable on HW (long-run soak, no leak); TLS T1/T2 (SSL buffers→PSRAM); BLE off (internal-DRAM); Lua off (WiFi PHY esp_timer UAF) |
 
 ## 🏗️ Project Structure
 
@@ -143,11 +160,16 @@ MicroAgent/
 │   │   ├── src/main.rs      # Entry point, tasks
 │   │   ├── src/{ble,sensors,power,watchdog}.rs
 │   │   ├── Cargo.toml · memory.x · build.rs · .cargo/config.toml
-│   ├── esp32-app/          # ESP32-C61 firmware (esp-idf-svc, std)
+│   ├── esp32-app/          # ESP32 firmware (esp-idf-svc, std) — C61 + S3 boards
 │   │   ├── src/main.rs      # Entry point, event loop
 │   │   ├── src/{at_dispatch,ble_at,ble_config,ble_gatt,ble_wallet,
-│   │   │        device_key,link_adapters,llm,local_tools,sntp_sync}.rs
-│   │   ├── Cargo.toml · build.rs · sdkconfig.defaults · .cargo/config.toml
+│   │   │        device_key,link_adapters,llm,local_tools,sntp_sync,
+│   │   │        web_admin,latency_metrics,core_affinity,rt_watchdog,
+│   │   │        ping,lua_task,blockchain_transport}.rs
+│   │   ├── Cargo.toml · build.rs · sdkconfig.defaults · sdkconfig.s3.defaults
+│   │   │        · sdkconfig.c61.defaults · partitions.s3.csv
+│   │   │        · build-c61.sh · build-s3.sh · flash-c61.sh · flash-s3.sh
+│   │   │        · .cargo/config.toml
 │   └── integration-test/    # nRF52840 on-device E2E test runner
 │
 ├── host/                     # Host-side tooling
@@ -209,12 +231,19 @@ MicroAgent/
 - PlatformIO ESP-IDF framework (auto-managed by build)
 - espflash for firmware deployment
 
+**For ESP32-S3 (Xtensa LX7):**
+- ESP-rs toolchain via `cargo install espup && espup install` (provides `cargo +esp`)
+- PlatformIO ESP-IDF framework (auto-managed by build)
+- espflash / esptool for firmware deployment
+
 ### Installation
 
 ```bash
 # Install Rust targets for the chips you want to build for
 rustup target add thumbv7em-none-eabihf       # nRF52840 (ARM Cortex-M4F) ✅ Ready
 rustup target add riscv32imac-esp-espidf      # ESP32-C61 (RISC-V) ✅ Ready
+# ESP32-S3 (Xtensa LX7) uses the ESP-rs toolchain, not rustup targets:
+cargo install espup && espup install          # provides `cargo +esp`
 
 # Install essential tools
 cargo install cargo-binutils    # For cargo size, cargo objcopy, etc.
@@ -259,6 +288,27 @@ esptool.py --chip esp32c61 --port /dev/cu.usbserial-10 --baud 460800 write_flash
 
 # 3) Reset + monitor the serial console at 115200
 esptool.py --chip esp32c61 --port /dev/cu.usbserial-10 --after hard_reset run
+```
+
+**ESP32-S3 Firmware (build & flash):**
+```bash
+# Build the S3 image (compile-time board switch via the `board-s3` feature)
+cd firmware/esp32-app
+./build-s3.sh                 # Xtensa target; 4MB flash + quad PSRAM config
+
+# Flash bootloader + partition table + app (esptool elf2image fails on Xtensa,
+# so espflash generates the app image first)
+./flash-s3.sh --port /dev/cu.usbserial-XXX
+```
+
+The S3 firmware runs the same agent/ingress threads as the C61 build and adds
+the **DeepSeek cloud LLM** path plus the **HTTP admin dashboard**. After the
+board joins Wi-Fi, the dashboard is reachable directly from a host on the same
+subnet:
+
+```bash
+curl http://<board-ip>/          # HTML dashboard
+curl http://<board-ip>/api/status # JSON status (incl. wifi_reason field)
 ```
 
 **Send a command to the agent over UART (bidirectional):** any text sent on the
@@ -337,6 +387,9 @@ verbatim.
 | [nRF52840 Memory](docs/NRF52_MEMORY_ANALYSIS.md) | Memory analysis |
 | [ESP32-C61 Build Guide](docs/ESP32_C61_BUILD.md) | ESP32-C61 detailed guide |
 | [ESP32-C61 Boot & Hardware Notes](docs/ESP32_C61_BOARD_BOOT_FAILURE.md) | Bring-up diagnosis, fixes, and verification |
+| [ESP32-S3 Port Success](docs/ESP32_S3_PORT_SUCCESS.md) | S3 bring-up, fixes, on-HW verification, S3 vs C61 matrix |
+| [ESP32 Build Status](docs/ESP32_BUILD_STATUS.md) | ESP32-C6x / S3 build status & board notes |
+| [ESP32 Notes](docs/ESP32.md) | General ESP32 target notes |
 | [Platform Comparison](docs/PLATFORM_COMPARISON.md) | Platform analysis |
 | [AT Command Reference](docs/AT_COMMAND_REFERENCE.md) | AT (Hayes / ESP-AT) provisioning subset |
 | [LLM Backends](docs/LLM_BACKENDS.md) | DeepSeek / Ollama provider wiring |
@@ -384,35 +437,37 @@ magent summary rollback boot-hang 2                # promote history[2] to activ
 
 ## 📊 Features Matrix
 
-| Feature | nRF52840 | ESP32-C61 |
-|---------|----------|------------|
-| ReAct Agent | ✅ | ✅ |
-| Skills Manager | ✅ | ✅ |
-| Tool Registry | ✅ | ✅ |
-| Real Local Tools (GPIO/sensor, no network) | ✅ | ✅ |
-| BLE Communication | ✅ | ✅ |
-| Wi-Fi 6 | ❌ | ✅ |
-| Health Sensors | ✅ | ✅ |
-| Sports Coach | ✅ | ✅ |
-| Sleep Manager | ✅ | ✅ |
-| Early Warning | ✅ | ✅ |
-| Web3 Identity (Ed25519) | ✅ | ✅ |
-| Ingress Gateway | ✅ | ✅ |
-| Bidirectional UART (command → result reply) | ✅ | ✅ |
-| **AT command subset (ESP-AT compatible provisioning)** | ✅ | ✅ |
-| **AT-managed secrets stored device-bound sealed (DBO2, HKDF + HMAC)** | ✅ | ✅ |
-| **`AT+WIFIPASSUPGRADE=1` (DBO1 → DBO2 in-place migration)** | ✅ | ✅ |
-| Crash-loop detection + safe mode | ✅ | ✅ |
-| Health monitoring (heartbeat, free-heap) | ✅ | ✅ |
-| **`AT+PING` (IPv4 ICMP via esp_ping; hostname DNS)** | ✅ | ✅ |
-| OTA Updates (`AT+OTA` + anti-rollback confirm; awaits on-hardware) | 🔄 | 🔄 |
-| **Cloud LLM backends (DeepSeek / Ollama, pluggable)** | ✅ | ✅ |
-| **Web browsing (`web_search` / `fetch_url` / `webpage_summary`)** | ✅ (host) | ✅ (host) |
-| **Weather query (`get_weather`, Open-Meteo, no key)** | ✅ (host) | ✅ (host) |
-| **Blockchain tools (`get_balance` / `send_transaction` / …)** | ✅ | ✅ |
-| **Email MCP tools (`--email-tools`)** | ✅ (host) | ❌ |
-| **Run summaries (`--save-summary` / `--load-summary`)** | ✅ | ✅ |
-| **Web3 signed run reports (`magent run --sign`)** | ✅ | ✅ |
+| Feature | nRF52840 | ESP32-C61 | ESP32-S3 |
+|---------|----------|------------|----------|
+| ReAct Agent | ✅ | ✅ | ✅ |
+| Skills Manager | ✅ | ✅ | ✅ |
+| Tool Registry | ✅ | ✅ | ✅ |
+| Real Local Tools (GPIO/sensor, no network) | ✅ | ✅ | ✅ |
+| BLE Communication | ✅ | ✅ | ❌ (off: internal-DRAM) |
+| Wi-Fi STA (2.4 GHz) | ❌ | ✅ | ✅ (verified on HW) |
+| Wi-Fi 6 | ❌ | ✅ | ➖ (2.4 GHz only) |
+| Health Sensors | ✅ | ✅ | ✅ |
+| Sports Coach | ✅ | ✅ | ✅ |
+| Sleep Manager | ✅ | ✅ | ✅ |
+| Early Warning | ✅ | ✅ | ✅ |
+| Web3 Identity (Ed25519) | ✅ | ✅ | ✅ |
+| Ingress Gateway | ✅ | ✅ | ✅ |
+| Bidirectional UART (command → result reply) | ✅ | ✅ | ✅ |
+| **AT command subset (ESP-AT compatible provisioning)** | ✅ | ✅ | ✅ |
+| **AT-managed secrets stored device-bound sealed (DBO2, HKDF + HMAC)** | ✅ | ✅ | ✅ |
+| **`AT+WIFIPASSUPGRADE=1` (DBO1 → DBO2 in-place migration)** | ✅ | ✅ | ✅ |
+| Crash-loop detection + safe mode | ✅ | ✅ | ✅ |
+| Health monitoring (heartbeat, free-heap) | ✅ | ✅ | ✅ |
+| **`AT+PING` (IPv4 ICMP via esp_ping; hostname DNS)** | ✅ | ✅ | ✅ |
+| OTA Updates (`AT+OTA` + anti-rollback confirm) | 🔄 | 🔄 | ❌ (4MB flash constraint) |
+| **Cloud LLM backends (DeepSeek / Ollama, pluggable)** | ✅ | ✅ (local) | ✅ (DeepSeek, verified) |
+| **HTTP admin dashboard** (`web_admin`) | ❌ | ✅ | ✅ (verified on HW) |
+| **Web browsing (`web_search` / `fetch_url` / `webpage_summary`)** | ✅ (host) | ✅ (host) | ✅ (host) |
+| **Weather query (`get_weather`, Open-Meteo, no key)** | ✅ (host) | ✅ (host) | ✅ (host) |
+| **Blockchain tools (`get_balance` / `send_transaction` / …)** | ✅ | ✅ | ✅ |
+| **Email MCP tools (`--email-tools`)** | ✅ (host) | ❌ | ❌ |
+| **Run summaries (`--save-summary` / `--load-summary`)** | ✅ | ✅ | ✅ |
+| **Web3 signed run reports (`magent run --sign`)** | ✅ | ✅ | ✅ |
 
 ## 🛡️ Reliability & Error-Handling
 
