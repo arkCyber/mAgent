@@ -1,75 +1,102 @@
 # ESP32 Build Status
 
+> **Last updated**: 2026-09-14
+
 ## Current State
 
-The ESP32 firmware **cannot be built** on this system due to a missing Rust target.
+Both ESP32 targets in this repository are **buildable and hardware-verified**:
 
-## Problem
+| Target | Board feature | Rust target | Toolchain | Status |
+|--------|---------------|-------------|-----------|--------|
+| **ESP32-C61** | `board-c61` (default) | `riscv32imac-esp-espidf` | `esp` (espup) via `cargo +esp` / `RUSTC_BOOTSTRAP=1` | ✅ Builds; verified on HW |
+| **ESP32-S3** | `board-s3` | `xtensa-esp32s3-espidf` | `esp` (espup, Xtensa LLVM) via `cargo +esp` | ✅ Builds; verified stable on HW |
 
-The ESP-IDF std library (`std` for RISC-V) is only provided by Espressif's **custom Rust fork** called `esp` toolchain.
+The ESP32 std targets (`riscv32imac-esp-espidf`, `xtensa-esp32s3-espidf`, …)
+are **not** part of upstream Rust — they ship with Espressif's `esp` toolchain.
 
-Standard Rust toolchains (stable, nightly) do **NOT** include:
-- `riscv32imac-esp-espidf`
-- `riscv32imc-esp-espidf`
-- `xtensa-esp32-espidf`
-
-## Required Installation
-
-The `esp` toolchain must be installed via `espup`:
+## Required toolchain
 
 ```bash
-espup install
-rustup toolchain list  # Should show: esp
+cargo install espup --locked
+espup install                 # installs the `esp` toolchain + targets
+source ~/export-esp.sh        # activate it in every new shell
+rustup toolchain list         # should list: esp
 ```
 
-### Current Installation Issues
+### Historical note (toolchain install)
 
-The `espup install` command is failing to install RISC-V targets due to network/proxy issues:
-```
-[warn]: Installation for 'RISC-V Rust target' failed, retrying
-Error: espup::toolchain::rust::install_riscv_target
-  × Failed to Install RISC-V targets for 'stable' toolchain
-```
+Early bring-up hit network/proxy failures during `espup install`
+(`Failed to Install RISC-V targets`). Workarounds that resolve it:
 
-## Workaround Options
-
-### Option 1: Fix Network Issues
-Try `espup install` without proxy:
 ```bash
+# Option 1: clear proxies and retry
 unset all_proxy socks5_proxy https_proxy http_proxy
 espup install
-```
 
-### Option 2: Use Docker (Recommended for macOS)
-Use the official Espressif Docker container:
-```bash
+# Option 2: official Espressif Docker image (nice on macOS)
 docker run -it espressif/idf-rust:latest
+
+# Option 3: build on Linux / WSL
 ```
 
-### Option 3: Build on Linux
-Set up a Linux VM or use WSL with a standard ESP-IDF installation.
+## Build commands
 
-## Status After Fix
-
-Once `espup install` succeeds:
 ```bash
-rustup toolchain list
-# Should show: esp
-
+# ESP32-C61 (default board)
+cd firmware/esp32-app
 source ~/export-esp.sh
-cargo build -p magent-esp32-app --release
+./build-c61.sh                # → target/riscv32imac-esp-espidf/release/magent-esp32-app
+
+# ESP32-S3 (Xtensa)
+cd firmware/esp32-app
+source ~/export-esp.sh
+./build-s3.sh                 # → target/xtensa-esp32s3-espidf/release/magent-esp32-app
 ```
 
-## What Works Now
+Both scripts wrap the exact env the ESP toolchain needs (`MCU`, `CC`/`CXX`,
+`BINDGEN_EXTRA_CLANG_ARGS`, board sdkconfig). See
+[`../firmware/esp32-app/BOARDS.md`](../firmware/esp32-app/BOARDS.md) and
+[`ESP32.md`](ESP32.md) for details.
 
-- ✅ `magent-core` tests: 113+ tests passing
-- ✅ `magent-cli`: Compiles successfully
-- ✅ `magent-simulator`: Compiles successfully
-- ❌ `magent-esp32-app`: Cannot build (missing espidf target)
+## What works now
 
-## GCC Tools Installed
+- ✅ `magent-core` host tests (1200+ across unit + integration targets)
+- ✅ `magent` CLI, `magent-simulator`, `magent-tools`, MCP executors
+- ✅ `magent-esp32-app` for **both** C61 and S3
+- ✅ ESP32-C61 on-HW: AT/UART, Wi-Fi, BLE, HTTP, TLS, OTA, web_admin
+- ✅ ESP32-S3 on-HW: Wi-Fi STA, HTTP dashboard, DeepSeek cloud LLM, PSRAM
 
-The following GCC tools are installed and available:
-- `riscv32-esp-elf-gcc` (in `~/.espressif/tools/`)
-- `xtensa-esp32-elf-gcc` (in `~/.espressif/tools/`)
-- ESP-IDF v6.0 SDK (in `~/.espressif/esp-idf/`)
+## Build/tool warnings
+
+- **`patch was not used in the crate graph`** — expected; the patched crate
+  versions aren't always selected by the resolver.
+- **TLS on 32-bit RISC-V** — the build uses `aws-lc-rs` instead of `ring`
+  (`ring` does not build cleanly for the ESP RISC-V targets).
+
+## Flashing / monitoring
+
+```bash
+cd firmware/esp32-app
+./flash-c61.sh                    # C61: bootloader + partitions + app
+./flash-s3.sh --port /dev/cu.usbserial-XXX
+espflash monitor                  # serial console @ 115200
+```
+
+> **Note**: on the C61, flash through the **CP2102 USB-UART bridge**, not the
+> native USB-JTAG (see
+> [`ESP32_C61_BOARD_BOOT_FAILURE.md`](ESP32_C61_BOARD_BOOT_FAILURE.md)).
+
+## GCC tools installed (this host)
+
+- `riscv32-esp-elf-gcc`
+- `xtensa-esp32s3-elf-gcc` (in `~/.platformio/packages/toolchain-xtensa-esp-elf/`)
+- ESP-IDF v6.0 SDK (via PlatformIO / `~/.espressif/esp-idf/`)
+
+## Related documentation
+
+- [ESP32-C61 Build Guide](ESP32_C61_BUILD.md)
+- [ESP32-C61 Build & Operations](ESP32.md)
+- [ESP32-S3 Port Success](ESP32_S3_PORT_SUCCESS.md)
+- [Dual-Core Scheduling (S3)](DUAL_CORE_SCHEDULING.md)
+- [Tier-6 On-Hardware Validation](TIER6_VALIDATION.md)
+- [Main README](../README.md)

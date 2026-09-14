@@ -13,6 +13,25 @@ here. Dates use `YYYY-MM-DD` and follow ISO 8601. Versions follow
 
 ## [Unreleased]
 
+### Changed
+- **Documentation refresh** (2026-09-14): brought the platform docs up to date
+  with the current state of the codebase (ESP32-S3 bring-up, ESP32-C61 OTA,
+  board feature switch):
+  - `firmware/README.md` — added ESP32-S3 (verified / flagship) and
+    `integration-test` rows, refreshed the project tree, platform comparison
+    matrices, build/test commands and roadmap (S3/S3-dual-core/OTA now done).
+  - `docs/README.md` — rebuilt the index (S3 guide, dual-core scheduling, Lua
+    on S3, Tier-6 validation, TLS/BLE gap analysis, build/ops, backlog) and
+    updated the build commands / binary-size tables.
+  - `docs/ESP32_BUILD_STATUS.md` — rewritten: the ESP32 targets build on both
+    C61 and S3 (was stale "cannot be built"), with the `espup` setup, build
+    scripts, warnings and hardware notes.
+  - `docs/PLATFORM_COMPARISON.md` — added an ESP32-S3 section + rows, corrected
+    the C61 PSRAM/RAM figures, refreshed the toolchain commands and status.
+  - `firmware/esp32-app/README.md` — retitled for C61 **and** S3, documented the
+    `build-c61.sh`/`build-s3.sh` scripts, board feature matrix, sdkconfig files
+    and the `board-*`/`lua` feature set.
+
 ### Added
 - **Feature-gated modules made host-testable + tested** (`magent-core/src/lib.rs`):
   the pure-logic embedded modules (`power`, `hardware`, `monitoring`, `ollama`,
