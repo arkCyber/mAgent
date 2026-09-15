@@ -249,7 +249,17 @@ pub mod monitoring;
 ))]
 pub mod ollama;
 
-#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+// `storage` needs `embedded_storage` (the NOR-flash trait), so a chip
+// feature or `std` must be on. Including `std` here means the KV-store
+// unit tests actually run on the host (`cargo test -p magent-core
+// --features std`) instead of being compiled out — they were previously
+// unreachable, which hid the integrity checks from CI.
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
 pub mod storage;
 
 // ---------------------------------------------------------------------------

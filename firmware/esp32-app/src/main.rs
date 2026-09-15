@@ -144,13 +144,17 @@ static HEAP_LOW_WATER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 fn update_heap_low_water() {
     use std::sync::atomic::Ordering;
     let free = free_heap();
-    let mut cur = HEAP_LOW_WATER.load(Ordering::Relaxed);
+    // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R7 — Acquire on the
+    // load + AcqRel on the CAS pair with the same orderings in
+    // `heap_low_water()`. The health-log task and the AT `/heap`
+    // reader may run on different cores.
+    let mut cur = HEAP_LOW_WATER.load(Ordering::Acquire);
     while free < cur {
         match HEAP_LOW_WATER.compare_exchange_weak(
             cur,
             free,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
         ) {
             Ok(_) => break,
             Err(actual) => cur = actual,
@@ -160,7 +164,9 @@ fn update_heap_low_water() {
 
 /// Lowest free heap (bytes) observed so far. `u32::MAX` if never sampled.
 fn heap_low_water() -> u32 {
-    HEAP_LOW_WATER.load(std::sync::atomic::Ordering::Relaxed)
+    // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R7 — Acquire pairs with
+    // the AcqRel on the producer's CAS above.
+    HEAP_LOW_WATER.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Shared heartbeat used to detect a hung (stalled, non-panicking) thread.
@@ -304,6 +310,13 @@ pub static LAST_SCAN: Mutex<Option<String>> = Mutex::new(None);
 /// that re-runs a one-shot init path (soft-reboot, OTA) surfaces a real
 /// double-leak instead of silently doubling heap use.
 ///
+/// TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R5 — cap the registry at 64
+/// entries so a runaway loop that calls `Box::leak` on a fresh pointer
+/// every iteration cannot grow this set without bound. The set is
+/// purely a diagnostic; once the cap is hit, an overflow entry replaces
+/// a sentinel value (`usize::MAX`) so the size stays at exactly 64 and
+/// further leaks just log an error instead of growing memory.
+///
 /// NOTE on `HashSet::insert` semantics (this was once inverted): `insert`
 /// returns `true` when the value was *newly* inserted and `false` when it was
 /// *already* present. So a genuine duplicate is detected with `!insert(...)`.
@@ -313,6 +326,43 @@ fn leaked_boxes() -> std::sync::MutexGuard<'static, std::collections::HashSet<us
         .lock()
         .unwrap_or_else(|e| e.into_inner())
 }
+
+/// TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R5 — bounded wrapper around
+/// `HashSet::insert`. Returns `true` on a *new* insert, `false` on a
+/// duplicate, and additionally enforces the `LEAKED_BOXES_CAP` ceiling
+/// by evicting a sentinel entry when the cap is hit. All call sites
+/// use this helper instead of calling `insert` directly so the cap
+/// is enforced uniformly.
+fn register_leak(ptr: usize) -> bool {
+    let mut set = leaked_boxes();
+    let inserted = set.insert(ptr);
+    if !inserted {
+        // Genuine duplicate — return false so the caller can log.
+        return false;
+    }
+    if set.len() > LEAKED_BOXES_CAP {
+        // Evict the sentinel entry to keep the set size bounded. If
+        // the sentinel isn't present (because the previous overflow
+        // already removed it), log an error so an operator can see
+        // the runaway loop. Either way, the set stays at exactly
+        // `LEAKED_BOXES_CAP` entries.
+        if set.remove(&usize::MAX) {
+            log::error!(
+                "[leak-registry] cap {} reached; evicting sentinel; \
+                 further leaks will be logged but not tracked",
+                LEAKED_BOXES_CAP
+            );
+        }
+    }
+    true
+}
+
+/// TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R5 — hard cap on the leaked
+/// pointer registry. Once the registry is full, further `register_leak`
+/// calls evict the sentinel `usize::MAX` entry (insert returns false but
+/// we *remove* it to keep the size bounded) and log an error. See the
+/// `leaked_boxes` docstring for the rationale.
+const LEAKED_BOXES_CAP: usize = 64;
 
 /// Take the default NVS partition exactly once and keep it for the life
 /// of the program. Must be called before EspWifi (or anything else) takes
@@ -328,8 +378,10 @@ pub(crate) fn init_default_nvs() {
             // instead of silently leaking a second NVS partition
             // (which corrupts the partition state and trips a
             // `ESP_ERR_NVS_INVALID_STATE` later).
-            // `!insert(...)` is true only when the pointer is ALREADY present.
-            if !leaked_boxes().insert(leaked as *const _ as usize) {
+            // `register_leak` returns `false` only when the pointer is
+            // ALREADY present (genuine duplicate) — see the helper's
+            // docstring.
+            if !register_leak(leaked as *const _ as usize) {
                 log::error!(
                     "[nvs] init_default_nvs is leaking a duplicate NVS partition \
                      (same pointer as a previous leak)"
@@ -982,7 +1034,9 @@ fn run_wifi_supervisor(
         // The dispatcher already persisted the new SSID/pass to NVS; we reload
         // them and force an immediate reconnect (no reboot required). Runs even
         // if currently associated, so switching APs is instant.
-        if WIFI_RECONNECT_REQUESTED.swap(false, Ordering::Relaxed) {
+        // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R7 — Acquire on the
+        // swap pairs with the Release on the dispatcher's store above.
+        if WIFI_RECONNECT_REQUESTED.swap(false, Ordering::AcqRel) {
             log::info!("[wifi-sup] AT+CWJAP changed credentials — reloading from NVS");
             if let (Some(s), Some(p)) = provision_and_load_wifi_credentials() {
                 ssid = s;
@@ -1007,7 +1061,11 @@ fn run_wifi_supervisor(
         // FAULT-TOLERANCE: publish the link-up bit for the SNTP supervisor.
         // Having a non-loopback IP means DHCP completed, so outbound UDP
         // (NTP) is genuinely possible.
-        net_up.store(ip.is_some(), Ordering::Relaxed);
+        // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R7 — Release pairs
+        // with the Acquire load in `sntp_sync::poll` so the SNTP
+        // supervisor on the same core observes the IP *and* the
+        // handshake state together.
+        net_up.store(ip.is_some(), Ordering::Release);
 
         // Publish the live snapshot for AT+CWSTATE.
         publish_wifi_state(
@@ -1752,10 +1810,13 @@ fn run_agent_loop(
                     // `LEAKED_BOXES` so a duplicate insert triggers an
                     // explicit error log instead of a quiet leak. Cost:
                     // one `HashSet` entry, no heap growth.
-                    // `!insert(...)` is true only when the pointer is ALREADY present.
+                    // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R5 —
+                    // `register_leak` also enforces the `LEAKED_BOXES_CAP`
+                    // ceiling so a runaway reconnect loop can't grow the
+                    // registry without bound.
                     let backend: &'static mut llm::ChannelLlmBackend =
                         Box::leak(Box::new(llm::ChannelLlmBackend::new(llm_tx)));
-                    if !leaked_boxes().insert(backend as *mut _ as usize) {
+                    if !register_leak(backend as *mut _ as usize) {
                         log::error!(
                             "[magent] agent boot path is leaking a second LLM backend \
                              (same pointer as a previous leak); refactor leak site or \
@@ -2115,9 +2176,12 @@ fn setup_platform(
                     // path (e.g. an OTA reboot sequence) surfaces a
                     // duplicate-leak log instead of silently
                     // doubling the radio's heap footprint.
-                    // `!insert(...)` is true only when the pointer is ALREADY present.
+                    // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R5 —
+                    // `register_leak` enforces the `LEAKED_BOXES_CAP`
+                    // ceiling so an OTA-driven init loop can't grow
+                    // the registry without bound.
                     let leaked_ptr = leaked_wifi as *mut _ as usize;
-                    if !leaked_boxes().insert(leaked_ptr) {
+                    if !register_leak(leaked_ptr) {
                         log::error!(
                             "[wifi] wifi_handle is leaking a duplicate BlockingWifi \
                              (same pointer as a previous leak)"

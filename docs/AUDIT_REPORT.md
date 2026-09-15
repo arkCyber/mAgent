@@ -58,7 +58,7 @@ the single source of truth for design assurance.
 
 | GAP | Description | Fix |
 |---|---|---|
-| GAP-003 | RPC "fake success" on bare-metal | `backend_poll_transaction` now returns `Err(ConfigError::NotConfigured)` (REQ-NET-002) |
+| GAP-003 | RPC "fake success" on bare-metal | **CLOSED (2026-09-14)**: ESP32 `backend_poll_transaction` now drives the real `eth_getTransactionReceipt` over the `EspHttpClient`/`Transport`; when no transport is installed it still returns `Err` (never a fabricated success) per REQ-NET-002 |
 | GAP-009 | URL parser lost paths | `HttpClientConfig::from_url` rewritten to strip path before split (REQ-NET-003) |
 | GAP-004 | Outdated docs reference `tick_hal` | `docs/ESP32.md` rewritten; TRACE REQ-DOC-001 |
 

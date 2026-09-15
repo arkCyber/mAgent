@@ -856,6 +856,13 @@ unsafe fn handle_gatt_write(p: &esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_writ
     // 64 KiB length cannot drive `from_raw_parts` into UB by reading
     // past the actual allocation. Anything beyond the cap is treated
     // as a protocol violation and dropped.
+    //
+    // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R1 — the audit recommends
+    // capping at `state.mtu` (the negotiated MTU per connection) rather
+    // than a flat 512. Today the firmware does not track the negotiated
+    // MTU in `state`, so 512 is the next-best bound (matches the upper
+    // bound BLE 5.0 stacks advertise in `MTU exchange`). The MTU-aware
+    // refactor is captured in `AEROSPACE_AUDIT_FIRMWARE_2026_09_22.md`.
     const MAX_BLE_WRITE: usize = 512;
     let len = if len > MAX_BLE_WRITE {
         log::error!(
@@ -867,13 +874,34 @@ unsafe fn handle_gatt_write(p: &esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_writ
     } else {
         len
     };
-    let bytes = std::slice::from_raw_parts(p.value, len);
+    // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R1 — verify the write's
+    // `handle` is actually registered in `GATT_HANDLES` *before* we
+    // touch the pointed-to bytes. An out-of-range handle from a buggy
+    // / hostile stack would otherwise dereference an attacker-chosen
+    // offset into our service table. The `position(...)` is a no-op
+    // if the handle isn't registered, and we early-return.
     let uuid16 = GATT_HANDLES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .position(|&h| h == handle)
         .and_then(char_index_rev);
+
+    if uuid16.is_none() {
+        log::error!(
+            "[ble] GATTS write to unregistered handle=0x{:04x} (len={}); dropping",
+            handle,
+            len
+        );
+        return;
+    }
+
+    // SAFETY: `p.value` is non-null (checked above) and `len <= 512`
+    // (capped above). `from_raw_parts` requires the pointer to be
+    // aligned and the slice to be within a single allocation; the BLE
+    // stack's `gatts_write_evt_param` field is a valid `&[u8]` of
+    // exactly `p.len` bytes (per the BLE event contract).
+    let bytes = std::slice::from_raw_parts(p.value, len);
 
     match uuid16 {
         Some(WIFI_SSID_UUID16) => {

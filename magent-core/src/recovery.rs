@@ -480,6 +480,173 @@ mod tests {
         assert_eq!(d.backoff_base_ms, 100);
         assert!(d.delay.is_none());
     }
+
+    // ============================================================================
+    // TRACE: AEROSPACE-AUDIT-2026-09-15
+    // execute_with_retry must respect every RecoveryStrategy variant, not just
+    // the Retry/RetryWithBackoff paths tested above. Each non-Retry variant
+    // (Fallback, Skip, Abort, Reset) MUST return the operation's Err on the
+    // first failure — no silent retry, no swallowed error. These tests pin
+    // the contract so a future refactor of `execute_with_retry` cannot
+    // accidentally demote any non-Retry strategy into a retry loop.
+    // ============================================================================
+    #[cfg(feature = "std")]
+    mod execute_with_retry_strategy_coverage {
+        use super::*;
+        use crate::error::{AgentError as E, ValidationError};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        /// Drives `execute_with_retry` with a closure that returns a fresh
+        /// clone of `error` on every invocation. Returns `(result, attempts)`.
+        /// We hand-clone the error each call because `F: Fn()` must own a
+        /// fresh future each invocation.
+        async fn drive_once(r: &RecoveryManager, error: E) -> (Result<u8>, u32) {
+            let attempts = Arc::new(AtomicU32::new(0));
+            let attempts_for_closure = attempts.clone();
+            let result = r
+                .execute_with_retry(move || {
+                    let a = attempts_for_closure.clone();
+                    let error_clone = clone_error(&error);
+                    async move {
+                        a.fetch_add(1, Ordering::SeqCst);
+                        Err::<u8, E>(error_clone)
+                    }
+                })
+                .await;
+            (result, attempts.load(Ordering::SeqCst))
+        }
+
+        /// Hand-rolled clone: every variant we use in this module holds only
+        /// `Copy` / `&'static str` fields, so a `match`-based reconstruction
+        /// is sufficient and avoids forcing `AgentError: Clone`.
+        fn clone_error(e: &E) -> E {
+            match e {
+                E::InputValidationFailed { field, reason } => E::InputValidationFailed {
+                    field,
+                    reason: *reason,
+                },
+                E::IterationBudgetExhausted { used, limit } => E::IterationBudgetExhausted {
+                    used: *used,
+                    limit: *limit,
+                },
+                E::MemoryAllocationFailed { requested, available } => E::MemoryAllocationFailed {
+                    requested: *requested,
+                    available: *available,
+                },
+                E::Unknown { code } => E::Unknown { code: *code },
+                E::StorageReadFailed { address, reason } => E::StorageReadFailed {
+                    address: *address,
+                    reason: *reason,
+                },
+                E::StorageWriteFailed { address, reason } => E::StorageWriteFailed {
+                    address: *address,
+                    reason: *reason,
+                },
+                E::OperationTimeout {
+                    operation,
+                    timeout_ms,
+                } => E::OperationTimeout {
+                    operation,
+                    timeout_ms: *timeout_ms,
+                },
+                _ => E::Unknown { code: 0 }, // not exercised in these tests
+            }
+        }
+
+        #[test]
+        fn abort_strategy_runs_exactly_once() {
+            let r = RecoveryManager::with_defaults();
+            let err = E::InputValidationFailed {
+                field: "field",
+                reason: ValidationError::Empty,
+            };
+            let (result, attempts) = futures::executor::block_on(drive_once(&r, err));
+            assert_eq!(attempts, 1, "Abort must NOT retry");
+            assert!(matches!(
+                result,
+                Err(E::InputValidationFailed { field: "field", .. })
+            ));
+        }
+
+        #[test]
+        fn skip_strategy_runs_exactly_once() {
+            let r = RecoveryManager::with_defaults();
+            let err = E::IterationBudgetExhausted { used: 1, limit: 0 };
+            let (result, attempts) = futures::executor::block_on(drive_once(&r, err));
+            assert_eq!(attempts, 1, "Skip must NOT retry");
+            assert!(matches!(
+                result,
+                Err(E::IterationBudgetExhausted { used: 1, limit: 0 })
+            ));
+        }
+
+        #[test]
+        fn fallback_strategy_runs_exactly_once() {
+            let r = RecoveryManager::with_defaults();
+            let err = E::StorageReadFailed {
+                address: 0,
+                reason: crate::error::StorageError::CorruptedData,
+            };
+            let (result, attempts) = futures::executor::block_on(drive_once(&r, err));
+            assert_eq!(attempts, 1, "Fallback must NOT retry");
+            assert!(matches!(
+                result,
+                Err(E::StorageReadFailed {
+                    reason: crate::error::StorageError::CorruptedData,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn reset_strategy_runs_exactly_once() {
+            let r = RecoveryManager::with_defaults();
+            let err = E::StorageWriteFailed {
+                address: 0,
+                reason: crate::error::StorageError::WriteProtected,
+            };
+            let (result, attempts) = futures::executor::block_on(drive_once(&r, err));
+            assert_eq!(attempts, 1, "Reset must NOT retry");
+            assert!(matches!(
+                result,
+                Err(E::StorageWriteFailed {
+                    reason: crate::error::StorageError::WriteProtected,
+                    ..
+                })
+            ));
+        }
+
+        #[test]
+        fn memory_allocation_failed_is_abort() {
+            let r = RecoveryManager::with_defaults();
+            let err = E::MemoryAllocationFailed {
+                requested: 1024,
+                available: 0,
+            };
+            let (result, attempts) = futures::executor::block_on(drive_once(&r, err));
+            assert_eq!(attempts, 1);
+            assert!(matches!(result, Err(E::MemoryAllocationFailed { .. })));
+        }
+
+        #[test]
+        fn security_timeout_is_abort_not_retry() {
+            // TRACE: AEROSPACE-AUDIT-2026-09-15 — `OperationTimeout { operation:
+            // "security", .. }` is documented as Abort because a security
+            // timeout is treated as a fatal signal. A future refactor that
+            // maps all timeouts to RetryWithBackoff would let an attacker
+            // pin the security subsystem indefinitely. This test pins the
+            // carve-out.
+            let r = RecoveryManager::with_defaults();
+            let err = E::OperationTimeout {
+                operation: "security",
+                timeout_ms: 1,
+            };
+            let (result, attempts) = futures::executor::block_on(drive_once(&r, err));
+            assert_eq!(attempts, 1, "security timeout must Abort, not Retry");
+            assert!(matches!(result, Err(E::OperationTimeout { .. })));
+        }
+    }
 }
 
 /// Fallback value provider

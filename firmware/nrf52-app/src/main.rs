@@ -16,7 +16,13 @@ use embassy_executor::Executor;
 use embassy_nrf::config::Config as NrfConfig;
 use embassy_time::{Duration, Timer};
 use embedded_alloc::Heap;
-use panic_probe as _;
+// TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R4 — replace `panic-probe`
+// with a reset-on-panic handler. The previous handler bkpt()'d in a
+// tight loop, which wedges the board without ever feeding the WDT.
+// The replacement arms `SCB::sys_reset()` so a panic surfaces as a
+// clean reset, and the watchdog-fed main task continues to make
+// progress between panics.
+use panic_reset as _;
 
 use magent_core::{
     MiniAgent,
@@ -33,7 +39,28 @@ static HEAP: Heap = Heap::empty();
 
 static EXECUTOR: static_cell::StaticCell<Executor> = static_cell::StaticCell::new();
 
-// SAFETY: These are initialized in main() before being accessed
+// TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R3 — these globals are
+// initialised once from `main()` (a single-core context on the nRF52)
+// and then accessed from a single Embassy task (`main_task`,
+// `pool_size = 1` enforced at the bottom of this file). Embassy
+// guarantees only one task instance runs at a time on the executor,
+// and `main_task` / `agent_task` are the only consumers.
+//
+// TODO (FW-R3 follow-up): migrate to `static_cell::StaticCell<T>` so
+// the borrow checker enforces the exclusivity instead of this
+// comment. The `static mut` form here is only safe because Embassy
+// executes the two tasks cooperatively on a single core; a future
+// refactor that adds a second core (or a second `main_task` spawn)
+// would silently break the invariant.
+//
+// SAFETY (FW-R3 status: documented, not yet refactored): these
+// `static mut` are touched only from `main_task` (WATCHDOG,
+// BLE_STATE, POWER_STATE) and from `agent_task` (AGENT), which are
+// declared at the bottom of this file with
+// `#[embassy_executor::task(pool_size = 1)]`. The executor's poll
+// loop serialises them on a single core, so the `unsafe { }` blocks
+// at the call sites are sound — but the comment on each unsafe
+// block still has to justify why that specific access is safe.
 static mut WATCHDOG: Option<watchdog::Watchdog> = None;
 // `BleState` is an *enum* (Idle/Advertising/Connected/…); the struct that
 // carries the runtime connection fields is `BleStateManager`. The initial
@@ -90,7 +117,7 @@ fn main() -> ! {
         let agent_config = AgentConfig::new()
             .with_max_iterations(50u16)
             .expect("valid max_iterations");
-        
+
         match MiniAgent::new(agent_config) {
             Ok(agent) => {
                 info!("AI Agent initialized successfully");
@@ -160,7 +187,7 @@ async fn main_task() {
                 info!("[MAIN] Cycle #{} | Battery: {}%", cycle_count, battery_level);
                 info!("[MAIN] BLE: {}", ble_status);
                 info!("[MAIN] Watchdog: {}ms remaining", watchdog_remaining);
-                info!("[MAIN] Agent: {}", 
+                info!("[MAIN] Agent: {}",
                     if AGENT.is_some() { "Ready" } else { "Not initialized" });
                 info!("========================================");
             }
@@ -188,18 +215,18 @@ async fn agent_task() {
         "Read heart rate",
         "Report system status",
     ];
-    
+
     let mut task_index = 0;
 
     loop {
         // Check if agent is initialized
         let agent_ready = unsafe { AGENT.is_some() };
-        
+
         if agent_ready {
             // Run a test task
             let task = test_tasks[task_index % test_tasks.len()];
             info!("[AGENT] Running task: {}", task);
-            
+
             // SAFETY: Only this task accesses AGENT
             unsafe {
                 if let Some(ref mut _agent) = AGENT {
@@ -209,7 +236,7 @@ async fn agent_task() {
                     info!("[AGENT] Budget check passed");
                 }
             }
-            
+
             task_index += 1;
         } else {
             info!("[AGENT] Waiting for initialization...");

@@ -43,6 +43,14 @@ pub mod bip39;
 mod english;
 pub mod error;
 pub mod keystore;
+
+// `wallet` is a sibling module that intentionally shares its name with the
+// `wallet` *directory*. Clippy's `module_inception` lint flags this; we
+// suppress it because the alternative (renaming either the directory or
+// the module) would force every external caller to update imports
+// (`magent_core::web3::wallet::wallet::Wallet` is intentionally ugly but
+// is the codebase convention).
+#[allow(clippy::module_inception)]
 pub mod wallet;
 
 /// ESP32 NVS storage module (only available with `esp32_nvs` feature)

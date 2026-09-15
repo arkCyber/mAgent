@@ -232,7 +232,7 @@ monitoring = []
 # feature flag so `web.rs` / `web3/blockchain/http_client.rs`'s
 # `#[cfg(feature = "reqwest")]` HTTP paths are compiled whenever `std` is on
 # (the dependency alone is not enough — the cfg flag is what gates the code).
-std = ["dep:reqwest", "reqwest", "dep:regex", "dep:magent-hal", "serde/std", "serde_json/std", "log/std"]
+std = ["dep:reqwest", "reqwest", "dep:regex", "dep:magent-hal", "serde/std", "serde_json/std", "log/std", "once_cell/std", "dep:embedded-storage"]
 host = ["std"]  # alias
 
 # ---------------------------------------------------------------------------
@@ -313,6 +313,15 @@ esp32 = [
     "dep:embedded-storage",
     "dep:embedded-storage-async",
     "dep:critical-section",
+    # `web3/blockchain/esp32_http.rs` keeps its process-wide default
+    # `Transport` in a `once_cell::sync::OnceLock`. `once_cell` is declared
+    # `default-features = false`, so the `sync` module only exists once the
+    # `std` (host) or `critical-section` (bare-metal) backing is selected.
+    # Previously this worked only by accident, via feature unification with
+    # the firmware crate's own `once_cell = "1"`; declaring it here makes
+    # `magent-core`'s `esp32` feature self-contained (it now host-checks and
+    # builds standalone). Chosen backend is a no-op where `std` is also on.
+    "once_cell/critical-section",
 ]
 
 # ---------------------------------------------------------------------------

@@ -1146,6 +1146,10 @@ mod tests {
         // path so concurrent tests can't trample us.
         unsafe { std::env::set_var(SUMMARIES_DIR_ENV, &custom) };
         let got = summaries_dir();
+        // SAFETY: undo the `set_var` above so the next test starts from
+        // the same environment we found on entry (`prev`). `set_var` and
+        // `remove_var` are both process-global; we only restore the value
+        // we observed, so no other test can be affected.
         unsafe {
             if let Some(v) = prev {
                 std::env::set_var(SUMMARIES_DIR_ENV, v);

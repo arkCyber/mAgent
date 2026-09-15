@@ -3,6 +3,12 @@
 //! Source: https://github.com/bitcoin/bips/blob/master/bip-0039/english.txt
 //! Indexed 0..=2047; word index = 11-bit big-endian chunk of the mnemonic.
 
+// Clippy flags any `[&str; 2048]` constant as a "large array defined as const";
+// we deliberately keep this `const` (vs `static`) so the words are baked into
+// `.rodata` at compile time and the binary never pays a one-time init cost
+// on boot. The 14 KiB cost is the documented trade-off vs. loading the
+// wordlist from flash at runtime.
+#[allow(clippy::large_const_arrays)]
 pub(crate) const WORDS: [&str; 2048] = [
     "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd",
     "abuse", "access", "accident", "account", "accuse", "achieve", "acid", "acoustic", "acquire",

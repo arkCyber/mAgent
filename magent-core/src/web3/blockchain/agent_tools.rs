@@ -739,18 +739,38 @@ fn backend_send_transaction(
 /// TRACE: REQ-NET-002: RPC failure must NEVER report `Ok`; the backend MUST
 /// return `Err` so the agent loop drives the tool call to finalisation.
 /// TRACE: REQ-FW-001: Available on the bare-metal ESP32 build path.
+///
+/// GAP-003 (closed): this previously refused with a `NotConfigured` error
+/// because the firmware did not yet link an ESP-IDF HTTP stack. The
+/// firmware now installs [`crate::web3::blockchain::esp32_http::Transport`]
+/// (see `firmware/esp32-app/src/blockchain_transport.rs`), and this path
+/// drives the real `eth_getTransactionReceipt` JSON-RPC call through it.
+/// When no transport is installed the call still fails loudly (never a
+/// synthetic receipt) — see `MockTransport`.
 #[cfg(feature = "esp32")]
 fn backend_poll_transaction(
-    _backend: &mut BlockchainBackend,
-    _tx_hash: &str,
+    backend: &mut BlockchainBackend,
+    tx_hash: &str,
 ) -> core::result::Result<String, AgentError> {
-    // TODO[GAP-003]: wire to `esp_idf_svc::http::client::EspHttpClient` once
-    // the firmware crate pulls in `esp-idf-svc 0.52`. Until then, refuse
-    // rather than fabricate a synthetic success — see REQ-NET-002.
-    Err(AgentError::ConfigurationError {
-        field: "blockchain_rpc",
-        reason: crate::error::ConfigError::NotConfigured,
-    })
+    let BlockchainBackend::Esp32 { client, .. } = backend else {
+        return Err(AgentError::ConfigurationError {
+            field: "blockchain",
+            reason: crate::error::ConfigError::MissingField,
+        });
+    };
+
+    match client.get_transaction_receipt(tx_hash) {
+        Ok(Some(receipt)) => Ok(alloc::format!(
+            "tx confirmed: status={}, block={}",
+            receipt.status_code(),
+            receipt.block_number_u64()
+        )),
+        Ok(None) => Ok(alloc::format!("tx {} still pending", tx_hash)),
+        Err(_e) => Err(AgentError::ConfigurationError {
+            field: "blockchain_rpc",
+            reason: crate::error::ConfigError::NotConfigured,
+        }),
+    }
 }
 
 #[cfg(all(feature = "std", not(feature = "esp32")))]
@@ -1265,6 +1285,85 @@ pub fn register_blockchain_tools_only(registry: &mut crate::tools::ToolRegistry)
 #[cfg(all(test, feature = "web3"))]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // GAP-003: ESP32 transaction polling drives the real JSON-RPC transport
+    // -----------------------------------------------------------------
+
+    /// With a transport installed, `backend_poll_transaction` must decode a
+    /// real `eth_getTransactionReceipt` response into a confirmed-status
+    /// string (it previously returned `NotConfigured` unconditionally).
+    #[cfg(feature = "esp32")]
+    #[test]
+    fn esp32_poll_transaction_decodes_receipt() {
+        use crate::web3::blockchain::esp32_http::{
+            EspHttpClient, HttpClientConfig, SharedTransport, StaticTransport,
+        };
+        use alloc::sync::Arc;
+
+        let receipt = r#"{"jsonrpc":"2.0","id":1,"result":{"transaction_hash":"0xaa","block_number":"0x10","block_hash":"0xbb","transaction_index":"0x0","from":"0xcc","to":"0xdd","cumulative_gas_used":"0x5208","gas_used":"0x5208","status":"0x1"}}"#;
+        let client = EspHttpClient::with_transport(
+            HttpClientConfig::from_url("https://example.com"),
+            Arc::new(StaticTransport::posting(receipt)) as SharedTransport,
+        );
+        let mut backend = BlockchainBackend::Esp32 {
+            client,
+            poller: None,
+        };
+
+        let out = backend_poll_transaction(&mut backend, "0xaa").expect("receipt decodes");
+        assert!(out.contains("status=1"), "got: {out}");
+        assert!(out.contains("block=16"), "got: {out}");
+    }
+
+    /// A `null` result means the transaction is not yet mined — that is a
+    /// legitimate "pending" answer, not an error.
+    #[cfg(feature = "esp32")]
+    #[test]
+    fn esp32_poll_transaction_reports_pending_on_null() {
+        use crate::web3::blockchain::esp32_http::{
+            EspHttpClient, HttpClientConfig, SharedTransport, StaticTransport,
+        };
+        use alloc::sync::Arc;
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+        let client = EspHttpClient::with_transport(
+            HttpClientConfig::from_url("https://example.com"),
+            Arc::new(StaticTransport::posting(body)) as SharedTransport,
+        );
+        let mut backend = BlockchainBackend::Esp32 {
+            client,
+            poller: None,
+        };
+
+        let out = backend_poll_transaction(&mut backend, "0xaa").expect("pending is Ok");
+        assert!(out.contains("still pending"), "got: {out}");
+    }
+
+    /// A revert (`status: "0x0"`) must surface as `status=0`, never as a
+    /// success — REQ-NET-002.
+    #[cfg(feature = "esp32")]
+    #[test]
+    fn esp32_poll_transaction_reports_revert_status() {
+        use crate::web3::blockchain::esp32_http::{
+            EspHttpClient, HttpClientConfig, SharedTransport, StaticTransport,
+        };
+        use alloc::sync::Arc;
+
+        let receipt = r#"{"jsonrpc":"2.0","id":1,"result":{"transaction_hash":"0xaa","block_number":"0x2a","block_hash":"0xbb","transaction_index":"0x0","from":"0xcc","to":"0xdd","cumulative_gas_used":"0x5208","gas_used":"0x5208","status":"0x0"}}"#;
+        let client = EspHttpClient::with_transport(
+            HttpClientConfig::from_url("https://example.com"),
+            Arc::new(StaticTransport::posting(receipt)) as SharedTransport,
+        );
+        let mut backend = BlockchainBackend::Esp32 {
+            client,
+            poller: None,
+        };
+
+        let out = backend_poll_transaction(&mut backend, "0xaa").expect("decodes");
+        assert!(out.contains("status=0"), "got: {out}");
+        assert!(out.contains("block=42"), "got: {out}");
+    }
 
     #[test]
     fn test_blockchain_manager_creation() {

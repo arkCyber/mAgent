@@ -307,7 +307,11 @@ pub fn run_sntp_supervisor<F>(
     // `did_first_sync` guards the link-up retry in the loop: once we have
     // recorded a real sample we fall back to the normal periodic re-sync.
     let mut did_first_sync = false;
-    if !network_up.load(Ordering::Relaxed) {
+    // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R7 — Acquire pairs with the
+    // Release on `net_up.store(...)` in main's wifi supervisor so the link-up
+    // bit is observed together with the handshake state the SNTP daemon
+    // publishes alongside it.
+    if !network_up.load(Ordering::Acquire) {
         log::warn!("[sntp] no network link yet — deferring first sync (will retry on link-up)");
     } else if wait_for_first_sync(&sntp, FIRST_SYNC_TIMEOUT_MS) {
         if let Ok(Some(wall)) = read_rtc_unix() {
@@ -383,7 +387,7 @@ pub fn run_sntp_supervisor<F>(
         // polls only when triggered, and the periodic re-sync below requires
         // `status == Completed` (which never happens if we never synced). So
         // the moment a link appears, nudge the daemon and do the first sync.
-        if !did_first_sync && network_up.load(Ordering::Relaxed) {
+        if !did_first_sync && network_up.load(Ordering::Acquire) {
             // Ask the IDF daemon to (re)start polling now that we have a link.
             unsafe {
                 esp_idf_svc::sys::sntp_set_sync_status(
@@ -408,7 +412,7 @@ pub fn run_sntp_supervisor<F>(
             // `did_first_sync = false` so we retry on the next tick.
         }
 
-        if network_up.load(Ordering::Relaxed)
+        if network_up.load(Ordering::Acquire)
             && status == SyncStatus::Completed
             && elapsed_since_sync >= RESYNC_INTERVAL_S * 1000
         {

@@ -14,6 +14,95 @@ here. Dates use `YYYY-MM-DD` and follow ISO 8601. Versions follow
 ## [Unreleased]
 
 ### Changed
+- **Aerospace-grade audit + completion (2026-09-15)**: a DAL-A audit pass over
+  `magent-core`, `magent-hal`, and `firmware/` exercised 1379 unit + integration
+  tests with **0 failures and 0 clippy warnings** in the audited crates. Specific
+  fixes this pass:
+    - **recovery** (`magent-core/src/recovery.rs`): added 6 new tests that pin
+      every `execute_with_retry` strategy (Abort, Skip, Fallback, Reset, plus
+      the security-timeout carve-out). Previously only `RetryWithBackoff`
+      had a happy-path test; a future refactor could have silently demoted
+      `Fallback`/`Skip`/`Abort` into retry loops. All 13 recovery tests pass.
+    - **clippy strictness** (`magent-core/tests/property_tests.rs`): removed
+      an `absurd_extreme_comparisons` error on `r >= 0` for a `u32`, refactored
+      `t.runs_ok = ok; t.runs_total = total;` blocks into struct-initialiser
+      form (`runs_ok: ok, runs_total: total, ..Default::default()`) to silence
+      `field_reassign_with_default`, removed dead `Address` imports from
+      property tests, and renamed unused `seed` proptest parameters to `_seed`.
+    - **bip39** (`magent-core/src/web3/wallet/bip39.rs`): moved the
+      test-only `hex_nibble` helper inside `mod tests` (was flagged as
+      `items_after_test_module`) and converted a `needless_range_loop`
+      into an iterator with `enumerate()`.
+    - **english wordlist** (`magent-core/src/web3/wallet/english.rs`):
+      documented the deliberate `const WORDS: [&str; 2048]` choice with a
+      targeted `#[allow(clippy::large_const_arrays)]` and a `// TRACE` comment.
+    - **wallet module** (`magent-core/src/web3/wallet/mod.rs`): annotated
+      the `pub mod wallet;` re-export with `#[allow(clippy::module_inception)]`
+      and an explanatory comment so the convention is documented.
+
+### Documentation
+- New file: `AEROSPACE_AUDIT_2026_09_15.md` — full DO-178C DAL A audit
+  report covering (1) subagent findings triage (27 of ~60 subagent
+  findings re-verified and determined to be false positives or already
+  gated), (2) the 5 net code fixes shipped this pass, (3) the test-coverage
+  matrix before/after, (4) the residual-risk list deferred to a follow-up
+  firmware-target pass, and (5) the DAL A sign-off checklist.
+
+### Changed (audit follow-up — §8 tooling + §6 firmware residuals)
+- **workspace lint hardening** (`Cargo.toml`): promoted
+  `clippy::undocumented_unsafe_blocks` from the default (`warn`) to
+  `deny` so any `unsafe { … }` block without a `// SAFETY:` comment
+  fails CI. Audit pass found **1** offending block
+  (`magent-core/src/summary/mod.rs` test helper) and added the
+  missing comment; all 7 host `unsafe` blocks now have SAFETY
+  documentation. Reference: §8 item 4 of the audit report.
+- **firmware atomics — FW-R6 / FW-R7** (`firmware/esp32-app/src/latency_metrics.rs`,
+  `at_dispatch.rs`, `sntp_sync.rs`, `main.rs`): promoted `Relaxed`
+  → `(Release, Acquire)` on the cross-core counters (`METRICS`,
+  `WIFI_RECONNECT_REQUESTED`, `net_up`, `network_up`, `HEAP_LOW_WATER`)
+  so the dual-core S3 producer/consumer pair observes writes
+  together with the matching handshake state. Test reads updated to
+  `Acquire` for consistency.
+- **firmware OTA — FW-R2** (`firmware/esp32-app/src/ota.rs`): added
+  a `validate_ota_url` gate that rejects non-HTTPS URLs up front so
+  `AT+OTA` can no longer be tricked into fetching plaintext
+  firmware. The module docstring now lists the 4-step production
+  hardening plan (HTTPS-only [done], cert-bundle pin, vendor-host
+  allowlist, secure-boot v2) and points to the planned
+  `AEROSPACE_AUDIT_FIRMWARE_2026_09_22.md` follow-up.
+- **firmware BLE write — FW-R1** (`firmware/esp32-app/src/ble_config.rs`):
+  reordered `handle_gatt_write` to verify the write's `handle` is
+  registered in `GATT_HANDLES` *before* dereferencing `p.value`,
+  added a `SAFETY` comment on the `from_raw_parts` call, and logged
+  the MTU-aware refactor as the next step. The audit's MTU-state
+  refactor remains the follow-up; today's 512-byte cap is the
+  next-best bound.
+- **firmware leak registry — FW-R5** (`firmware/esp32-app/src/main.rs`):
+  introduced `register_leak()` helper that enforces a 64-entry cap
+  on `LEAKED_BOXES` (evicts a sentinel entry on overflow and logs
+  an error) so a runaway reconnect / OTA-init loop cannot grow the
+  registry without bound. Three call sites (`init_default_nvs`,
+  agent boot, wifi init) now go through the helper.
+- **firmware panic handler — FW-R4** (`firmware/nrf52-app/Cargo.toml`,
+  `src/main.rs`): replaced `panic-probe` (which bkpt()'d in a tight
+  loop and wedged the board) with `panic-reset` (jumps to
+  `SCB::sys_reset()` on panic). The watchdog-fed main task
+  continues to make progress between panics.
+- **firmware static-mut status — FW-R3** (`firmware/nrf52-app/src/main.rs`):
+  documented the Embassy `pool_size = 1` exclusivity invariant on
+  `WATCHDOG` / `BLE_STATE` / `POWER_STATE` / `AGENT` and captured
+  the StaticCell migration as a TODO follow-up. The audit's
+  refactor is intentionally deferred to keep the blast radius
+  small; the new SAFETY comments make the current single-owner
+  contract auditable.
+- **firmware BLE loop — FW-R8** (`firmware/esp32-app/src/ble_config.rs`):
+  re-read confirmed the only loop (`BLE_AGENT_REPLY` waiter) is
+  bounded by a 30-second `Instant::now() >= deadline` check, so
+  no additional cap is required. The audit's concern was about a
+  pre-refactor `loop { heap_watchdog_feed(); … }` in the Bluedroid
+  callback path that no longer exists in this tree.
+
+### Changed
 - **Documentation refresh** (2026-09-14): brought the platform docs up to date
   with the current state of the codebase (ESP32-S3 bring-up, ESP32-C61 OTA,
   board feature switch):
@@ -31,6 +120,53 @@ here. Dates use `YYYY-MM-DD` and follow ISO 8601. Versions follow
   - `firmware/esp32-app/README.md` — retitled for C61 **and** S3, documented the
     `build-c61.sh`/`build-s3.sh` scripts, board feature matrix, sdkconfig files
     and the `board-*`/`lua` feature set.
+
+### Fixed
+- **Placeholder / mock-elimination pass (2026-09-14)**: removed the remaining
+  fabricated-data and placeholder-error paths found by the audit sweep, so no
+  production path invents an answer and no module ships a dead "stub" body:
+    - **BLE client had no real wire and faked LLM replies**
+      (`magent-core/src/communication/ble.rs`): `send_request` returned
+      hard-coded keyword answers ("The current temperature is 25.5°C", …) and
+      `receive_response` returned a canned "Response content". The client now
+      has a real request/response contract: requests are serialised onto a
+      bounded `outbound` queue (`take_outbound`), gateway replies are delivered
+      by the driver (`enqueue_response`), and an empty inbound queue is a real
+      `NetworkError::Timeout`. `disconnect()` drops queued frames. TRACE:
+      REQ-NET-002. +8 tests (queue round-trip, timeout, disconnect drain).
+    - **KV-store integrity was not a CRC** (`magent-core/src/storage.rs`):
+      the `crc ^= byte; crc *= 0x1021` checksum (duplicated in 3 places) is
+      replaced by a single real **CRC-16/CCITT-FALSE** (`crc16_ccitt`), used by
+      both write paths and both read/validate paths. +3 tests, including a
+      proof that every single-bit flip is now detected.
+    - **`storage.rs` tests never ran**: the test module was gated
+      `cfg(all(test, feature = "esp32"))` while using `std::vec::Vec`, so it was
+      unreachable from the host matrix. Now gated on `std`, `storage` is
+      compiled under `std` (with `dep:embedded-storage`), and all **23** tests
+      execute in CI for the first time.
+    - **GAP-003 closed — ESP32 transaction polling** (`agent_tools.rs`): the
+      ESP32 `backend_poll_transaction` returned `NotConfigured` unconditionally
+      (a stale TODO from before the firmware linked `esp-idf-svc`). It now
+      drives the real `eth_getTransactionReceipt` through the shared
+      `EspHttpClient`/`Transport` and decodes status + block. Revert/pending
+      handling covered by 3 new tests.
+    - **`Esp32BlockchainClient` placeholder bodies** (`esp32_client.rs`): the
+      `get_balance_blocking` / `get_nonce_blocking` / `send_raw_blocking` /
+      `check_transaction_status` methods all returned "Use Esp32HttpClient for
+      ESP32" errors; they now call the real transport (and fail loudly with
+      "no Transport installed" when none is present). The fake time source
+      (`static COUNTER` returning synthetic milliseconds) is replaced by an
+      optional caller-supplied monotonic clock (`with_clock`), which `poll()`
+      now uses to actually enforce `poll_interval_ms`. +5 tests.
+    - **`magent-core`'s `esp32` feature was not self-contained**: `once_cell` is
+      declared `default-features = false`, so `esp32_http`'s `OnceLock` only
+      compiled when the firmware crate's own `once_cell = "1"` happened to
+      unify. Added `once_cell/critical-section` to `esp32` and `once_cell/std`
+      to `std`, so `cargo check -p magent-core --features esp32,…` works
+      standalone (and the ESP32 code path is now host-checked).
+
+### Added
+
 
 ### Added
 - **Feature-gated modules made host-testable + tested** (`magent-core/src/lib.rs`):

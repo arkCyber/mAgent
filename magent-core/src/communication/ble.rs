@@ -14,12 +14,41 @@ use serde::{Deserialize, Serialize};
 /// Maximum message size
 const MAX_MESSAGE_SIZE: usize = 512;
 
-/// BLE client for cloud communication
+/// Maximum number of frames buffered in each direction before the client
+/// reports `BufferOverflow`. Small and fixed on purpose (aerospace-grade
+/// bounds): the BLE driver drains `outbound` long before it fills.
+const BLE_QUEUE_DEPTH: usize = 4;
+
+/// BLE client for cloud communication.
+///
+/// ## Transport contract
+///
+/// This client contains **no radio and no fabricated responses**. A BLE
+/// gateway integration drives it from the outside:
+///
+/// 1. The agent calls [`BleClient::send_request`] /
+///    [`BleClient::send_tool_result`], which serialise a [`BleMessage`] onto
+///    the `outbound` queue.
+/// 2. The driver drains those frames with [`BleClient::take_outbound`] and
+///    writes them to the radio.
+/// 3. When the gateway replies, the driver decodes the frame and hands it
+///    back with [`BleClient::enqueue_response`].
+/// 4. [`BleClient::send_request`] returns that reply — or, if nothing
+///    arrived, a real [`NetworkError::Timeout`]. It never invents content.
+///
+/// TRACE: REQ-NET-002 — a missing wire is reported as an error, never as a
+/// synthetic success.
 pub struct BleClient {
     connected: bool,
-    /// Connection timeout, in milliseconds, used by `connect()` /
-    /// send-and-await paths.
+    /// Connection timeout, in milliseconds. Retained for callers that
+    /// wrap their own wait around [`BleClient::send_request`].
     pub timeout_ms: u32,
+    /// Frames queued for the radio driver to transmit (FIFO).
+    outbound: Vec<BleMessage, BLE_QUEUE_DEPTH>,
+    /// LLM responses delivered by the gateway, awaiting the agent loop.
+    inbound: Vec<LlmResponse, BLE_QUEUE_DEPTH>,
+    /// Monotonic message-id source for request/response correlation.
+    next_message_id: u32,
 }
 
 impl BleClient {
@@ -28,6 +57,9 @@ impl BleClient {
         Self {
             connected: false,
             timeout_ms,
+            outbound: Vec::new(),
+            inbound: Vec::new(),
+            next_message_id: 0,
         }
     }
 
@@ -36,16 +68,21 @@ impl BleClient {
         Self::new(30000) // 30 seconds
     }
 
-    /// Connect to gateway
+    /// Connect to gateway.
+    ///
+    /// The link itself is established by the platform BLE driver; this only
+    /// arms the client's request/response state machine.
     pub async fn connect(&mut self) -> Result<()> {
-        // In real implementation, this would establish BLE connection
         self.connected = true;
         Ok(())
     }
 
-    /// Disconnect from gateway
+    /// Disconnect from gateway, discarding any queued frames so a later
+    /// reconnect can't deliver stale replies.
     pub async fn disconnect(&mut self) -> Result<()> {
         self.connected = false;
+        self.outbound.clear();
+        self.inbound.clear();
         Ok(())
     }
 
@@ -54,8 +91,13 @@ impl BleClient {
         self.connected
     }
 
-    /// Send request to cloud LLM API
-    pub async fn send_request(&self, prompt: &str) -> Result<String<MAX_MESSAGE_SIZE>> {
+    /// Queue an LLM request for the gateway and await its reply.
+    ///
+    /// The prompt is handed to the radio driver via the `outbound` queue;
+    /// the return value comes from a frame the driver delivered through
+    /// [`BleClient::enqueue_response`]. If nothing arrives, this returns
+    /// [`NetworkError::Timeout`] — it never fabricates an answer.
+    pub async fn send_request(&mut self, prompt: &str) -> Result<String<MAX_MESSAGE_SIZE>> {
         if !self.connected {
             return Err(AgentError::NetworkConnectionFailed {
                 reason: NetworkError::ConnectionRefused,
@@ -70,62 +112,92 @@ impl BleClient {
             });
         }
 
-        // In real implementation, this would:
-        // 1. Serialize prompt to BLE message
-        // 2. Send via BLE to gateway
-        // 3. Gateway forwards to cloud LLM API (or local Ollama)
-        // 4. Wait for response
-        // 5. Deserialize response
+        let request = BleMessage::new(MessageType::LlmRequest, self.next_id(), prompt)?;
+        self.outbound
+            .push(request)
+            .map_err(|_| AgentError::BufferOverflow {
+                capacity: BLE_QUEUE_DEPTH,
+                attempted: BLE_QUEUE_DEPTH + 1,
+            })?;
 
-        // For now, simulate response with more realistic content
-        let response = if prompt.contains("temperature") {
-            "The current temperature is 25.5°C"
-        } else if prompt.contains("LED") {
-            "LED has been turned on"
-        } else if prompt.contains("flash") {
-            "Configuration read from flash successfully"
-        } else {
-            "Task completed successfully"
-        };
-
-        Ok(heapless::String::try_from(response).unwrap())
+        let response = self.receive_response().await?;
+        Ok(response.content)
     }
 
-    /// Send tool result to cloud
-    pub async fn send_tool_result(&self, _result: &ToolResult) -> Result<()> {
+    /// Queue a tool result for transmission to the cloud gateway.
+    pub async fn send_tool_result(&mut self, result: &ToolResult) -> Result<()> {
         if !self.connected {
             return Err(AgentError::NetworkConnectionFailed {
                 reason: NetworkError::ConnectionRefused,
             });
         }
 
-        // In real implementation, this would:
-        // 1. Serialize tool result to BLE message
-        // 2. Send via BLE to gateway
-        // 3. Gateway forwards to LLM API
-
+        // JSON is the on-wire payload the gateway expects; the bounded
+        // `BleMessage` constructor rejects anything over `MAX_MESSAGE_SIZE`.
+        let payload =
+            serde_json::to_string(result).map_err(|_| AgentError::InputValidationFailed {
+                field: "tool_result",
+                reason: crate::error::ValidationError::InvalidFormat,
+            })?;
+        let message = BleMessage::new(MessageType::ToolResult, self.next_id(), &payload)?;
+        self.outbound
+            .push(message)
+            .map_err(|_| AgentError::BufferOverflow {
+                capacity: BLE_QUEUE_DEPTH,
+                attempted: BLE_QUEUE_DEPTH + 1,
+            })?;
         Ok(())
     }
 
-    /// Receive response from cloud
-    pub async fn receive_response(&self) -> Result<LlmResponse> {
+    /// Receive the next response delivered by the gateway.
+    ///
+    /// Returns [`NetworkError::Timeout`] when the driver has not queued a
+    /// frame yet; a missing wire must never look like a successful answer.
+    pub async fn receive_response(&mut self) -> Result<LlmResponse> {
         if !self.connected {
             return Err(AgentError::NetworkConnectionFailed {
                 reason: NetworkError::ConnectionRefused,
             });
         }
 
-        // In real implementation, this would:
-        // 1. Wait for BLE message from gateway
-        // 2. Deserialize LLM response
-        // 3. Parse tool calls if any
+        if self.inbound.is_empty() {
+            return Err(AgentError::NetworkConnectionFailed {
+                reason: NetworkError::Timeout,
+            });
+        }
 
-        // For now, simulate response
-        Ok(LlmResponse {
-            content: heapless::String::try_from("Response content").unwrap(),
-            tool_calls: Vec::new(),
-            finish_reason: heapless::String::try_from("stop").unwrap(),
-        })
+        Ok(self.inbound.remove(0))
+    }
+
+    /// Driver hook: queue an LLM response decoded from a gateway frame.
+    pub fn enqueue_response(&mut self, response: LlmResponse) -> Result<()> {
+        self.inbound
+            .push(response)
+            .map_err(|_| AgentError::BufferOverflow {
+                capacity: BLE_QUEUE_DEPTH,
+                attempted: BLE_QUEUE_DEPTH + 1,
+            })
+    }
+
+    /// Driver hook: take the next frame the radio should transmit (FIFO).
+    pub fn take_outbound(&mut self) -> Option<BleMessage> {
+        if self.outbound.is_empty() {
+            None
+        } else {
+            Some(self.outbound.remove(0))
+        }
+    }
+
+    /// Number of frames awaiting transmission.
+    pub fn pending_outbound(&self) -> usize {
+        self.outbound.len()
+    }
+
+    /// Next monotonic message id (wraps after 2^32 frames).
+    fn next_id(&mut self) -> u32 {
+        let id = self.next_message_id;
+        self.next_message_id = self.next_message_id.wrapping_add(1);
+        id
     }
 }
 
@@ -260,7 +332,7 @@ mod tests {
 
     #[test]
     fn send_request_fails_when_disconnected() {
-        let c = BleClient::new(1000);
+        let mut c = BleClient::new(1000);
         let err = block_on(c.send_request("temperature")).unwrap_err();
         assert!(matches!(
             err,
@@ -271,27 +343,81 @@ mod tests {
     }
 
     #[test]
-    fn send_request_returns_keyword_responses() {
+    fn send_request_requires_connection() {
+        let mut c = BleClient::new(1000);
+        assert!(block_on(c.send_request("temperature")).is_err());
+    }
+
+    /// The reply is whatever the driver queued — the client must not
+    /// fabricate one. Drive the full round-trip: request goes out on the
+    /// wire queue, the (simulated) radio answers, the client returns it.
+    #[test]
+    fn send_request_returns_driver_supplied_response() {
         let mut c = BleClient::new(1000);
         assert!(block_on(c.connect()).is_ok());
-        assert_eq!(
-            block_on(c.send_request("what is temperature"))
-                .unwrap()
-                .as_str(),
-            "The current temperature is 25.5°C"
-        );
-        assert_eq!(
-            block_on(c.send_request("turn LED on")).unwrap().as_str(),
-            "LED has been turned on"
-        );
-        assert_eq!(
-            block_on(c.send_request("read flash")).unwrap().as_str(),
-            "Configuration read from flash successfully"
-        );
-        assert_eq!(
-            block_on(c.send_request("hello")).unwrap().as_str(),
-            "Task completed successfully"
-        );
+        assert!(block_on(c.receive_response()).is_err());
+
+        assert!(c
+            .enqueue_response(LlmResponse {
+                content: heapless::String::try_from("gateway says hi").unwrap(),
+                tool_calls: Vec::new(),
+                finish_reason: heapless::String::try_from("stop").unwrap(),
+            })
+            .is_ok());
+
+        let reply = block_on(c.send_request("hello")).unwrap();
+        assert_eq!(reply.as_str(), "gateway says hi");
+    }
+
+    /// A request is serialised onto the outbound queue for the radio driver.
+    #[test]
+    fn send_request_queues_outbound_frame() {
+        let mut c = BleClient::new(1000);
+        assert!(block_on(c.connect()).is_ok());
+        assert_eq!(c.pending_outbound(), 0);
+
+        // No reply queued → the call times out, but the request must still
+        // have been handed to the driver.
+        let err = block_on(c.send_request("what is the temperature")).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::NetworkConnectionFailed {
+                reason: NetworkError::Timeout
+            }
+        ));
+        assert_eq!(c.pending_outbound(), 1);
+
+        let frame = c.take_outbound().expect("frame queued for the radio");
+        assert_eq!(frame.message_type, MessageType::LlmRequest);
+        assert_eq!(frame.payload.as_str(), "what is the temperature");
+        assert!(c.take_outbound().is_none());
+    }
+
+    /// An empty inbound queue is a timeout, never a synthetic answer
+    /// (REQ-NET-002).
+    #[test]
+    fn receive_response_is_empty_without_driver_frame() {
+        let mut c = BleClient::new(1000);
+        assert!(block_on(c.connect()).is_ok());
+        let err = block_on(c.receive_response()).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::NetworkConnectionFailed {
+                reason: NetworkError::Timeout
+            }
+        ));
+    }
+
+    #[test]
+    fn disconnect_discards_queued_frames() {
+        let mut c = BleClient::new(1000);
+        assert!(block_on(c.connect()).is_ok());
+        let _ = block_on(c.send_request("hello"));
+        assert_eq!(c.pending_outbound(), 1);
+
+        assert!(block_on(c.disconnect()).is_ok());
+        assert_eq!(c.pending_outbound(), 0);
+        assert!(c.take_outbound().is_none());
     }
 
     #[test]
@@ -317,18 +443,29 @@ mod tests {
             success: true,
             error: None,
         };
-        let c = BleClient::new(1000);
+        let mut c = BleClient::new(1000);
         assert!(block_on(c.send_tool_result(&result)).is_err());
 
         let mut c2 = BleClient::new(1000);
         assert!(block_on(c2.connect()).is_ok());
         assert!(block_on(c2.send_tool_result(&result)).is_ok());
+        // The tool result is serialised into an outbound frame.
+        let frame = c2.take_outbound().expect("tool result queued");
+        assert_eq!(frame.message_type, MessageType::ToolResult);
+        assert!(frame.payload.as_str().contains("noop"));
     }
 
     #[test]
-    fn receive_response_returns_llm_response() {
+    fn enqueue_response_round_trip() {
         let mut c = BleClient::new(1000);
         assert!(block_on(c.connect()).is_ok());
+        assert!(c
+            .enqueue_response(LlmResponse {
+                content: heapless::String::try_from("Response content").unwrap(),
+                tool_calls: Vec::new(),
+                finish_reason: heapless::String::try_from("stop").unwrap(),
+            })
+            .is_ok());
         let resp = block_on(c.receive_response()).unwrap();
         assert_eq!(resp.content.as_str(), "Response content");
         assert!(resp.tool_calls.is_empty());

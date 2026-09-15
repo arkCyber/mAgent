@@ -7,6 +7,36 @@ use crate::error::{AgentError, IntoStorageError, Result, StorageError};
 use embedded_storage::nor_flash::NorFlash;
 use heapless::Vec;
 
+/// CRC-16/CCITT-FALSE over `data`: polynomial `0x1021`, init `0xFFFF`,
+/// no input/output reflection and no final XOR.
+///
+/// This is the **single** integrity function for the KV wire format
+/// (`[key_len][key][value_len LE][value][crc16 LE]`). It replaces the
+/// historical `crc ^= byte; crc = crc.wrapping_mul(0x1021)` expression,
+/// which — despite the `0x1021` constant — was a multiplication-based
+/// checksum rather than a polynomial CRC and detected far fewer error
+/// patterns (e.g. two corruptions of the same byte value cancel out).
+/// Because both the write and *both* read paths now route through this
+/// function, entries validate consistently.
+///
+/// Test vectors, per the CRC catalogue:
+/// - `b""`          → `0xFFFF`
+/// - `b"123456789"` → `0x29B1`
+pub(crate) fn crc16_ccitt(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
 /// Flash storage wrapper
 pub struct FlashStorage<F> {
     flash: F,
@@ -245,16 +275,10 @@ where
                 let value_start = 3 + key_len;
                 let value_end = value_start + value_len;
 
-                // Validate CRC
+                // Validate CRC (CRC-16/CCITT-FALSE over the header + body)
                 let crc_offset = value_end;
                 let stored_crc = u16::from_le_bytes([buf[crc_offset], buf[crc_offset + 1]]);
-
-                // Calculate CRC of data
-                let mut crc: u16 = 0;
-                for &byte in &buf[..crc_offset] {
-                    crc ^= byte as u16;
-                    crc = crc.wrapping_mul(0x1021);
-                }
+                let crc = crc16_ccitt(&buf[..crc_offset]);
 
                 if crc != stored_crc {
                     // CRC mismatch, data corrupted
@@ -330,12 +354,8 @@ where
             let _ = entry.push(byte);
         }
 
-        // Calculate CRC (simple XOR for now, should use proper CRC16)
-        let mut crc: u16 = 0;
-        for &byte in entry.iter() {
-            crc ^= byte as u16;
-            crc = crc.wrapping_mul(0x1021);
-        }
+        // CRC-16/CCITT-FALSE trailer over the header + body.
+        let crc = crc16_ccitt(&entry);
         let _ = entry.push((crc & 0xFF) as u8);
         let _ = entry.push(((crc >> 8) & 0xFF) as u8);
 
@@ -405,11 +425,8 @@ where
         for &b in value {
             let _ = entry.push(b);
         }
-        let mut crc: u16 = 0;
-        for &b in entry.iter() {
-            crc ^= b as u16;
-            crc = crc.wrapping_mul(0x1021);
-        }
+        // CRC-16/CCITT-FALSE trailer over the header + body.
+        let crc = crc16_ccitt(&entry);
         let _ = entry.push((crc & 0xFF) as u8);
         let _ = entry.push(((crc >> 8) & 0xFF) as u8);
         self.storage.write(self.base_address + offset, &entry)?;
@@ -565,15 +582,10 @@ where
                     reason: e.into_storage_error(),
                 })?;
 
-            // Validate CRC
+            // Validate CRC (CRC-16/CCITT-FALSE over the header + body)
             let crc_offset = 3 + key_len + value_len;
             let stored_crc = u16::from_le_bytes([buf[crc_offset], buf[crc_offset + 1]]);
-
-            let mut crc: u16 = 0;
-            for &byte in &buf[..crc_offset] {
-                crc ^= byte as u16;
-                crc = crc.wrapping_mul(0x1021);
-            }
+            let crc = crc16_ccitt(&buf[..crc_offset]);
 
             if crc == stored_crc {
                 valid_entries += 1;
@@ -598,7 +610,7 @@ where
     }
 }
 
-#[cfg(all(test, feature = "esp32"))]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     //! These tests pin down the post-H1 contract of `KvStore` and
     //! `FlashStorage`: every flash error surfaces as a typed
@@ -611,6 +623,52 @@ mod tests {
     //! an in-memory mock that implements `embedded_storage::nor_flash`.
 
     use super::*;
+
+    // -----------------------------------------------------------------
+    // CRC-16/CCITT-FALSE (KV entry integrity)
+    // -----------------------------------------------------------------
+
+    /// The canonical CRC-16/CCITT-FALSE check value: `"123456789"` → `0x29B1`.
+    #[test]
+    fn crc16_ccitt_known_vectors() {
+        assert_eq!(crc16_ccitt(b""), 0xFFFF);
+        assert_eq!(crc16_ccitt(b"123456789"), 0x29B1);
+        // Short-payload values, computed with the same bitwise algorithm,
+        // pin the implementation against regressions.
+        assert_eq!(crc16_ccitt(&[0x00]), 0xE1F0);
+        assert_eq!(crc16_ccitt(&[0xFF]), 0xFF00);
+        assert_eq!(crc16_ccitt(b"AB"), 0x4B74);
+    }
+
+    /// A polynomial CRC-16 must detect every single-bit flip, whereas the
+    /// historical `crc ^= byte; crc *= 0x1021` checksum did not. This is the
+    /// property that motivated the change, so assert it explicitly.
+    #[test]
+    fn crc16_ccitt_detects_every_single_bit_flip() {
+        let base = b"config-key\0\x01\x02\x03payload-bytes";
+        let baseline = crc16_ccitt(base);
+        for byte_idx in 0..base.len() {
+            for bit in 0..8 {
+                let mut mutated = base.to_vec();
+                mutated[byte_idx] ^= 1 << bit;
+                assert_ne!(
+                    crc16_ccitt(&mutated),
+                    baseline,
+                    "single-bit flip at byte {byte_idx} bit {bit} was not detected"
+                );
+            }
+        }
+    }
+
+    /// Swapping two adjacent bytes must change the CRC (a classic weakness of
+    /// additive/XOR checksums).
+    #[test]
+    fn crc16_ccitt_detects_adjacent_swap() {
+        assert_ne!(
+            crc16_ccitt(b"abcdef"),
+            crc16_ccitt(b"abdcef"),
+        );
+    }
 
     // The trait impls below write `Result<(), Self::Error>`. The crate root
     // re-exports `Result<T>` as a 1-arg alias fixed to `AgentError`, which

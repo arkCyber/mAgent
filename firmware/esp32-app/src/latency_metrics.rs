@@ -9,6 +9,16 @@
 //! NOTE: these targets (RISC-V / Xtensa 32-bit) have no 64-bit atomics, so we
 //! store timings in `u32` microseconds — ample here (u32 wraps only after
 //! ~71 minutes) — and keep the average as a signed running mean.
+//!
+//! TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R6 — the dual-core S3 firmware
+//! records from both Core 0 (agent worker) and Core 1 (AT ingress). On
+//! dual-core Xtensa, the producer (Core 1) and consumer (Core 0 reading
+//! `/api/status`) require Release/Acquire ordering; Relaxed can let the
+//! consumer observe a stale `max_us` for arbitrarily long (the producer's
+//! CAS store is in a write buffer that the consumer's load can bypass).
+//! We use (Release, Acquire) on every store/load pair and on the CAS
+//! success path; the CAS failure path remains Relaxed because it only
+//! re-reads the same word, no cross-core dependency.
 
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::LazyLock;
@@ -49,24 +59,27 @@ impl TimingChannel {
     /// Record a duration in microseconds.
     pub fn record(&self, us: u64) {
         let us = us as u32;
-        let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
-        // Running max (relaxed CAS loop — lossy under contention is fine for
-        // telemetry; we only need the observed worst case).
-        let mut cur = self.max_us.load(Ordering::Relaxed);
+        // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R6 — Release on the
+        // count fetch_add pairs with the Acquire load in `report()` /
+        // `sample()`, so a Core-1 producer's bump is visible to a
+        // Core-0 consumer after the consumer's load.
+        let n = self.count.fetch_add(1, Ordering::Release) + 1;
+        // Running max (release/acquire CAS loop — see module docs).
+        let mut cur = self.max_us.load(Ordering::Acquire);
         while us > cur {
             match self
                 .max_us
-                .compare_exchange_weak(cur, us, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(cur, us, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
             }
         }
-        let mut cur = self.min_us.load(Ordering::Relaxed);
+        let mut cur = self.min_us.load(Ordering::Acquire);
         while us < cur {
             match self
                 .min_us
-                .compare_exchange_weak(cur, us, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(cur, us, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
@@ -76,12 +89,12 @@ impl TimingChannel {
         // avg += (x - avg) / n.
         let x = us as i32;
         let n = n as i32;
-        let mut avg = self.avg_us.load(Ordering::Relaxed);
+        let mut avg = self.avg_us.load(Ordering::Acquire);
         loop {
             let new_avg = avg + (x - avg) / n;
             match self
                 .avg_us
-                .compare_exchange_weak(avg, new_avg, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(avg, new_avg, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => break,
                 Err(actual) => avg = actual,
@@ -91,13 +104,15 @@ impl TimingChannel {
 
     /// One-line summary: `name: n=.. min=..ms avg=..ms max(WCET)=..ms`.
     pub fn report(&self, name: &str) -> String {
-        let count = self.count.load(Ordering::Relaxed);
+        // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R6 — Acquire pairs
+        // with the Release on the producer's count fetch_add.
+        let count = self.count.load(Ordering::Acquire);
         if count == 0 {
             return format!("{name}: -");
         }
-        let min = self.min_us.load(Ordering::Relaxed);
-        let max = self.max_us.load(Ordering::Relaxed);
-        let avg = self.avg_us.load(Ordering::Relaxed) as i64;
+        let min = self.min_us.load(Ordering::Acquire);
+        let max = self.max_us.load(Ordering::Acquire);
+        let avg = self.avg_us.load(Ordering::Acquire) as i64;
         format!(
             "{name}: n={count} min={}ms avg={}ms wcet={}ms",
             min / 1000,
@@ -109,23 +124,25 @@ impl TimingChannel {
     /// Structured snapshot (milliseconds) for JSON telemetry (web-admin
     /// `/api/status`). All-zero when the channel has no samples yet.
     pub fn sample(&self) -> TimingSample {
-        let count = self.count.load(Ordering::Relaxed);
+        // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R6 — Acquire pairs
+        // with the Release on the producer's count fetch_add.
+        let count = self.count.load(Ordering::Acquire);
         TimingSample {
             count: count as u64,
             min_ms: if count == 0 {
                 0
             } else {
-                (self.min_us.load(Ordering::Relaxed) / 1000) as u64
+                (self.min_us.load(Ordering::Acquire) / 1000) as u64
             },
             avg_ms: if count == 0 {
                 0
             } else {
-                (self.avg_us.load(Ordering::Relaxed).max(0) as u64) / 1000
+                (self.avg_us.load(Ordering::Acquire).max(0) as u64) / 1000
             },
             wcet_ms: if count == 0 {
                 0
             } else {
-                (self.max_us.load(Ordering::Relaxed) / 1000) as u64
+                (self.max_us.load(Ordering::Acquire) / 1000) as u64
             },
         }
     }
@@ -135,10 +152,13 @@ impl TimingChannel {
     /// external benchmark harness to bracket a measurement window.
     #[allow(dead_code)]
     pub fn reset(&self) {
-        self.count.store(0, Ordering::Relaxed);
-        self.min_us.store(u32::MAX, Ordering::Relaxed);
-        self.max_us.store(0, Ordering::Relaxed);
-        self.avg_us.store(0, Ordering::Relaxed);
+        // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R6 — Release so a
+        // later producer's `record()` observes the cleared state before
+        // its own fetch_add.
+        self.count.store(0, Ordering::Release);
+        self.min_us.store(u32::MAX, Ordering::Release);
+        self.max_us.store(0, Ordering::Release);
+        self.avg_us.store(0, Ordering::Release);
     }
 }
 
@@ -214,10 +234,10 @@ mod tests {
     fn single_sample_tracks_min_max_avg() {
         let ch = TimingChannel::new();
         ch.record(1_000_000); // 1 s in µs
-        assert_eq!(ch.count.load(Ordering::Relaxed), 1);
-        assert_eq!(ch.min_us.load(Ordering::Relaxed), 1_000_000);
-        assert_eq!(ch.max_us.load(Ordering::Relaxed), 1_000_000);
-        assert_eq!(ch.avg_us.load(Ordering::Relaxed), 1_000_000);
+        assert_eq!(ch.count.load(Ordering::Acquire), 1);
+        assert_eq!(ch.min_us.load(Ordering::Acquire), 1_000_000);
+        assert_eq!(ch.max_us.load(Ordering::Acquire), 1_000_000);
+        assert_eq!(ch.avg_us.load(Ordering::Acquire), 1_000_000);
     }
 
     #[test]
@@ -226,10 +246,10 @@ mod tests {
         ch.record(100);
         ch.record(5_000);
         ch.record(3_000);
-        assert_eq!(ch.min_us.load(Ordering::Relaxed), 100);
-        assert_eq!(ch.max_us.load(Ordering::Relaxed), 5_000);
+        assert_eq!(ch.min_us.load(Ordering::Acquire), 100);
+        assert_eq!(ch.max_us.load(Ordering::Acquire), 5_000);
         // Running mean of {100, 5000, 3000} = 8100/3 = 2700 exactly.
-        assert_eq!(ch.avg_us.load(Ordering::Relaxed), 2_700);
+        assert_eq!(ch.avg_us.load(Ordering::Acquire), 2_700);
     }
 
     #[test]
@@ -238,9 +258,9 @@ mod tests {
         for _ in 0..1000 {
             ch.record(1_000); // constant 1 ms
         }
-        assert_eq!(ch.avg_us.load(Ordering::Relaxed), 1_000);
-        assert_eq!(ch.min_us.load(Ordering::Relaxed), 1_000);
-        assert_eq!(ch.max_us.load(Ordering::Relaxed), 1_000);
+        assert_eq!(ch.avg_us.load(Ordering::Acquire), 1_000);
+        assert_eq!(ch.min_us.load(Ordering::Acquire), 1_000);
+        assert_eq!(ch.max_us.load(Ordering::Acquire), 1_000);
     }
 
     #[test]
@@ -248,10 +268,10 @@ mod tests {
         let ch = TimingChannel::new();
         ch.record(123);
         ch.reset();
-        assert_eq!(ch.count.load(Ordering::Relaxed), 0);
-        assert_eq!(ch.min_us.load(Ordering::Relaxed), u32::MAX);
-        assert_eq!(ch.max_us.load(Ordering::Relaxed), 0);
-        assert_eq!(ch.avg_us.load(Ordering::Relaxed), 0);
+        assert_eq!(ch.count.load(Ordering::Acquire), 0);
+        assert_eq!(ch.min_us.load(Ordering::Acquire), u32::MAX);
+        assert_eq!(ch.max_us.load(Ordering::Acquire), 0);
+        assert_eq!(ch.avg_us.load(Ordering::Acquire), 0);
     }
 
     #[test]

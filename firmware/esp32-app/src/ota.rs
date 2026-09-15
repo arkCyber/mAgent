@@ -17,6 +17,36 @@
 //! - Requires an OTA-capable partition table (`ota_0`/`ota_1` + `otadata`). The
 //!   stock `partitions.csv` provides this; an OTA-only table is required for
 //!   anti-rollback (see `docs/BACKLOG.md`).
+//!
+//! ## Security model & FW-R2 (audit-2026-09-15)
+//!
+//! TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R2 — this module is
+//! **fail-open by default**: any reachable HTTP(S) URL is accepted as
+//! a candidate image and the running firmware reboots into it. The
+//! production hardening plan is:
+//!   1. Require `https://` (reject `http://` outright — see
+//!      `validate_ota_url`).
+//!   2. Pin the connection to the IDF `crt_bundle_attach` cert bundle
+//!      so the TLS handshake validates the server cert chain.
+//!   3. Enforce a vendor-host allowlist (e.g. `*.firmware.example.com`)
+//!      in `validate_ota_url`. Reject everything else with a clear
+//!      error so an attacker can't trick the operator into reflashing
+//!      a malicious image from a typo-squatted URL.
+//!   4. Long-term: enable ESP-IDF **secure-boot v2** so the bootloader
+//!      refuses to boot an image without a valid ECDSA signature;
+//!      today the board accepts any image that passes the OTA
+//!      checksum, which is a defense-in-depth gap.
+//!
+//! Until steps 1-4 land, an attacker on the same network as the board
+//! (Wi-Fi or BLE GATT) can potentially trick `AT+OTA=<url>` into
+//! flashing arbitrary firmware. The `validate_ota_url` helper
+//! already implements step 1 (HTTPS-only) so any consumer of this
+//! module gets the cheapest mitigation for free.
+//!
+//! **Production gate**: before enabling `AT+OTA` on a production
+//! board, complete steps 2-4 above. The audit pass at
+//! `AEROSPACE_AUDIT_FIRMWARE_2026_09_22.md` (planned follow-up) will
+//! re-audit this module against the gate.
 
 use std::time::Duration;
 
@@ -30,10 +60,31 @@ const OTA_CHUNK: usize = 2048;
 /// Bounded HTTP request timeout (seconds).
 const OTA_TIMEOUT_S: u64 = 30;
 
+/// TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R2 — first-pass URL check.
+/// Returns `true` only for `https://` URLs. Plain `http://` is
+/// rejected so a network-level attacker cannot intercept the image
+/// in transit. The vendor-host allowlist (step 3 in the module
+/// docstring) is **not** enforced here — the board has no built-in
+/// host allowlist yet, so the function only catches the
+/// plaintext-HTTP case for now. Production deployments must extend
+/// this with an explicit `cfg`/`compile-time!` allowlist.
+fn validate_ota_url(url: &str) -> bool {
+    url.starts_with("https://")
+}
+
 /// Stream the firmware image at `url` into the inactive OTA slot and reboot
 /// into it. Returns `Err(reason)` on any failure without changing the boot
 /// target (the running firmware continues).
 pub fn perform_ota(url: &str) -> Result<(), String> {
+    // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R2 — refuse plaintext
+    // HTTP up front. Production hardening (steps 2-4 in the module
+    // docstring) is still pending; this is the cheapest mitigation
+    // and applies regardless of caller.
+    if !validate_ota_url(url) {
+        return Err(format!(
+            "OTA: refusing non-HTTPS URL {url:?} (FW-R2 hardening, see docstring)"
+        ));
+    }
     // 1) Confirm the running app is valid so anti-rollback accepts the next
     //    update. Ignore errors — this is a best-effort precondition.
     // SAFETY: `esp_ota_mark_app_valid_cancel_rollback` takes no pointers.

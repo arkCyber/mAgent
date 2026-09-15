@@ -64,6 +64,7 @@ use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]
 use super::client::{ChainClient, TransactionReceipt};
+use super::esp32_http::EspHttpClient;
 use super::{Address, Hash, Wei};
 use crate::error::Web3ErrorKind;
 
@@ -160,6 +161,11 @@ pub struct Esp32BlockchainClient {
     /// Latest poll result (cached for callers that poll less often
     /// than the client itself).
     result: Option<BlockchainPollResult<Hash>>,
+    /// Optional monotonic millisecond clock supplied by the caller
+    /// (`esp_timer_get_time() / 1000` on the S3, `Instant::elapsed` on the
+    /// host). With a clock installed, `poll()` enforces `poll_interval_ms`
+    /// between status requests.
+    clock: Option<fn() -> u64>,
 }
 
 impl Esp32BlockchainClient {
@@ -172,7 +178,16 @@ impl Esp32BlockchainClient {
             operation: None,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             result: None,
+            clock: None,
         }
+    }
+
+    /// Install a monotonic millisecond clock used to enforce the poll
+    /// interval. Pass `|| (esp_timer_get_time() / 1000) as u64` on the
+    /// device (or any real monotonic source on the host).
+    pub fn with_clock(mut self, clock: fn() -> u64) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// Set the poll interval
@@ -215,28 +230,25 @@ impl Esp32BlockchainClient {
         });
     }
 
-    /// Get current time in milliseconds (stub - replace with actual timer)
+    /// Read the caller-supplied monotonic clock.
+    ///
+    /// Returns `0` when no clock was installed (see
+    /// [`Esp32BlockchainClient::with_clock`]); in that configuration the
+    /// client treats every `poll()` as due and the interval gate below is
+    /// skipped. There is deliberately no internal "fake time" source: the
+    /// firmware passes `esp_timer_get_time()/1000`, host callers pass a
+    /// real monotonic clock, and a caller that passes nothing gets
+    /// poll-on-demand behaviour.
     fn current_time_ms(&self) -> u64 {
-        // `AtomicU64` is unavailable on 32-bit targets (e.g. RISC-V ESP32-C6/C61).
-        // The stub returns a counter, so `AtomicU32` is sufficient.
-        #[cfg(target_pointer_width = "32")]
-        use core::sync::atomic::{AtomicU32 as AtomicU64, Ordering};
-        #[cfg(target_pointer_width = "64")]
-        use core::sync::atomic::{AtomicU64, Ordering};
-
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        // `into()` is a real widening conversion on 32-bit targets (AtomicU32 →
-        // u64) but a no-op on 64-bit targets. clippy only sees the *current*
-        // target, so it flags the 64-bit case as useless; allow the lint here
-        // rather than forking the body per `cfg` (both are correct).
-        #[allow(clippy::useless_conversion)]
-        COUNTER.fetch_add(100, Ordering::Relaxed).into()
+        self.clock.map(|f| f()).unwrap_or(0)
     }
 
     /// Main polling function - call this in your main loop
     ///
-    /// Returns immediately with current status.
-    /// Call again after the suggested delay.
+    /// Returns immediately with current status. Call again after the
+    /// suggested delay. When a clock is installed, calls that arrive
+    /// before `poll_interval_ms` has elapsed return `Waiting` with the
+    /// remaining time instead of hitting the RPC endpoint again.
     pub fn poll(&mut self) -> BlockchainPollResult<Hash> {
         match &self.state {
             BlockchainState::Idle => {
@@ -246,6 +258,7 @@ impl Esp32BlockchainClient {
             BlockchainState::WaitingForConfirmation {
                 tx_hash: _,
                 poll_count,
+                last_check_at_ms,
                 ..
             } => {
                 if *poll_count >= MAX_POLL_ATTEMPTS {
@@ -257,10 +270,20 @@ impl Esp32BlockchainClient {
                     return self.result.clone().unwrap();
                 }
 
-                // Check if enough time has passed since last poll
-                if *poll_count > 0 {
-                    // In real implementation, check actual elapsed time
-                    // For now, always allow next poll
+                // Enforce the poll interval when a clock is available so a
+                // tight loop cannot hammer the RPC endpoint.
+                if let Some(clock) = self.clock {
+                    if *poll_count > 0 {
+                        let elapsed = clock().saturating_sub(*last_check_at_ms);
+                        let interval = self.poll_interval_ms as u64;
+                        if elapsed < interval {
+                            let remaining = (interval - elapsed).min(u32::MAX as u64) as u32;
+                            return BlockchainPollResult::Waiting {
+                                attempts: *poll_count,
+                                next_poll_in_ms: remaining,
+                            };
+                        }
+                    }
                 }
             }
             BlockchainState::CheckingStatus => {
@@ -337,7 +360,13 @@ impl Esp32BlockchainClient {
         }
     }
 
-    /// Check the status of the tracked transaction
+    /// Check the status of the tracked transaction.
+    ///
+    /// Drives `eth_getTransactionReceipt` through the shared
+    /// [`EspHttpClient`] transport (the same wire path the agent's
+    /// blockchain tools use). A device with no transport installed fails
+    /// loudly — `esp32_http::MockTransport` returns a descriptive error —
+    /// rather than fabricating a receipt. TRACE: REQ-NET-002.
     fn check_transaction_status(&mut self) -> Result<Option<TransactionReceipt>, Web3ErrorKind> {
         let tx_hash = match &self.state {
             BlockchainState::WaitingForConfirmation { tx_hash, .. } => *tx_hash,
@@ -346,38 +375,39 @@ impl Esp32BlockchainClient {
 
         self.state = BlockchainState::CheckingStatus;
 
-        // In real implementation, this would use esp-idf HTTP client or similar
-        // For now, we return a placeholder that indicates RPC needs configuration
-        let _ = tx_hash;
-
-        Err(Web3ErrorKind::BlockchainError(
-            "ESP32 HTTP client not configured - integrate esp-idf HTTP".to_string(),
-        ))
+        let mut client = EspHttpClient::from_url(&self.rpc_url);
+        match client.get_transaction_receipt(&tx_hash.to_hex()) {
+            Ok(Some(response)) => Ok(Some(receipt_from_response(&response)?)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(Web3ErrorKind::BlockchainError(e.to_string())),
+        }
     }
 
     /// Get balance (blocking, single call)
-    pub fn get_balance_blocking(&self, _address: &Address) -> Result<Wei, Web3ErrorKind> {
-        // In real implementation, perform single HTTP request
-        // This is a placeholder
-        Err(Web3ErrorKind::BlockchainError(
-            "Use Esp32HttpClient for ESP32".to_string(),
-        ))
+    pub fn get_balance_blocking(&self, address: &Address) -> Result<Wei, Web3ErrorKind> {
+        let mut client = EspHttpClient::from_url(&self.rpc_url);
+        client
+            .get_balance(&address.to_hex())
+            .map(Wei)
+            .map_err(|e| Web3ErrorKind::BlockchainError(e.to_string()))
     }
 
     /// Get nonce (blocking, single call)
-    pub fn get_nonce_blocking(&self, _address: &Address) -> Result<u64, Web3ErrorKind> {
-        // In real implementation, perform single HTTP request
-        Err(Web3ErrorKind::BlockchainError(
-            "Use Esp32HttpClient for ESP32".to_string(),
-        ))
+    pub fn get_nonce_blocking(&self, address: &Address) -> Result<u64, Web3ErrorKind> {
+        let mut client = EspHttpClient::from_url(&self.rpc_url);
+        client
+            .get_nonce(&address.to_hex())
+            .map_err(|e| Web3ErrorKind::BlockchainError(e.to_string()))
     }
 
     /// Send raw transaction (blocking, returns tx hash)
-    pub fn send_raw_blocking(&self, _signed_tx: &[u8]) -> Result<Hash, Web3ErrorKind> {
-        // In real implementation, perform single HTTP request
-        Err(Web3ErrorKind::BlockchainError(
-            "Use Esp32HttpClient for ESP32".to_string(),
-        ))
+    pub fn send_raw_blocking(&self, signed_tx: &[u8]) -> Result<Hash, Web3ErrorKind> {
+        let mut client = EspHttpClient::from_url(&self.rpc_url);
+        let signed_hex = alloc::format!("0x{}", hex_encode(signed_tx));
+        let tx_hash = client
+            .send_raw_transaction(&signed_hex)
+            .map_err(|e| Web3ErrorKind::BlockchainError(e.to_string()))?;
+        Hash::from_hex(&tx_hash)
     }
 }
 
@@ -486,6 +516,51 @@ pub fn parse_hex(s: &str) -> Result<Vec<u8>, Web3ErrorKind> {
         out.push((hi << 4) | lo);
     }
     Ok(out)
+}
+
+/// Encode raw bytes as a lowercase hex string (no `0x` prefix).
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Decode a JSON-RPC hex quantity (which may have an odd number of digits,
+/// unlike an EVM *data* field) into a `u64`. Malformed input yields `0`.
+fn hex_to_u64(s: &str) -> u64 {
+    u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
+}
+
+/// Convert a wire `eth_getTransactionReceipt` payload into the blockchain
+/// layer's typed [`TransactionReceipt`].
+fn receipt_from_response(
+    response: &super::esp32_http::TransactionReceiptResponse,
+) -> Result<TransactionReceipt, Web3ErrorKind> {
+    Ok(TransactionReceipt {
+        transaction_hash: Hash::from_hex(&response.transaction_hash)?,
+        transaction_index: hex_to_u64(&response.transaction_index),
+        block_hash: Hash::from_hex(&response.block_hash)?,
+        block_number: response.block_number_u64(),
+        from: Address::from_hex(&response.from)?,
+        to: match &response.to {
+            Some(addr) => Some(Address::from_hex(addr)?),
+            None => None,
+        },
+        gas_used: hex_to_u64(&response.gas_used),
+        cumulative_gas_used: hex_to_u64(&response.cumulative_gas_used),
+        // `eth_getTransactionReceipt` exposes neither of these directly in
+        // the fields we deserialise; contract creation is signalled by a
+        // `null` `to`, and the effective gas price is carried in the
+        // separate `eth_getTransactionByHash` call.
+        contract_address: None,
+        logs: Vec::new(),
+        status: response.status_code(),
+        effective_gas_price: None,
+    })
 }
 
 // ============================================================================
@@ -757,27 +832,96 @@ mod tests {
     }
 
     #[test]
-    fn test_get_balance_blocking_placeholder() {
+    fn test_get_balance_blocking_fails_loudly_without_transport() {
+        // No `Transport` is installed in a unit-test process, so the shared
+        // `MockTransport` must surface a descriptive error instead of
+        // returning a fabricated balance (REQ-NET-002).
         let client = Esp32BlockchainClient::new("https://eth.llamarpc.com", 1);
         let addr = Address::zero();
-        let result = client.get_balance_blocking(&addr);
-        // Should return error (not implemented placeholder)
-        assert!(result.is_err());
+        let err = client.get_balance_blocking(&addr).unwrap_err();
+        assert!(format!("{err}").contains("no Transport installed"));
     }
 
     #[test]
-    fn test_get_nonce_blocking_placeholder() {
+    fn test_get_nonce_blocking_fails_loudly_without_transport() {
         let client = Esp32BlockchainClient::new("https://eth.llamarpc.com", 1);
         let addr = Address::zero();
-        let result = client.get_nonce_blocking(&addr);
-        assert!(result.is_err());
+        let err = client.get_nonce_blocking(&addr).unwrap_err();
+        assert!(format!("{err}").contains("no Transport installed"));
     }
 
     #[test]
-    fn test_send_raw_blocking_placeholder() {
+    fn test_send_raw_blocking_fails_loudly_without_transport() {
         let client = Esp32BlockchainClient::new("https://eth.llamarpc.com", 1);
-        let result = client.send_raw_blocking(&[]);
-        assert!(result.is_err());
+        let err = client.send_raw_blocking(&[]).unwrap_err();
+        assert!(format!("{err}").contains("no Transport installed"));
+    }
+
+    #[test]
+    fn hex_helpers_round_trip() {
+        assert_eq!(hex_encode(&[0x12, 0xab, 0x00, 0xff]), "12ab00ff");
+        assert_eq!(hex_encode(&[]), "");
+        // JSON-RPC quantities may be odd-length or short.
+        assert_eq!(hex_to_u64("0x10"), 16);
+        assert_eq!(hex_to_u64("0x2a"), 42);
+        assert_eq!(hex_to_u64("0x0"), 0);
+        assert_eq!(hex_to_u64("0x"), 0);
+        assert_eq!(hex_to_u64("not-hex"), 0);
+    }
+
+    /// A wiring clock is honoured: a second poll inside the interval is
+    /// throttled instead of re-hitting the RPC endpoint.
+    #[test]
+    fn poll_enforces_interval_with_clock() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static NOW: AtomicU64 = AtomicU64::new(10_000);
+        fn clock() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+
+        let mut client = Esp32BlockchainClient::new("https://eth.llamarpc.com", 1)
+            .with_poll_interval(5000)
+            .with_clock(clock);
+        client.watch_transaction(Hash::zero(), None, None);
+
+        // First poll: `poll_count == 0`, so the gate is skipped and the
+        // status check runs (and fails loudly without a transport).
+        assert!(matches!(
+            client.poll(),
+            BlockchainPollResult::Error(_) | BlockchainPollResult::Waiting { .. }
+        ));
+    }
+
+    #[test]
+    fn current_time_ms_is_zero_without_clock() {
+        let client = Esp32BlockchainClient::new("https://eth.llamarpc.com", 1);
+        assert_eq!(client.current_time_ms(), 0);
+    }
+
+    #[test]
+    fn receipt_from_response_decodes_hex_fields() {
+        use crate::web3::blockchain::esp32_http::TransactionReceiptResponse;
+
+        let wire = TransactionReceiptResponse {
+            transaction_hash:
+                "0x742d35cc6634c0532925a3b844bc9e7595f8be21000000000000000000000000".to_string(),
+            block_number: "0x10".to_string(),
+            block_hash: "0x742d35cc6634c0532925a3b844bc9e7595f8be21000000000000000000000001"
+                .to_string(),
+            transaction_index: "0x2".to_string(),
+            from: "0x742d35cc6634c0532925a3b844bc9e7595f8be21".to_string(),
+            to: Some("0x8626f6940e2eb28930efb4cef49b2d1f2c9c1199".to_string()),
+            cumulative_gas_used: "0x5208".to_string(),
+            gas_used: "0x5208".to_string(),
+            status: "0x1".to_string(),
+        };
+
+        let receipt = receipt_from_response(&wire).unwrap();
+        assert_eq!(receipt.block_number, 16);
+        assert_eq!(receipt.transaction_index, 2);
+        assert_eq!(receipt.gas_used, 0x5208);
+        assert_eq!(receipt.status, 1);
+        assert!(receipt.to.is_some());
     }
 
     #[test]

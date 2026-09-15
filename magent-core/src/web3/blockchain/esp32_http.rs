@@ -715,6 +715,29 @@ pub struct TransactionReceiptResponse {
     pub status: String,
 }
 
+impl TransactionReceiptResponse {
+    /// Decode a `0x`-prefixed hex quantity into a `u64`.
+    ///
+    /// RPC endpoints occasionally omit leading zeros or return an empty
+    /// string for a field the node didn't populate; treat anything that
+    /// doesn't parse as `0` rather than panicking (this runs on the agent's
+    /// real-time thread).
+    fn hex_u64(s: &str) -> u64 {
+        u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
+    }
+
+    /// EIP-658 status as a `u8`: `1` = success, `0` = revert. Any value
+    /// that isn't `0x1` normalises to `0`, matching geth's behaviour.
+    pub fn status_code(&self) -> u8 {
+        u8::from(Self::hex_u64(&self.status) == 1)
+    }
+
+    /// Block number the transaction was mined in (`0` if absent).
+    pub fn block_number_u64(&self) -> u64 {
+        Self::hex_u64(&self.block_number)
+    }
+}
+
 // ============================================================================
 // Integration with Blockchain State Machine
 // ============================================================================

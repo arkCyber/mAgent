@@ -420,10 +420,10 @@ mod tests {
         let expected_hex =
             "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4";
         let mut expected = [0u8; 64];
-        for i in 0..64 {
+        for (i, byte) in expected.iter_mut().enumerate() {
             let hi = hex_nibble(expected_hex.as_bytes()[i * 2]);
             let lo = hex_nibble(expected_hex.as_bytes()[i * 2 + 1]);
-            expected[i] = (hi << 4) | lo;
+            *byte = (hi << 4) | lo;
         }
         assert_eq!(seed, expected);
     }
@@ -522,14 +522,14 @@ mod tests {
         assert!(Mnemonic::from_phrase(&a.to_phrase()).is_ok());
         assert!(Mnemonic::from_phrase(&c.to_phrase()).is_ok());
     }
-}
 
-#[cfg(test)]
-fn hex_nibble(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        b'A'..=b'F' => b - b'A' + 10,
-        _ => 0,
+    /// Decode a single hex nibble. Test-only helper.
+    fn hex_nibble(b: u8) -> u8 {
+        match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => 0,
+        }
     }
 }

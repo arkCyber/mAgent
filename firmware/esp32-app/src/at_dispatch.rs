@@ -704,7 +704,12 @@ fn cwjap_dispatch(cmd: &AtCommand<'_>, safe_mode: bool) -> AtOutcome {
             // COMPLETION (2026-08-27): signal the Wi-Fi supervisor to reload the
             // new credentials from NVS and reconnect immediately — no reboot
             // required. The supervisor polls this flag once on its next tick.
-            crate::WIFI_RECONNECT_REQUESTED.store(true, core::sync::atomic::Ordering::Relaxed);
+            // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R7 — Release pairs
+            // with the Acquire load in the supervisor's `swap(false, Acquire)`
+            // below. Relaxed would let the supervisor miss a request that
+            // completed before its next poll on the other core.
+            crate::WIFI_RECONNECT_REQUESTED
+                .store(true, core::sync::atomic::Ordering::Release);
             AtOutcome::NoReply
         }
         AtCommandKind::Execute => {

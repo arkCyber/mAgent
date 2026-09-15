@@ -104,6 +104,14 @@ missing_docs = "warn"
 mutex_atomic = "deny"
 # == unsafe
 # SAFETY: `unsafe_op_in_unsafe_fn` is in `[workspace.lints.rust]`, not here.
+# TRACE: AEROSPACE-AUDIT-2026-09-15 §8.4
+# `undocumented_unsafe_blocks` denies any `unsafe { ... }` block that does
+# not have a `// SAFETY:` comment immediately above it. DAL-A-grade
+# code review requires every unsafe block to justify its existence in
+# source — a `cargo clippy` run is the cheapest place to enforce that.
+# TRACE: REQ-DO178C-5.3 (Source Code — every `unsafe` block must have a
+# traceability comment).
+undocumented_unsafe_blocks = "deny"
 # == arithmetic overflow (deprecated alias; promoted to `rustc`)
 # == panic-in-result
 panic_in_result_fn = "deny"
