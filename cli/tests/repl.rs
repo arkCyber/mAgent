@@ -293,9 +293,10 @@ fn repl_boxes_are_rectangular() {
 
     let mut box_lines = 0;
     for line in s.lines() {
-        // The first box row is printed after the `❯ ` prompt on the same
-        // line; later rows start at column 0.
-        let line = line.rsplit("❯ ").next().unwrap_or(line);
+        // Every box row starts at column 0 — the prompt that used to
+        // share a line with the first row now goes to stderr (see
+        // `repl_prompt_goes_to_stderr_not_stdout`), because this harness
+        // makes neither stream a terminal.
         if !line.starts_with(['║', '╔', '╚', '╠']) {
             continue;
         }
@@ -768,6 +769,36 @@ fn repl_probe_ollama_refuses_to_simulate_a_dropped_backend() {
     );
     // A failed task is not fatal: the session is still there to retry.
     assert!(s.contains("Goodbye"), "the session ended early:\n{s}");
+}
+
+/// The `❯ ` prompt is terminal UI, not data: when no stream is a
+/// terminal it belongs on the diagnostic one (stderr), so a redirected
+/// stdout holds the transcript and nothing else.
+///
+/// This harness pipes both streams, so it pins the "neither is a
+/// terminal" arm of `lineedit::ui_on_stdout` for the fallback read; the
+/// TTY arm makes the same choice through the same helper. Writing the
+/// prompt to stdout unconditionally is what made
+/// `magent run --repl > session.log` (stdin still a terminal) log one
+/// line per keystroke — `❯ h`, `❯ he`, `❯ hel`, … — each with the
+/// redraw's `\r\x1b[K` in front of it.
+#[test]
+fn repl_prompt_goes_to_stderr_not_stdout() {
+    let sb = Sandbox::new("prompt-stream");
+    let out = sb.session("help\nq\n");
+    assert!(out.status.success());
+    let s = stdout(&out);
+    assert!(!s.contains("❯"), "the prompt must not reach stdout:\n{s}");
+    let err = stderr(&out);
+    assert!(
+        err.contains("❯"),
+        "the prompt should be visible on stderr:\n{err}"
+    );
+    // The transcript itself is still whole on stdout.
+    assert!(
+        s.contains("mAgent REPL Commands"),
+        "the `help` box should still be part of the transcript:\n{s}"
+    );
 }
 
 /// A scripted REPL session (stdin is not a terminal) has no human to read

@@ -96,6 +96,29 @@
 ## 🟡 P2 — outstanding
 
 ### 🟢 P2 — REPL line editing and ragged boxes, both done (2026-09-24)
+- [x] **The REPL prompt no longer leaks into a redirected stdout** (fixed
+      2026-09-24). The line editor wrote its prompt and every redraw to
+      stdout, so `magent run --repl > session.log` (stdin still a terminal)
+      logged one line per keystroke with a `\r\x1b[K` in front of it.
+      Terminal UI now goes through `lineedit::ui_on_stdout` — stdout while
+      stdout is the terminal, stderr otherwise — and `clear`/`cls` follows
+      the same rule (and draws nothing when neither stream is a terminal).
+      Covered by `repl_prompt_goes_to_stderr_not_stdout`; all four
+      stdin/stdout combinations verified against a real pty.
+- [ ] **Ctrl-C leaves the terminal in raw mode if the shell does not
+      restore it.** `RawMode`'s `Drop` restores the saved `termios`, but
+      Ctrl-C is deliberately still `SIGINT` (the module keeps `ISIG` set so
+      it "kills the REPL the way it always has"), and a signal-terminated
+      process never unwinds, so the guard does not run. Verified with zsh:
+      the shell's job control restores the terminal on the next prompt, so
+      this is invisible interactively — but a pty driven by a program with
+      no such restore is left with `ICANON`/`ECHO` cleared. Options if an
+      owner wants it airtight: **(a)** install a `SIGINT` handler
+      (via `sigaction`) that restores `termios` and re-raises, keeping the
+      exit status; **(b)** ignore `SIGINT` while a line is being edited and
+      treat `0x03` as "clear the current line" the way readline does;
+      **(c)** leave it and document. **Owner's call** — (b) changes
+      behaviour, (a) needs a signal-safe global.
 - [x] **`run --repl` now sees the config-file layer** (fixed 2026-09-24, see
       CHANGELOG). The REPL check moved in `execute()` to *after*
       `config::load()` + `apply_config_overrides` and the prompt resolution,

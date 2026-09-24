@@ -2832,13 +2832,17 @@ fn handle_repl_command(
         }
         "quit" | "exit" | "q" => ReplCommandResult::Stop,
         "clear" | "cls" => {
-            // Only write the escape sequence to a terminal — a redirected
-            // or piped stdout would otherwise collect raw `ESC[2J` bytes
-            // in its transcript.
+            // Screen-clearing is terminal UI, so it goes to the same
+            // stream the prompt does (see `lineedit::ui_on_stdout`) — and
+            // nowhere at all when neither stream is a terminal, since a
+            // redirected stream would just collect raw `ESC[2J` bytes.
             use std::io::IsTerminal as _;
-            if std::io::stdout().is_terminal() {
+            if crate::lineedit::ui_on_stdout() {
                 print!("\x1B[2J\x1B[H");
                 let _ = std::io::stdout().flush();
+            } else if std::io::stderr().is_terminal() {
+                eprint!("\x1B[2J\x1B[H");
+                let _ = std::io::stderr().flush();
             }
             ReplCommandResult::Continue
         }

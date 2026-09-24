@@ -13,6 +13,25 @@ here. Dates use `YYYY-MM-DD` and follow ISO 8601. Versions follow
 
 ## [Unreleased]
 
+### Fixed (2026-09-24) — the REPL prompt no longer leaks into a redirected stdout
+- **`magent run --repl > session.log` logged one line *per keystroke*.**
+  The line editor wrote its prompt and every redraw to stdout, so with a
+  terminal stdin and a redirected stdout the log collected
+  `❯ h`, `❯ he`, `❯ hel`, … — each prefixed with the redraw's `\r\x1b[K` —
+  instead of the transcript. The prompt is terminal UI, not data.
+  Both read paths now draw through the new `lineedit::ui_on_stdout`: UI
+  goes to stdout only while stdout *is* the terminal. Otherwise it goes to
+  stderr, which keeps two things true at once — the redirected stream
+  holds the transcript and nothing else, and the prompt is still visible
+  on the terminal when the *other* stream was the one redirected
+  (`2> err.log`). When neither is a terminal (a scripted session) stderr
+  takes it as the diagnostic stream.
+  `clear`/`cls` follows the same rule and, unlike before, clears the
+  screen on a terminal stderr too, while still writing nothing at all when
+  neither stream is a terminal (no `ESC[2J` bytes in a file).
+  Guarded by `repl_prompt_goes_to_stderr_not_stdout`; the four
+  stdin/stdout combinations were each verified against a real pty.
+
 ### Fixed (2026-09-24) — a scripted `--repl` session now reports failure through its exit code
 - **`printf 'do the thing\nq\n' | magent run --repl` exited 0 even when the
   task errored.** A failed task printed `✗ Error: …` to stderr and the loop

@@ -20,6 +20,10 @@
 //! Raw mode deliberately leaves `ISIG` alone, so Ctrl-C still sends
 //! `SIGINT` and kills the REPL the way it always has; nothing here has
 //! to invent an interrupt path.
+//!
+//! The prompt and the redraws go to the terminal stream — stdout when it
+//! is a terminal, stderr otherwise — so a redirected stdout stays the
+//! transcript rather than a log of every keystroke. See `ui_on_stdout`.
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
@@ -162,6 +166,10 @@ impl LineBuffer {
 /// * `history` — oldest first; ↑ walks towards the front, ↓ back
 ///   towards the empty draft line.
 ///
+/// The prompt and every redraw go to the stream `ui_on_stdout` names —
+/// terminal UI belongs on the terminal, not baked into whichever stream
+/// the shell happened to redirect.
+///
 /// Returns `None` at end-of-input, which the REPL loop reads as "quit".
 pub fn read_line<F>(prompt: &str, char_width: F, history: &VecDeque<String>) -> Option<String>
 where
@@ -175,12 +183,36 @@ where
     fallback(prompt)
 }
 
+/// Whether terminal UI — the prompt, the redraws, a screen clear — should
+/// be drawn on stdout rather than stderr.
+///
+/// stdout wins whenever it is the terminal, so the common case (both
+/// streams a terminal) behaves exactly as it always has. If stdout is
+/// redirected but stderr is not (`… > session.log`, stdin still a
+/// terminal) the callers fall back to stderr, which keeps two things
+/// true at once: the log holds the transcript instead of one line per
+/// keystroke, and the prompt is still visible on the terminal. When
+/// *neither* is a terminal there is nobody to draw for, and stderr takes
+/// it as the diagnostic stream so stdout stays the program's data.
+///
+/// Writing the prompt to stdout unconditionally is what made
+/// `magent run --repl > session.log` log `❯ h`, `❯ he`, `❯ hel`, … — each
+/// with the redraw's `\r\x1b[K` in front of it.
+pub(crate) fn ui_on_stdout() -> bool {
+    io::stdout().is_terminal()
+}
+
 /// The original line-at-a-time read. Also the escape hatch when raw mode
 /// cannot be enabled — a bad `tcgetattr` must not cost the user their
 /// session.
 fn fallback(prompt: &str) -> Option<String> {
-    print!("{}", prompt);
-    let _ = io::stdout().flush();
+    if ui_on_stdout() {
+        print!("{}", prompt);
+        let _ = io::stdout().flush();
+    } else {
+        eprint!("{}", prompt);
+        let _ = io::stderr().flush();
+    }
 
     let mut line = String::new();
     match io::stdin().read_line(&mut line) {
@@ -433,13 +465,12 @@ mod tty {
             // Could not enter raw mode; the plain read still works.
             return super::fallback(prompt);
         };
-        edit(
-            prompt,
-            char_width,
-            history,
-            &mut io::stdin(),
-            &mut io::stdout(),
-        )
+        let mut input = io::stdin();
+        if super::ui_on_stdout() {
+            edit(prompt, char_width, history, &mut input, &mut io::stdout())
+        } else {
+            edit(prompt, char_width, history, &mut input, &mut io::stderr())
+        }
     }
 
     /// The key loop, on any byte source and sink.
