@@ -180,6 +180,10 @@ impl Output {
     /// familiar `writeln!`/`write!` syntax with positional args.
     /// The data is rendered into an in-memory buffer and then flushed
     /// to the underlying `StderrLock` via [`io::Write`].
+    ///
+    /// Use this for **diagnostics** — labelled traces, warnings,
+    /// confirmations. For a command's actual *data* use
+    /// [`Self::stdout_fmt_line`] so `magent … > file` works.
     pub fn stderr_fmt_line(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
         if self.kind == OutputKind::Json {
             return Ok(());
@@ -192,6 +196,26 @@ impl Output {
             .map_err(io::Error::other)?;
         buf.push('\n');
         self.stderr.write_all(buf.as_bytes())
+    }
+
+    /// [`Self::stderr_fmt_line`]'s opposite number: the same formatting
+    /// contract, but the line goes to **stdout**.
+    ///
+    /// Human-mode data belongs on stdout — `magent config show >
+    /// backup.json`, `magent config list | grep ollama`, and
+    /// `magent set-prompt show foo | jq .provider` are the whole point
+    /// of those subcommands, and writing them to stderr silently sent
+    /// every redirect an empty file while `--json` worked. Still a
+    /// no-op in JSON mode, where the envelope is the only stdout
+    /// output.
+    pub fn stdout_fmt_line(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+        if self.kind == OutputKind::Json {
+            return Ok(());
+        }
+        let mut buf = String::new();
+        std::fmt::Write::write_fmt(&mut buf, args).map_err(io::Error::other)?;
+        buf.push('\n');
+        self.stdout.write_all(buf.as_bytes())
     }
 
     /// Emit the final answer on stdout. In Human mode this is the only

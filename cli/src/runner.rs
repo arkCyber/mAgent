@@ -52,7 +52,6 @@
 //! See `apply_config_overrides` for step 2.
 
 use std::collections::VecDeque;
-use std::io;
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -107,6 +106,12 @@ pub enum RunError {
     /// only becomes known once the config file is loaded — so the same
     /// conflict has to be caught here, before the transcript starts.
     ReplJsonMode,
+    /// A **scripted** `--repl` session (stdin is not a terminal) ended
+    /// with at least one task that failed. An interactive user reads the
+    /// error and decides whether to continue, so that session exits 0;
+    /// a piped one has nobody watching, so the shell must be able to tell
+    /// `magent run --repl < script` apart from a clean run.
+    ReplTaskFailed { failed: usize, total: usize },
 }
 
 impl std::fmt::Display for RunError {
@@ -122,6 +127,12 @@ impl std::fmt::Display for RunError {
                 "`magent run --repl` streams an interactive transcript and cannot emit a JSON \
                  envelope — set `io.json_default` to false (`magent config set io.json_default \
                  false`) or drop --json"
+            ),
+            RunError::ReplTaskFailed { failed, total } => write!(
+                f,
+                "`magent run --repl` was driven from non-interactive stdin and {} of {} task(s) \
+                 failed — exiting non-zero so a scripted session can detect it",
+                failed, total
             ),
         }
     }
@@ -740,6 +751,9 @@ impl<'a> RunCmd<'a> {
                     "No DeepSeek API key found — pass --api-key <KEY> or set DEEPSEEK_API_KEY. \
                      Falling back to simulated reasoning.",
                 )?;
+                if self.opts.probe_ollama {
+                    out.warn(PROBE_NOT_HONOURED)?;
+                }
                 runner.config_mut().probe_ollama_on_run = false;
                 // Don't bother swapping the backend — the runner's
                 // default Ollama client is harmless because we've
@@ -774,6 +788,9 @@ impl<'a> RunCmd<'a> {
                 out.warn(
                     "DeepSeek API key was blank after trimming — falling back to simulated reasoning.",
                 )?;
+                if self.opts.probe_ollama {
+                    out.warn(PROBE_NOT_HONOURED)?;
+                }
                 runner.config_mut().probe_ollama_on_run = false;
                 let task = self.opts.task.clone();
                 out.trace_labeled("Task", &task)?;
@@ -795,6 +812,14 @@ impl<'a> RunCmd<'a> {
                         self.opts.deepseek_url, model_display
                     ),
                 )?;
+            } else if self.opts.probe_ollama {
+                // `--probe-ollama`: keep the backend wired and the probe
+                // flag on, so `run()` probes and reports the failure
+                // instead of answering from the simulated responder.
+                out.warn(&format!(
+                    "DeepSeek not reachable at {} — --probe-ollama forbids the simulated fallback",
+                    self.opts.deepseek_url
+                ))?;
             } else {
                 runner.config_mut().probe_ollama_on_run = false;
                 runner.force_disable_backend();
@@ -825,6 +850,14 @@ impl<'a> RunCmd<'a> {
                     "Ollama",
                     &format!("connected at {} (model: {})", url, model),
                 )?;
+            } else if self.opts.probe_ollama {
+                // `--probe-ollama`: keep the backend wired and the probe
+                // flag on, so `run()` probes and reports the failure
+                // instead of answering from the simulated responder.
+                out.warn(&format!(
+                    "Ollama not reachable at {} — --probe-ollama forbids the simulated fallback",
+                    url
+                ))?;
             } else {
                 // Ollama unreachable — fall back to simulated responses
                 // for this run, but don't pollute the runner config so
@@ -852,9 +885,7 @@ impl<'a> RunCmd<'a> {
             match store.load(&topic) {
                 Ok(prev) => {
                     let body = render_summary_context(&prev);
-                    runner.insert_after_system_prompt(
-                        magent_core::agent_runner::Message::system(&body),
-                    );
+                    runner.seed_system_context(&body);
                     // `trace_labeled` returns `io::Result`; we
                     // ignore it because a stderr failure is not
                     // a load failure — the summary was loaded
@@ -912,7 +943,6 @@ impl<'a> RunCmd<'a> {
         system_prompt: &str,
         cfg: &crate::config::ConfigRecord,
     ) -> Result<RunReport, RunError> {
-        use std::io::{self, Write};
         use std::sync::Arc;
 
         // `--json` + `--repl` is refused by the parser, but the config's
@@ -932,10 +962,12 @@ impl<'a> RunCmd<'a> {
         // --save-summary demo` used to accept the flag and silently write
         // nothing — not even the "no summary named …" warning the one-shot
         // path emits for a bad topic.
+        //
+        // `--load-summary` used to be listed here too. It is now honoured:
+        // `execute_repl` loads the record and seeds the conversation itself
+        // (there is no "end of run" to hang a save off, which is why
+        // `--save-summary` is still warned about).
         let mut ignored: Vec<&str> = Vec::new();
-        if self.opts.load_summary_topic.is_some() {
-            ignored.push("--load-summary");
-        }
         if self.opts.save_summary_topic.is_some() {
             ignored.push("--save-summary");
         }
@@ -1033,6 +1065,13 @@ impl<'a> RunCmd<'a> {
         };
 
         let mut runner = RealAgentRunner::with_config(executor, config);
+        // `--probe-ollama` means "never latch an unreachable verdict".
+        // Without it a failed startup probe calls `force_disable_backend`,
+        // which also clears `probe_ollama_on_run` — so the whole session
+        // simulates, and a backend that comes up later is never noticed.
+        // With it we wire the backend anyway and let each task re-probe
+        // (see `reset_backend_probe` below).
+        let probe_each_task = self.opts.probe_ollama && !self.opts.mock;
         let backend_label = if self.opts.mock {
             runner.force_disable_backend();
             "mock".to_string()
@@ -1050,16 +1089,25 @@ impl<'a> RunCmd<'a> {
                         runner.set_backend(ds);
                         runner.force_enable_backend();
                         "deepseek".to_string()
+                    } else if probe_each_task {
+                        runner.set_backend(ds);
+                        "deepseek (unreachable; probing each task)".to_string()
                     } else {
                         runner.force_disable_backend();
                         "deepseek (mock fallback)".to_string()
                     }
                 } else {
                     runner.force_disable_backend();
+                    if probe_each_task {
+                        warn_probe_not_honoured("the DeepSeek client could not be built");
+                    }
                     "deepseek (mock fallback)".to_string()
                 }
             } else {
                 runner.force_disable_backend();
+                if probe_each_task {
+                    warn_probe_not_honoured("no DeepSeek API key is configured");
+                }
                 "deepseek (no API key)".to_string()
             }
         } else {
@@ -1068,6 +1116,9 @@ impl<'a> RunCmd<'a> {
                 runner.set_backend(client);
                 runner.force_enable_backend();
                 "ollama".to_string()
+            } else if probe_each_task {
+                runner.set_backend(client);
+                "ollama (unreachable; probing each task)".to_string()
             } else {
                 runner.force_disable_backend();
                 "ollama (mock fallback)".to_string()
@@ -1085,6 +1136,36 @@ impl<'a> RunCmd<'a> {
         shared.install(Box::new(LogSink));
         runner.set_trace_sink(Some(shared));
 
+        // `--load-summary <TOPIC>` — seed the session with a previous run's
+        // head/tail window, the same way the one-shot path does at step 3.5.
+        // `seed_system_context` queues the note for `run_inner`, which
+        // inserts it at index 1 once the system prompt is in place, so the
+        // order the model sees is prompt → previous-run note → task.
+        // `run_continuing` keeps the conversation, so the note stays in the
+        // history for every later turn.
+        if let Some(topic) = self.opts.load_summary_topic.clone() {
+            match FileSummaryStore::open_default().load(&topic) {
+                Ok(prev) => {
+                    let body = render_summary_context(&prev);
+                    runner.seed_system_context(&body);
+                    out.trace_labeled(
+                        "Summary",
+                        &format!(
+                            "loaded {} window ({} messages, kept={})",
+                            topic,
+                            prev.head_tail_window.len(),
+                            prev.stats.kept,
+                        ),
+                    )?;
+                }
+                // The REPL cannot be in JSON mode (the parser refuses
+                // `--repl --json`, and `io.json_default` is rejected at the
+                // top of this function), so a missing topic is always a
+                // warning: the session is still worth starting.
+                Err(e) => out.warn(&format!("--load-summary {:?} failed: {}", topic, e))?,
+            }
+        }
+
         // Initialize REPL session. The backend label is pinned to what the
         // banner just printed, so `backend` / `stats` report the same thing
         // the welcome box does. Deriving it from `using_ollama()` instead
@@ -1098,12 +1179,24 @@ impl<'a> RunCmd<'a> {
         // Print welcome banner
         print_welcome_banner(&backend_label, &model);
 
+        // A session whose stdin is not a terminal is *scripted*: nobody is
+        // watching the transcript, so the exit code is the only signal. Read
+        // it once — the line editor's raw-mode branch never runs here, but
+        // `is_terminal` is cheap and must not be re-evaluated mid-session.
+        let scripted = {
+            use std::io::IsTerminal as _;
+            !std::io::stdin().is_terminal()
+        };
+        let mut failed_tasks: usize = 0;
+
         // REPL loop
         loop {
-            print!("\n❯ ");
-            io::stdout().flush().map_err(RunError::Io)?;
-
-            let input = match read_repl_line("") {
+            // The prompt is written by the line editor, not here: it
+            // redraws the line (and the prompt with it) after every
+            // keystroke, so it has to own the column math.
+            println!();
+            let input = match crate::lineedit::read_line("❯ ", char_display_width, &session.history)
+            {
                 Some(line) => line,
                 // EOF (e.g. piped stdin, or Ctrl-D): exit instead of
                 // spinning forever re-reading an empty line.
@@ -1124,6 +1217,13 @@ impl<'a> RunCmd<'a> {
                     session.add_to_history(task.clone());
                     session.task_count += 1;
 
+                    // `--probe-ollama` refreshes the reachability verdict so
+                    // this call to `run_continuing` probes instead of reusing
+                    // whatever the previous task concluded.
+                    if probe_each_task {
+                        runner.reset_backend_probe();
+                    }
+
                     // `run_continuing`, not `run`: `--repl` is documented as
                     // keeping context across turns ("maintains conversation
                     // context across multiple turns"), and `run` clears the
@@ -1135,6 +1235,7 @@ impl<'a> RunCmd<'a> {
                         }
                         Err(e) => {
                             eprintln!("\n✗ Error: {}", e);
+                            failed_tasks += 1;
                         }
                     }
                     // The runner resets its counters per `run()`, so fold
@@ -1146,6 +1247,18 @@ impl<'a> RunCmd<'a> {
         }
 
         println!("\n\nGoodbye! 👋");
+
+        // A scripted session that saw a failure must exit non-zero. An
+        // interactive one keeps exiting 0: the user read the error and
+        // chose to keep going (or not), so a failing turn is not a failing
+        // session. Deciding by stdin rather than by "did the last task
+        // fail" keeps the rule simple and is what a script needs.
+        if scripted && failed_tasks > 0 {
+            return Err(RunError::ReplTaskFailed {
+                failed: failed_tasks,
+                total: session.task_count,
+            });
+        }
 
         // Return a summary report. Iterations / tool calls are session
         // totals (the runner's own counters only cover the last task).
@@ -1166,16 +1279,19 @@ impl<'a> RunCmd<'a> {
 /// Print REPL welcome banner
 fn print_welcome_banner(backend: &str, model: &str) {
     println!();
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║                                                              ║");
-    println!("║                  🤖  mAgent REPL  v{}                      ║", env!("CARGO_PKG_VERSION"));
-    println!("║                                                              ║");
-    println!("║  Backend: {:>50}        ║", backend);
-    println!("║  Model:   {:>50}        ║", model);
-    println!("║                                                              ║");
-    println!("║  Type 'help' for commands, 'quit' to exit                  ║");
-    println!("║                                                              ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!("{}", box_rule('╔', '═', '╗'));
+    box_line("");
+    println!(
+        "{}",
+        box_row_centered(&format!("🤖  mAgent REPL  v{}", env!("CARGO_PKG_VERSION")))
+    );
+    box_line("");
+    box_line(&format!("  Backend: {}", backend));
+    box_line(&format!("  Model:   {}", model));
+    box_line("");
+    box_line("  Type 'help' for commands, 'quit' to exit");
+    box_line("");
+    box_close();
 }
 
 /// Run the ReAct loop, emit the final answer, write the JSON
@@ -1797,9 +1913,14 @@ pub fn build_runner(
 }
 
 /// Load a system prompt from a file. Returns the trimmed contents.
-pub(crate) fn load_prompt_file(path: &Path) -> Result<String, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("{}: {}", path.display(), e))?;
+///
+/// The error is the bare `io::Error`, **not** a pre-formatted string with
+/// the path baked in: [`crate::prompt::PromptError::PromptFileLoad`]
+/// already carries the path and renders it once, so stringifying it here
+/// made the message read `/nope.txt: could not read prompt file
+/// /nope.txt: …`.
+pub(crate) fn load_prompt_file(path: &Path) -> Result<String, std::io::Error> {
+    let raw = std::fs::read_to_string(path)?;
     Ok(raw.trim().to_string())
 }
 
@@ -2544,12 +2665,12 @@ mod tests {
 
 /// REPL session state
 struct ReplSession {
-    /// Task history for the `history` command. Only tasks are recorded —
-    /// built-in commands are never pushed — so `retry` can treat the last
-    /// entry as the previous task.
+    /// Task history for the `history` command and for ↑/↓ recall at the
+    /// prompt. Only tasks are recorded — built-in commands are never
+    /// pushed — so `retry` can treat the last entry as the previous task.
+    /// The browse position lives in `lineedit::read_line`, not here: it is
+    /// per-read state, not session state.
     history: VecDeque<String>,
-    /// Current history position (for up/down arrow navigation)
-    history_pos: usize,
     /// Number of tasks executed
     task_count: usize,
     /// Sum of every task's LLM iterations. The runner zeroes its own
@@ -2571,7 +2692,6 @@ impl Default for ReplSession {
     fn default() -> Self {
         Self {
             history: VecDeque::new(),
-            history_pos: 0,
             task_count: 0,
             total_iterations: 0,
             total_tool_calls: 0,
@@ -2597,16 +2717,6 @@ impl ReplSession {
         if self.history.len() > 100 {
             self.history.pop_front();
         }
-        self.history_pos = self.history.len();
-    }
-
-    #[allow(dead_code)]
-    fn get_history_entry(&self, offset: isize) -> Option<&String> {
-        let pos = self.history_pos as isize + offset;
-        if pos < 0 || pos >= self.history.len() as isize {
-            return None;
-        }
-        self.history.get(pos as usize)
     }
 
     fn session_duration(&self) -> std::time::Duration {
@@ -2659,6 +2769,18 @@ fn handle_repl_command(
 ) -> ReplCommandResult {
     let parts: Vec<&str> = input.split_whitespace().collect();
     let raw_cmd = parts.first().copied().unwrap_or("");
+    // `!<task>` forces the rest of the line to be a task. Without it a
+    // one-word task that happens to be a built-in name (`help`, `stats`)
+    // is unreachable: the whole-line rule sends the multi-word form to the
+    // LLM but the bare form always dispatches the command.
+    if let Some(rest) = input.strip_prefix('!') {
+        let task = rest.trim();
+        if task.is_empty() {
+            println!("`!` must be followed by a task, e.g. `!help` runs \"help\" as a task.");
+            return ReplCommandResult::Continue;
+        }
+        return ReplCommandResult::RunTask(task.to_string());
+    }
     // Accept a leading `/` (e.g. `/help`) — the slash form users expect
     // from other REPLs. The dispatcher only ever matched the bare token,
     // so `/help` used to fall through to "Unknown command".
@@ -2785,7 +2907,13 @@ fn handle_repl_command(
                 println!("  history, hist - Show task history");
                 println!("  retry, rerun  - Run the previous task again");
             } else {
-                println!("Aliases are fixed shortcuts for commands.");
+                // `alias <name>` is the argument form the whole-line rule
+                // makes an exception for. It used to answer "Aliases are
+                // fixed shortcuts for commands." whatever the argument was,
+                // which made the exception pointless — the name is now
+                // resolved against the same table the dispatcher matches on.
+                let name = args[0].strip_prefix('/').unwrap_or(args[0]);
+                println!("{}", alias_lookup(name));
             }
             ReplCommandResult::Continue
         }
@@ -2863,6 +2991,132 @@ fn handle_repl_command(
     }
 }
 
+/// Inner width of the REPL's box-drawing columns (between the `║` rails).
+const REPL_BOX_WIDTH: usize = 62;
+
+/// Display width of `s` in terminal columns: one per char, two for
+/// East-Asian wide/fullwidth text and emoji, zero for combining marks.
+///
+/// The boxes used to pad with `{:>50}` / `{:>6}`, which counts **bytes**
+/// and ignores the double-width `🤖` entirely, so every row's right rail
+/// landed at a different column. A hand-rolled width is enough for the
+/// handful of glyphs the REPL prints and keeps `unicode-width` out of the
+/// CLI's dependency set.
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(c: char) -> usize {
+    let cp = c as u32;
+    match cp {
+        // Combining marks, zero-width formatters, variation selectors.
+        0x0300..=0x036F
+        | 0x0483..=0x0489
+        | 0x0591..=0x05BD
+        | 0x0610..=0x061A
+        | 0x064B..=0x065F
+        | 0x0E31
+        | 0x0E34..=0x0E3A
+        | 0x200B..=0x200F
+        | 0xFE00..=0xFE0F
+        | 0xFE20..=0xFE2F => 0,
+        // East-Asian Wide/Fullwidth, CJK, Hangul, and the emoji blocks the
+        // REPL prints (`🤖 📊 📅 📜 📝 🌐 🔧`). `✓`/`✗` (Dingbats) are
+        // East-Asian *Ambiguous* and render narrow in most terminals, so
+        // they fall through to width 1.
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE6F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F
+        | 0x1F900..=0x1F9FF
+        | 0x1FA70..=0x1FAFF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+/// One `║ … ║` row, right-padded to [`REPL_BOX_WIDTH`] display columns.
+fn box_row(text: &str) -> String {
+    let pad = REPL_BOX_WIDTH.saturating_sub(display_width(text));
+    format!("║{}{}║", text, " ".repeat(pad))
+}
+
+/// One `║ … ║` row with `text` centred between the rails.
+fn box_row_centered(text: &str) -> String {
+    let slack = REPL_BOX_WIDTH.saturating_sub(display_width(text));
+    format!(
+        "║{}{}{}║",
+        " ".repeat(slack / 2),
+        text,
+        " ".repeat(slack - slack / 2)
+    )
+}
+
+/// A full-width border row: `left` + `fill`×[`REPL_BOX_WIDTH`] + `right`.
+fn box_rule(left: char, fill: char, right: char) -> String {
+    format!("{left}{}{right}", fill.to_string().repeat(REPL_BOX_WIDTH))
+}
+
+/// Print the top rule, the centred `title`, and the separator rule.
+fn box_open(title: &str) {
+    println!("{}", box_rule('╔', '═', '╗'));
+    println!("{}", box_row_centered(title));
+    println!("{}", box_rule('╠', '═', '╣'));
+}
+
+/// Print the box's bottom rule.
+fn box_close() {
+    println!("{}", box_rule('╚', '═', '╝'));
+}
+
+/// Print one padded `║ … ║` row. A thin wrapper so every call site stays a
+/// single short line instead of wrapping each `println!("{}", box_row(…))`
+/// across four.
+fn box_line(text: &str) {
+    println!("{}", box_row(text));
+}
+
+/// The inner horizontal separator used between box sections.
+fn box_separator() -> String {
+    format!("  {}", "─".repeat(REPL_BOX_WIDTH - 2))
+}
+
+/// The `alias <name>` lookup: which canonical command `name` dispatches to.
+///
+/// Kept as a table (rather than a chain of `if let`) so it can only list
+/// aliases the dispatcher actually matches — the `alias` listing above and
+/// this lookup used to disagree with the `match` arms.
+fn alias_lookup(name: &str) -> String {
+    let key = name.to_lowercase();
+    for (canonical, aliases) in [
+        ("help", &["help", "?"][..]),
+        ("quit", &["quit", "exit", "q"][..]),
+        ("clear", &["clear", "cls"][..]),
+        ("history", &["history", "hist"][..]),
+        ("retry", &["retry", "rerun"][..]),
+    ] {
+        if aliases.contains(&key.as_str()) {
+            return if key == canonical {
+                format!("{} is a command (no alias needed).", canonical)
+            } else {
+                format!("{} → {} (alias).", key, canonical)
+            };
+        }
+    }
+    format!(
+        "No command or alias named \"{}\". Type 'alias' for the alias table.",
+        name
+    )
+}
+
 /// Value of `name` for the REPL `env` listing, or `not set`.
 fn env_or(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| "not set".into())
@@ -2893,40 +3147,62 @@ fn backend_display(label: &str) -> &str {
     }
 }
 
+/// Tell the user that `--probe-ollama` cannot be honoured this session.
+/// Silence would be worse than the warning: the flag exists so the agent
+/// never quietly answers from canned text, and an un-honourable probe —
+/// no key, no client — is exactly the case where it silently does nothing.
+const PROBE_NOT_HONOURED: &str =
+    "--probe-ollama cannot be honoured here (no usable LLM backend); responses will be simulated";
+
+/// Same, for the REPL, which prints straight to stderr and has no `Output`.
+fn warn_probe_not_honoured(reason: &str) {
+    eprintln!("warning: --probe-ollama cannot be honoured — {reason}; responses will be simulated");
+}
+
 /// Print REPL help
 fn print_repl_help() {
-    println!("\n╔══════════════════════════════════════════════════════════════╗");
-    println!("║                     mAgent REPL Commands                    ║");
-    println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║  Navigation & Session                                       ║");
-    println!("║  ─────────────────────────────────────────────────────────  ║");
-    println!("║  help, ?        Show this help message                     ║");
-    println!("║  quit, exit, q  Exit the REPL                             ║");
-    println!("║  clear, cls     Clear the terminal screen                  ║");
-    println!("║                                                                ║");
-    println!("║  Conversation                                                ║");
-    println!("║  ─────────────────────────────────────────────────────────  ║");
-    println!("║  reset         Reset conversation (keep system prompt)       ║");
-    println!("║  context       Show current context size                    ║");
-    println!("║  prompt        Show current system prompt                   ║");
-    println!("║  retry, rerun  Run the previous task again                 ║");
-    println!("║                                                                ║");
-    println!("║  Info & Debug                                                ║");
-    println!("║  ─────────────────────────────────────────────────────────  ║");
-    println!("║  stats         Show session statistics                       ║");
-    println!("║  history, hist Show task history                            ║");
-    println!("║  tools         List available tools                         ║");
-    println!("║  session       Show session info                            ║");
-    println!("║  backend       Show current LLM backend                     ║");
-    println!("║  env           Show environment variables                   ║");
-    println!("║  alias         List the command aliases                     ║");
-    println!("║                                                                ║");
-    println!("║  Any other input is treated as a task for the agent.        ║");
-    println!("║  A leading `/` is accepted: `/help` == `help`.              ║");
-    println!("║  A command must be on a line by itself — `reset the feed`   ║");
-    println!("║  is a task, not `reset`. (`alias` alone takes an argument.) ║");
-    println!("║  Type 'history' to list previous tasks.                     ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    box_open("mAgent REPL Commands");
+    box_line("  Navigation & Session");
+    box_line(&box_separator());
+    box_line("  help, ?        Show this help message");
+    box_line("  quit, exit, q  Exit the REPL");
+    box_line("  clear, cls     Clear the terminal screen");
+    box_line("");
+    box_line("  Conversation");
+    box_line(&box_separator());
+    box_line("  reset         Reset conversation (keep system prompt)");
+    box_line("  context       Show current context size");
+    box_line("  prompt        Show current system prompt");
+    box_line("  retry, rerun  Run the previous task again");
+    box_line("");
+    box_line("  Info & Debug");
+    box_line(&box_separator());
+    box_line("  stats         Show session statistics");
+    box_line("  history, hist Show task history (tasks, not commands)");
+    box_line("  tools         List available tools");
+    box_line("  session       Show session info");
+    box_line("  backend       Show current LLM backend");
+    box_line("  env           Show environment variables");
+    box_line("  alias [name]  List aliases, or expand <name>");
+    box_line("");
+    box_line("  Line editing (when stdin is a terminal)");
+    box_line(&box_separator());
+    box_line("  ← →, Ctrl-B F   Move the cursor");
+    box_line("  ↑ ↓             Recall the previous / next task");
+    box_line("  Ctrl-A, Ctrl-E  Jump to the start / end of the line");
+    box_line("  Ctrl-W          Delete the previous word");
+    box_line("  Ctrl-U, Ctrl-K  Delete to the start / end of the line");
+    box_line("  Ctrl-L          Redraw the line");
+    box_line("");
+    box_line("  Any other input is treated as a task for the agent.");
+    box_line("  A leading `/` is accepted: `/help` == `help`.");
+    box_line("  A command must be on a line by itself — `reset the feed`");
+    box_line("  is a task, not `reset`. (`alias` takes an argument.)");
+    box_line("  `!<task>` forces a task: `!help` runs \"help\" as a task,");
+    box_line("  which the bare word cannot do for a built-in name.");
+    box_line("  Type 'history' to list previous tasks (commands are");
+    box_line("  not recorded, so 'retry' always reruns the last task).");
+    box_close();
 }
 
 /// Print REPL stats
@@ -2939,27 +3215,28 @@ fn print_repl_stats(runner: &RealAgentRunner<CompositeExecutor>, session: &ReplS
     let tool_calls = session.total_tool_calls;
     let using = backend_display(&session.backend);
 
-    println!("\n╔══════════════════════════════════════════════════════════════╗");
-    println!("║                       Session Statistics                     ║");
-    println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║  Session                                                       ║");
-    println!("║  ─────────────────────────────────────────────────────────  ║");
-    println!("║  Tasks run:      {:>6}                                      ║", session.task_count);
-    println!("║  Duration:       {:?}                              ║", duration);
-    println!("║  History size:   {:>6}                                      ║", session.history.len());
-    println!("║                                                                ║");
-    println!("║  Context                                                       ║");
-    println!("║  ─────────────────────────────────────────────────────────  ║");
-    println!("║  Messages:      {:>6}                                      ║", msgs);
-    println!("║  Approx tokens:  {:>6}                                      ║", tokens);
-    println!("║  Size:          ~{:>6} bytes                              ║", runner.approx_total_bytes());
-    println!("║                                                                ║");
-    println!("║  Agent State                                                 ║");
-    println!("║  ─────────────────────────────────────────────────────────  ║");
-    println!("║  Total iterations: {:>5}                                     ║", iterations);
-    println!("║  Tool calls:      {:>5}                                     ║", tool_calls);
-    println!("║  Backend:         {}                                      ║", using);
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    box_open("Session Statistics");
+    box_line("  Session");
+    box_line(&box_separator());
+    box_line(&format!("  Tasks run:      {:>6}", session.task_count));
+    box_line(&format!("  Duration:       {:?}", duration));
+    box_line(&format!("  History size:   {:>6}", session.history.len()));
+    box_line("");
+    box_line("  Context");
+    box_line(&box_separator());
+    box_line(&format!("  Messages:      {:>6}", msgs));
+    box_line(&format!("  Approx tokens:  {:>6}", tokens));
+    box_line(&format!(
+        "  Size:           ~{} bytes",
+        runner.approx_total_bytes()
+    ));
+    box_line("");
+    box_line("  Agent State");
+    box_line(&box_separator());
+    box_line(&format!("  Total iterations: {:>5}", iterations));
+    box_line(&format!("  Tool calls:      {:>5}", tool_calls));
+    box_line(&format!("  Backend:         {}", using));
+    box_close();
 }
 
 /// Print task history
@@ -2990,9 +3267,7 @@ fn print_repl_history(session: &ReplSession) {
 /// `ble_scan()` implemented nowhere, and sensor names the host executor
 /// doesn't back.)
 fn print_repl_tools() {
-    println!("\n╔══════════════════════════════════════════════════════════════╗");
-    println!("║                     Available Tools                          ║");
-    println!("╠══════════════════════════════════════════════════════════════╣");
+    box_open("Available Tools");
     for (name, description, params) in magent_core::ollama::TOOL_DEFINITIONS {
         let signature = if params.is_empty() {
             format!("{}()", name)
@@ -3000,8 +3275,8 @@ fn print_repl_tools() {
             let names: Vec<&str> = params.iter().map(|(p, _, _)| *p).collect();
             format!("{}({})", name, names.join(", "))
         };
-        println!("║  {}", signature);
-        println!("║      {}", description);
+        box_line(&format!("  {}", signature));
+        box_line(&format!("      {}", description));
     }
     // The optional backends supply their own catalogs, so reuse them
     // rather than hand-writing names (the previous static list named
@@ -3015,50 +3290,18 @@ fn print_repl_tools() {
     // unrunnable — the exact divergence this listing exists to avoid.
     let email = CompositeExecutor::email_tool_descriptions();
     if !email.is_empty() {
-        println!("║  ── Email MCP tools (require `--email-tools`) ──");
+        box_line("  ── Email MCP tools (require `--email-tools`) ──");
         for (name, _) in email {
-            println!("║  {}", name);
+            box_line(&format!("  {}", name));
         }
     }
     let chain = CompositeExecutor::blockchain_tool_descriptions();
     if !chain.is_empty() {
-        println!("║  ── Blockchain tools (require `--email-tools`) ──");
+        box_line("  ── Blockchain tools (require `--email-tools`) ──");
         for (name, _) in chain {
-            println!("║  {}", name);
+            box_line(&format!("  {}", name));
         }
     }
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    box_close();
 }
 
-/// Read one line of REPL input.
-///
-/// Plain `read_line`: it does **not** put the terminal into raw mode,
-/// so there is no line editing, no in-line history recall, and arrow
-/// keys arrive as literal escape sequences (which would be submitted
-/// as a task). Real line editing is a backlogged enhancement; the
-/// session's `history` is available to the user via the `history`
-/// command instead.
-fn read_repl_line(prompt: &str) -> Option<String> {
-    print!("{}", prompt);
-    let _ = std::io::stdout().flush();
-
-    let stdin = io::stdin();
-    let mut line = String::new();
-
-    match stdin.read_line(&mut line) {
-        // `read_line` returns Ok(0) at EOF — signal the caller to stop.
-        Ok(0) => None,
-        Ok(_) => Some(line.trim().to_string()),
-        // A decode error is **not** EOF. `read_line` reads the line's bytes
-        // off the stream before trying to validate them, so the offending
-        // bytes are already consumed: report and return an empty line
-        // (which the loop skips) so one stray non-UTF-8 byte — a pasted
-        // binary blob, a mis-encoded pipe — does not silently end the
-        // session. Treating the old `Err(_) => None` as EOF did exactly
-        // that, discarding the rest of the input with no message.
-        Err(e) => {
-            eprintln!("\n  ✗ Input error (line skipped): {}", e);
-            Some(String::new())
-        }
-    }
-}

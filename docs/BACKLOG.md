@@ -95,7 +95,7 @@
 
 ## 🟡 P2 — outstanding
 
-### 🟡 P2 — the REPL has no line editing, and its boxes are ragged (2026-09-24)
+### 🟢 P2 — REPL line editing and ragged boxes, both done (2026-09-24)
 - [x] **`run --repl` now sees the config-file layer** (fixed 2026-09-24, see
       CHANGELOG). The REPL check moved in `execute()` to *after*
       `config::load()` + `apply_config_overrides` and the prompt resolution,
@@ -223,21 +223,26 @@
       header and the field doc all called it a "command history" — typing
       `help`/`stats`/`tools` then `history` printed `(empty)`. All three now
       say task history. Covered by `repl_history_lists_tasks_not_commands`.
-- [ ] **Decision: should a `--repl` session exit non-zero after a task
-      fails?** A failed task prints `✗ Error: …` to stderr and the loop
-      carries on; when the user quits, `execute_repl` always returns
-      `Ok(RunReport)`, and `main` maps `Ok` to `ExitCode::SUCCESS`. So
-      `printf 'do the thing\nq\n' | magent run --repl` exits 0 even though
-      the task errored — unlike the one-shot path, where the same failure
-      propagates and exits 1. Verified reachable only with a *live* backend
-      that fails mid-session (`run_continuing` returns `Err` on a chat
-      error / unreachable backend; mock mode has no error path), so it is
-      not covered by a test. Options: **(a)** count failures on `ReplSession`
-      and return `Err` at session end (breaks the convention that quitting
-      an interactive session is success), **(b)** return `Err` only when
-      stdin is not a terminal (scripted mode), or **(c)** leave it and
-      document that `--repl` is interactive-only. **Owner's call** — same
-      family as the broken-pipe exit-code item below.
+- [x] **A scripted `--repl` session exits non-zero after a failed task**
+      (fixed 2026-09-24, option **(b)** below). A failed task printed
+      `✗ Error: …` to stderr and the loop carried on; when the user quit,
+      `execute_repl` always returned `Ok(RunReport)`, and `main` maps `Ok`
+      to `ExitCode::SUCCESS`. So `printf 'do the thing\nq\n' | magent run
+      --repl` exited 0 even though the task errored — unlike the one-shot
+      path, where the same failure propagates and exits 1. Reachable only
+      with a *live* backend that fails mid-session (`run_continuing`
+      returns `Err` on a chat error / unreachable backend; mock mode has no
+      error path). The session now counts failures and, **only when stdin
+      is not a terminal**, returns `RunError::ReplTaskFailed { failed,
+      total }` at the end. A human at a terminal keeps exiting 0 — quitting
+      an interactive session is success, and the transcript already showed
+      the failure. Rationale for the split: a scripted caller has no
+      transcript, so the exit code is its only signal. Regression tests:
+      `scripted_repl_exits_non_zero_after_a_failed_task` (piped stdin,
+      `--ollama http://127.0.0.1:1 --probe-ollama`) and
+      `scripted_repl_exits_zero_when_every_task_succeeds` (a successful
+      scripted session must stay at 0, so the signal is real). Interactive
+      exit-0 was verified under a real pty.
 - [x] **The multi-turn task anchor is now the session's *current* task**
       (fixed 2026-09-24). `magent-core/src/conversation.rs::slice_messages`
       pinned the **oldest** user message as the "task anchor". That is right
@@ -258,10 +263,14 @@
       (drives the REPL at `--max-messages 2` and asserts the mock's
       keyword-driven reply for the *second* task, which only appears if that
       task reached the model).
-- [ ] **Decision: should `history` record built-in commands too?** Today it
-      records tasks only, which is what `retry` depends on. Recording
-      commands as well would need `retry` to skip them (or a separate
-      store), and `history`'s numbering would no longer match `Tasks run`.
+- [x] **`history` records tasks only — resolved and documented**
+      (2026-09-24). It stays tasks-only: recording commands
+      would need `retry` to skip them (or a separate store) and would
+      desynchronise `history`'s numbering from `Tasks run` in `stats`, for
+      no user benefit. No behaviour change — the `ReplSession::history`
+      field doc already stated this; the help box now says it too
+      (`history, hist Show task history (tasks, not commands)` plus a prose
+      note that `retry` therefore always reruns the last task).
 - [x] **A lone `/` reports itself instead of doing nothing** (fixed
       2026-09-24). It stripped to an empty command and hit the empty-input
       arm, returning silently, while `/nosuch` and `/help extra` both
@@ -304,68 +313,101 @@
       consults". The indirection var is shown verbatim (its value is a
       name), the secret redacted as `set (***)`. Covered by
       `repl_env_lists_passphrase_vars`.
-- [ ] **Decision: is `--probe-ollama` a no-op?** `opts.probe_ollama` is
-      set by the flag and by `config.runner.probe_ollama_on_run`, but the
-      runner config is built with `probe_ollama_on_run: !opts.mock` on
-      *both* paths (`build_runner`, `execute_repl`), so the flag never
-      reaches the runner. In non-mock mode the runner already probes, so
-      the flag is redundant rather than wrong — but the help advertises it
-      as a switch. Not REPL-specific.
-- [ ] **`alias <arg>` accepts an argument but does nothing with it.**
-      `alias` is the sole exception to the "command must be the whole line"
-      rule, justified in the dispatcher by "it has an argument form" — but
-      `alias foo` just prints "Aliases are fixed shortcuts for commands."
-      and `alias` (bare) prints the fixed table. Options: **(a)** give it a
-      real form (e.g. `alias help` → show what `help` expands to), or
-      **(b)** drop the exception so `alias foo` is a task, and reword the
-      `help` parenthetical accordingly. Low value either way; recorded so
-      the exception is not mistaken for a working feature.
-- [ ] **The REPL panics (exit 101) when stdout closes early; the one-shot
-      path exits 1.** `magent run --repl | head` aborts with a Rust panic on
-      a broken pipe, because the REPL writes with raw `println!` while the
-      one-shot path writes through `Output`, whose `io::Result`s are
-      `?`-propagated. Two coherent fixes: **(a)** route every REPL print
-      through `Output` (consistent, but the REPL has many ad-hoc `println!`
-      calls and no `Output` in `handle_repl_command`'s signature), or
-      **(b)** add `libc` to the CLI and reset `SIGPIPE` to `SIG_DFL` at
-      startup (one line, but it changes pipe behaviour for the *whole* CLI —
-      `magent … | head` would then die on SIGPIPE as Unix tools do, instead
-      of reporting a write error). (b) is a CLI-wide behaviour change and
-      `libc` is currently only a workspace `[patch]`, not a `cli`
-      dependency, so this needs an owner call. Documented, not changed.
-- [ ] **`--load-summary` could be supported in the REPL instead of warned.**
-      Seeding the session with a previous run's window (via
-      `insert_after_system_prompt`, as step 3.5 does) is a natural fit for
-      "continue where the last run left off", and the message history
-      survives `run_continuing`. Left as a warning for now because it is a
-      feature, not a fix — and because `--save-summary`/`--sign` have no
-      equally obvious interactive meaning (sign each turn? the session?).
-- [ ] **A task that is exactly one built-in command word cannot be run.**
-      Only the single-word case is left: typing `help`, `stats`, `tools`, …
-      always dispatches the command, so a task literally named `help` is
-      unreachable, and there is no escape syntax (a leading `/` selects the
-      command form, but the bare form *also* selects it). Needs either a
-      forcing prefix (e.g. `!help` runs it as a task) or the rule "`/` always
-      means command, bare always means task" — the latter is a bigger
-      behaviour change and would break every existing script. Deliberate
-      owner decision; the multi-word half is already fixed above.
-- [ ] **No line editing in the REPL.** `read_repl_line` is a plain
-      `stdin.read_line`, so there is no backspace handling, no in-line
-      history recall, and ↑/↓ arrive as literal `ESC[A` sequences (which
-      get submitted as a *task* to the LLM). The help text no longer claims
-      otherwise (removed 2026-09-24), but the feature itself is unbuilt.
-      `ReplSession::get_history_entry` is the vestigial helper for it (still
-      `#[allow(dead_code)]`). Building it means termios raw mode —
-      non-trivial, and it must degrade gracefully when stdin is not a TTY
-      (piped input is how the tests drive it).
-- [ ] **Cosmetic: the REPL's box-drawing is ragged.** Measured line widths
-      in a real session range 59–72 columns against a 64-column border.
-      `print_welcome_banner` / `print_repl_stats` / `print_repl_help` /
-      `print_repl_tools` pad with `{:>50}` / `{:>6}`, which counts **bytes**
-      (not display columns) and ignores the double-width `🤖` entirely. A
-      fix means either a small `pad_to(width)` helper that sums display
-      width per char, or dropping the boxes for plain headers. Purely
-      cosmetic — no command behaviour depends on it.
+- [x] **The REPL aliases and case-folding have dispatch tests** (fixed
+      2026-09-24). The aliases live in the `match` patterns, not a table, so
+      nothing forced an advertised alias to still dispatch — the suite only
+      typed `q`, `clear`, `retry` … lowercase and mostly canonical. Three
+      new tests: `repl_aliases_reach_the_same_arms_as_their_canonical_spellings`
+      (`?`/`cls`/`hist`/`rerun`/`exit`; fails when `| "?"` is removed),
+      `repl_commands_are_case_insensitive` (`STATS`/`Hist`/`Quit`; fails when
+      `cmd.to_lowercase()` is dropped) and
+      `repl_exit_stops_reading_further_input` (a task after `exit` must not
+      run; fails when the quit arm returns `Continue`). 28 → 31 tests.
+- [x] **`--probe-ollama` was a no-op — now it decides whether a failed probe
+      is an error** (fixed 2026-09-24). The flag (and
+      `config.runner.probe_ollama_on_run`, which `apply_config_overrides`
+      mirrored onto it) never reached the runner: both `build_runner` and
+      `execute_repl` hard-coded `probe_ollama_on_run: !opts.mock`, so the only
+      runs where it could matter were the ones where it was already true.
+      Chosen semantics — the documented one: "probe on every `run()` call",
+      and a failed probe **errors** rather than falling back to the canned
+      responder. Both paths now skip `force_disable_backend()` on a failed
+      startup probe when the flag is set (that call also cleared
+      `probe_ollama_on_run`, which is what froze a REPL session into
+      simulation for good), and the REPL calls the new
+      `RealAgentRunner::reset_backend_probe()` before each task so the
+      reachability verdict is not latched. `--probe-ollama --mock` is now
+      `ParseError::ProbeWithMock` instead of a silent contradiction. An
+      un-honourable probe (no key / unbuildable client) warns on stderr.
+      **Behaviour change**: `runner.probe_ollama_on_run = true` in a config
+      now inherits the strict behaviour — the CLI already treated the two as
+      one switch, and the config default is `false`, so only explicit opt-ins
+      change.
+- [x] **`alias <arg>` accepts an argument but does nothing with it** (fixed
+      2026-09-24). Took option (a): `alias <name>` expands the name via the
+      new `alias_lookup` (`hist → history (alias)`, `help is a command (no
+      alias needed).`, and a miss is named with a pointer back to `alias`).
+      The "command must be the whole line" exception is now backed by a real
+      argument form, which is what the dispatcher's comment claimed.
+- [x] **The REPL exits cleanly on a closed stdout** (fixed 2026-09-24).
+      Took option (b): `main()` calls `restore_default_sigpipe()` (a
+      `libc::signal(SIGPIPE, SIG_DFL)`) as its first statement, and `libc`
+      is now a `cfg(unix)` dependency of the `cli` crate. `magent … | head`
+      now dies on SIGPIPE (status 141) as Unix tools do, with no panic and
+      no `exit 101`. The owner accepted the CLI-wide scope: the same latent
+      panic sat on the one-shot path's `println!` trace writes. Option (a)
+      (routing every REPL print through `Output`) was rejected as far more
+      churn for no extra correctness. Covered by
+      `repl_is_not_killed_by_a_rust_panic_when_stdout_closes`.
+- [x] **`--load-summary` is supported in the REPL** (fixed 2026-09-24) —
+      and fixing it uncovered that the flag **never worked on either path**.
+      The note was inserted at step 3.5, before the runner started, and did
+      not survive to the first request: on the one-shot path `run()`'s
+      `reset()` cleared the conversation first; on the REPL path
+      `insert_after_system_prompt` put the note at index 0 (the conversation
+      was still empty), where `ensure_system_prompt` read it as a stale
+      prompt and overwrote it. Insertion now happens inside `run_inner` via
+      the new `RealAgentRunner::seed_system_context(body)`, which queues the
+      note and applies it at index 1 once the prompt is reconciled. Verified
+      end-to-end against a local stand-in Ollama logging request bodies:
+      one-shot and REPL turns 1 and 2 each show `system prompt | note | task`
+      with exactly one copy of the note. The REPL additionally drops
+      `--load-summary` from its `--repl ignores` list. `--save-summary` is
+      still warned about — a REPL has no "end of run" to hang a save off.
+- [x] **A task that is exactly one built-in command word cannot be run**
+      (fixed 2026-09-24). Took the forcing-prefix option: a leading `!` makes
+      the rest of the line a task (`!help` runs `"help"`), and a bare `!`
+      explains itself rather than being sent to the model. The alternative
+      rule ("`/` always command, bare always task") was rejected — it would
+      silently turn every bare `help` / `quit` / `stats` into an LLM call and
+      break every existing script. Documented in the `help` box; pinned by
+      `repl_bang_prefix_forces_a_builtin_word_to_be_a_task`.
+- [x] **The REPL has line editing** (built 2026-09-24). New
+      `cli/src/lineedit.rs`: a pure `LineBuffer` (char-indexed cursor,
+      insert / backspace / forward-delete / motion / kill) plus a thin
+      termios loop that clears `ICANON | ECHO` — leaving `ISIG` alone so
+      Ctrl-C keeps working — and redraws after every key. ↑/↓ recall the
+      task history, so an arrow key is no longer submitted to the LLM as a
+      task. Piped stdin is detected with `io::stdin().is_terminal()` and
+      falls back to the original `read_line`, which is how every existing
+      test still drives the REPL; a failed `tcgetattr` falls back the same
+      way. `ReplSession::get_history_entry` and `history_pos` were deleted
+      — the browse position is per-read state now. Verified under a real
+      pty (insertion, Ctrl-A/E, ↑ recall, Ctrl-C as a signal) and by 37
+      unit tests over `tty::edit`, which is generic over `Read`/`Write` so
+      no pty is needed in CI.
+      **Left open:** the redraw assumes the line fits the terminal width —
+      a wrapped line redraws progressively more wrongly. Cosmetic only, and
+      the fix is real row/column tracking across wraps.
+- [x] **Cosmetic: the REPL's box-drawing was ragged** (fixed 2026-09-24).
+      Settled on the `pad_to(width)` route rather than dropping the boxes:
+      the four printers now share `box_open` / `box_line` / `box_separator` /
+      `box_close`, which pad through a `display_width` helper that sums
+      per-char display width. Every row of a `help` + `stats` + `tools`
+      session is exactly 64 columns, asserted by `repl_boxes_are_rectangular`
+      (fails both on a wrong pad and on a byte-length `display_width`). The
+      helper covers only the ranges the REPL prints, which keeps
+      `unicode-width` out of the CLI's dependency set.
 
 - [x] **BLE removed (2026-09-20)** — the whole GATT config service, the BLE AT
       channel (`SYS_CMD`/`SYS_RSP`), the BLE wallet service (0x1851) and the Lua
@@ -771,95 +813,74 @@
       Implementing it for real (gate the TX echo path on a stored flag) is a
       feature, not a P0 fix.
 
-### 🟡 P2 — the CLI's data subcommands write human output to stderr, so redirection yields an empty file (2026-09-23)
-- [ ] In human mode `config show`, `config list`, `config where`,
-      `set-prompt show` and `set-prompt list` render their payload with
-      `Output::stderr_fmt_line`, i.e. to **stderr**. So
-      `magent config show > backup.json` writes a 0-byte file (the JSON is on
-      the terminal), and `magent config list | grep …` matches nothing.
-      `summary list` (and `set-prompt export`, by design) go to **stdout**
-      instead, so the routing is not uniform across the store commands.
-- [ ] **Same command, different stream.** In `--json` mode the same five
-      commands call `Output::write_json`, which writes to **stdout**. So
-      `magent --json config show | jq` works while `magent config show | …`
-      does not — the stream depends on the mode, not on the command.
-- [ ] **The workaround today** is `--json` (stdout) or the dedicated
-      `export`/`load` verbs, which the docs already present as the pipeable
-      surface (`README.md:464`, `docs/PROMPT_STORE.md:94`, `docs/SUMMARY_STORE.md:83`).
-      `config` has no `export`, so `--json` is the only way to redirect it.
-- [ ] **Partially fixed (2026-09-23, see CHANGELOG).** The two `web3`
-      commands whose payload *is* their stdout — `web3 sign` (default output)
-      and `web3 export` — no longer share this bug: they wrote through
-      `write_json_str` (also a human-mode no-op, so they produced empty
-      redirects too) and now use `Output::write_stdout_line`, which writes in
-      both modes. `web3 list` / `web3 identity` / `web3 did` / `web3 pubkey`
-      still render their human output to stderr, so the entry below still
-      applies to them.
-- [ ] **Fixed for `config` (2026-09-23).** Option (c) was taken: a new
-      `magent config export` verb writes the record to stdout in both modes,
-      so `magent config export > backup.json` works without changing what a
-      TTY user sees from `config show`. `set-prompt` / `summary` already had
-      `export`; the remaining `show`/`list` commands and `scheduler status`
-      still write human output to stderr, by design — the convention is
-      "stdout = machine-readable (`--json` / `export`), stderr = human
-      display". Documented in `magent config --help` and `docs/CONFIG.md`.
-      Not revisited: whether `set-prompt show` / `web3 list` should also grow
-      an `export` verb (they have no non-`--json` way to redirect today).
-- [ ] **Owner's call.** (a) Move human-mode *data* output for these five
-      commands to stdout (keep stderr for the labelled trace), matching
-      `summary list` and the `--json` stream — the consistent fix, but it
-      changes what a TTY user sees interleaved with trace lines unless the
-      trace is also reordered. (b) Declare the convention explicitly
-      ("stdout = machine-readable (`--json`/`export`), stderr = human display")
-      and document it in `magent config --help` / `set-prompt --help`, so the
-      empty-redirect isn't a surprise. (c) Add `config export` to mirror the
-      prompt/summary stores. Not changed here: it is a CLI-wide output
-      convention, not a single-site correctness fix.
+### 🟢 P2 — data subcommands wrote human output to stderr — fixed (2026-09-24)
+- [x] **Owner decision: option (a).** Human-mode *data* output now goes to
+      stdout; stderr keeps the labelled trace, warnings and confirmations.
+      `config where`, `config show`, `config list`, `config get`,
+      `set-prompt show` and `set-prompt list` render through the new
+      `Output::stdout_fmt_line` instead of `stderr_fmt_line`, so
+      `magent config show > backup.json` produces a real (parseable) file and
+      `magent config list | grep ollama` matches. The stream no longer depends
+      on the mode: `--json` and human mode both put the payload on stdout.
+      Confirmations (`config set`, `config init`), the `config validate`
+      verdict and the `scheduler status` trace stay on stderr — they are
+      diagnostics, not data.
+- [x] `Output::stdout_fmt_line` mirrors `stderr_fmt_line` exactly (same
+      `format_args!` contract, same no-op in JSON mode) so the two are
+      interchangeable at a call site and the choice is the *only* thing that
+      encodes data-vs-diagnostic. Documented in `config --help`
+      ("OUTPUT STREAMS"), `set-prompt --help` and `docs/CONFIG.md`.
+- [x] Guarded by `cli/tests/streams.rs` (5 tests, spawns the real binary and
+      asserts on the two streams separately — the unit tests can't, because
+      `Output` holds the process's real `StdoutLock`/`StderrLock`). Mutation-
+      checked: reverting `config where` to `stderr_fmt_line` fails
+      `human_mode_config_data_goes_to_stdout` and nothing else.
+- [x] **Deliberately unchanged:** `web3 list` / `identity` / `did` / `pubkey`
+      still render human output to stderr (they have `--json`, and their
+      human form is a display table, not a wire format); `scheduler status`
+      uses `trace_labeled`, which is a labelled trace by construction.
+      `config export` / `set-prompt export` keep working as before.
 
-### 🟡 P2 — `--prompt <missing-file>` prints the path twice in its error (2026-09-24)
-- [ ] `magent run --prompt /nope.txt "hi"` (and `run --repl --prompt /nope.txt`)
-      fails with the path repeated:
+### 🟢 P2 — `--prompt <missing-file>` printed the path twice — fixed (2026-09-24)
+- [x] `magent run --prompt /nope.txt "hi"` used to fail with
       `could not load system prompt: /nope.txt: /nope.txt: No such file or
-      directory (os error 2)`. Cause: `runner::load_prompt_file` already
-      formats `"{path}: {io}"` into its `String` error
-      (`cli/src/runner.rs:1659`), `resolve_for_run` wraps that string in
-      `io::Error::other(...)` (`cli/src/prompt.rs:1412-1417`), and the
-      runner's mapping then prepends `path.display()` a second time
-      (`cli/src/runner.rs`, the `PromptFileLoad` arm).
-      **How to apply:** have `resolve_for_run`'s legacy `--prompt` branch
-      carry the bare `io::Error` (read the file there, or change
-      `load_prompt_file` to return `io::Error`) so the path is added exactly
-      once. Left alone here because `load_prompt_file` is shared, unit-tested,
-      and the duplication is purely cosmetic — the command errors correctly
-      (`rc=1`).
+      directory (os error 2)`. `runner::load_prompt_file` now returns the bare
+      `std::io::Error` instead of stringifying it as `"{path}: {io}"`, so
+      `PromptError::PromptFileLoad` (which carries the path) adds it exactly
+      once. The runner's `PromptFileLoad` arm is unchanged and now yields
+      `could not load system prompt: /nope.txt: No such file or directory
+      (os error 2)`. Pinned by
+      `prompt::tests::prompt_file_load_error_names_the_path_exactly_once`,
+      which asserts the path appears once and the message still says what
+      failed.
 
-### 🟡 P2 — `ParseError::UnknownFlag` is the CLI's catch-all, so misuse errors read "unknown flag: …" (2026-09-23)
-- [ ] `cli::ParseError` has only four variants (`UnknownFlag`, `InvalidValue`,
-      `MissingValue`, `TooManyPositional`), and roughly forty call sites use
-      `UnknownFlag` for *any* usage error — not just an unrecognised flag. The
-      `Display` impl prefixes all of them with `unknown flag: `, so a user who
-      passes two mutually exclusive flags sees
-      `error: unknown flag: scheduler daemon: --interval, --cron, and --at are mutually exclusive; pass exactly one`,
-      and `magent web3 new` with no name prints
-      `unknown flag: web3 new: missing <NAME>`.  A genuinely unknown flag also
-      renders oddly (`unknown flag: help --bogus-xyz`).
-- [ ] **Impact is diagnostics-only** — the exit code (2) and the behaviour are
-      correct; only the message misleads, and only on the error path.
-- [ ] **Feature-gated builds are hit too.** A default `cargo build -p magent`
-      (no `web3` feature) answers `magent web3 …` with
-      `error: unknown flag: web3`, which reads as if `web3` were a flag that
-      doesn't exist rather than a subcommand this binary was compiled without.
-      A `unknown subcommand: web3 (built without the \`web3\` feature)` message
-      would be clearer. Same root cause: one error variant for every
-      "that input isn't something I know" case.
-- [ ] **Owner's call.** (a) Add `ParseError::Usage(String)` (renders as the bare
-      message) and migrate the ~40 non-flag sites — mechanical but touches
-      every subcommand parser; or (b) leave the prefix but reword each message
-      to be flag-shaped where it makes sense; or (c) drop the prefix entirely
-      and let the message stand alone. Not changed here: it is a cross-cutting
-      error-taxonomy change, not a single-site P0 fix. (The `web3` key-derivation
-      messages were fixed under a narrower, clearly-wrong case — see CHANGELOG
-      `Web3CliError::Usage`.)
+### 🟢 P2 — `ParseError::UnknownFlag` was the CLI's catch-all — fixed (2026-09-24)
+- [x] **Option (a): added `ParseError::Usage(String)`, which renders verbatim.**
+      `UnknownFlag` used to carry *any* usage error — not just an unrecognised
+      flag — while its `Display` prefixes `unknown flag: `, so two mutually
+      exclusive scheduler flags produced
+      `error: unknown flag: scheduler daemon: --interval, --cron, and --at are mutually exclusive; pass exactly one`.
+      That was the "nonsense sentence" case. Note `web3 new: missing <NAME>`
+      was already fixed earlier under `Web3CliError::Usage`, so it was not a
+      live example by the time of this change.
+- [x] The ~85 non-flag call sites were migrated to `Usage`; the genuinely
+      flag-shaped sites (`format!("--{}", other)`, the `-温度` short-flag trap,
+      `doctor`/`version` stray tokens) keep `UnknownFlag` and still print
+      `error: unknown flag: --bogus`. Verified live: `run --bogus`,
+      `run -温度 hi`, `doctor x`, `version x` all still say `unknown flag:`.
+- [x] **Feature-gated builds are fixed too.** A default `cargo build -p magent`
+      (no `web3`) now answers `magent web3 …` with
+      `unknown subcommand: web3 (this binary was built without the \`web3\` feature)`
+      via the new `unknown_subcommand_message` helper, instead of reading as if
+      `web3` were a mistyped flag. Any other unknown token gets
+      `unknown subcommand: <token> (try \`help\` for the list of subcommands)`.
+- [x] **`help <topic>`** for an unknown topic now says
+      `no help for \`<topic>\` — try \`help run\`, …`, not `unknown flag: help …`.
+- Exit code was 2 before and after; this was always diagnostics-only. Pinned by
+  four unit tests in `cli/src/cli.rs` (`usage_errors_render_verbatim_…`,
+  `unknown_subcommand_is_named_as_a_subcommand`,
+  `help_for_an_unknown_topic_lists_the_known_ones`,
+  `web3_on_a_non_web3_build_explains_it_was_not_built_in`).
 
 ### 🟡 P2 — an empty `search_emails` query matches the whole INBOX, and `shutdown()` cannot be called from async code (2026-09-23)
 - [ ] **`search_emails` with an empty (or whitespace-only, or all-quote)
@@ -942,33 +963,40 @@
       default with no doc mention. Not changed here because it is a UX
       decision, not a correctness fix.
 
-### 🟡 P2 — three CLI surface inconsistencies left after the `--json` fix (2026-09-23)
-- [ ] **`scheduler --timezone <TZ>` silently accepts any string.** `cli/src/cli.rs`
-      `resolve_timezone()` maps `"utc"`/`"UTC"` to `SchedulerTimezone::Utc` and
-      **everything else** to `Local` — so `--timezone Bogus/Zone` runs happily and
-      is treated as local time. `scheduler --help` meanwhile advertises IANA names
-      (e.g. `Europe/London`), which the code cannot honour. Either validate against
-      a real tz database (pulls in a dependency) or reject anything that is not
-      `utc`/`local` with a clear message and fix the help text. **Why not P0:** a
-      wrong timezone means cron fires at the wrong wall-clock time, but only for a
-      user who typed a bogus zone; the default (`Local`) is correct for most.
-- [ ] **`magent version --json` emits a bare JSON string**, not an object
-      (`"0.1.0"`), unlike every other command's `{"action":…}` / `{…}` envelope.
-      A `jq '.version'` consumer gets `null`. Wrap it
-      (`{"version":"0.1.0"}`) or document the shape. **Owner's call** because it is
-      a wire-format change to an existing, shipping output.
+### 🟡 P2 — two CLI surface inconsistencies left after the `--json` fix (2026-09-23)
+- [x] **`scheduler --timezone <TZ>` silently accepted any string** — fixed
+      (2026-09-24). `resolve_timezone()` now returns a `Result`: `utc`/`UTC` →
+      `Utc`, `local`/`LOCAL`/absent → `Local`, anything else →
+      `ParseError::Usage("scheduler daemon: --timezone expects \`utc\` or
+      \`local\`, got \`X\`")` (exit 2). Also removed two lies: the
+      `SchedulerTimezone::Local` doc claimed it read `$MAGENT_TIMEZONE` (an IANA
+      name), and `scheduler --help` advertised `<utc|local>` while the next
+      clause promised IANA names — neither was implemented. The help now states
+      the two accepted values and that a bogus one is rejected. The daemon usage
+      synopsis also gained `--cron`/`--at`/`--timezone`, which it was missing.
+      Pinned by `cli::tests::scheduler_rejects_a_timezone_it_cannot_honour`.
+- [x] **Left alone, deliberately:** `--timezone` on `scheduler run-once` is still
+      parsed and then ignored (only `daemon` consumes it). Rejecting it there
+      would break anyone who passes it harmlessly today, and `run-once` runs the
+      queue immediately regardless of zone.
+- [x] **`magent version --json` emits a bare JSON string** — already fixed.
+      This entry was stale: the live binary emits
+      `{"name":"magent","version":"0.1.0"}`, so `jq '.version'` works. A test
+      pins the object shape in `cli/tests/json_output.rs`, so the "bare string"
+      description above (verified 2026-09-24) no longer describes the code.
 - [ ] **`--json` never emits an *error* envelope.** On failure every command still
       prints human text to stderr and exits non-zero; there is no
       `{"error":…,"code":…}` object on stdout. A CI consumer that pipes stdout to
       `jq` therefore gets a parse error instead of a structured failure. Adding one
       is a cross-cutting change to the dispatch layer, so it is left to the owner.
-- [ ] **`--json help` still prints human text.** `help`, `run --help`, and the
-      per-subcommand `--help` bypass `Output` (they `print!` a static string), so
-      `magent --json help` is not valid JSON. This is deliberate — help is prose,
-      not data, and every other data command now satisfies
-      `--json ⇒ parseable stdout` (verified in `cli/tests/json_output.rs`) — but
-      it is worth documenting so the invariant is understood as "data commands",
-      not "all commands".
+- [x] **`--json help` still prints human text** — deliberate, now documented
+      (2026-09-24). `help`, `run --help`, and the per-subcommand `--help` bypass
+      `Output` (they `print!` a static string), so `magent --json help` is not
+      valid JSON. Help is prose, not data. The invariant is now stated on
+      `GlobalFlags::json` in `cli/src/cli.rs`: "`--json` ⇒ parseable stdout"
+      applies to *data* commands, not all commands, so scripts should only rely
+      on stdout JSON for commands that document a `--json` shape. Every data
+      command satisfies it (verified in `cli/tests/json_output.rs`).
 
 ### 🟡 P2 — `--tool-max-chars` truncation could grow the payload (2026-09-24)
 - [x] **The cap grew the content it capped, at small budgets** (fixed
@@ -989,24 +1017,29 @@
       `examples/topic-watcher`. Covered by
       `compress_reports_the_net_bytes_it_removed`.
 
-### 🟡 P2 — `--tool-max-chars` caps *bytes*, not chars (2026-09-24)
-- [ ] **The flag name, the core parameter, and the actual limit disagree.**
-      `--tool-max-chars <N>` (help: "Cap each tool result content") is
-      threaded to `CompressionPolicy::tool_content_max_chars` and applied by
-      `magent-core/src/conversation.rs::truncate_tool_content`, whose
-      parameter is `max_chars` — but the comparison is
-      `msg.content.len() <= max_chars`, i.e. **bytes**. For non-ASCII tool
-      output the effective cap is ~⅓ of the advertised value (800 ⇒ ≈266
-      CJK chars). The truncation *marker* it writes is honest ("…truncated N
-      bytes…"), so the core is self-consistent; only the CLI surface
-      promises chars. Affects the one-shot path and REPL alike (the REPL
-      passes `--tool-max-chars` straight through). Options: **(a)** rename
-      the flag / parameter to `…-bytes` (compat break for scripts using the
-      flag), **(b)** count `chars()` in `truncate_tool_content` (changes
-      payload sizes for every existing user, and the byte→char switch has to
-      be redone against the head/tail byte budgets). Same bytes-vs-chars
-      family as the `context`/`stats` "Size" fix (see the REPL section),
-      which chose to relabel the display to match the bytes it already had.
+### 🟢 P2 — `--tool-max-chars` capped *bytes*, not chars — fixed (2026-09-24)
+- [x] **Owner decision: option (b) — make the limit count characters.**
+      `truncate_tool_content` compared `msg.content.len() <= max_chars`, i.e.
+      bytes, so an 800 "char" budget kept only ≈266 CJK characters. It now
+      counts `msg.content.chars().count()` and translates the 60/40 head/tail
+      budgets into byte offsets on code-point boundaries
+      (`byte_offset_after_chars`). Every name is now truthful:
+      `--tool-max-chars`, `compression.tool_content_max_chars`, and the core
+      parameter all mean characters. The `[...truncated N bytes...]` marker and
+      `CompressionStats::bytes_saved` still report **bytes**, which is what
+      they say.
+      **Why (b) and not (a):** the flag name is not the only surface that says
+      "chars" — the config key and the summary record's `policy.tool_content_max_chars`
+      are on-disk formats (`config get/set`, saved `.json` summaries). Renaming
+      them would silently discard existing values, whereas counting chars fixes
+      the advertised contract and, for ASCII, changes nothing. The cost is that
+      non-ASCII tool output now keeps ~3× more bytes — which is the intent of a
+      character budget. Pinned by `truncate_caps_characters_not_bytes` and
+      `byte_offset_after_chars_lands_on_code_point_boundaries`.
+- [x] Docs realigned: `cli/src/cli.rs` (module doc + `run --help` + `config --help`),
+      `docs/CONFIG.md` (the key table now says characters and notes the marker's
+      bytes), `docs/CONTEXT_MANAGEMENT.md` (its "`content.len() > tool_content_max_chars`"
+      description was the clearest statement of the old byte semantics).
 
 ### 🟠 P2 — the ESP32 firmware crate's five `#[cfg(test)]` modules can never run (2026-09-23)
 - [ ] `firmware/esp32-app` is an `esp-idf` **bin** crate. Its inline test

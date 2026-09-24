@@ -229,6 +229,189 @@ fn repl_slash_prefixed_commands_are_recognised() {
     );
 }
 
+/// Every alias `help` advertises has to reach the same arm as its
+/// canonical spelling. The aliases live in the `match` patterns, not in a
+/// table, so dropping one leaves `help` listing a name that answers
+/// "Unknown command" — and nothing else in the suite types them.
+#[test]
+fn repl_aliases_reach_the_same_arms_as_their_canonical_spellings() {
+    let sb = Sandbox::new("aliasarms");
+    // `read the temperature` seeds the history so `hist` has a task to
+    // show and `rerun` one to re-run.
+    let out = sb.session("read the temperature\n?\ncls\nhist\nrerun\nexit\n");
+    assert!(out.status.success(), "REPL exited non-zero");
+    let s = stdout(&out);
+    assert!(
+        s.contains("mAgent REPL Commands"),
+        "`?` did not print help:\n{s}"
+    );
+    assert!(
+        s.contains("Task history"),
+        "`hist` did not print the task history:\n{s}"
+    );
+    assert!(
+        s.contains("Retrying:"),
+        "`rerun` did not re-run the task:\n{s}"
+    );
+    assert!(
+        s.contains("Goodbye"),
+        "`exit` did not end the session:\n{s}"
+    );
+    assert!(
+        !s.contains("\u{1b}[2J"),
+        "`cls` wrote a screen-clear escape to a non-terminal stdout:\n{s}"
+    );
+    assert!(
+        !s.contains("Unknown command"),
+        "an advertised alias was reported as an unknown command:\n{s}"
+    );
+}
+
+/// Every box row must end at the same display column. The printers used
+/// `{:>50}` / `{:>6}`, which counts **bytes** and ignores the double-width
+/// `🤖`, so measured widths ranged 59–72 against a 64-column border.
+#[test]
+fn repl_boxes_are_rectangular() {
+    let sb = Sandbox::new("boxes");
+    let out = sb.session("help\nstats\ntools\nq\n");
+    assert!(out.status.success(), "REPL exited non-zero");
+    let s = stdout(&out);
+
+    /// Display width for the glyphs that appear in a box: the box itself is
+    /// one column, ASCII one, and the emoji block two.
+    fn width(line: &str) -> usize {
+        line.chars()
+            .map(|c| {
+                if ('\u{1F300}'..='\u{1FAFF}').contains(&c) {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
+    let mut box_lines = 0;
+    for line in s.lines() {
+        // The first box row is printed after the `❯ ` prompt on the same
+        // line; later rows start at column 0.
+        let line = line.rsplit("❯ ").next().unwrap_or(line);
+        if !line.starts_with(['║', '╔', '╚', '╠']) {
+            continue;
+        }
+        box_lines += 1;
+        assert_eq!(
+            width(line),
+            64,
+            "box row is {w} columns, not 64: {line:?}",
+            w = width(line)
+        );
+    }
+    assert!(box_lines > 10, "no box rows found in:\n{s}");
+}
+
+/// `alias <name>` is the one argument form the whole-line rule allows, so
+/// it has to *use* the argument. It used to print the same fixed sentence
+/// for every input, which made the exception pointless.
+#[test]
+fn repl_alias_with_an_argument_resolves_that_name() {
+    let sb = Sandbox::new("aliasarg");
+    let out = sb.session("alias hist\nalias ?\nalias help\nalias /cls\nalias nosuch\nq\n");
+    assert!(out.status.success(), "REPL exited non-zero");
+    let s = stdout(&out);
+    assert!(
+        s.contains("hist → history (alias)."),
+        "`alias hist` did not resolve the alias:\n{s}"
+    );
+    assert!(
+        s.contains("? → help (alias)."),
+        "`alias ?` did not resolve the alias:\n{s}"
+    );
+    assert!(
+        s.contains("cls → clear (alias)."),
+        "a slash-prefixed argument was not resolved:\n{s}"
+    );
+    assert!(
+        s.contains("help is a command (no alias needed)."),
+        "`alias help` did not recognise a canonical command:\n{s}"
+    );
+    assert!(
+        s.contains("No command or alias named \"nosuch\""),
+        "an unknown name was not reported:\n{s}"
+    );
+}
+
+/// A one-word task that collides with a built-in command is otherwise
+/// unreachable: the bare word always dispatches the command, and the
+/// whole-line rule only rescues the multi-word form. `!<task>` is the
+/// escape hatch.
+#[test]
+fn repl_bang_prefix_forces_a_builtin_word_to_be_a_task() {
+    let sb = Sandbox::new("bangescape");
+    let out = sb.session("!stats\nhistory\nq\n");
+    assert!(out.status.success(), "REPL exited non-zero");
+    let s = stdout(&out);
+    assert!(
+        !s.contains("Session Statistics"),
+        "`!stats` was dispatched as the command instead of run as a task:\n{s}"
+    );
+    assert!(
+        s.contains("1. stats"),
+        "the forced task was not recorded in the history:\n{s}"
+    );
+
+    // A bare `!` says what it needs instead of running an empty task.
+    let bare = sb.session("!\nq\n");
+    assert!(
+        stdout(&bare).contains("`!` must be followed by a task"),
+        "a bare `!` was silently ignored:\n{}",
+        stdout(&bare),
+    );
+}
+
+/// The dispatcher lowercases the first word before matching (`cmd
+/// .to_lowercase()`), so the documented commands work in any case. No test
+/// pinned it: every other script types them lowercase.
+#[test]
+fn repl_commands_are_case_insensitive() {
+    let sb = Sandbox::new("replcase");
+    let out = sb.session("read the temperature\nSTATS\nHist\nQuit\n");
+    assert!(out.status.success(), "REPL exited non-zero");
+    let s = stdout(&out);
+    assert!(
+        s.contains("Session Statistics"),
+        "`STATS` did not reach the stats arm:\n{s}"
+    );
+    assert!(
+        s.contains("Task history"),
+        "`Hist` did not reach the history arm:\n{s}"
+    );
+    assert!(
+        s.contains("Goodbye"),
+        "`Quit` did not end the session:\n{s}"
+    );
+    assert!(
+        !s.contains("Unknown command"),
+        "an uppercase command fell through to a task:\n{s}"
+    );
+}
+
+/// `exit` must stop the loop, not merely print the farewell: input after
+/// it is never read. Otherwise a scripted session would still run whatever
+/// the operator wrote after the exit.
+#[test]
+fn repl_exit_stops_reading_further_input() {
+    let sb = Sandbox::new("exitstop");
+    let out = sb.session("exit\nread the temperature\n");
+    assert!(out.status.success(), "REPL exited non-zero");
+    let s = stdout(&out);
+    assert!(s.contains("Goodbye"), "no farewell on exit:\n{s}");
+    assert!(
+        !s.contains("Temperature sensor reading completed"),
+        "a task after `exit` was still executed:\n{s}"
+    );
+}
+
 /// A slash line with arguments is rejected, but the message must not claim
 /// the command is *unknown* when it is one of the built-ins — `/help extra`
 /// used to answer `Unknown command: /help`.
@@ -301,11 +484,13 @@ fn repl_multi_word_input_is_a_task_not_a_command() {
         "the five multi-word inputs did not all run as tasks:\n{s}",
     );
 
-    // `alias` keeps its argument form.
+    // `alias` keeps its argument form — and the argument is now *used*
+    // (it resolves against the alias table) instead of being discarded
+    // behind a fixed sentence.
     let alias = sb.session("alias foo\nq\n");
     assert!(
-        stdout(&alias).contains("Aliases are fixed shortcuts"),
-        "`alias` with an argument no longer dispatches:\n{}",
+        stdout(&alias).contains("No command or alias named \"foo\""),
+        "`alias` with an argument no longer dispatches, or ignores it:\n{}",
         stdout(&alias),
     );
 }
@@ -332,14 +517,309 @@ fn repl_warns_about_flags_it_cannot_honour() {
         stderr(&out),
     );
 
-    // `--load-summary` is consumed at step 3.5 of `execute()`, *after* the
-    // REPL dispatch — so the one-shot path's "no summary named …" warning
-    // never fires here either. It has to be named too.
+    // `--load-summary` used to be listed here; it is now honoured by
+    // `execute_repl` itself, so it must NOT appear in the drop list. (Its
+    // own "no summary named …" warning is the one-shot message, not this.)
     let load = sb.session_with(&["--mock", "--load-summary", "nosuchtopic"], "q\n");
+    let load_err = stderr(&load);
     assert!(
-        stderr(&load).contains("--repl ignores --load-summary"),
-        "silently ignored --load-summary:\n{}",
-        stderr(&load),
+        !load_err.contains("--repl ignores"),
+        "--load-summary is honoured now, so nothing should be dropped:\n{load_err}",
+    );
+    assert!(
+        load_err.contains("no summary named"),
+        "a missing topic should still be reported:\n{load_err}",
+    );
+}
+
+/// `--load-summary` used to be dropped in the REPL with a
+/// `--repl ignores` warning — the one-shot path consumed the flag at step
+/// 3.5, *after* the REPL had already been entered and returned. It is now
+/// honoured, so this pins the plumbing around it: the load is reported,
+/// nothing is listed as dropped, and a missing topic warns without killing
+/// the session. That the note actually reaches the model is asserted by
+/// `repl_keeps_the_loaded_summary_across_a_turn`.
+#[test]
+fn repl_load_summary_is_honoured_and_reported() {
+    let sb = Sandbox::new("loadsummary");
+
+    // A summary of the shape `magent summary save` writes. Written
+    // directly: the point under test is the *load* path, and building the
+    // record through a mock run would couple this test to the save path.
+    let dir = sb.home.join("summaries");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("coach.json"),
+        r#"{
+  "schema_version": 1,
+  "topic": "coach",
+  "source": {
+    "session_id": null,
+    "provider": "ollama",
+    "model": "llama3.2",
+    "original_message_count": 2,
+    "policy": { "max_messages": 32, "tool_content_max_chars": 800 }
+  },
+  "head_tail_window": [
+    { "role": "user", "content": "PREVIOUS_RUN_MARKER please continue", "tool_call_id": null },
+    { "role": "assistant", "content": "acknowledged", "tool_call_id": null }
+  ],
+  "llm_summary": "PRIOR_SUMMARY_MARKER",
+  "stats": { "kept": 2, "dropped": 0, "tool_results_truncated": 0, "bytes_saved": 0 },
+  "metadata": { "description": null, "author": null, "tags": [] },
+  "history": [],
+  "created_at": 1754716800,
+  "updated_at": 1754800000
+}"#,
+    )
+    .unwrap();
+
+    let out = sb.session_env(
+        &[("MAGENT_SUMMARIES_DIR", dir.to_str().unwrap())],
+        &["--mock", "--load-summary", "coach"],
+        "q\n",
+    );
+    assert!(out.status.success(), "REPL exited non-zero");
+    let err = stderr(&out);
+    assert!(
+        err.contains("loaded coach window"),
+        "the summary should have been loaded:\n{err}",
+    );
+    assert!(
+        !err.contains("--repl ignores"),
+        "--load-summary must not be reported as dropped:\n{err}",
+    );
+
+    // A topic that is not on disk is a warning, not a dead session: the REPL
+    // cannot be in JSON mode (the parser refuses `--repl --json`, and
+    // `io.json_default` is rejected on entry), so there is no hard-error case
+    // to mirror from the one-shot path.
+    let missing = sb.session_env(
+        &[("MAGENT_SUMMARIES_DIR", dir.to_str().unwrap())],
+        &["--mock", "--load-summary", "nosuchtopic"],
+        "q\n",
+    );
+    assert!(
+        missing.status.success(),
+        "a missing topic killed the session"
+    );
+    assert!(
+        stderr(&missing).contains("no summary named"),
+        "a missing topic should be named:\n{}",
+        stderr(&missing),
+    );
+}
+
+/// The seeded window has to survive the first task, not just sit there
+/// until `run_continuing` resets it.
+#[test]
+fn repl_keeps_the_loaded_summary_across_a_turn() {
+    let sb = Sandbox::new("loadsummaryturn");
+    let dir = sb.home.join("summaries");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("coach.json"),
+        r#"{
+  "schema_version": 1,
+  "topic": "coach",
+  "source": {
+    "session_id": null,
+    "provider": "ollama",
+    "model": "llama3.2",
+    "original_message_count": 1,
+    "policy": { "max_messages": 32, "tool_content_max_chars": 800 }
+  },
+  "head_tail_window": [
+    { "role": "user", "content": "PREVIOUS_RUN_MARKER please continue", "tool_call_id": null }
+  ],
+  "llm_summary": null,
+  "stats": { "kept": 1, "dropped": 0, "tool_results_truncated": 0, "bytes_saved": 0 },
+  "metadata": { "description": null, "author": null, "tags": [] },
+  "history": [],
+  "created_at": 1754716800,
+  "updated_at": 1754800000
+}"#,
+    )
+    .unwrap();
+
+    let env: &[(&str, &str)] = &[("MAGENT_SUMMARIES_DIR", dir.to_str().unwrap())];
+
+    // Differential: the same script with and without the load. An absolute
+    // threshold proves nothing here, because the mock's own turns already
+    // clear any small number — only the *delta* shows the note survived.
+    let plain = sb.session_env(env, &["--mock"], "read the temperature\ncontext\nq\n");
+    let loaded = sb.session_env(
+        env,
+        &["--mock", "--load-summary", "coach"],
+        "read the temperature\ncontext\nq\n",
+    );
+
+    let plain_msgs = number_after(&stdout(&plain), "Messages:");
+    let loaded_msgs = number_after(&stdout(&loaded), "Messages:");
+    assert_eq!(
+        loaded_msgs,
+        plain_msgs + 1,
+        "the loaded window was dropped when the first task ran \
+         (with: {loaded_msgs}, without: {plain_msgs}):\n{}",
+        stdout(&loaded),
+    );
+}
+
+/// A reader that walks away (`magent run --repl | head`) must not turn
+/// into a Rust panic. Rust ignores `SIGPIPE`, so the write fails with
+/// `EPIPE` — and `println!` treats a failed stdout write as fatal. The
+/// REPL did exactly that: `exit 101` plus a panic backtrace on stderr,
+/// where a Unix filter is expected to die on `SIGPIPE` (status 141)
+/// silently. `main` now restores the default disposition before doing
+/// anything else.
+#[cfg(unix)]
+#[test]
+fn repl_is_not_killed_by_a_rust_panic_when_stdout_closes() {
+    let sb = Sandbox::new("brokenpipe");
+    let mut cmd = sb.cmd();
+    let mut child = cmd
+        .args(["run", "--repl", "--mock"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn magent");
+
+    // Enough long output (300 × the help box) to exceed the 64 KiB pipe
+    // buffer, so the child is guaranteed to still be writing when the read
+    // end goes away — otherwise it would finish into the buffer and exit 0
+    // without ever hitting the broken pipe.
+    let script: String = std::iter::repeat_n("help\n", 300).collect();
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(script.as_bytes())
+        .expect("write REPL script");
+
+    // Walk away mid-write, the way `| head` does.
+    drop(child.stdout.take());
+
+    let out = child.wait_with_output().expect("collect magent output");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "the REPL panicked on a closed stdout:\n{err}",
+    );
+    assert!(
+        !err.contains("panicked"),
+        "a panic escaped even though the exit code was not 101:\n{err}",
+    );
+}
+
+/// `--probe-ollama` promised "probe on every run() call" but the REPL
+/// eagerly probed once at startup and then either latched the live
+/// verdict or called `force_disable_backend()` — which also clears
+/// `probe_ollama_on_run`, freezing the whole session into simulation.
+/// Either way the flag did nothing. It must now survive a dropped
+/// backend by reporting the failure per task instead of simulating.
+#[test]
+fn repl_probe_ollama_refuses_to_simulate_a_dropped_backend() {
+    let sb = Sandbox::new("probe");
+    // Port 1 has no listener, so the probe is refused immediately.
+    let dead = ["--ollama", "http://127.0.0.1:1"];
+
+    // Baseline: without the flag the session falls back to the canned
+    // responder, so the assertions below cannot pass by accident.
+    let plain = sb.session_with(&dead, "read the temperature\nq\n");
+    let plain_out = stdout(&plain);
+    assert!(
+        plain_out.contains("mock fallback"),
+        "the unreachable backend should have been latched as a fallback:\n{plain_out}"
+    );
+    assert!(
+        plain_out.contains("Temperature sensor reading completed"),
+        "the simulated responder should have answered:\n{plain_out}"
+    );
+
+    let out = sb.session_with(
+        &[dead[0], dead[1], "--probe-ollama"],
+        "read the temperature\nq\n",
+    );
+    // The *session* must survive the failed task — it keeps reading stdin
+    // and quits cleanly. But this session is scripted (piped stdin), so it
+    // must also report the failure through its exit code: see
+    // `scripted_repl_exits_non_zero_after_a_failed_task`.
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a scripted session with a failed task must exit non-zero"
+    );
+    let s = stdout(&out);
+    let err = stderr(&out);
+
+    assert!(
+        s.contains("probing each task"),
+        "the banner should say the backend is being re-probed:\n{s}"
+    );
+    assert!(
+        err.contains("LLM backend unreachable"),
+        "the task should have reported the unreachable backend:\n{err}"
+    );
+    assert!(
+        !s.contains("Temperature sensor reading completed"),
+        "a simulated answer leaked into a --probe-ollama session:\n{s}"
+    );
+    // A failed task is not fatal: the session is still there to retry.
+    assert!(s.contains("Goodbye"), "the session ended early:\n{s}");
+}
+
+/// A scripted REPL session (stdin is not a terminal) has no human to read
+/// the transcript, so its exit code is the only failure signal a caller
+/// gets. A task that fails must therefore end the process non-zero — even
+/// though the session itself survives the failure.
+#[test]
+fn scripted_repl_exits_non_zero_after_a_failed_task() {
+    let sb = Sandbox::new("scripted-fail");
+    // Port 1 has no listener; `--probe-ollama` makes the task error instead
+    // of falling back to the simulator, so exactly one task fails.
+    let out = sb.session_with(
+        &["--ollama", "http://127.0.0.1:1", "--probe-ollama"],
+        "read the temperature\nq\n",
+    );
+    assert!(
+        !out.status.success(),
+        "a scripted session with a failed task must exit non-zero, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        stdout(&out),
+        stderr(&out),
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("non-interactive stdin"),
+        "the exit-code reason must be reported on stderr:\n{err}"
+    );
+    assert!(
+        err.contains("1 of 1 task"),
+        "the message must count the failed tasks:\n{err}"
+    );
+    // The session still reached its normal end — the failure is reported,
+    // not fatal mid-session.
+    assert!(
+        stdout(&out).contains("Goodbye"),
+        "the session should still quit cleanly:\n{}",
+        stdout(&out),
+    );
+}
+
+/// The other half of the scripted contract: a session whose tasks all
+/// succeed must stay at exit 0, so the non-zero above is a real signal and
+/// not just "any scripted session exits 1".
+#[test]
+fn scripted_repl_exits_zero_when_every_task_succeeds() {
+    let sb = Sandbox::new("scripted-ok");
+    let out = sb.session("read the temperature\nq\n");
+    assert!(
+        out.status.success(),
+        "a scripted session with no failures must exit 0, got {:?}\nstderr:\n{}",
+        out.status,
+        stderr(&out),
     );
 }
 
@@ -431,6 +911,32 @@ fn repl_exits_cleanly_on_eof() {
     let out = sb.session("");
     assert!(out.status.success(), "EOF exit was non-zero");
     assert!(stdout(&out).contains("Goodbye"));
+}
+
+/// A pipe that ends without a trailing newline must still run its last
+/// command, and only then report end-of-input. `printf 'help' | magent
+/// run --repl` is an ordinary invocation, and before line editing the
+/// `read_line` that served it returned those partial bytes and the REPL
+/// ran them; introducing an editor must not quietly change that.
+///
+/// Note this drives a *pipe*, so it exercises the non-TTY fallback, not
+/// the raw-mode loop — the pty path is covered by `cli/src/lineedit.rs`'s
+/// own tests over `tty::edit`. This test is the guard that the fallback
+/// kept the old semantics.
+#[test]
+fn repl_runs_a_piped_command_without_a_trailing_newline() {
+    let sb = Sandbox::new("nonewline");
+    let out = sb.session("help");
+    assert!(out.status.success(), "REPL exited non-zero");
+    let s = stdout(&out);
+    assert!(
+        s.contains("mAgent REPL Commands"),
+        "`help` was dropped:\n{s}"
+    );
+    assert!(
+        s.contains("Goodbye"),
+        "the session did not end cleanly after the partial line:\n{s}"
+    );
 }
 
 /// A read error is not EOF. `read_line` consumes the line's bytes before it
@@ -667,7 +1173,7 @@ fn repl_prompt_shows_the_prompt_before_the_first_task() {
 fn repl_honours_the_max_messages_cap() {
     let sb = Sandbox::new("cap");
     let out = sb.session_with(
-        &["--max-messages", "2"],
+        &["--mock", "--max-messages", "2"],
         "task a\ncontext\ntask b\ncontext\ntask c\ncontext\ntask d\ncontext\nq\n",
     );
     assert!(out.status.success());

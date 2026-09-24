@@ -71,10 +71,24 @@ magent config format               Re-serialise the file with canonical key orde
 magent config export               Dump the JSON record to stdout (redirect-safe)
 ```
 
-`config export` writes the resolved record to **stdout** in both modes, so
-`magent config export > backup.json` produces a real file. (`config show`
-renders its human output to stderr for display, so it is not redirect-safe;
-use `export` when you want to pipe or save the record.)
+### Output streams
+
+**Data goes to stdout; diagnostics go to stderr.** That is what makes
+`magent config show > backup.json` and `magent config list | grep ollama`
+work. Concretely:
+
+| Action                        | Human mode | `--json` mode         |
+| ----------------------------- | ---------- | --------------------- |
+| `where`, `show`, `list`, `get`| stdout     | envelope on stdout    |
+| `init`, `set`, `format`       | stderr     | envelope on stdout    |
+| `validate`                    | stderr     | envelope on stdout    |
+| `export`                      | stdout     | envelope on stdout    |
+
+So `where`/`show`/`list`/`get` are redirect-safe in both modes; `show` and
+`export` differ only in their JSON-mode payload (envelope vs. the record).
+`--json` always puts exactly one JSON object on stdout and nothing else.
+
+### Example session
 
 ### Example session
 
@@ -190,6 +204,10 @@ magent config reset --yes
 | ----------------------------------------- | ------- | ------- |
 | `compression.max_messages`                | integer | `32`    |
 | `compression.tool_content_max_chars`      | integer | `800`   |
+
+`tool_content_max_chars` counts **characters**, not bytes; `0` disables
+tool-result truncation. The `[...truncated N bytes...]` marker the runner
+writes reports bytes removed, a different unit on purpose.
 
 ### `io.*`
 

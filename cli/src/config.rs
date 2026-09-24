@@ -1447,7 +1447,7 @@ impl<'a> ConfigCmd<'a> {
                 "exists": Path::new(&resolved).exists(),
             }))?;
         } else {
-            let _ = out.stderr_fmt_line(format_args!("{}", resolved));
+            let _ = out.stdout_fmt_line(format_args!("{}", resolved));
         }
         Ok(())
     }
@@ -1467,14 +1467,15 @@ impl<'a> ConfigCmd<'a> {
                 }
             })?)?;
         } else {
-            let _ = out.stderr_fmt_line(format_args!("{}", json));
+            let _ = out.stdout_fmt_line(format_args!("{}", json));
         }
         Ok(())
     }
 
     /// Write the resolved config record to stdout as pretty JSON, in
-    /// both modes, so `magent config export > file` produces a file
-    /// (unlike `show`, whose human output goes to stderr for display).
+    /// both modes. `show` does the same in human mode now; `export`
+    /// remains the JSON-mode-safe spelling (its payload is the
+    /// envelope in JSON mode, the raw record otherwise).
     fn run_export(&self, out: &mut Output) -> Result<(), ConfigError> {
         let record = load()?;
         let json = serde_json::to_string_pretty(&record).map_err(|source| ConfigError::Json {
@@ -1521,14 +1522,14 @@ impl<'a> ConfigCmd<'a> {
             }
             out.write_json(serde_json::Value::Object(map))?;
         } else {
-            let _ = out.stderr_fmt_line(format_args!("{:<40} VALUE", "KEY"));
-            let _ = out.stderr_fmt_line(format_args!("{}", "-".repeat(40 + 30)));
+            let _ = out.stdout_fmt_line(format_args!("{:<40} VALUE", "KEY"));
+            let _ = out.stdout_fmt_line(format_args!("{}", "-".repeat(40 + 30)));
             for (k, v) in flat {
                 let s = match &v {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let _ = out.stderr_fmt_line(format_args!(
+                let _ = out.stdout_fmt_line(format_args!(
                     "{:<40} {}",
                     k,
                     truncate(&s, 60)
@@ -1549,12 +1550,12 @@ impl<'a> ConfigCmd<'a> {
         } else {
             match &value {
                 serde_json::Value::String(s) => {
-                    let _ = out.stderr_fmt_line(format_args!("{}", s));
+                    let _ = out.stdout_fmt_line(format_args!("{}", s));
                 }
                 other => {
                     let pretty = serde_json::to_string_pretty(other)
                         .unwrap_or_else(|_| other.to_string());
-                    let _ = out.stderr_fmt_line(format_args!("{}", pretty));
+                    let _ = out.stdout_fmt_line(format_args!("{}", pretty));
                 }
             }
         }

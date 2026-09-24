@@ -81,7 +81,35 @@ fn init_logger(global: &GlobalFlags) {
     });
 }
 
+/// Restore the default `SIGPIPE` disposition.
+///
+/// Rust's runtime ignores `SIGPIPE` before `main` runs, so a reader that
+/// walks away (`magent run --repl | head`) leaves writes failing with
+/// `EPIPE`. `println!` treats a failed stdout write as fatal and panics,
+/// which turned `… | head` into `exit 101` plus a panic backtrace. Going
+/// back to the default handler restores what every other Unix filter
+/// does: the process is killed by `SIGPIPE` (status 141) and exits
+/// quietly.
+///
+/// This is a process-wide, CLI-wide change by design — the one-shot path
+/// reports write errors through `Output` today, but it has the same
+/// `println!` calls on the trace path, so it has the same latent panic.
+/// `SIGPIPE` is not part of the WASI/Windows API surface, hence the
+/// `cfg(unix)` gate.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: `signal` is async-signal-safe, called once before any
+    // thread or handler exists, and `SIG_DFL` is a valid disposition.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 fn main() -> ExitCode {
+    restore_default_sigpipe();
     let argv: Vec<String> = std::env::args().collect();
 
     let args = match Args::parse(&argv) {

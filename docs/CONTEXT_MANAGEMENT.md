@@ -16,11 +16,13 @@ it.
 LLM call** in `RealAgentRunner::think()` and applies two steps in order:
 
 1. **Tool-result truncation** — any `Message` whose `role == Tool` and
-   whose `content.len() > tool_content_max_chars` is shortened to a
-   `head + marker + tail` window. The marker is
-   `` `[...truncated N bytes...]` `` where `N` is the exact byte count
-   removed. The `tool_call_id` is preserved so the LLM can still
-   correlate the result with the original call.
+   whose `content` is longer than `tool_content_max_chars`
+   **characters** (not bytes) is shortened to a `head + marker + tail`
+   window. The split is 60/40 head/tail, and the byte offsets are chosen
+   on code-point boundaries so multi-byte content is never sliced
+   mid-character. The marker is `` `[...truncated N bytes...]` `` where
+   `N` is the byte count removed. The `tool_call_id` is preserved so the
+   LLM can still correlate the result with the original call.
 
 2. **Message slicing** — once the message list exceeds
    `max_messages`, the runner drops the oldest messages and keeps:
@@ -33,6 +35,12 @@ LLM call** in `RealAgentRunner::think()` and applies two steps in order:
 Truncation only ever shrinks a payload: if the marker's fixed overhead
 would make the rewritten content longer than the original (a very small
 `tool_content_max_chars`), the original is kept unchanged.
+
+> **Bytes vs characters.** The cap is in characters — that is what
+> `--tool-max-chars` and the config key promise — while the marker and
+> `CompressionStats::bytes_saved` report the byte count. Before this was
+> aligned the comparison was against `content.len()`, so an 800-character
+> budget silently kept only ≈266 CJK characters.
 
 The runner logs the compression counters when verbose mode is on:
 
@@ -95,8 +103,8 @@ println!("kept {} dropped {}", stats.kept, stats.dropped);
 ```
 
 `CompressionPolicy::default()` returns the safe defaults (32 messages,
-800 chars per tool result). `CompressionPolicy::disabled()` is a no-op
-policy (both fields `0`).
+800 **characters** per tool result). `CompressionPolicy::disabled()` is a
+no-op policy (both fields `0`).
 
 `RunnerConfig` carries a `compression: CompressionPolicy` field. The
 runner applies it transparently — you don't have to call

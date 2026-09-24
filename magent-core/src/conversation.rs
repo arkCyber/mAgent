@@ -126,32 +126,44 @@ pub struct CompressionStats {
 /// Trim a single tool result's `content` to a head + marker + tail
 /// window. The original `tool_call_id` is preserved.
 ///
+/// The limit is in **characters**, matching the flag name
+/// (`--tool-max-chars`) and the config key
+/// (`compression.tool_content_max_chars`). It used to be compared against
+/// `content.len()`, i.e. bytes, so an 800-character budget only kept ~266
+/// CJK characters — a silent threefold under-truncation for non-ASCII tool
+/// output. The head/tail budgets are still translated to byte offsets so a
+/// slice never lands inside a code point; the marker keeps reporting the
+/// dropped count in bytes, which is what it says.
+///
 /// Returns `true` if the content was actually shortened — callers can
 /// use this to update `CompressionStats`.
 pub fn truncate_tool_content(msg: &mut Message, max_chars: usize) -> bool {
     if max_chars == 0 || msg.role != Role::Tool {
         return false;
     }
-    if msg.content.len() <= max_chars {
+
+    let original_len = msg.content.len();
+    let char_count = msg.content.chars().count();
+    if char_count <= max_chars {
         return false;
     }
 
-    let original_len = msg.content.len();
     // Split the budget 60/40 between head and tail. Head wins because
     // tool outputs (status banners, JSON preamble, schema notes) tend
     // to be most informative at the top.
     let head_budget = (max_chars * 3) / 5;
     let tail_budget = max_chars - head_budget;
 
-    // Find the nearest char boundary at or below head_budget so we
-    // never slice through the middle of a UTF-8 code point.
-    let head_end = floor_char_boundary(&msg.content, head_budget);
-    let tail_start = ceil_char_boundary(&msg.content, original_len.saturating_sub(tail_budget));
+    // Translate the char budgets into byte offsets (`char_count >
+    // tail_budget`, so `char_count - tail_budget` is a valid index).
+    let head_end = byte_offset_after_chars(&msg.content, head_budget);
+    let tail_start = byte_offset_after_chars(&msg.content, char_count - tail_budget);
 
-    // Approximate the dropped count: original_len minus the bytes we kept
-    // (head + tail) minus the marker overhead. The exact number after the
-    // marker is built is irrelevant for telemetry — the substring and tail
-    // are at the user's eye level, the marker is diagnostics.
+    // The dropped count is measured in bytes: that is what the marker
+    // and `CompressionStats::bytes_saved` report. original_len minus the
+    // bytes we kept (head + tail) approximates it before the marker is
+    // built; the tail is at the user's eye level, the marker is
+    // diagnostics.
     let kept_payload = head_end + (original_len - tail_start);
     let marker_approx = original_len.saturating_sub(kept_payload);
 
@@ -160,7 +172,7 @@ pub fn truncate_tool_content(msg: &mut Message, max_chars: usize) -> bool {
     // the placeholder sequence, and `replacen` would then clobber the
     // *user's* bytes instead of the marker. Constructing the marker inline
     // keeps user content untouched.
-    let mut candidate = String::with_capacity(max_chars + 64);
+    let mut candidate = String::with_capacity(original_len);
     candidate.push_str(&msg.content[..head_end]);
     candidate.push_str("\n[...truncated ");
     candidate.push_str(&marker_approx.to_string());
@@ -398,28 +410,11 @@ pub fn gc_to_budget(messages: &mut Vec<Message>, max_bytes: usize) -> Compressio
 // UTF-8 helpers (private)
 // ---------------------------------------------------------------------------
 
-/// Largest index `<= idx` that is a UTF-8 char boundary in `s`.
-fn floor_char_boundary(s: &str, idx: usize) -> usize {
-    if idx >= s.len() {
-        return s.len();
-    }
-    let mut i = idx;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-/// Smallest index `>= idx` that is a UTF-8 char boundary in `s`.
-fn ceil_char_boundary(s: &str, idx: usize) -> usize {
-    if idx >= s.len() {
-        return s.len();
-    }
-    let mut i = idx;
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
+/// Byte offset just past the first `n` characters of `s` — i.e. the byte
+/// slice point that keeps exactly `n` characters. Clamps to `s.len()`
+/// when `s` has fewer than `n` characters. Always a char boundary.
+fn byte_offset_after_chars(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map_or(s.len(), |(i, _)| i)
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +466,38 @@ mod tests {
         assert!(m.content.contains("[...truncated"));
         // The tool_call_id survives so the LLM can still correlate.
         assert_eq!(m.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    /// The cap is in **characters**, not bytes: an 800 "char" budget used
+    /// to keep only ~266 CJK characters, silently under-truncating
+    /// threefold for non-ASCII tool output. `max_chars` characters must now
+    /// survive (modulo the head/tail split), regardless of how many bytes
+    /// they occupy.
+    #[test]
+    fn truncate_caps_characters_not_bytes() {
+        // 2_000 CJK characters = 6_000 bytes. A 300-char cap is well below
+        // the character count but well above nothing in bytes, so a
+        // byte-based cap would have kept ~300 bytes ≈ 100 characters.
+        let body = "测".repeat(2_000);
+        let mut m = tool("call_1", &body);
+        assert!(truncate_tool_content(&mut m, 300));
+
+        let kept_chars = m.content.chars().count();
+        // head(180) + tail(120) = 300 chars, plus the marker line.
+        assert!(
+            (300..400).contains(&kept_chars),
+            "expected ~300 characters kept, got {kept_chars}"
+        );
+        // A byte-based cap would have kept ~100 characters; assert we are
+        // clearly past that, which is the regression this pins.
+        assert!(
+            m.content.len() > 300,
+            "content should be more than 300 bytes of CJK, got {}",
+            m.content.len()
+        );
+        // No code point was sliced in half.
+        assert!(m.content.contains("测"));
+        assert!(std::str::from_utf8(m.content.as_bytes()).is_ok());
     }
 
     #[test]
@@ -734,21 +761,16 @@ mod tests {
     }
 
     #[test]
-    fn floor_char_boundary_handles_multibyte() {
-        // "héllo" — the 'é' is 2 bytes (0xC3 0xA9).
+    fn byte_offset_after_chars_lands_on_code_point_boundaries() {
+        // "héllo" — the 'é' is 2 bytes (0xC3 0xA9), so the first 2
+        // characters occupy 3 bytes.
         let s = "héllo";
-        // Index 2 is in the middle of 'é'.
-        let i = floor_char_boundary(s, 2);
-        assert!(s.is_char_boundary(i));
-        assert_eq!(i, 1);
-    }
-
-    #[test]
-    fn ceil_char_boundary_handles_multibyte() {
-        let s = "héllo";
-        let i = ceil_char_boundary(s, 2);
-        assert!(s.is_char_boundary(i));
-        assert_eq!(i, 3);
+        assert_eq!(byte_offset_after_chars(s, 0), 0);
+        assert_eq!(byte_offset_after_chars(s, 1), 1);
+        assert_eq!(byte_offset_after_chars(s, 2), 3);
+        assert!(s.is_char_boundary(byte_offset_after_chars(s, 2)));
+        // Past the end clamps to the length rather than panicking.
+        assert_eq!(byte_offset_after_chars(s, 99), s.len());
     }
 
     #[test]

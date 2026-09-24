@@ -15,6 +15,7 @@
 //! ├── output.rs      ← human-readable / JSON output formatting
 //! ├── runner.rs      ← `RunCmd` — wires the agent runner + executor
 //! ├── email_executor.rs ← `CompositeExecutor`: SimulatorExecutor + optional MCP email backend
+//! ├── lineedit.rs    ← REPL line editing (pure `LineBuffer` + a termios loop)
 //! ├── prompt.rs      ← `SetPromptCmd` — manages stored system prompts
 //! ├── scheduler.rs   ← concurrency-limited task queue
 //! ├── doctor.rs      ← `doctor` subcommand — environment sanity checks
@@ -30,6 +31,7 @@ pub mod cli;
 pub mod config;
 pub mod doctor;
 pub mod email_executor;
+pub mod lineedit;
 pub mod output;
 pub mod prompt;
 pub mod runner;

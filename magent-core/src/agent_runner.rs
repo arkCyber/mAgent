@@ -1881,6 +1881,11 @@ pub struct RealAgentRunner<E: ToolExecutor> {
     /// can tell whether the window was generated with aggressive or
     /// conservative limits.
     last_compression_policy: Option<crate::summary::CompressionPolicySnapshot>,
+    /// System note queued by [`Self::seed_system_context`], inserted
+    /// immediately after the system prompt at the start of the next run
+    /// and then cleared. See that method for why it cannot be inserted by
+    /// the caller.
+    pending_system_seed: Option<String>,
     /// Whether the ReAct loop should route the next chat through the
     /// configured [`LlmBackend`]. Flipped to `true` automatically by
     /// `probe_ollama_on_run` when the probe succeeds.
@@ -1904,6 +1909,7 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
             config: RunnerConfig::default(),
             last_compression_stats: None,
             last_compression_policy: None,
+            pending_system_seed: None,
             backend_enabled: false,
             backend: Some(Box::new(OllamaClient::new(
                 "http://localhost:11434",
@@ -1938,6 +1944,7 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
             config,
             last_compression_stats: None,
             last_compression_policy: None,
+            pending_system_seed: None,
             backend_enabled: false,
             backend: Some(Box::new(OllamaClient::new(
                 "http://localhost:11434",
@@ -2014,22 +2021,49 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
 
     /// Insert `msg` immediately **after** the leading system prompt.
     ///
-    /// Used by the CLI's `--load-summary <TOPIC>` path to prepend
-    /// a "context from the previous run" note without disturbing
-    /// the user's `--prompt` / `--prompt-name` content. The
-    /// insertion point is `messages[1]` when `messages[0]` is a
-    /// system message (the common case after `ensure_system_prompt`
-    /// has run); otherwise we prepend at the very front.
+    /// The insertion point is `messages[1]` when `messages[0]` is a
+    /// system message; otherwise we prepend at the very front.
     ///
     /// Cheap (one `Vec::insert`) and safe to call multiple times.
     /// Callers that need to inject several messages should batch
     /// them into a single call rather than calling this in a loop.
+    ///
+    /// **Not safe for seeding a run that has not started yet.** On an
+    /// empty conversation there is no system message, so the message
+    /// lands at index 0 — and the next `run()` treats a system message
+    /// with unexpected content at index 0 as a *stale prompt* and
+    /// overwrites it (see `ensure_system_prompt`), or drops it outright
+    /// if it is a plain `run()` and `reset()` cleared the conversation
+    /// first. Use [`Self::seed_system_context`] for that; this method is
+    /// for injecting into a conversation that is already under way.
     pub fn insert_after_system_prompt(&mut self, msg: Message) {
         let pos = match self.messages.first() {
             Some(m) if m.role == Role::System => 1,
             _ => 0,
         };
         self.messages.insert(pos, msg);
+    }
+
+    /// Queue `body` as a system note to be inserted immediately after the
+    /// live system prompt at the start of the next `run()` /
+    /// `run_continuing()`, then forgotten.
+    ///
+    /// This is the reliable way to seed a not-yet-started run — the CLI's
+    /// `--load-summary <TOPIC>` window is the only caller. Applying it
+    /// inside `run_inner`, *after* the conversation reset and the
+    /// `ensure_system_prompt` reconciliation, is what makes it survive
+    /// both of them; injecting it from the caller beforehand does not:
+    ///
+    /// * `run()` calls `reset()`, which clears the conversation, so an
+    ///   early insert is simply gone;
+    /// * `run_continuing()` keeps the conversation, but the note would be
+    ///   at index 0 — where `ensure_system_prompt` sees a system message
+    ///   whose content is not the prompt and overwrites it.
+    ///
+    /// Consumed once, so a multi-turn session gets the note in its history
+    /// rather than re-prepended on every turn.
+    pub fn seed_system_context(&mut self, body: &str) {
+        self.pending_system_seed = Some(body.to_string());
     }
 
     /// Internal: dispatch a `TraceEvent` to the installed sink, or
@@ -2204,6 +2238,25 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         }
     }
 
+    /// Drop the cached "this backend is reachable" verdict so the next
+    /// `run()` probes again instead of reusing the earlier result.
+    ///
+    /// This is what turns `probe_ollama_on_run` from "probe once per
+    /// process" into "probe every run" — the long-lived REPL resets
+    /// the verdict between turns so a backend that came up (or went
+    /// down) mid-session is noticed, rather than the first answer
+    /// being latched for the whole session.
+    ///
+    /// No-op when no backend is wired up, or when
+    /// `probe_ollama_on_run` is off. In the latter case `run()` would
+    /// not probe, so clearing the flag would only silently downgrade
+    /// a working backend to the simulated responder.
+    pub fn reset_backend_probe(&mut self) {
+        if self.backend.is_some() && self.config.probe_ollama_on_run {
+            self.backend_enabled = false;
+        }
+    }
+
     /// Force-disable the backend: nothing is sent to the LLM and every response
     /// comes from the built-in simulated responder.
     ///
@@ -2320,6 +2373,14 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         // message is already there (the `run_continuing` case) — so a
         // multi-turn session doesn't accumulate a system message per turn.
         self.ensure_system_prompt(&system_prompt);
+        // A queued system note (the CLI's `--load-summary` window) lands
+        // right after the prompt. Applied here — after the reset and the
+        // prompt reconciliation above — because that is the only point
+        // where both are guaranteed: `reset()` has already run, and
+        // `ensure_system_prompt` only ever looks at index 0.
+        if let Some(body) = self.pending_system_seed.take() {
+            self.messages.insert(1, Message::system(&body));
+        }
         self.messages.push(Message::user(task));
         self.state = AgentState::Thinking;
 
@@ -4097,6 +4158,231 @@ mod run_react_loop_tests {
             .run("read the temperature")
             .expect_err("a mid-run backend error must propagate");
         assert!(err.contains("LLM backend error"), "unexpected error: {err}");
+    }
+
+    /// A backend whose reachability the test flips between runs, so it
+    /// can prove the runner re-probes rather than latching the first
+    /// verdict for the life of the runner.
+    struct FlakyLlm {
+        reachable: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        probes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LlmBackend for FlakyLlm {
+        fn check_connection(&self) -> bool {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.reachable.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn chat_with_messages(
+            &mut self,
+            _messages: &[Message],
+            _sampling: SamplingParams,
+        ) -> std::result::Result<String, String> {
+            Ok(r#"{"result":"LIVE_BACKEND"}"#.to_string())
+        }
+
+        fn provider(&self) -> LlmProvider {
+            LlmProvider::Ollama
+        }
+
+        fn model(&self) -> &str {
+            "flaky"
+        }
+
+        fn base_url(&self) -> &str {
+            "flaky://llm"
+        }
+    }
+
+    /// Every chat request's message list, in order.
+    type CapturedRequests = std::sync::Arc<std::sync::Mutex<Vec<Vec<Message>>>>;
+
+    /// Records the message list of every chat request, so a test can
+    /// assert what the model was actually shown.
+    struct CapturingLlm {
+        seen: CapturedRequests,
+    }
+
+    impl LlmBackend for CapturingLlm {
+        fn check_connection(&self) -> bool {
+            true
+        }
+
+        fn chat_with_messages(
+            &mut self,
+            messages: &[Message],
+            _sampling: SamplingParams,
+        ) -> std::result::Result<String, String> {
+            self.seen.lock().unwrap().push(messages.to_vec());
+            Ok(r#"{"result":"seen"}"#.to_string())
+        }
+
+        fn provider(&self) -> LlmProvider {
+            LlmProvider::Ollama
+        }
+
+        fn model(&self) -> &str {
+            "capture"
+        }
+
+        fn base_url(&self) -> &str {
+            "capture://llm"
+        }
+    }
+
+    fn capturing_runner() -> (RealAgentRunner<SimulatorExecutor>, CapturedRequests) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = RealAgentRunner::new(SimulatorExecutor::new());
+        runner.set_backend(CapturingLlm { seen: seen.clone() });
+        runner.force_enable_backend();
+        (runner, seen)
+    }
+
+    /// The note must be the *second* message: after the system prompt and
+    /// ahead of the task. Index 0 is checked by content, not role, because
+    /// the bug this guards against put the note *at* index 0.
+    fn assert_note_builtin_second(msgs: &[Message], note: &str) -> bool {
+        msgs.len() >= 3
+            && msgs[0].role == Role::System
+            && !msgs[0].content.contains(note)
+            && msgs[1].content.contains(note)
+    }
+
+    #[test]
+    fn a_seeded_system_context_reaches_the_model_on_a_plain_run() {
+        let (mut runner, seen) = capturing_runner();
+        runner.seed_system_context("PRIOR_RUN_NOTE");
+
+        runner.run("do the thing").unwrap();
+
+        let reqs = seen.lock().unwrap();
+        let first = &reqs[0];
+        assert!(
+            assert_note_builtin_second(first, "PRIOR_RUN_NOTE"),
+            "the seed did not land after the system prompt: {:?}",
+            first.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_seeded_system_context_survives_continuing_runs_and_is_not_repeated() {
+        let (mut runner, seen) = capturing_runner();
+        runner.seed_system_context("PRIOR_RUN_NOTE");
+
+        runner.run_continuing("first task").unwrap();
+        runner.run_continuing("second task").unwrap();
+
+        let reqs = seen.lock().unwrap();
+        let first = &reqs[0];
+        assert!(
+            assert_note_builtin_second(first, "PRIOR_RUN_NOTE"),
+            "the seed was dropped on the first continuing run: {:?}",
+            first.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+
+        // The note is a one-shot seed: after two turns it is in the history
+        // exactly once, not re-prepended each turn.
+        let last = reqs.last().unwrap();
+        assert_eq!(
+            last.iter()
+                .filter(|m| m.content.contains("PRIOR_RUN_NOTE"))
+                .count(),
+            1,
+            "the seed was re-inserted on the following turn"
+        );
+    }
+
+    #[test]
+    fn insert_after_system_prompt_on_an_empty_conversation_is_the_trap() {
+        // Documents *why* `seed_system_context` exists rather than the
+        // caller doing this: on an empty conversation the note lands at
+        // index 0, and the next `run()` overwrites it with the prompt.
+        let (mut runner, seen) = capturing_runner();
+        runner.insert_after_system_prompt(Message::system("PRIOR_RUN_NOTE"));
+
+        runner.run("do the thing").unwrap();
+
+        let reqs = seen.lock().unwrap();
+        let first = &reqs[0];
+        assert!(
+            !first.iter().any(|m| m.content.contains("PRIOR_RUN_NOTE")),
+            "the trap no longer exists — `insert_after_system_prompt` \
+             unexpectedly preserved the note: {:?}",
+            first.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reset_backend_probe_makes_the_next_run_probe_again() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let reachable = std::sync::Arc::new(AtomicBool::new(true));
+        let probes = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut runner = RealAgentRunner::new(SimulatorExecutor::new());
+        runner.set_backend(FlakyLlm {
+            reachable: reachable.clone(),
+            probes: probes.clone(),
+        });
+        runner.config_mut().probe_ollama_on_run = true;
+        runner.config_mut().compression = crate::conversation::CompressionPolicy::disabled();
+
+        runner.run("first").unwrap();
+        assert_eq!(probes.load(Ordering::SeqCst), 1, "the first run must probe");
+
+        // The verdict is cached: a second run on the same runner reuses it.
+        runner.run("second").unwrap();
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            1,
+            "the cached verdict should be reused"
+        );
+
+        // The REPL resets the verdict between turns, so a backend that
+        // dropped mid-session is noticed instead of being used anyway.
+        runner.reset_backend_probe();
+        reachable.store(false, Ordering::SeqCst);
+        let err = runner
+            .run("third")
+            .expect_err("a dead backend must not be reused silently");
+        assert!(err.contains("unreachable"), "unexpected error: {err}");
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "the reset run must have re-probed"
+        );
+    }
+
+    #[test]
+    fn reset_backend_probe_is_a_noop_without_a_wired_backend() {
+        let mut runner = RealAgentRunner::new(SimulatorExecutor::new()).without_backend();
+        runner.config_mut().probe_ollama_on_run = true;
+
+        // No backend to probe: the deliberate simulation path must survive.
+        runner.reset_backend_probe();
+        let out = runner
+            .run("read the temperature")
+            .expect("no-backend simulation must still run");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn reset_backend_probe_will_not_downgrade_a_probe_less_runner() {
+        // `force_disable_backend` clears `probe_ollama_on_run`, so a
+        // reset must be a no-op — otherwise it would clear
+        // `backend_enabled` and `run()` would never re-enable it,
+        // silently turning an explicitly-live backend into the
+        // simulated responder.
+        let mut runner = runner_with_mock(vec![r#"{"result":"MOCK_FINAL_ANSWER_42"}"#.to_string()]);
+        runner.config_mut().probe_ollama_on_run = false;
+
+        runner.reset_backend_probe();
+        let result = runner.run("what is the temperature?").unwrap();
+        assert_eq!(
+            result, "MOCK_FINAL_ANSWER_42",
+            "the wired backend must still be used after a reset"
+        );
     }
 
     #[test]

@@ -13,6 +13,315 @@ here. Dates use `YYYY-MM-DD` and follow ISO 8601. Versions follow
 
 ## [Unreleased]
 
+### Fixed (2026-09-24) — a scripted `--repl` session now reports failure through its exit code
+- **`printf 'do the thing\nq\n' | magent run --repl` exited 0 even when the
+  task errored.** A failed task printed `✗ Error: …` to stderr and the loop
+  carried on; at quit, `execute_repl` always returned `Ok(RunReport)`, which
+  `main` maps to `ExitCode::SUCCESS`. So a *scripted* session — stdin is not a
+  terminal, nobody reads the transcript — had no way to detect the failure,
+  unlike the one-shot path where the same error propagates and exits 1. The
+  session now counts failures and, **only when stdin is not a terminal**,
+  returns the new `RunError::ReplTaskFailed { failed, total }` at the end
+  (`error: \`magent run --repl\` was driven from non-interactive stdin and 1 of
+  1 task(s) failed — exiting non-zero so a scripted session can detect it`).
+  A human at a terminal still exits 0: quitting an interactive session is
+  success, and the transcript already showed the failure.
+  Guarded by `scripted_repl_exits_non_zero_after_a_failed_task` and
+  `scripted_repl_exits_zero_when_every_task_succeeds`; the interactive
+  exit-0 path was verified under a real pty.
+  Exposing the exit code also surfaced a latent test bug:
+  `repl_honours_the_max_messages_cap` drove its session **without `--mock`**,
+  so it depended on whatever LLM happened to be reachable — against a local
+  Ollama answering 401 all four tasks failed and the new non-zero exit
+  tripped its `assert!(out.status.success())` — and it had been passing
+  vacuously, since a failed task appends nothing to the conversation, so
+  the `--max-messages` cap it exists to check was never under pressure. It
+  now runs `--mock`, like every other REPL test, so the session really
+  accumulates and the cap has teeth (17 messages uncapped vs 3 at
+  `--max-messages 2`).
+- **The REPL help now states that `history` records tasks only**, not
+  commands (`history, hist Show task history (tasks, not commands)` plus a
+  prose note) — the behaviour `retry` depends on, and the reason `history`'s
+  numbering matches `Tasks run` in `stats`. Documentation only.
+
+### Fixed (2026-09-24) — human-mode data now goes to stdout
+- **`magent config show > backup.json` wrote a zero-byte file.** In human mode
+  `config where` / `show` / `list` / `get` and `set-prompt show` / `list`
+  rendered their payload through `Output::stderr_fmt_line`, i.e. to **stderr**,
+  while the same commands' `--json` output went to **stdout** — so the stream
+  depended on the mode rather than on the command, and every redirect silently
+  produced an empty file. All six now write through the new
+  `Output::stdout_fmt_line`, so `magent config show > backup.json`,
+  `magent config list | grep ollama` and `magent set-prompt show foo | jq .provider`
+  work in both modes.
+  Diagnostics stay on stderr: confirmations (`config set`, `config init`), the
+  `config validate` verdict, warnings, and the `scheduler status` labelled
+  trace. `Output::stdout_fmt_line` mirrors `stderr_fmt_line` exactly (same
+  `format_args!` contract, same no-op under `--json`), so a call site's stream
+  choice is now the only thing that encodes data-vs-diagnostic — documented
+  under "OUTPUT STREAMS" in `config --help` and `set-prompt --help`, and in
+  `docs/CONFIG.md`.
+  Guarded by `cli/tests/streams.rs`, which spawns the real binary and asserts
+  on stdout and stderr separately (the unit tests can't observe the bug, since
+  `Output` holds the process's real locks). Mutation-checked.
+- `web3 list`/`identity`/`did`/`pubkey` are deliberately unchanged (their human
+  form is a display table reached through `--json` for data), as is
+  `scheduler status` (a labelled trace by construction).
+
+### Fixed (2026-09-24) — three CLI-surface inconsistencies
+- **`--tool-max-chars` now counts characters, not bytes.** The limit was
+  applied as `msg.content.len() <= max_chars`, so an 800-"char" budget kept
+  only ≈266 CJK characters — a silent threefold under-truncation for
+  non-ASCII tool output (one-shot and REPL alike). `truncate_tool_content`
+  now counts `chars()` and maps the 60/40 head/tail budgets onto code-point
+  boundaries, so the flag, the config key
+  (`compression.tool_content_max_chars`) and the core parameter all mean what
+  they say. ASCII payloads are unaffected. The `[...truncated N bytes...]`
+  marker and `CompressionStats::bytes_saved` still report **bytes**, which is
+  what they claim. Docs realigned (`run --help`, `config --help`,
+  `docs/CONFIG.md`, `docs/CONTEXT_MANAGEMENT.md`, whose
+  "`content.len() > tool_content_max_chars`" line was the old semantics
+  stated outright). Pinned by `truncate_caps_characters_not_bytes`.
+  (Renaming the flag to `--tool-max-bytes` was rejected: the config key and
+  the summary record's `policy` field are on-disk formats, so a rename would
+  silently drop existing values.)
+- **`scheduler --timezone <TZ>` no longer accepts a value it cannot honour.**
+  `utc`/`UTC` mapped to `Utc` and *everything else* to `Local`, so
+  `--timezone Bogus/Zone` ran happily and silently moved the cron wall clock;
+  the help meanwhile advertised IANA names. It now accepts only
+  `utc`/`local` (absent ⇒ local) and rejects anything else with
+  `scheduler daemon: --timezone expects \`utc\` or \`local\`, got \`X\``.
+  Honouring real IANA names would need a tz database, and the CLI takes no
+  new dependencies. Two stale claims were removed: the
+  `SchedulerTimezone::Local` doc's `$MAGENT_TIMEZONE` reading (never
+  implemented) and the help's IANA clause. The daemon usage synopsis also
+  gained the `--cron` / `--at` / `--timezone` it was missing. Pinned by
+  `scheduler_rejects_a_timezone_it_cannot_honour`.
+- **`magent run --prompt /nope.txt` printed the path twice.**
+  `runner::load_prompt_file` stringified its error as `"{path}: {io}"` and
+  `PromptError::PromptFileLoad` prefixed the same path again, giving
+  `could not load system prompt: /nope.txt: /nope.txt: No such file or
+  directory (os error 2)`. The loader now returns the bare `io::Error`, so
+  the path appears once. Pinned by
+  `prompt_file_load_error_names_the_path_exactly_once`.
+
+### Fixed (2026-09-24) — usage errors no longer read "unknown flag: …"
+- **`ParseError::UnknownFlag` was the CLI's catch-all.** Roughly eighty-five
+  call sites used it for *any* usage error — a missing positional, two
+  mutually exclusive flags, an unknown sub-action — while its `Display`
+  prefixes `unknown flag: `. Two mutually exclusive scheduler flags therefore
+  produced the nonsense sentence
+  `error: unknown flag: scheduler daemon: --interval, --cron, and --at are
+  mutually exclusive; pass exactly one`.
+  New `ParseError::Usage(String)` renders its message **verbatim**, and the
+  non-flag sites were migrated to it. The genuinely flag-shaped sites keep
+  `UnknownFlag`, so `magent run --bogus`, `magent run -温度 hi`,
+  `magent doctor x`, and `magent version x` still print `unknown flag: …`.
+  Exit code is unchanged (2); the change is diagnostics-only.
+- **A mistyped subcommand is no longer reported as a flag.** `magent
+  frobnicate` used to say `unknown flag: frobnicate`; it now says
+  `unknown subcommand: frobnicate (try \`help\` for the list of subcommands)`.
+  A build without the `web3` feature special-cases the token it was compiled
+  without: `magent web3 …` →
+  `unknown subcommand: web3 (this binary was built without the \`web3\` feature)`
+  (`unknown_subcommand_message`), instead of implying `web3` is a mistyped flag.
+- **`help <topic>`** for a topic that is neither a subcommand nor a known help
+  topic now answers `no help for \`<topic>\` — try \`help run\`, …`, not
+  `unknown flag: help …`.
+- Four new unit tests in `cli/src/cli.rs` pin the taxonomy: `Usage` renders
+  verbatim with no prefix, an unknown subcommand is named as one, the
+  `help <topic>` message, and the non-`web3`-build message. Verified live
+  against both a default and a `--features web3` build.
+- The `--json` contract is now stated on `GlobalFlags::json`: "`--json` ⇒
+  parseable stdout" applies to *data* commands, not all of them — `help` and
+  the `--help` texts stay human-readable prose by design.
+
+### Added (2026-09-24) — the REPL has line editing and ↑/↓ history recall
+- **`read_repl_line` was a bare `stdin.read_line`.** A typo could only be
+  fixed with the terminal's own erase key, and ↑/↓ arrived as the literal
+  bytes `ESC [ A` / `ESC [ B` — which the dispatcher then submitted to the
+  LLM as a *task*. (`ReplSession::get_history_entry` and its `history_pos`
+  field had been sitting `#[allow(dead_code)]` since the feature was
+  sketched; both are now gone, since the browse position is per-read state
+  and lives in the editor.)
+  New `cli/src/lineedit.rs`, in two deliberately separate pieces:
+  * `LineBuffer` — a pure `Vec<char>` + cursor with `insert`, `backspace`,
+    `delete_forward`, `move_left/right/home/end`, `kill_to_end/start/word`.
+    Cursor math is in **chars**, so multi-byte input edits correctly.
+  * `read_line` — the terminal loop. On a TTY it clears `ICANON | ECHO`
+    via `tcgetattr`/`tcsetattr` (`libc`, already a `cfg(unix)` dependency
+    for the SIGPIPE fix), feeds each key to the buffer, and redraws with
+    `\r ESC[K prompt text ESC[nD`. `ISIG` is deliberately **left set**, so
+    Ctrl-C still signals the foreground process group and kills the REPL
+    exactly as before — verified under a pty, not assumed. The terminal is
+    restored by an RAII guard, so a panic cannot leave the shell in raw
+    mode.
+  Bindings: ←/→, ↑/↓, Home/End, Delete, Ctrl-A/B/E/F/K/U/W/L, and Ctrl-D
+  (delete-forward mid-line, end-of-input on an empty line) — documented in
+  the `help` box, whose rows stay rectangular.
+  Two behaviours that had to be preserved, both pinned by tests:
+  * **Piped input keeps working byte-for-byte.** Anywhere stdin is not a
+    TTY the original `read_line` path runs unchanged, which is how every
+    existing test drives the REPL.
+  * **A pipe ending without a trailing newline still runs its last
+    command** (`printf 'help' | magent run --repl`). EOF now hands back a
+    non-empty buffer instead of discarding it; only an empty buffer means
+    end-of-input. The `read_line` this replaced returned those partial
+    bytes too.
+  Raw mode is entered only when `io::stdin().is_terminal()`, and a failed
+  `tcgetattr`/`tcsetattr` falls back to the plain read rather than costing
+  the user the session. Verified end to end against a real pty: left-arrow
+  insertion, Ctrl-A/Ctrl-E, and ↑ recall of the previous task all produced
+  the expected redraws and ran the right tasks.
+  Tested without a pty by splitting the loop into `tty::edit` over a
+  generic `R: Read`/`W: Write`, so the whole keymap is driven from a
+  `Cursor<Vec<u8>>`: 37 unit tests in `lineedit.rs` (16 over `LineBuffer`,
+  21 over `edit`) plus one integration test for the no-trailing-newline
+  pipe. Mutation-checked — dropping the draft-restore in history recall
+  fails two tests.
+
+### Fixed (2026-09-24) — a closed stdout turned `magent run --repl` into a panic
+- **`magent run --repl | head` exited 101 with a Rust panic instead of
+  stopping quietly.** Rust's runtime installs `SIG_IGN` for `SIGPIPE`
+  before `main`, so when the reader walks away the next write fails with
+  `EPIPE` rather than killing the process. `println!` treats a failed
+  stdout write as fatal: `thread 'main' panicked at …/stdio.rs:1166: failed
+  printing to stdout: Broken pipe (os error 32)`, exit 101. Every Unix
+  filter does the opposite, and a pager or `head` quitting early is
+  normal, not an error.
+  `main()` now calls `restore_default_sigpipe()` as its first statement,
+  setting the disposition back to `SIG_DFL` via `libc::signal`. The
+  process is then killed by the signal (status 141) and exits without a
+  panic. It is a CLI-wide, process-wide change on purpose: the REPL's
+  trace path is not the only place with `println!`, so the one-shot path
+  had the same latent panic. `libc` is a `cfg(unix)`-only dependency used
+  for nothing else; a `#[cfg(not(unix))]` stub keeps other targets
+  building, since `SIGPIPE` is a POSIX concept. Verified live —
+  `yes help | head -500 | magent run --repl --mock` went from
+  `pipestatus=0 101 0` + panic on stderr to `141 0 0` with clean stderr —
+  and covered by `repl_is_not_killed_by_a_rust_panic_when_stdout_closes`
+  (fails with exit 101 when the call is removed).
+
+### Fixed (2026-09-24) — `--load-summary` never reached the model, on **either** path
+- **The stored window was read, announced, and then discarded before the
+  first LLM call.** Found while implementing the flag in the REPL: the
+  injected note never survived to the request. Two independent reasons,
+  one per path, both a direct consequence of *when* the CLI inserts it —
+  at step 3.5, before the runner starts:
+  * **One-shot**: the next call is `runner.run(&task)`, whose `run_inner`
+    begins with `reset()` — and `reset()` clears the conversation. The
+    note was gone before `ensure_system_prompt` ever ran. Verified with a
+    local stand-in Ollama that logs the request body: the first request
+    contained only the system prompt and the task.
+  * **REPL**: `run_continuing()` keeps the conversation, but on a
+    still-empty one `insert_after_system_prompt` puts the note at index 0
+    (there is no system message yet for it to go after). `ensure_system_prompt`
+    then sees a system message whose content is not the prompt, reads it as
+    a *stale prompt*, and overwrites it in place.
+  The fix moves the insertion into `run_inner`, where both hazards are
+  behind it: `RealAgentRunner::seed_system_context(body)` queues the note,
+  and `run_inner` applies it at index 1 right after the prompt is
+  reconciled — after `reset()`, and at the one index `ensure_system_prompt`
+  never touches. It is consumed once, so a multi-turn session keeps the
+  note in its history instead of re-prepending it every turn.
+  `insert_after_system_prompt` keeps its existing behaviour (it is still
+  the right tool mid-session) but now documents the trap.
+  End-to-end verified against the stand-in Ollama: one-shot and REPL turns
+  1 and 2 all show `system prompt | previous-run note | task`, with exactly
+  one copy of the note. Covered by
+  `a_seeded_system_context_reaches_the_model_on_a_plain_run` (fails when the
+  apply step is stubbed out), the same for `run_continuing` plus a
+  no-duplication assertion, and
+  `insert_after_system_prompt_on_an_empty_conversation_is_the_trap`
+  (pins the old behaviour so the trap is not rediscovered).
+
+### Added (2026-09-24) — the REPL honours `--load-summary`
+- **The flag is no longer listed under `--repl ignores`.** `execute_repl`
+  now loads the stored record and seeds the session, so
+  `magent run --repl --load-summary coach` continues where the previous run
+  left off instead of warning that it dropped the flag. A missing topic is
+  a warning (the REPL cannot be in JSON mode, so there is no hard-error case
+  to mirror from the one-shot path) and does not stop the session.
+  `render_summary_context` is shared with the one-shot path, so both render
+  the note identically. Covered by `repl_load_summary_is_honoured_and_reported`
+  (load reported, nothing dropped, missing topic named) and
+  `repl_keeps_the_loaded_summary_across_a_turn` (a differential message
+  count against the same script without the flag — fails when the seeding is
+  removed). `--save-summary` is still warned about: a REPL has no "end of
+  run" to hang a save off.
+
+### Fixed (2026-09-24) — `--probe-ollama` was a no-op, and `--mock` silently overrode it
+- **The flag promised "probe on every `run()` call" and changed nothing.**
+  `opts.probe_ollama` was set by the flag and by
+  `config.runner.probe_ollama_on_run`, and `apply_config_overrides` dutifully
+  mirrored the config onto it — but neither `build_runner` nor `execute_repl`
+  ever read the field, because both hard-code
+  `probe_ollama_on_run: !opts.mock`. In non-mock runs the runner already
+  probed once, so the flag's only possible effect was one it never had; in
+  mock runs it contradicted the mode it was combined with and was dropped
+  without a word.
+  The flag now means what it says. Both the one-shot and REPL paths stop
+  calling `force_disable_backend()` on a failed startup probe when it is set
+  — that call also clears `probe_ollama_on_run`, which was what froze a
+  whole session into simulation — leaving the backend wired so `run()` reports
+  `LLM backend unreachable` instead of answering from the canned responder.
+  The REPL additionally resets the cached verdict between turns via the new
+  `RealAgentRunner::reset_backend_probe()`, so a backend that comes up (or
+  drops) mid-session is noticed rather than the first answer being latched.
+  A probe that cannot be honoured at all (no API key, unbuildable client) now
+  says so on stderr instead of failing silently, and `--probe-ollama --mock`
+  is rejected up front as `ParseError::ProbeWithMock` — one insists the LLM
+  be reachable, the other refuses to contact it. **Behaviour change**: a
+  config that sets `runner.probe_ollama_on_run = true` now inherits the strict
+  behaviour, since the CLI already treated the two as the same switch; the
+  default is `false`, so only explicit opt-ins are affected.
+  Covered by `reset_backend_probe_makes_the_next_run_probe_again` (a flaky
+  backend, verified to fail when the reset is stubbed out),
+  `reset_backend_probe_is_a_noop_without_a_wired_backend`,
+  `reset_backend_probe_will_not_downgrade_a_probe_less_runner`,
+  `probe_ollama_with_mock_is_rejected` (both flag orders, plus the REPL),
+  `probe_ollama_alone_is_accepted`, and the REPL end-to-end
+  `repl_probe_ollama_refuses_to_simulate_a_dropped_backend` — which pins the
+  contrast against the unflagged run and asserts no simulated answer leaks
+  into the transcript.
+
+### Fixed (2026-09-24) — the REPL's boxes were ragged, and a one-word task could be shadowed by a command name
+- **Box-drawing rows used byte length as their column count.** `print_welcome_banner`,
+  `print_repl_stats`, `print_repl_help` and `print_repl_tools` padded with
+  `REPL_BOX_WIDTH - text.len()`, so every row containing a non-ASCII glyph —
+  the `🤖` in the banner, the `──` rules in the help and tools boxes — was
+  short (bytes ≥ columns) and the right border wandered. Padding now goes
+  through `display_width` / `char_display_width`, a small table covering the
+  ranges the REPL actually prints; this keeps `unicode-width` out of the CLI's
+  dependency set. Covered by `repl_boxes_are_rectangular`, which asserts every
+  `║`/`╔`/`╚`/`╠` row of a `help`+`stats`+`tools` session is exactly 64 display
+  columns — verified to fail both against a wrong pad and against a byte-length
+  `display_width`.
+- **`alias <name>` now resolves a name; `!<task>` forces a task.** `alias`
+  ignored its argument and reprinted the fixed table, so a user asking
+  `alias hist` learned nothing. It now expands the name through
+  `alias_lookup` (`hist → history (alias)`, `help is a command (no alias
+  needed)`, and a miss is named). Separately, the whole-line dispatch rule
+  made a single-word task unreachable whenever it collided with a built-in
+  name: `help` always ran the command. A leading `!` escapes that —
+  `!help` runs `"help"` as a task — and a bare `!` explains itself. The help
+  box documents both. Covered by `repl_alias_with_an_argument_resolves_that_name`
+  and `repl_bang_prefix_forces_a_builtin_word_to_be_a_task`.
+
+### Tests (2026-09-24) — the REPL's aliases and case-folding were undocumented by tests
+- **Every alias the `help` box advertises now has to reach its arm.** The
+  aliases (`?`, `cls`, `hist`, `rerun`, `exit`, `q`) live in the `match`
+  patterns rather than a table, so dropping one leaves `help` advertising a
+  name that answers `Unknown command` — and no test typed them. Added
+  `repl_aliases_reach_the_same_arms_as_their_canonical_spellings` (seed a
+  task, then drive `?`, `cls`, `hist`, `rerun`, `exit`), verified to fail
+  when `| "?"` is removed from the help arm. Also added
+  `repl_commands_are_case_insensitive` (`STATS` / `Hist` / `Quit` — the
+  dispatcher matches on `cmd.to_lowercase()`, pinned for the first time;
+  fails if the fold is removed) and `repl_exit_stops_reading_further_input`
+  (a task written after `exit` must not run; fails if `exit` returns
+  `Continue`). REPL integration tests: 28 → 31.
+
 ### Fixed (2026-09-24) — `--tool-max-chars` could *grow* a tool result instead of capping it
 - **A small budget inflated the very payload it was meant to cap, and the
   savings counter under-reported.** `truncate_tool_content` rewrites an

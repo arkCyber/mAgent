@@ -305,7 +305,17 @@ reaches disk.
 * `--load-summary <TOPIC>` — load the stored record for `<TOPIC>`
   and inject its `head_tail_window` as a system note immediately
   after the live system prompt. A missing topic is a warning in
-  Human mode and a hard error in `--json` mode.
+  Human mode and a hard error in `--json` mode. `run --repl` honours
+  the flag too: the note seeds the session's first turn and then stays
+  in its history. There a missing topic is always a warning, because the
+  REPL cannot be in JSON mode.
+
+The injection is queued with `RealAgentRunner::seed_system_context()` and
+applied by the runner at the start of the next run, once the system prompt
+is in place. Inserting it from the caller does not work: `run()` resets the
+conversation before the prompt is written, and on the REPL path an early
+insert lands at index 0, where the prompt reconciliation overwrites it as a
+stale prompt.
 
 ```sh
 # First run: persist the compressed tail.
@@ -313,6 +323,9 @@ magent run --save-summary coach_session "Track my morning run"
 
 # Second run: continue from where the last one left off.
 magent run --load-summary coach_session "Now compare with yesterday"
+
+# Or continue interactively, with the same window as background.
+magent run --repl --load-summary coach_session
 ```
 
 The injected system note is rendered by `render_summary_context()`

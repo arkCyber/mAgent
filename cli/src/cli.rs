@@ -45,11 +45,13 @@
 //! * `--prompt-name <NAME>` — Use a prompt stored via `magent set-prompt set <NAME>`. Wins over `--prompt`.
 //! * `-q`, `--quiet` — Suppress step-by-step output (final answer only).
 //! * `--mock` — Skip the LLM entirely; use canned responses.
-//! * `--probe-ollama` — Force a fresh LLM probe on every `run()` call.
+//! * `--probe-ollama` — Force a fresh LLM probe on every `run()` call, and
+//!   refuse the simulated fallback when it fails. Mutually exclusive with
+//!   `--mock`.
 //! * `--temperature <F>` — Sampling temperature (default 0.3).
 //! * `--num-predict <N>` — LLM `max_tokens` (default 512).
 //! * `--max-messages <N>` — Cap the live conversation history (default 32). `0` disables.
-//! * `--tool-max-chars <N>` — Cap each tool result's `content` length (default 800). `0` disables.
+//! * `--tool-max-chars <N>` — Cap each tool result's `content` at `N` characters (default 800). `0` disables.
 //! * `--json` — Emit a single JSON envelope with the result + stats.
 //! * `--no-color` — Disable ANSI colour even on a TTY.
 //!
@@ -91,6 +93,15 @@ pub struct Args {
 /// Flags that apply to every subcommand.
 #[derive(Debug, Clone, Default)]
 pub struct GlobalFlags {
+    /// `--json` — emit the command's *data* as a single JSON envelope on
+    /// stdout instead of human prose.
+    ///
+    /// The contract is "data commands emit parseable JSON on stdout", not
+    /// "everything becomes JSON": `help`, the `*-help` texts and the
+    /// usage error on stderr are deliberately human-readable, so
+    /// `magent --json help` still prints the prose help. Scripts
+    /// redirecting stdout should therefore only rely on it for the
+    /// commands that document a `--json` shape.
     pub json: bool,
     pub no_color: bool,
     /// `--verbose` / `-v` — turn on debug-level `env_logger` output.
@@ -197,6 +208,9 @@ pub struct RunOptions {
     /// Skip LLM entirely.
     pub mock: bool,
     /// Probe LLM on every run, even after the first successful connect.
+    /// A failed probe is an error rather than a silent fall back to the
+    /// simulated responder, so a session never reports canned text as if
+    /// the model had produced it. Rejected together with `--mock`.
     pub probe_ollama: bool,
     /// Sampling temperature. `None` → fall through to the config
     /// file (and finally the built-in default).
@@ -313,10 +327,27 @@ pub enum ParseError {
     /// is entered — so `--repl` would be silently dropped.
     #[cfg(feature = "web3_app")]
     ReplVerifySigned,
+    /// `--probe-ollama` was combined with `--mock`. One insists the
+    /// LLM be reachable before answering; the other refuses to
+    /// contact it at all. Honouring either would silently drop the
+    /// other, so reject the pair.
+    ProbeWithMock,
     /// `run` was given more than one positional argument.
     TooManyPositional { expected: usize, got: usize },
     /// An unrecognised flag was passed.
     UnknownFlag(String),
+    /// Any other usage error — a missing positional, an unknown
+    /// sub-action, two mutually exclusive flags, a subcommand this
+    /// binary was not built with.
+    ///
+    /// Kept separate from [`ParseError::UnknownFlag`] because the
+    /// `Display` impl prefixes that variant with `unknown flag: `,
+    /// which turned every usage error into a nonsense sentence:
+    /// `unknown flag: scheduler daemon: --interval, --cron, and --at are
+    /// mutually exclusive`, or `unknown flag: web3 new: missing <NAME>`.
+    /// These messages are already complete sentences and are rendered
+    /// verbatim.
+    Usage(String),
 }
 
 impl std::fmt::Display for ParseError {
@@ -353,10 +384,15 @@ impl std::fmt::Display for ParseError {
                 f,
                 "`magent run --repl` is interactive and `--verify-signed` only verifies an envelope (the REPL would never start) — pick one"
             ),
+            ParseError::ProbeWithMock => write!(
+                f,
+                "`--probe-ollama` requires a reachable LLM while `--mock` never contacts one — drop one of them"
+            ),
             ParseError::TooManyPositional { expected, got } => {
                 write!(f, "expected {} positional arg(s), got {}", expected, got)
             }
             ParseError::UnknownFlag(s) => write!(f, "unknown flag: {}", s),
+            ParseError::Usage(s) => write!(f, "{}", s),
         }
     }
 }
@@ -555,9 +591,13 @@ impl Args {
                     Some("doctor") => Command::DoctorHelp,
                     #[cfg(feature = "web3")]
                     Some("web3") => Command::Web3Help,
+                    // `help <topic>` where the topic is not a subcommand.
+                    // Rendering this as an unknown *flag* gave
+                    // `unknown flag: help --bogus-xyz`.
                     Some(other) => {
-                        return Err(ParseError::UnknownFlag(format!(
-                            "help {}",
+                        return Err(ParseError::Usage(format!(
+                            "no help for `{}` — try `help run`, `help set-prompt`, `help summary`, \
+                             `help config`, `help scheduler`, or `help doctor`",
                             other
                         )))
                     }
@@ -579,9 +619,28 @@ impl Args {
                     global,
                 })
             }
-            other => Err(ParseError::UnknownFlag(other.to_string())),
+            // An unrecognised subcommand. This used to be reported as an
+            // unknown *flag*, so a build without the `web3` feature
+            // answered `magent web3 …` with `unknown flag: web3` — as if
+            // `web3` were a mistyped flag rather than a subcommand that
+            // this binary does not have.
+            other => Err(ParseError::Usage(unknown_subcommand_message(other))),
         }
     }
+}
+
+/// Message for a subcommand this binary does not recognise, singling out
+/// the ones that exist but are compiled out by a feature flag.
+fn unknown_subcommand_message(token: &str) -> String {
+    // `web3` / `blockchain` subcommands are gated behind features that are
+    // off by default, so "unknown" usually means "not built in".
+    #[cfg(not(feature = "web3"))]
+    if token == "web3" {
+        return format!(
+            "unknown subcommand: {token} (this binary was built without the `web3` feature)"
+        );
+    }
+    format!("unknown subcommand: {token} (try `help` for the list of subcommands)")
 }
 
 /// Internal return type for `parse_run_args` so we can distinguish
@@ -787,6 +846,12 @@ fn parse_run_args<'a>(
     // ignored: `execute()` enters the REPL as soon as `repl_mode` is
     // set, so the task would never run and the user would be none the
     // wiser.
+    // `--probe-ollama` demands a live LLM on every run; `--mock` answers
+    // from canned responses without contacting one. Whichever won, the
+    // other would be silently dropped, so refuse the pair.
+    if opts.probe_ollama && opts.mock {
+        return Err(ParseError::ProbeWithMock);
+    }
     if opts.repl_mode && !opts.task.is_empty() {
         return Err(ParseError::ReplWithTask);
     }
@@ -826,7 +891,7 @@ enum SetPromptParseOutcome {
 /// The grammar is intentionally narrow — five positional actions,
 /// each with its own flag set — because `set-prompt` is a
 /// maintenance command, not an interactive loop. Anything weird
-/// surfaces as [`ParseError::UnknownFlag`] for a consistent error
+/// surfaces as [`ParseError::Usage`] for a consistent error
 /// UX with `run` / `doctor`.
 fn parse_set_prompt_args<'a, I: Iterator<Item = &'a String>>(
     iter: I,
@@ -850,7 +915,7 @@ fn parse_set_prompt_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("show") => {
             if snapshot.len() != 2 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent set-prompt show` requires exactly one <NAME>".to_string(),
                 ));
             }
@@ -858,7 +923,7 @@ fn parse_set_prompt_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("list") => {
             if snapshot.len() != 1 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent set-prompt list` takes no arguments".to_string(),
                 ));
             }
@@ -866,7 +931,7 @@ fn parse_set_prompt_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("delete") => {
             if snapshot.len() != 2 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent set-prompt delete` requires exactly one <NAME>".to_string(),
                 ));
             }
@@ -874,7 +939,7 @@ fn parse_set_prompt_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("export") => {
             if snapshot.len() != 2 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent set-prompt export` requires exactly one <NAME>".to_string(),
                 ));
             }
@@ -907,7 +972,7 @@ fn parse_set_prompt_args<'a, I: Iterator<Item = &'a String>>(
             ));
         }
         Some(other) => {
-            return Err(ParseError::UnknownFlag(format!(
+            return Err(ParseError::Usage(format!(
                 "set-prompt {} (try `set`, `show`, `list`, `delete`, `export`, `import`, `template`{})",
                 other,
                 if cfg!(feature = "web3_app") { ", `sign`, `verify-signed`" } else { "" },
@@ -934,7 +999,7 @@ enum SummaryParseOutcome {
 /// The grammar is intentionally narrow — seven positional
 /// actions, each with its own flag set — mirroring the
 /// `set-prompt` subcommand. Anything weird surfaces as
-/// [`ParseError::UnknownFlag`] for a consistent error UX with
+/// [`ParseError::Usage`] for a consistent error UX with
 /// `run` / `doctor` / `set-prompt`.
 fn parse_summary_args<'a, I: Iterator<Item = &'a String>>(
     iter: I,
@@ -957,7 +1022,7 @@ fn parse_summary_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("show") => {
             if snapshot.len() != 2 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent summary show` requires exactly one <TOPIC>".to_string(),
                 ));
             }
@@ -965,7 +1030,7 @@ fn parse_summary_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("list") => {
             if snapshot.len() != 1 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent summary list` takes no arguments".to_string(),
                 ));
             }
@@ -973,7 +1038,7 @@ fn parse_summary_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("delete") => {
             if snapshot.len() != 2 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent summary delete` requires exactly one <TOPIC>".to_string(),
                 ));
             }
@@ -981,7 +1046,7 @@ fn parse_summary_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("export") => {
             if snapshot.len() != 2 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent summary export` requires exactly one <TOPIC>".to_string(),
                 ));
             }
@@ -989,7 +1054,7 @@ fn parse_summary_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("load") => {
             if snapshot.len() != 2 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent summary load` requires exactly one <TOPIC>".to_string(),
                 ));
             }
@@ -1001,7 +1066,7 @@ fn parse_summary_args<'a, I: Iterator<Item = &'a String>>(
             )?));
         }
         Some(other) => {
-            return Err(ParseError::UnknownFlag(format!(
+            return Err(ParseError::Usage(format!(
                 "summary {} (try `save`, `show`, `list`, `delete`, `export`, `load`, `rollback`)",
                 other
             )));
@@ -1026,7 +1091,7 @@ fn parse_summary_save(args: &[String]) -> Result<summary::SummaryAction, ParseEr
     let topic = match args.first() {
         Some(s) if !s.starts_with("--") => s.clone(),
         _ => {
-            return Err(ParseError::UnknownFlag(
+            return Err(ParseError::Usage(
                 "`magent summary save` requires <TOPIC> as the first argument".to_string(),
             ));
         }
@@ -1059,7 +1124,7 @@ fn parse_summary_save(args: &[String]) -> Result<summary::SummaryAction, ParseEr
                 i += 2;
             }
             other => {
-                return Err(ParseError::UnknownFlag(format!(
+                return Err(ParseError::Usage(format!(
                     "summary save: unknown flag {}",
                     other
                 )));
@@ -1075,7 +1140,7 @@ fn parse_summary_rollback(args: &[String]) -> Result<summary::SummaryAction, Par
     let topic = match args.first() {
         Some(s) if !s.starts_with("--") => s.clone(),
         _ => {
-            return Err(ParseError::UnknownFlag(
+            return Err(ParseError::Usage(
                 "`magent summary rollback` requires <TOPIC> as the first argument".to_string(),
             ));
         }
@@ -1083,14 +1148,14 @@ fn parse_summary_rollback(args: &[String]) -> Result<summary::SummaryAction, Par
     let index_str = match args.get(1) {
         Some(s) if !s.starts_with("--") => s.clone(),
         _ => {
-            return Err(ParseError::UnknownFlag(
+            return Err(ParseError::Usage(
                 "`magent summary rollback` requires <INDEX> after <TOPIC>".to_string(),
             ));
         }
     };
     let index: usize = index_str
         .parse()
-        .map_err(|_| ParseError::UnknownFlag(format!("rollback index {:?}", index_str)))?;
+        .map_err(|_| ParseError::Usage(format!("rollback index {:?}", index_str)))?;
     let mut dir = None;
     let mut i = 2;
     while i < args.len() {
@@ -1103,7 +1168,7 @@ fn parse_summary_rollback(args: &[String]) -> Result<summary::SummaryAction, Par
                 i += 2;
             }
             other => {
-                return Err(ParseError::UnknownFlag(format!(
+                return Err(ParseError::Usage(format!(
                     "summary rollback: unknown flag {}",
                     other
                 )));
@@ -1168,9 +1233,7 @@ fn parse_web3_args<'a, I: Iterator<Item = &'a String>>(
         "new" => {
             let name = snapshot
                 .get(1)
-                .ok_or_else(|| {
-                    ParseError::UnknownFlag("web3 new: missing <NAME>".to_string())
-                })?
+                .ok_or_else(|| ParseError::Usage("web3 new: missing <NAME>".to_string()))?
                 .clone();
             let opts = parse_web3_new_flags(&snapshot[2..])?;
             Web3Action::New(Web3NewOptions {
@@ -1183,12 +1246,10 @@ fn parse_web3_args<'a, I: Iterator<Item = &'a String>>(
         "identity" => {
             let name = snapshot
                 .get(1)
-                .ok_or_else(|| {
-                    ParseError::UnknownFlag("web3 identity: missing <NAME>".to_string())
-                })?
+                .ok_or_else(|| ParseError::Usage("web3 identity: missing <NAME>".to_string()))?
                 .clone();
             if snapshot.len() != 2 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "web3 identity: takes no flags beyond <NAME>".to_string(),
                 ));
             }
@@ -1205,9 +1266,7 @@ fn parse_web3_args<'a, I: Iterator<Item = &'a String>>(
         "sign" => {
             let name = snapshot
                 .get(1)
-                .ok_or_else(|| {
-                    ParseError::UnknownFlag("web3 sign: missing <NAME>".to_string())
-                })?
+                .ok_or_else(|| ParseError::Usage("web3 sign: missing <NAME>".to_string()))?
                 .clone();
             let opts = parse_web3_sign_flags(&snapshot[2..])?;
             Web3Action::Sign(Web3SignOptions {
@@ -1224,7 +1283,7 @@ fn parse_web3_args<'a, I: Iterator<Item = &'a String>>(
         }
         "list" => {
             if snapshot.len() != 1 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "web3 list: takes no arguments".to_string(),
                 ));
             }
@@ -1233,12 +1292,10 @@ fn parse_web3_args<'a, I: Iterator<Item = &'a String>>(
         "export" => {
             let name = snapshot
                 .get(1)
-                .ok_or_else(|| {
-                    ParseError::UnknownFlag("web3 export: missing <NAME>".to_string())
-                })?
+                .ok_or_else(|| ParseError::Usage("web3 export: missing <NAME>".to_string()))?
                 .clone();
             if snapshot.len() != 2 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "web3 export: takes no flags beyond <NAME>".to_string(),
                 ));
             }
@@ -1247,19 +1304,17 @@ fn parse_web3_args<'a, I: Iterator<Item = &'a String>>(
         "delete" => {
             let name = snapshot
                 .get(1)
-                .ok_or_else(|| {
-                    ParseError::UnknownFlag("web3 delete: missing <NAME>".to_string())
-                })?
+                .ok_or_else(|| ParseError::Usage("web3 delete: missing <NAME>".to_string()))?
                 .clone();
             if snapshot.len() != 2 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "web3 delete: takes no flags beyond <NAME>".to_string(),
                 ));
             }
             Web3Action::Delete(name)
         }
         other => {
-            return Err(ParseError::UnknownFlag(format!(
+            return Err(ParseError::Usage(format!(
                 "web3 {} (try `new`, `identity`, `did`, `pubkey`, `sign`, `verify`, `list`, `export`, or `delete`)",
                 other
             )));
@@ -1300,7 +1355,7 @@ fn parse_web3_new_flags(args: &[String]) -> Result<Web3NewFlags, ParseError> {
                 i += 2;
             }
             other => {
-                return Err(ParseError::UnknownFlag(format!(
+                return Err(ParseError::Usage(format!(
                     "web3 new: unknown flag {}",
                     other
                 )));
@@ -1332,7 +1387,7 @@ fn parse_web3_did_flags(args: &[String]) -> Result<Web3DidOptions, ParseError> {
                 i += 2;
             }
             other => {
-                return Err(ParseError::UnknownFlag(format!(
+                return Err(ParseError::Usage(format!(
                     "web3 did: unknown flag {}",
                     other
                 )));
@@ -1359,7 +1414,7 @@ fn parse_web3_pubkey_flags(args: &[String]) -> Result<Web3PubkeyOptions, ParseEr
                 i += 2;
             }
             other => {
-                return Err(ParseError::UnknownFlag(format!(
+                return Err(ParseError::Usage(format!(
                     "web3 pubkey: unknown flag {}",
                     other
                 )));
@@ -1425,7 +1480,7 @@ fn parse_web3_sign_flags(args: &[String]) -> Result<Web3SignFlags, ParseError> {
                 i += 2;
             }
             other => {
-                return Err(ParseError::UnknownFlag(format!(
+                return Err(ParseError::Usage(format!(
                     "web3 sign: unknown flag {}",
                     other
                 )));
@@ -1461,19 +1516,17 @@ fn parse_web3_verify_flags(args: &[String]) -> Result<Web3VerifyOptions, ParseEr
                 i += 2;
             }
             other => {
-                return Err(ParseError::UnknownFlag(format!(
+                return Err(ParseError::Usage(format!(
                     "web3 verify: unknown flag {}",
                     other
                 )));
             }
         }
     }
-    let payload = payload.ok_or_else(|| {
-        ParseError::UnknownFlag("web3 verify: --payload is required".to_string())
-    })?;
-    let envelope = envelope.ok_or_else(|| {
-        ParseError::UnknownFlag("web3 verify: --envelope is required".to_string())
-    })?;
+    let payload = payload
+        .ok_or_else(|| ParseError::Usage("web3 verify: --payload is required".to_string()))?;
+    let envelope = envelope
+        .ok_or_else(|| ParseError::Usage("web3 verify: --envelope is required".to_string()))?;
     Ok(Web3VerifyOptions { payload, envelope })
 }
 
@@ -1519,7 +1572,7 @@ fn parse_scheduler_args<'a, I: Iterator<Item = &'a String>>(
             // be a typo (`--status`, perhaps) so we let them fall
             // through to the generic unknown-flag path.
             if snapshot.len() != 1 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent scheduler status` takes no arguments".to_string(),
                 ));
             }
@@ -1538,7 +1591,7 @@ fn parse_scheduler_args<'a, I: Iterator<Item = &'a String>>(
             // right here in the parser so the executor can assume
             // a single, validated schedule mode.
             let schedule = opts.resolve_schedule()?;
-            let timezone = opts.resolve_timezone();
+            let timezone = opts.resolve_timezone()?;
             scheduler::SchedulerAction::Daemon {
                 tasks_file: opts.tasks_file,
                 preset: opts.preset,
@@ -1547,7 +1600,7 @@ fn parse_scheduler_args<'a, I: Iterator<Item = &'a String>>(
             }
         }
         Some(other) => {
-            return Err(ParseError::UnknownFlag(format!(
+            return Err(ParseError::Usage(format!(
                 "scheduler {} (try `run-once`, `daemon`, or `status`)",
                 other
             )));
@@ -1594,7 +1647,7 @@ impl SchedulerSourceFlags {
             });
         }
         if kinds > 1 {
-            return Err(ParseError::UnknownFlag(
+            return Err(ParseError::Usage(
                 "scheduler daemon: --interval, --cron, and --at are \
                  mutually exclusive; pass exactly one"
                     .to_string(),
@@ -1627,10 +1680,18 @@ impl SchedulerSourceFlags {
         unreachable!("kinds > 0 but no field was set");
     }
 
-    fn resolve_timezone(&self) -> scheduler::SchedulerTimezone {
+    fn resolve_timezone(&self) -> Result<scheduler::SchedulerTimezone, ParseError> {
         match self.timezone.as_deref() {
-            Some("utc") | Some("UTC") => scheduler::SchedulerTimezone::Utc,
-            _ => scheduler::SchedulerTimezone::Local,
+            None | Some("local") | Some("LOCAL") => Ok(scheduler::SchedulerTimezone::Local),
+            Some("utc") | Some("UTC") => Ok(scheduler::SchedulerTimezone::Utc),
+            // Anything else used to fall through to `Local`, so a bogus
+            // value ran happily and silently moved the cron wall clock.
+            // We have no tz database (by policy: no new dependencies), so
+            // reject rather than guess.
+            Some(other) => Err(ParseError::Usage(format!(
+                "scheduler daemon: --timezone expects `utc` or `local`, got `{}`",
+                other
+            ))),
         }
     }
 }
@@ -1690,7 +1751,7 @@ fn parse_scheduler_source_flags(
                 i += 2;
             }
             other => {
-                return Err(ParseError::UnknownFlag(format!(
+                return Err(ParseError::Usage(format!(
                     "scheduler: unknown flag {}",
                     other
                 )));
@@ -1823,7 +1884,7 @@ fn parse_set_prompt_template(args: &[String]) -> Result<prompt::SetPromptAction,
         .first()
         .filter(|s| !s.starts_with("--"))
         .ok_or_else(|| {
-            ParseError::UnknownFlag(
+            ParseError::Usage(
                 "`magent set-prompt template` requires <NAME> as the first argument".to_string(),
             )
         })?
@@ -1909,12 +1970,12 @@ fn parse_set_prompt_template(args: &[String]) -> Result<prompt::SetPromptAction,
 /// [`SetPromptImportOptions`].
 fn parse_set_prompt_import(args: &[String]) -> Result<prompt::SetPromptAction, ParseError> {
     let first = args.first().ok_or_else(|| {
-        ParseError::UnknownFlag(
+        ParseError::Usage(
             "`magent set-prompt import` requires <PATH> as the first argument".to_string(),
         )
     })?;
     if first.starts_with("--") {
-        return Err(ParseError::UnknownFlag(
+        return Err(ParseError::Usage(
             "`magent set-prompt import` requires <PATH> as the first argument".to_string(),
         ));
     }
@@ -1974,13 +2035,13 @@ fn parse_set_prompt_sign(args: &[String]) -> Result<prompt::SetPromptAction, Par
     let name = match args.first() {
         Some(s) if !s.starts_with("--") => s.clone(),
         Some(s) => {
-            return Err(ParseError::UnknownFlag(format!(
+            return Err(ParseError::Usage(format!(
                 "`magent set-prompt sign` requires <NAME> as the first argument, got flag {}",
                 s
             )))
         }
         None => {
-            return Err(ParseError::UnknownFlag(
+            return Err(ParseError::Usage(
                 "`magent set-prompt sign` requires <NAME> as the first argument".to_string(),
             ))
         }
@@ -2076,13 +2137,13 @@ fn parse_set_prompt_verify_signed(
     let path = match args.first() {
         Some(s) if !s.starts_with("--") => PathBuf::from(s),
         _ => {
-            return Err(ParseError::UnknownFlag(
+            return Err(ParseError::Usage(
                 "`magent set-prompt verify-signed` requires <PATH> as the first argument".to_string(),
             ))
         }
     };
     if args.len() > 1 {
-        return Err(ParseError::UnknownFlag(
+        return Err(ParseError::Usage(
             "`magent set-prompt verify-signed` takes a single <PATH> argument".to_string(),
         ));
     }
@@ -2097,7 +2158,7 @@ fn parse_set_prompt_set(args: &[String]) -> Result<prompt::SetPromptAction, Pars
     let name = match args.first() {
         Some(n) if !n.starts_with("--") => n.clone(),
         _ => {
-            return Err(ParseError::UnknownFlag(
+            return Err(ParseError::Usage(
                 "`magent set-prompt set` requires <NAME> as the first argument".to_string(),
             ));
         }
@@ -2216,7 +2277,7 @@ fn parse_config_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("init") => {
             if snapshot.len() != 1 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent config init` takes no arguments".to_string(),
                 ));
             }
@@ -2224,7 +2285,7 @@ fn parse_config_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("where") => {
             if snapshot.len() != 1 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent config where` takes no arguments".to_string(),
                 ));
             }
@@ -2232,7 +2293,7 @@ fn parse_config_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("show") => {
             if snapshot.len() != 1 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent config show` takes no arguments".to_string(),
                 ));
             }
@@ -2240,7 +2301,7 @@ fn parse_config_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("list") => {
             if snapshot.len() != 1 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent config list` takes no arguments".to_string(),
                 ));
             }
@@ -2248,7 +2309,7 @@ fn parse_config_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("format") => {
             if snapshot.len() != 1 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent config format` takes no arguments".to_string(),
                 ));
             }
@@ -2256,7 +2317,7 @@ fn parse_config_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("validate") => {
             if snapshot.len() != 1 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent config validate` takes no arguments".to_string(),
                 ));
             }
@@ -2264,7 +2325,7 @@ fn parse_config_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("export") => {
             if snapshot.len() != 1 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent config export` takes no arguments".to_string(),
                 ));
             }
@@ -2272,7 +2333,7 @@ fn parse_config_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("get") => {
             if snapshot.len() != 2 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent config get` requires exactly one <KEY>".to_string(),
                 ));
             }
@@ -2280,7 +2341,7 @@ fn parse_config_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("set") => {
             if snapshot.len() != 3 {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent config set` requires <KEY> <VALUE>".to_string(),
                 ));
             }
@@ -2297,14 +2358,14 @@ fn parse_config_args<'a, I: Iterator<Item = &'a String>>(
             } else if snapshot.len() == 1 {
                 false
             } else {
-                return Err(ParseError::UnknownFlag(
+                return Err(ParseError::Usage(
                     "`magent config reset` takes only `--yes`".to_string(),
                 ));
             };
             config::ConfigAction::Reset { yes }
         }
         Some(other) => {
-            return Err(ParseError::UnknownFlag(format!(
+            return Err(ParseError::Usage(format!(
                 "config {} (try `init`, `where`, `show`, `list`, `get`, `set`, `reset`, `validate`, `format`)",
                 other
             )));
@@ -2560,13 +2621,17 @@ pub fn run_help_text() -> String {
     let _ = writeln!(s, "    -i, --max-iterations <N>   Cap the ReAct loop (default 10)");
     let _ = writeln!(s, "    -t, --max-tool-calls <N>   Cap tool executions (default 8)");
     let _ = writeln!(s, "    --max-messages <N>         Cap conversation history (default 32, 0=off)");
-    let _ = writeln!(s, "    --tool-max-chars <N>       Cap each tool result content (default 800, 0=off)");
+    let _ = writeln!(
+        s,
+        "    --tool-max-chars <N>       Cap each tool result content at N characters \
+         (default 800, 0=off)"
+    );
     let _ = writeln!(s, "    -p, --prompt <FILE>        Load a custom system prompt from a file");
     let _ = writeln!(s, "    --prompt-name <NAME>      Use a prompt stored via `set-prompt` (wins over --prompt)");
     let _ = writeln!(s, "    -q, --quiet                Suppress step-by-step output");
     let _ = writeln!(s, "    --mock                     Skip the LLM entirely (canned responses)");
     let _ = writeln!(s, "    --repl                     Interactive REPL (multi-turn; takes no <TASK>, rejects --json / --verify-signed)");
-    let _ = writeln!(s, "    --probe-ollama             Probe LLM on every run() call");
+    let _ = writeln!(s, "    --probe-ollama             Probe LLM on every run() call; error if unreachable (incompatible with --mock)");
     let _ = writeln!(s, "    --temperature <F>          Sampling temperature (default 0.3)");
     let _ = writeln!(s, "    --num-predict <N>          LLM max_tokens (default 512)");
     let _ = writeln!(
@@ -2678,6 +2743,14 @@ pub fn set_prompt_help_text() -> String {
     let _ = writeln!(s, "    $XDG_DATA_HOME/magent/prompts (or ~/.local/share/magent/prompts).");
     let _ = writeln!(s, "    The JSON shape is intentionally trivial so the files are easy to");
     let _ = writeln!(s, "    diff, audit, and hand-edit. See docs/PROMPT_STORE.md.");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "OUTPUT STREAMS:");
+    let _ = writeln!(s, "    `show` and `list` write their data to stdout, so");
+    let _ = writeln!(
+        s,
+        "    `magent set-prompt show foo | jq .provider` works. Confirmations"
+    );
+    let _ = writeln!(s, "    and warnings go to stderr.");
     s
 }
 
@@ -2854,6 +2927,10 @@ pub fn web3_help_text() -> String {
         s,
         "        $MAGENT_WEB3_KEYSTORE         full file path (highest priority)"
     );
+    let _ = writeln!(s, "        $MAGENT_WEB3_KEYSTORE_DIR/keys.json");
+    let _ = writeln!(s, "        $XDG_DATA_HOME/magent/web3/keys.json");
+    let _ = writeln!(s, "        $HOME/.local/share/magent/web3/keys.json");
+    let _ = writeln!(s);
     let _ = writeln!(
         s,
         "        $MAGENT_WEB3_KEYSTORE_DIR/keys.json"
@@ -2921,6 +2998,18 @@ pub fn config_help_text() -> String {
     let _ = writeln!(s, "    format               Re-serialise the file with canonical key order");
     let _ = writeln!(s, "    export               Dump the JSON record to stdout (redirect-safe; both modes)");
     let _ = writeln!(s);
+    let _ = writeln!(s, "OUTPUT STREAMS:");
+    let _ = writeln!(s, "    Data (where/show/list/get) goes to stdout, so");
+    let _ = writeln!(
+        s,
+        "    `magent config show > backup.json` works. Confirmations,"
+    );
+    let _ = writeln!(
+        s,
+        "    traces and `validate` verdicts go to stderr. `--json` puts"
+    );
+    let _ = writeln!(s, "    one envelope on stdout and nothing else.");
+    let _ = writeln!(s);
     let _ = writeln!(s, "KEY PATHS (most useful first):");
     let _ = writeln!(s, "    provider.default                       \"ollama\" | \"deepseek\"");
     let _ = writeln!(s, "    provider.ollama.url                    Base URL for the local Ollama");
@@ -2936,7 +3025,10 @@ pub fn config_help_text() -> String {
     let _ = writeln!(s, "    runner.max_tool_calls                  Tool execution cap");
     let _ = writeln!(s, "    runner.probe_ollama_on_run             true | false");
     let _ = writeln!(s, "    compression.max_messages               Live conversation cap (0 = off)");
-    let _ = writeln!(s, "    compression.tool_content_max_chars     Tool result cap (0 = off)");
+    let _ = writeln!(
+        s,
+        "    compression.tool_content_max_chars     Tool result cap, in characters (0 = off)"
+    );
     let _ = writeln!(s, "    io.no_color / io.quiet_default / io.json_default");
     let _ = writeln!(s);
     let _ = writeln!(s, "STORAGE:");
@@ -3185,6 +3277,154 @@ mod tests {
         );
     }
 
+    /// A usage error is a complete sentence, so it must reach the user
+    /// verbatim. Before the `Usage` variant existed these flowed through
+    /// `UnknownFlag`, whose `Display` prepends `unknown flag: ` — turning
+    /// `scheduler daemon: --interval, --cron, and --at are mutually
+    /// exclusive` into the nonsense `unknown flag: scheduler daemon: …`.
+    #[test]
+    fn usage_errors_render_verbatim_without_an_unknown_flag_prefix() {
+        let err = Args::parse(&argv([
+            "magent",
+            "scheduler",
+            "daemon",
+            "--interval",
+            "60",
+            "--at",
+            "2026-08-11T09:00:00",
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(err, ParseError::Usage(_)),
+            "expected Usage, got {err:?}"
+        );
+        let rendered = err.to_string();
+        assert_eq!(
+            rendered,
+            "scheduler daemon: --interval, --cron, and --at are mutually exclusive; \
+             pass exactly one"
+        );
+        assert!(
+            !rendered.contains("unknown flag"),
+            "usage messages must not be prefixed: {rendered}"
+        );
+    }
+
+    /// A mistyped subcommand is a subcommand problem, not a flag one — the
+    /// old rendering answered `magent frobnicate` with `unknown flag:
+    /// frobnicate`, as if `frobnicate` were a mistyped `--flag`.
+    #[test]
+    fn unknown_subcommand_is_named_as_a_subcommand() {
+        let err = Args::parse(&argv(["magent", "frobnicate"])).unwrap_err();
+        assert!(
+            matches!(err, ParseError::Usage(_)),
+            "expected Usage, got {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("unknown subcommand: frobnicate"),
+            "got {rendered}"
+        );
+        assert!(!rendered.contains("unknown flag"), "got {rendered}");
+    }
+
+    /// `help <topic>` where the topic is neither a subcommand nor a known
+    /// help topic. This used to render as `unknown flag: help --bogus`.
+    #[test]
+    fn help_for_an_unknown_topic_lists_the_known_ones() {
+        let err = Args::parse(&argv(["magent", "help", "--bogus-xyz"])).unwrap_err();
+        assert!(
+            matches!(err, ParseError::Usage(_)),
+            "expected Usage, got {err:?}"
+        );
+        let rendered = err.to_string();
+        assert_eq!(
+            rendered,
+            "no help for `--bogus-xyz` — try `help run`, `help set-prompt`, `help summary`, \
+             `help config`, `help scheduler`, or `help doctor`"
+        );
+    }
+
+    /// On a build without the `web3` feature, `magent web3 …` is a
+    /// subcommand that exists but was compiled out — the message should say
+    /// so rather than pretend the user mistyped a flag.
+    #[cfg(not(feature = "web3"))]
+    #[test]
+    fn web3_on_a_non_web3_build_explains_it_was_not_built_in() {
+        let err = Args::parse(&argv(["magent", "web3", "status"])).unwrap_err();
+        assert!(
+            matches!(err, ParseError::Usage(_)),
+            "expected Usage, got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "unknown subcommand: web3 (this binary was built without the `web3` feature)"
+        );
+    }
+
+    /// `--timezone` used to map `utc`/`UTC` to `Utc` and *everything else*
+    /// to `Local`, so `--timezone Bogus/Zone` ran happily and silently
+    /// shifted the cron wall clock. There is no tz database (no new
+    /// dependencies), so a bogus value must be rejected rather than guessed.
+    #[test]
+    fn scheduler_rejects_a_timezone_it_cannot_honour() {
+        use crate::scheduler::SchedulerAction;
+
+        let err = Args::parse(&argv([
+            "magent",
+            "scheduler",
+            "daemon",
+            "--interval",
+            "60",
+            "--timezone",
+            "Bogus/Zone",
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, ParseError::Usage(_)), "got {err:?}");
+        assert_eq!(
+            err.to_string(),
+            "scheduler daemon: --timezone expects `utc` or `local`, got `Bogus/Zone`"
+        );
+
+        // The two accepted spellings, both casings.
+        for (raw, want) in [
+            ("utc", true),
+            ("UTC", true),
+            ("local", false),
+            ("LOCAL", false),
+        ] {
+            let a = Args::parse(&argv([
+                "magent",
+                "scheduler",
+                "daemon",
+                "--interval",
+                "60",
+                "--timezone",
+                raw,
+            ]))
+            .unwrap_or_else(|e| panic!("`{raw}` should be accepted: {e}"));
+            match a.command {
+                Command::Scheduler(SchedulerAction::Daemon { timezone, .. }) => {
+                    assert_eq!(
+                        timezone == crate::scheduler::SchedulerTimezone::Utc,
+                        want,
+                        "`{raw}`"
+                    );
+                }
+                other => panic!("expected Daemon, got {other:?}"),
+            }
+        }
+
+        // No flag at all → Local, preserving the documented default.
+        let a = Args::parse(&argv(["magent", "scheduler", "daemon", "--interval", "60"])).unwrap();
+        match a.command {
+            Command::Scheduler(SchedulerAction::Daemon { timezone, .. }) => {
+                assert_eq!(timezone, crate::scheduler::SchedulerTimezone::Local);
+            }
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+    }
+
     #[test]
     fn rejects_run_with_no_task() {
         let err = Args::parse(&argv(["magent", "run"])).unwrap_err();
@@ -3219,6 +3459,41 @@ mod tests {
         assert!(matches!(e1, ParseError::ReplJsonIncompatible), "got {e1:?}");
         let e2 = Args::parse(&argv(["magent", "run", "--repl", "--json"])).unwrap_err();
         assert!(matches!(e2, ParseError::ReplJsonIncompatible), "got {e2:?}");
+    }
+
+    #[test]
+    fn probe_ollama_with_mock_is_rejected() {
+        // `--probe-ollama` requires the LLM to be reachable before the
+        // agent answers; `--mock` never contacts one. Whichever we
+        // honoured, the other would be dropped without a word — and
+        // silently simulating is exactly what `--probe-ollama` exists
+        // to prevent.
+        let e1 =
+            Args::parse(&argv(["magent", "run", "--probe-ollama", "--mock", "hi"])).unwrap_err();
+        assert!(matches!(e1, ParseError::ProbeWithMock), "got {e1:?}");
+        let e2 =
+            Args::parse(&argv(["magent", "run", "--mock", "--probe-ollama", "hi"])).unwrap_err();
+        assert!(matches!(e2, ParseError::ProbeWithMock), "got {e2:?}");
+        // The REPL is not exempt.
+        let e3 = Args::parse(&argv([
+            "magent",
+            "run",
+            "--repl",
+            "--probe-ollama",
+            "--mock",
+        ]))
+        .unwrap_err();
+        assert!(matches!(e3, ParseError::ProbeWithMock), "got {e3:?}");
+    }
+
+    #[test]
+    fn probe_ollama_alone_is_accepted() {
+        let args = Args::parse(&argv(["magent", "run", "--probe-ollama", "hi"])).unwrap();
+        let Command::Run(opts) = args.command else {
+            panic!("expected a run command");
+        };
+        assert!(opts.probe_ollama);
+        assert!(!opts.mock);
     }
 
     #[cfg(feature = "web3_app")]
@@ -3667,7 +3942,7 @@ mod tests {
     #[test]
     fn help_subcommand_rejects_unknown_target() {
         let err = Args::parse(&argv(["magent", "help", "wat"])).unwrap_err();
-        assert!(matches!(err, ParseError::UnknownFlag(_)));
+        assert!(matches!(err, ParseError::Usage(_)));
     }
 
     #[test]
@@ -3731,7 +4006,7 @@ mod tests {
     fn set_prompt_set_missing_name() {
         let a = Args::parse(&argv(["magent", "set-prompt", "set"])).unwrap_err();
         // No NAME positional → "requires <NAME>" via UnknownFlag.
-        assert!(matches!(a, ParseError::UnknownFlag(_)));
+        assert!(matches!(a, ParseError::Usage(_)));
     }
 
     #[test]
@@ -3752,7 +4027,7 @@ mod tests {
             "magent", "set-prompt", "show", "alpha", "extra",
         ]))
         .unwrap_err();
-        assert!(matches!(a, ParseError::UnknownFlag(_)));
+        assert!(matches!(a, ParseError::Usage(_)));
     }
 
     #[test]
@@ -3765,7 +4040,7 @@ mod tests {
     fn set_prompt_list_rejects_args() {
         let a =
             Args::parse(&argv(["magent", "set-prompt", "list", "extra"])).unwrap_err();
-        assert!(matches!(a, ParseError::UnknownFlag(_)));
+        assert!(matches!(a, ParseError::Usage(_)));
     }
 
     #[test]
@@ -3827,7 +4102,7 @@ mod tests {
     #[test]
     fn set_prompt_import_missing_path_is_an_error() {
         let a = Args::parse(&argv(["magent", "set-prompt", "import"])).unwrap_err();
-        assert!(matches!(a, ParseError::UnknownFlag(_)));
+        assert!(matches!(a, ParseError::Usage(_)));
     }
 
     #[test]
@@ -3902,7 +4177,7 @@ mod tests {
     fn set_prompt_template_missing_name_is_an_error() {
         let a = Args::parse(&argv(["magent", "set-prompt", "template"]))
             .unwrap_err();
-        assert!(matches!(a, ParseError::UnknownFlag(_)));
+        assert!(matches!(a, ParseError::Usage(_)));
     }
 
     #[test]
@@ -3995,7 +4270,7 @@ mod tests {
     fn set_prompt_unknown_action_is_an_error() {
         let a =
             Args::parse(&argv(["magent", "set-prompt", "frobnicate"])).unwrap_err();
-        assert!(matches!(a, ParseError::UnknownFlag(_)));
+        assert!(matches!(a, ParseError::Usage(_)));
     }
 
     #[test]
@@ -4065,7 +4340,7 @@ mod tests {
     #[test]
     fn config_init_rejects_args() {
         let a = Args::parse(&argv(["magent", "config", "init", "extra"])).unwrap_err();
-        assert!(matches!(a, ParseError::UnknownFlag(_)));
+        assert!(matches!(a, ParseError::Usage(_)));
     }
 
     #[test]
@@ -4103,7 +4378,7 @@ mod tests {
     #[test]
     fn config_get_requires_key() {
         let a = Args::parse(&argv(["magent", "config", "get"])).unwrap_err();
-        assert!(matches!(a, ParseError::UnknownFlag(_)));
+        assert!(matches!(a, ParseError::Usage(_)));
     }
 
     #[test]
@@ -4125,7 +4400,7 @@ mod tests {
     fn config_set_requires_key_and_value() {
         let a = Args::parse(&argv(["magent", "config", "set", "sampling.temperature"]))
             .unwrap_err();
-        assert!(matches!(a, ParseError::UnknownFlag(_)));
+        assert!(matches!(a, ParseError::Usage(_)));
     }
 
     #[test]
@@ -4146,7 +4421,7 @@ mod tests {
     fn config_reset_rejects_unknown_flags() {
         let a = Args::parse(&argv(["magent", "config", "reset", "--force"]))
             .unwrap_err();
-        assert!(matches!(a, ParseError::UnknownFlag(_)));
+        assert!(matches!(a, ParseError::Usage(_)));
     }
 
     #[test]
@@ -4167,13 +4442,13 @@ mod tests {
     #[test]
     fn config_export_rejects_arguments() {
         let e = Args::parse(&argv(["magent", "config", "export", "extra"])).unwrap_err();
-        assert!(matches!(e, ParseError::UnknownFlag(_)));
+        assert!(matches!(e, ParseError::Usage(_)));
     }
 
     #[test]
     fn config_unknown_action_is_an_error() {
         let a = Args::parse(&argv(["magent", "config", "frobnicate"])).unwrap_err();
-        assert!(matches!(a, ParseError::UnknownFlag(_)));
+        assert!(matches!(a, ParseError::Usage(_)));
     }
 
     #[test]

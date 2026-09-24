@@ -818,7 +818,7 @@ impl<'a> SetPromptCmd<'a> {
                     path: PathBuf::from(name),
                     source,
                 })?;
-            let _ = out.stderr_fmt_line(format_args!("{}", pretty));
+            let _ = out.stdout_fmt_line(format_args!("{}", pretty));
         }
         Ok(())
     }
@@ -840,16 +840,16 @@ impl<'a> SetPromptCmd<'a> {
         } else if records.is_empty() {
             out.info("no prompts stored yet — try `magent set-prompt set ...` first")?;
         } else {
-            let _ = out.stderr_fmt_line(format_args!(
+            let _ = out.stdout_fmt_line(format_args!(
                 "{:<24} {:<10} {:<20} TAGS",
                 "NAME", "PROVIDER", "MODEL"
             ));
-            let _ = out.stderr_fmt_line(format_args!(
+            let _ = out.stdout_fmt_line(format_args!(
                 "{}",
                 "-".repeat(24 + 10 + 20 + 8)
             ));
             for r in &records {
-                let _ = out.stderr_fmt_line(format_args!(
+                let _ = out.stdout_fmt_line(format_args!(
                     "{:<24} {:<10} {:<20} {}",
                     truncate(&r.name, 24),
                     truncate(if r.provider.is_empty() { "(default)" } else { &r.provider }, 10),
@@ -1409,10 +1409,10 @@ pub fn resolve_for_run(opts: &RunOptions) -> Result<ResolvedPrompt, PromptError>
     }
     // 2. Legacy file path.
     if let Some(path) = opts.prompt_file.as_ref() {
-        let text = crate::runner::load_prompt_file(path).map_err(|e| {
+        let text = crate::runner::load_prompt_file(path).map_err(|source| {
             PromptError::PromptFileLoad {
                 path: path.clone(),
-                source: io::Error::other(e),
+                source,
             }
         })?;
         return Ok(ResolvedPrompt {
@@ -2006,6 +2006,32 @@ mod tests {
             .unwrap();
         let loaded = load("victim").unwrap();
         assert_eq!(loaded.prompt, "new");
+    }
+
+    /// `--prompt <FILE>` on a missing file used to name the path twice:
+    /// `load_prompt_file` stringified its error as `"{path}: {io}"` and
+    /// `PromptFileLoad`'s `Display` then prefixed the same path again. The
+    /// loader returns the bare `io::Error` now, so the path appears once.
+    #[test]
+    fn prompt_file_load_error_names_the_path_exactly_once() {
+        let path = PathBuf::from("/no/such/prompt-file.txt");
+        let opts = RunOptions {
+            prompt_file: Some(path),
+            ..RunOptions::default()
+        };
+        let msg = match resolve_for_run(&opts) {
+            Ok(_) => panic!("a missing prompt file must not resolve"),
+            Err(e) => e.to_string(),
+        };
+        assert_eq!(
+            msg.matches("/no/such/prompt-file.txt").count(),
+            1,
+            "path should appear exactly once: {msg}"
+        );
+        assert!(
+            msg.contains("could not read prompt file"),
+            "message should still say what failed: {msg}"
+        );
     }
 
     /// Reading a non-existent file surfaces a `PromptFileLoad` error.

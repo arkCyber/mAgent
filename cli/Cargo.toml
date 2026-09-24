@@ -64,6 +64,15 @@ serde = { workspace = true, features = ["derive"] }
 log = { workspace = true }
 env_logger = { version = "0.11", default-features = false }
 
+# `libc` is used for exactly one thing: restoring the default `SIGPIPE`
+# disposition at startup (see `main.rs`). Rust ignores `SIGPIPE`, so a
+# closed stdout turns into an `EPIPE` write error — which `println!`
+# *panics* on, aborting the REPL with exit 101 and a panic message where
+# a Unix tool would just exit. Host-only (`cfg(unix)`): Windows has no
+# `SIGPIPE` and its console writes fail differently.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # ---------------------------------------------------------------------------
 # Web3 keystore (host-only)
 # ---------------------------------------------------------------------------

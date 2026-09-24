@@ -541,11 +541,15 @@ pub enum DaemonSchedule {
 
 /// Timezone policy for cron / --at evaluation.
 ///
-/// `Local` reads `$MAGENT_TIMEZONE` (IANA name, e.g. `Asia/Shanghai`)
-/// and falls back to the system local zone. `Utc` ignores the env
-/// var and always interprets cron fields as UTC. The split is the
-/// same one `tokio-cron-scheduler` and `crontab` use so users with
-/// muscle memory from those tools get the same behaviour.
+/// `Local` uses the system's current UTC offset (read fresh on every
+/// `next_after`, so a DST boundary only affects one tick). `Utc`
+/// ignores the system zone and interprets every cron field as UTC.
+/// The split is the same one `crontab` users expect.
+///
+/// Deliberately only these two: honouring an IANA name such as
+/// `Asia/Shanghai` would need a tz database, and the CLI takes no new
+/// dependencies. `--timezone` therefore rejects anything that is not
+/// `utc`/`local` instead of silently treating a bogus value as local.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchedulerTimezone {
     Local,
@@ -1596,7 +1600,11 @@ pub fn scheduler_help_text() -> String {
         s,
         "    magent scheduler daemon   [--tasks-file <PATH> | --preset <NAME>]"
     );
-    let _ = writeln!(s, "                                       [--interval <SECS>]");
+    let _ = writeln!(
+        s,
+        "                                       [--interval <SECS> | --cron <EXPR> | --at <RFC3339>]"
+    );
+    let _ = writeln!(s, "                                       [--timezone <utc|local>]");
     let _ = writeln!(s, "    magent scheduler status");
     let _ = writeln!(s);
     let _ = writeln!(s, "ACTIONS:");
@@ -1636,8 +1644,9 @@ pub fn scheduler_help_text() -> String {
     );
     let _ = writeln!(
         s,
-        "    --timezone <utc|local>   Force UTC or honour $MAGENT_TIMEZONE \
-         (default: local, IANA name like Asia/Shanghai)."
+        "    --timezone <utc|local>   Interpret cron fields as UTC, or in the \
+         system's local zone (default: local). Only these two values are \
+         accepted; a bogus value is rejected."
     );
     let _ = writeln!(s);
     let _ = writeln!(s, "TASK FILE SCHEMA:");
