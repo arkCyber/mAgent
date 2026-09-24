@@ -970,6 +970,25 @@
       it is worth documenting so the invariant is understood as "data commands",
       not "all commands".
 
+### 🟡 P2 — `--tool-max-chars` truncation could grow the payload (2026-09-24)
+- [x] **The cap grew the content it capped, at small budgets** (fixed
+      2026-09-24). `truncate_tool_content` writes `head + "\n[...truncated N
+      bytes...]\n" + tail`; the marker's fixed ~29-byte cost is charged to the
+      budget without being part of it, so for `max_chars` below that, the
+      "truncated" string was *longer* than the original. The contract ("Cap
+      each tool result content") inverted: lower cap ⇒ larger context.
+      Measured via `magent run --repl --mock --tool-max-chars N` reading the
+      `context` size — `1` → 3302 B, `10` → 3311 B, versus 3293 B with
+      truncation off; all now 3293 B. The candidate is kept only when
+      strictly shorter. Covered by `truncate_never_grows_the_content`.
+- [x] **`CompressionStats::bytes_saved` reported the marker length** (fixed
+      2026-09-24). It was `new_len - tool_content_max_chars` — the marker's
+      own byte count, not the bytes removed — so the telemetry in
+      `cli/src/summary.rs` and the `[Compress]` trace line was meaningless.
+      It now sums `before - after`, matching the field doc and
+      `examples/topic-watcher`. Covered by
+      `compress_reports_the_net_bytes_it_removed`.
+
 ### 🟡 P2 — `--tool-max-chars` caps *bytes*, not chars (2026-09-24)
 - [ ] **The flag name, the core parameter, and the actual limit disagree.**
       `--tool-max-chars <N>` (help: "Cap each tool result content") is

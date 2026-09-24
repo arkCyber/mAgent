@@ -187,8 +187,8 @@ Field reference:
   * `dropped` — messages dropped by the slicing step.
   * `tool_results_truncated` — tool messages that had their content
     shortened because they exceeded `tool_content_max_chars`.
-  * `bytes_saved` — bytes of tool content removed by the truncation
-    step (before the marker is inserted). Useful for telemetry.
+  * `bytes_saved` — net bytes of tool content removed by the truncation
+    step, counting the inserted marker text. Useful for telemetry.
 * **`metadata.tags`** — always serialised as an array (possibly
   empty) so `grep` / `jq` queries work.
 * **`history`** — FIFO of superseded snapshots. Index 0 is the

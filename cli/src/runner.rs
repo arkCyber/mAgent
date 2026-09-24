@@ -241,7 +241,7 @@ fn render_event(event: &TraceEvent) -> String {
             tool_results_truncated,
             bytes_saved,
         } => format!(
-            "kept={} dropped={} truncated={} bytes_saved≈{}",
+            "kept={} dropped={} truncated={} bytes_saved={}",
             kept, dropped, tool_results_truncated, bytes_saved
         ),
         TraceEvent::LlmResponse { body } => {

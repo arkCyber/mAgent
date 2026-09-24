@@ -118,8 +118,8 @@ pub struct CompressionStats {
     /// Tool result messages that were truncated (had their `content`
     /// shortened because it exceeded `tool_content_max_chars`).
     pub tool_results_truncated: usize,
-    /// Bytes of tool `content` removed by the truncation step, *before*
-    /// the marker is inserted. Useful for telemetry.
+    /// Net bytes removed from tool `content` by the truncation step,
+    /// including the marker text. Useful for telemetry.
     pub bytes_saved: usize,
 }
 
@@ -160,15 +160,25 @@ pub fn truncate_tool_content(msg: &mut Message, max_chars: usize) -> bool {
     // the placeholder sequence, and `replacen` would then clobber the
     // *user's* bytes instead of the marker. Constructing the marker inline
     // keeps user content untouched.
-    let mut new_content = String::with_capacity(max_chars + 64);
-    new_content.push_str(&msg.content[..head_end]);
-    new_content.push_str("\n[...truncated ");
-    new_content.push_str(&marker_approx.to_string());
-    new_content.push_str(" bytes...]\n");
+    let mut candidate = String::with_capacity(max_chars + 64);
+    candidate.push_str(&msg.content[..head_end]);
+    candidate.push_str("\n[...truncated ");
+    candidate.push_str(&marker_approx.to_string());
+    candidate.push_str(" bytes...]\n");
     if tail_start < original_len {
-        new_content.push_str(&msg.content[tail_start..]);
+        candidate.push_str(&msg.content[tail_start..]);
     }
-    msg.content = new_content;
+
+    // The marker's fixed overhead (~29 bytes) can exceed the payload it
+    // replaces when `max_chars` is tiny, which would make the "truncated"
+    // content *longer* than the original. That inverts the contract (cap
+    // the content, never grow it) and would corrupt `bytes_saved`
+    // telemetry, so keep the original in that case.
+    if candidate.len() >= original_len {
+        return false;
+    }
+
+    msg.content = candidate;
 
     true
 }
@@ -274,15 +284,13 @@ pub fn compress_messages(
     // accurate even if they never invoke the slicing step.
     if policy.tool_content_max_chars > 0 {
         for msg in messages.iter_mut() {
+            let before = msg.content.len();
             if truncate_tool_content(msg, policy.tool_content_max_chars) {
                 stats.tool_results_truncated += 1;
-                // `truncate_tool_content` replaced the marker with the
-                // exact byte count, so we can't recover it from the
-                // string cheaply. Track the rough delta instead.
-                stats.bytes_saved += msg
-                    .content
-                    .len()
-                    .saturating_sub(policy.tool_content_max_chars);
+                // Net bytes removed, marker included. `truncate_tool_content`
+                // only reports success when it really shortened the content,
+                // so this subtraction can never underflow.
+                stats.bytes_saved += before - msg.content.len();
             }
         }
     }
@@ -475,6 +483,46 @@ mod tests {
         assert!(truncate_tool_content(&mut m, 200));
         assert!(m.content.starts_with(head), "head lost: {}", m.content);
         assert!(m.content.ends_with(tail), "tail lost: {}", m.content);
+    }
+
+    #[test]
+    fn truncate_never_grows_the_content() {
+        // The inline marker costs a fixed ~29 bytes. For a budget below
+        // that, truncating a short-but-over-budget tool result used to
+        // produce a *longer* string than the original — inverting the cap
+        // contract and making `bytes_saved` underflow to zero. Sweep the
+        // pathological corner instead of testing a single point.
+        for max_chars in 1..64usize {
+            for len in 1..256usize {
+                let original = "a".repeat(len);
+                let mut m = tool("call_1", &original);
+                let shortened = truncate_tool_content(&mut m, max_chars);
+                assert!(
+                    m.content.len() <= original.len(),
+                    "max_chars={max_chars} len={len}: content grew to {}",
+                    m.content.len()
+                );
+                assert_eq!(
+                    shortened,
+                    m.content.len() < original.len(),
+                    "max_chars={max_chars} len={len}: return value disagrees with the result"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compress_reports_the_net_bytes_it_removed() {
+        let policy = CompressionPolicy {
+            tool_content_max_chars: 100,
+            max_messages: 20,
+        };
+        let long = "a".repeat(2_000);
+        let mut v = vec![user("task"), tool("call_1", &long)];
+        let stats = compress_messages(&mut v, &policy);
+        assert_eq!(stats.tool_results_truncated, 1);
+        assert_eq!(stats.bytes_saved, 2_000 - v[1].content.len());
+        assert!(stats.bytes_saved > 0);
     }
 
     #[test]

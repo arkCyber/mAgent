@@ -26,13 +26,18 @@ LLM call** in `RealAgentRunner::think()` and applies two steps in order:
    `max_messages`, the runner drops the oldest messages and keeps:
    - every `System` message at the head (so the system prompt never
      gets lost — this is the v3 design, see below);
-   - the first `User` message (the original task anchor);
+   - the **last** `User` message (the current turn's task anchor — the
+     one-shot path has only one, but the REPL appends one per turn);
    - the **most recent** `max_messages - preserved_head` messages.
+
+Truncation only ever shrinks a payload: if the marker's fixed overhead
+would make the rewritten content longer than the original (a very small
+`tool_content_max_chars`), the original is kept unchanged.
 
 The runner logs the compression counters when verbose mode is on:
 
 ```text
-[Compress] kept=24 dropped=8 tools_truncated=2 bytes_saved≈1700
+[Compress] kept=24 dropped=8 tools_truncated=2 bytes_saved=1700
 ```
 
 ## v3: system prompt is persisted (not transient)

@@ -2101,7 +2101,7 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
             } => {
                 if dropped > 0 || tool_results_truncated > 0 {
                     println!(
-                        "[Compress] kept={} dropped={} tools_truncated={} bytes_saved≈{}",
+                        "[Compress] kept={} dropped={} tools_truncated={} bytes_saved={}",
                         kept, dropped, tool_results_truncated, bytes_saved
                     );
                 }

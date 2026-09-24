@@ -13,6 +13,26 @@ here. Dates use `YYYY-MM-DD` and follow ISO 8601. Versions follow
 
 ## [Unreleased]
 
+### Fixed (2026-09-24) — `--tool-max-chars` could *grow* a tool result instead of capping it
+- **A small budget inflated the very payload it was meant to cap, and the
+  savings counter under-reported.** `truncate_tool_content` rewrites an
+  over-budget tool result as `head + "\n[...truncated N bytes...]\n" +
+  tail`. The marker's fixed ~29-byte overhead is charged against the budget
+  but not included in it, so when `max_chars` was smaller than the marker
+  the "truncated" string came out **longer** than the original — inverting
+  the documented contract (`Cap each tool result content`) and pushing the
+  context *up* as the cap went down. Measured end-to-end with
+  `magent run --repl --mock --tool-max-chars N`: `1` → 3302 B and `10` →
+  3311 B of context, versus 3293 B with truncation disabled. The function
+  now builds the candidate and keeps the original when the candidate is not
+  strictly shorter, so it can only ever shrink. In the same pass,
+  `compress_messages`'s `bytes_saved` was `new_len - max_chars` — the
+  marker length, not bytes removed — and now sums the true net delta
+  (`before - after`), matching the field's doc and the
+  `examples/topic-watcher` reference implementation. Covered by
+  `truncate_never_grows_the_content` (a 63 × 255 sweep, verified to fail
+  against the old code) and `compress_reports_the_net_bytes_it_removed`.
+
 ### Fixed (2026-09-24) — `io.json_default = true` started a REPL that promised JSON and printed prose
 - **The `--json` ⇒ JSON-on-stdout contract had a config-shaped hole.** The
   parser refuses `--repl` with the explicit `--json` flag
