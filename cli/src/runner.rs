@@ -3047,15 +3047,48 @@ fn char_display_width(c: char) -> usize {
     }
 }
 
+/// Clip `s` to at most `max` display columns, marking a clip with `…`.
+///
+/// Every box row pads to [`REPL_BOX_WIDTH`], so a row wider than the box
+/// pushes its right rail off the edge and breaks the rectangle. The text
+/// is not always ours: `--model <name>` goes straight into the banner,
+/// and a 90-column model name used to widen that one row to 103 columns.
+/// Clipping keeps the invariant for any input. Only the *display* is
+/// clipped, and only ever for a value the user typed themselves (`--model`
+/// is the one banner field that is not a fixed short label) — the model
+/// the session actually talks to is untouched.
+fn clip_display(s: &str, max: usize) -> String {
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    // One column goes to the ellipsis, so clip to `max - 1`. A double-width
+    // char that would straddle the boundary is dropped rather than halved.
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = char_display_width(c);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 /// One `║ … ║` row, right-padded to [`REPL_BOX_WIDTH`] display columns.
 fn box_row(text: &str) -> String {
-    let pad = REPL_BOX_WIDTH.saturating_sub(display_width(text));
+    let text = clip_display(text, REPL_BOX_WIDTH);
+    let pad = REPL_BOX_WIDTH.saturating_sub(display_width(&text));
     format!("║{}{}║", text, " ".repeat(pad))
 }
 
 /// One `║ … ║` row with `text` centred between the rails.
 fn box_row_centered(text: &str) -> String {
-    let slack = REPL_BOX_WIDTH.saturating_sub(display_width(text));
+    let text = clip_display(text, REPL_BOX_WIDTH);
+    let slack = REPL_BOX_WIDTH.saturating_sub(display_width(&text));
     format!(
         "║{}{}{}║",
         " ".repeat(slack / 2),
@@ -3209,6 +3242,15 @@ fn print_repl_help() {
     box_close();
 }
 
+/// One `label … value` row of the stats box. The label is padded to a
+/// fixed width and the value right-aligned in another, so every section's
+/// value shares one right edge. Hand-tuned spaces used to put the value
+/// column at three different offsets (`Tasks run:` 23, `Messages:` 22,
+/// `Tool calls:` 24), which read as a mistake rather than a table.
+fn stats_row(label: &str, value: &str) {
+    box_line(&format!("  {:<17}{:>12}", label, value));
+}
+
 /// Print REPL stats
 fn print_repl_stats(runner: &RealAgentRunner<CompositeExecutor>, session: &ReplSession) {
     let duration = session.session_duration();
@@ -3222,24 +3264,21 @@ fn print_repl_stats(runner: &RealAgentRunner<CompositeExecutor>, session: &ReplS
     box_open("Session Statistics");
     box_line("  Session");
     box_line(&box_separator());
-    box_line(&format!("  Tasks run:      {:>6}", session.task_count));
-    box_line(&format!("  Duration:       {:?}", duration));
-    box_line(&format!("  History size:   {:>6}", session.history.len()));
+    stats_row("Tasks run:", &session.task_count.to_string());
+    stats_row("Duration:", &format!("{:?}", duration));
+    stats_row("History size:", &session.history.len().to_string());
     box_line("");
     box_line("  Context");
     box_line(&box_separator());
-    box_line(&format!("  Messages:      {:>6}", msgs));
-    box_line(&format!("  Approx tokens:  {:>6}", tokens));
-    box_line(&format!(
-        "  Size:           ~{} bytes",
-        runner.approx_total_bytes()
-    ));
+    stats_row("Messages:", &msgs.to_string());
+    stats_row("Approx tokens:", &tokens.to_string());
+    stats_row("Size:", &format!("~{} bytes", runner.approx_total_bytes()));
     box_line("");
     box_line("  Agent State");
     box_line(&box_separator());
-    box_line(&format!("  Total iterations: {:>5}", iterations));
-    box_line(&format!("  Tool calls:      {:>5}", tool_calls));
-    box_line(&format!("  Backend:         {}", using));
+    stats_row("Total iterations:", &iterations.to_string());
+    stats_row("Tool calls:", &tool_calls.to_string());
+    stats_row("Backend:", using);
     box_close();
 }
 

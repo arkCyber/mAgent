@@ -105,6 +105,23 @@
       the same rule (and draws nothing when neither stream is a terminal).
       Covered by `repl_prompt_goes_to_stderr_not_stdout`; all four
       stdin/stdout combinations verified against a real pty.
+- [x] **A long value no longer breaks the box frame** (fixed 2026-09-24).
+      `box_row` could only pad, so a row already wider than
+      `REPL_BOX_WIDTH` got zero padding and pushed its right rail off the
+      edge. The one row built from user input is the banner's `Model:`
+      (`--model <name>`), and a 90-column name printed that row 103 columns
+      wide — the frame fell apart on the session's first screen. Rows are
+      now clipped by the new `clip_display`, which measures in display
+      columns (CJK/emoji-safe, never splits a char, drops a wide char that
+      would straddle the edge) and marks a clip with `…`; only the display
+      is clipped, never the value actually used. Covered by
+      `repl_boxes_survive_a_long_model_name` and
+      `repl_banner_leaves_a_normal_model_name_alone`.
+- [x] **`stats` value column aligned** (fixed 2026-09-24). Hand-spaced rows
+      put the value at column 23 / 22 / 24 across the three sections. All
+      rows now go through `stats_row` (label padded to 17, value
+      right-aligned in 12), so every section shares one right edge. The
+      `repl_boxes_are_rectangular` test continues to hold.
 - [ ] **Ctrl-C leaves the terminal in raw mode if the shell does not
       restore it.** `RawMode`'s `Drop` restores the saved `termios`, but
       Ctrl-C is deliberately still `SIGINT` (the module keeps `ISIG` set so
@@ -431,6 +448,17 @@
       (fails both on a wrong pad and on a byte-length `display_width`). The
       helper covers only the ranges the REPL prints, which keeps
       `unicode-width` out of the CLI's dependency set.
+
+- [x] **Audited 2026-09-24, no change needed: `--max-iterations 0`.** It
+      briefly looked as if it printed the generic top-level help instead of
+      a usage error, but that was a `2>&1` merge artifact in the probe. The
+      binary prints `error: invalid value '0' for flag 'max-iterations'
+      (expected a positive integer (>= 1))` on **stderr**, prints nothing on
+      stdout, and exits 2 — as `--max-tool-calls 0` does. `--max-messages 0`
+      and `--tool-max-chars 0` keep the documented `0 = off` sentinel
+      (`parse_usize_nonzero` vs `parse_usize`). Covered already by
+      `rejects_zero_max_iterations` / `rejects_zero_max_tool_calls`, so no
+      new test.
 
 - [x] **BLE removed (2026-09-20)** — the whole GATT config service, the BLE AT
       channel (`SYS_CMD`/`SYS_RSP`), the BLE wallet service (0x1851) and the Lua

@@ -13,6 +13,30 @@ here. Dates use `YYYY-MM-DD` and follow ISO 8601. Versions follow
 
 ## [Unreleased]
 
+### Fixed (2026-09-24) — a long value no longer breaks the REPL's box frame
+- **`magent run --repl --model <90-column name>` printed a banner row 103
+  columns wide** in an otherwise 64-column box: the `Model:` row is built
+  from user input, and `box_row` could only *pad* — a row already wider than
+  the box got zero padding and pushed its right rail off the edge, so the
+  frame visibly fell apart on the first screen of the session. The box
+  renderer now clips to `REPL_BOX_WIDTH` display columns via the new
+  `clip_display`, which is UTF-8- and double-width-aware (it never splits a
+  character, and drops a wide char that would straddle the boundary) and
+  marks a clip with `…`. This is the same class of bug the `display_width`
+  table was added to fix, one input further out: the invariant that
+  `repl_boxes_are_rectangular` asserts now holds for *any* value, not just
+  the fixed labels. Only the display is clipped — the model the session
+  actually uses is untouched.
+  Guarded by `repl_boxes_survive_a_long_model_name`, plus
+  `repl_banner_leaves_a_normal_model_name_alone` so the clip can't start
+  eating ordinary names.
+- **`stats` put its value column at three different offsets.** The rows were
+  hand-spaced, which placed the value at column 23 (`Tasks run:`), 22
+  (`Messages:`) and 24 (`Tool calls:`) — it read as a mistake rather than a
+  table. All rows now go through `stats_row`, which pads the label to 17
+  columns and right-aligns the value in 12, so every section shares one
+  right edge.
+
 ### Fixed (2026-09-24) — the REPL prompt no longer leaks into a redirected stdout
 - **`magent run --repl > session.log` logged one line *per keystroke*.**
   The line editor wrote its prompt and every redraw to stdout, so with a

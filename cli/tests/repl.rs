@@ -267,30 +267,23 @@ fn repl_aliases_reach_the_same_arms_as_their_canonical_spellings() {
     );
 }
 
-/// Every box row must end at the same display column. The printers used
-/// `{:>50}` / `{:>6}`, which counts **bytes** and ignores the double-width
-/// `🤖`, so measured widths ranged 59–72 against a 64-column border.
-#[test]
-fn repl_boxes_are_rectangular() {
-    let sb = Sandbox::new("boxes");
-    let out = sb.session("help\nstats\ntools\nq\n");
-    assert!(out.status.success(), "REPL exited non-zero");
-    let s = stdout(&out);
+/// Display width for the glyphs that appear in a box: the box itself is
+/// one column, ASCII one, the emoji block two, and `…` one.
+fn box_width(line: &str) -> usize {
+    line.chars()
+        .map(|c| {
+            if ('\u{1F300}'..='\u{1FAFF}').contains(&c) {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
 
-    /// Display width for the glyphs that appear in a box: the box itself is
-    /// one column, ASCII one, and the emoji block two.
-    fn width(line: &str) -> usize {
-        line.chars()
-            .map(|c| {
-                if ('\u{1F300}'..='\u{1FAFF}').contains(&c) {
-                    2
-                } else {
-                    1
-                }
-            })
-            .sum()
-    }
-
+/// Assert every box row in `s` ends at the same display column, and that
+/// there were enough of them for the check to mean anything.
+fn assert_boxes_are_rectangular(s: &str) {
     let mut box_lines = 0;
     for line in s.lines() {
         // Every box row starts at column 0 — the prompt that used to
@@ -302,13 +295,63 @@ fn repl_boxes_are_rectangular() {
         }
         box_lines += 1;
         assert_eq!(
-            width(line),
+            box_width(line),
             64,
             "box row is {w} columns, not 64: {line:?}",
-            w = width(line)
+            w = box_width(line)
         );
     }
     assert!(box_lines > 10, "no box rows found in:\n{s}");
+}
+
+/// Every box row must end at the same display column. The printers used
+/// `{:>50}` / `{:>6}`, which counts **bytes** and ignores the double-width
+/// `🤖`, so measured widths ranged 59–72 against a 64-column border.
+#[test]
+fn repl_boxes_are_rectangular() {
+    let sb = Sandbox::new("boxes");
+    let out = sb.session("help\nstats\ntools\nq\n");
+    assert!(out.status.success(), "REPL exited non-zero");
+    assert_boxes_are_rectangular(&stdout(&out));
+}
+
+/// A user-supplied string in a box must not widen that one row past the
+/// border. `--model <90 columns>` went straight into the banner's
+/// `Model:` row, which then measured 103 columns against a 64-column box
+/// — every other row in the session stayed rectangular, so the frame
+/// visibly fell apart on the very first screen.
+#[test]
+fn repl_boxes_survive_a_long_model_name() {
+    let sb = Sandbox::new("longmodel");
+    let model = "m".repeat(90);
+    let out = sb.session_with(&["--mock", "--model", &model], "stats\nq\n");
+    assert!(out.status.success(), "REPL exited non-zero");
+    let s = stdout(&out);
+    assert_boxes_are_rectangular(&s);
+    // The row is clipped, not dropped: the banner still names the model.
+    assert!(
+        s.contains("Model:   mmm"),
+        "the banner lost the model row entirely:\n{s}"
+    );
+    assert!(
+        s.contains('…'),
+        "a clipped row should be marked with an ellipsis:\n{s}"
+    );
+}
+
+/// The clipping above must not fire on ordinary values — a `…` in the
+/// banner of a normal session would be a bug of its own.
+#[test]
+fn repl_banner_leaves_a_normal_model_name_alone() {
+    let sb = Sandbox::new("shortmodel");
+    let out = sb.session_with(&["--mock", "--model", "llama3.2"], "q\n");
+    assert!(out.status.success(), "REPL exited non-zero");
+    let s = stdout(&out);
+    assert!(
+        s.contains("Model:   llama3.2"),
+        "the model name was mangled:\n{s}"
+    );
+    assert!(!s.contains('…'), "a short value was clipped:\n{s}");
 }
 
 /// `alias <name>` is the one argument form the whole-line rule allows, so
