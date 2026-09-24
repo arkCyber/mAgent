@@ -15,14 +15,13 @@
 //!
 //! ## Storage
 //!
-//! The config file lives at:
+//! The config file is resolved by [`config_path`], in this order:
 //!
 //! | Source                                | Path                                              |
 //! | ------------------------------------- | ------------------------------------------------- |
 //! | `$MAGENT_CONFIG_FILE` (explicit)      | the value of the env var                          |
 //! | `$MAGENT_CONFIG_DIR/magent.json`      | per-user, XDG-compliant                           |
-//! | macOS / Linux default                 | `~/.magent/config.json`                           |
-//! | Windows default                       | `%APPDATA%\magent\config.json` (best-effort)      |
+//! | `$XDG_CONFIG_HOME/magent/magent.json` | XDG default (falls back to `~/.config`)           |
 //!
 //! If neither an explicit env var nor a writable home is available,
 //! `config init` fails with a clear error rather than silently writing
@@ -34,12 +33,16 @@
 //! order (later wins):
 //!
 //! 1. Built-in defaults baked into the binary.
-//! 2. `~/.magent/config.json` (this file).
-//! 3. Environment variables (`OLLAMA_HOST`, `DEEPSEEK_HOST`, …).
-//! 4. CLI flags (`--provider`, `--model`, `--temperature`, …).
+//! 2. The config file (this module).
+//! 3. CLI flags (`--provider`, `--model`, `--temperature`, …).
 //!
-//! Step 2 is what this module reads/writes. The other steps live in
-//! [`crate::runner::build_runner`] and are not duplicated here.
+//! There is no general environment-variable layer: `OLLAMA_HOST` and
+//! friends are read only by `magent doctor`, not by `magent run` (which
+//! additionally reads the API-key env vars named by each provider's
+//! `api_key_env`).
+//!
+//! Step 2 is what this module reads/writes; step 3 lives in
+//! `crate::runner::apply_config_overrides` and is not duplicated here.
 //!
 //! ## Schema
 //!
@@ -630,7 +633,12 @@ pub fn get(record: &ConfigRecord, key: &str) -> Result<serde_json::Value, Config
         ["provider", "default"] => Ok(json_of(&record.provider.default)),
         ["provider", name] => endpoint_value(&record.provider, name),
         ["provider", name, field] => endpoint_field(&record.provider, name, field),
-        ["sampling"] => Ok(json_of(&record.sampling)),
+        ["sampling"] => Ok(serde_json::json!({
+            "temperature": json_of_f32(record.sampling.temperature),
+            "num_predict": record.sampling.num_predict,
+            "top_p": json_of_f32(record.sampling.top_p),
+            "top_k": record.sampling.top_k,
+        })),
         ["sampling", field] => sampling_field(&record.sampling, field),
         ["runner"] => Ok(json_of(&record.runner)),
         ["runner", field] => runner_field(&record.runner, field),
@@ -955,9 +963,9 @@ pub fn flatten(record: &ConfigRecord) -> Vec<(String, serde_json::Value)> {
         ("provider.ollama.model".to_string(), json_of(&record.provider.ollama.model)),
         ("provider.deepseek.url".to_string(), json_of(&record.provider.deepseek.url)),
         ("provider.deepseek.model".to_string(), json_of(&record.provider.deepseek.model)),
-        ("sampling.temperature".to_string(), json_of(record.sampling.temperature)),
+        ("sampling.temperature".to_string(), json_of_f32(record.sampling.temperature)),
         ("sampling.num_predict".to_string(), json_of(record.sampling.num_predict)),
-        ("sampling.top_p".to_string(), json_of(record.sampling.top_p)),
+        ("sampling.top_p".to_string(), json_of_f32(record.sampling.top_p)),
         ("sampling.top_k".to_string(), json_of(record.sampling.top_k)),
         ("runner.max_iterations".to_string(), json_of(record.runner.max_iterations)),
         ("runner.max_tool_calls".to_string(), json_of(record.runner.max_tool_calls)),
@@ -1004,6 +1012,21 @@ fn top_level_keys() -> Vec<String> {
 
 fn json_of<T: Serialize>(v: T) -> serde_json::Value {
     serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
+}
+
+/// Convert an `f32` to a JSON number using its *shortest* round-trip
+/// decimal (e.g. `0.9`, not `0.8999999761581421`).
+///
+/// `serde_json::to_value` widens `f32` to `f64` before encoding, so
+/// `config get` / `config list` printed the full binary expansion of
+/// every float — `0.9` came back as `0.8999999761581421` and the
+/// built-in default `0.3` as `0.30000001192092896`. `f32`'s `Display`
+/// already emits the shortest decimal that round-trips, so we parse
+/// that back into a `Number`. The on-disk file was never affected
+/// (it serialises the struct directly).
+fn json_of_f32(v: f32) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(&v.to_string())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn endpoint_value(p: &ProviderConfig, name: &str) -> Result<serde_json::Value, ConfigError> {
@@ -1132,9 +1155,9 @@ fn endpoint_set(ep: ProviderEndpoint, field: &str, value: &serde_json::Value, fu
 
 fn sampling_field(s: &SamplingConfig, field: &str) -> Result<serde_json::Value, ConfigError> {
     match field {
-        "temperature" => Ok(json_of(s.temperature)),
+        "temperature" => Ok(json_of_f32(s.temperature)),
         "num_predict" => Ok(json_of(s.num_predict)),
-        "top_p" => Ok(json_of(s.top_p)),
+        "top_p" => Ok(json_of_f32(s.top_p)),
         "top_k" => Ok(json_of(s.top_k)),
         other => Err(ConfigError::KeyNotFound {
             key: format!("sampling.{}", other),
@@ -1358,6 +1381,12 @@ pub enum ConfigAction {
     /// Re-print the JSON file with keys re-serialised in canonical
     /// order. Useful after hand-edits.
     Format,
+    /// Dump the config record as pretty JSON to **stdout** in both
+    /// modes. `show` renders to stdout only under `--json` (human
+    /// output goes to stderr for display), so it cannot be redirected;
+    /// `export` is the pipeable surface (`magent config export >
+    /// backup.json`), mirroring `set-prompt export` / `summary export`.
+    Export,
 }
 
 /// Glue struct so `main.rs` can construct and run the subcommand in
@@ -1382,6 +1411,7 @@ impl<'a> ConfigCmd<'a> {
             ConfigAction::Reset { yes } => self.run_reset(*yes, out),
             ConfigAction::Format => self.run_format(out),
             ConfigAction::Validate => self.run_validate(out),
+            ConfigAction::Export => self.run_export(out),
         }
     }
 
@@ -1439,6 +1469,19 @@ impl<'a> ConfigCmd<'a> {
         } else {
             let _ = out.stderr_fmt_line(format_args!("{}", json));
         }
+        Ok(())
+    }
+
+    /// Write the resolved config record to stdout as pretty JSON, in
+    /// both modes, so `magent config export > file` produces a file
+    /// (unlike `show`, whose human output goes to stderr for display).
+    fn run_export(&self, out: &mut Output) -> Result<(), ConfigError> {
+        let record = load()?;
+        let json = serde_json::to_string_pretty(&record).map_err(|source| ConfigError::Json {
+            path: config_path().unwrap_or_else(|_| PathBuf::from("(unresolved)")),
+            source,
+        })?;
+        out.write_stdout_line(&json);
         Ok(())
     }
 
@@ -1903,6 +1946,22 @@ pub fn validate_record(record: &ConfigRecord) -> Vec<ValidationIssue> {
     }
 
     // --- runner ---
+    // `0` is not a "no cap" sentinel for these two: the runner tests
+    // `iteration >= max` before its first step, so 0 makes every run
+    // fail. The CLI flags reject 0 at parse time; a config file must
+    // not smuggle it in either.
+    if record.runner.max_iterations == 0 {
+        issues.push(ValidationIssue {
+            key: "runner.max_iterations".to_string(),
+            message: "max_iterations must be >= 1 (0 permits no iterations)".to_string(),
+        });
+    }
+    if record.runner.max_tool_calls == 0 {
+        issues.push(ValidationIssue {
+            key: "runner.max_tool_calls".to_string(),
+            message: "max_tool_calls must be >= 1 (0 permits no tool calls)".to_string(),
+        });
+    }
     if record.runner.max_iterations > MAX_ITERATIONS_MAX {
         issues.push(ValidationIssue {
             key: "runner.max_iterations".to_string(),
@@ -2517,6 +2576,29 @@ mod tests {
     }
 
     #[test]
+    fn f32_keys_are_not_widened_by_get_or_list() {
+        // Regression: `sampling.temperature` / `sampling.top_p` are
+        // f32, and `serde_json::to_value` widens them to f64, so
+        // `config get` printed 0.8999999761581421 for a value the
+        // user wrote as 0.9 (and the default 0.3 as
+        // 0.30000001192092896). The read path must round-trip the
+        // shortest decimal instead.
+        let mut r = ConfigRecord::with_defaults();
+        r.sampling.temperature = 0.9;
+        r.sampling.top_p = 0.7;
+        assert_eq!(get(&r, "sampling.temperature").unwrap().to_string(), "0.9");
+        assert_eq!(get(&r, "sampling.top_p").unwrap().to_string(), "0.7");
+        let whole = get(&r, "sampling").unwrap();
+        assert_eq!(whole["temperature"].to_string(), "0.9");
+        assert_eq!(whole["top_p"].to_string(), "0.7");
+        let listed = flatten(&r)
+            .into_iter()
+            .find(|(k, _)| k == "sampling.temperature")
+            .map(|(_, v)| v.to_string());
+        assert_eq!(listed.as_deref(), Some("0.9"));
+    }
+
+    #[test]
     fn validate_rejects_top_p_out_of_range() {
         let mut r = ConfigRecord::with_defaults();
         r.sampling.top_p = 1.5;
@@ -2538,6 +2620,25 @@ mod tests {
         r.runner.max_iterations = 999_999;
         let issues = validate_record(&r);
         assert!(issues.iter().any(|i| i.key == "runner.max_iterations"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_iterations() {
+        // `0` is not a "no cap" sentinel: the runner permits zero steps
+        // and the run fails. Reject it so a config file can't smuggle in
+        // a run that can never make progress.
+        let mut r = ConfigRecord::with_defaults();
+        r.runner.max_iterations = 0;
+        let issues = validate_record(&r);
+        assert!(issues.iter().any(|i| i.key == "runner.max_iterations"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_tool_calls() {
+        let mut r = ConfigRecord::with_defaults();
+        r.runner.max_tool_calls = 0;
+        let issues = validate_record(&r);
+        assert!(issues.iter().any(|i| i.key == "runner.max_tool_calls"));
     }
 
     #[test]

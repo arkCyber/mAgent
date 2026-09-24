@@ -377,8 +377,12 @@ impl VoiceNotificationManager {
 
     /// Get next voice message to speak
     pub fn get_next_voice(&mut self, current_time_ms: u32) -> Option<VoiceMessage> {
-        // Check minimum interval
-        if current_time_ms - self.last_speech_ms < self.min_speech_interval_ms
+        // Check minimum interval. `saturating_sub` so a clock that has gone
+        // backwards — a u32 millisecond counter wrapping every ~49.7 days, or a
+        // caller switching time sources — reads as "no time has passed" and
+        // holds the rate limit, instead of wrapping to a huge elapsed value
+        // that bypasses it (and panics under debug overflow checks).
+        if current_time_ms.saturating_sub(self.last_speech_ms) < self.min_speech_interval_ms
             && !self.voice_queue.is_empty()
         {
             return None;
@@ -840,6 +844,18 @@ mod tests {
         mgr.queue_voice("b", 4, VoiceCategory::Coaching, 0).unwrap();
         let next = mgr.get_next_voice(103_000);
         assert_eq!(next.unwrap().text.as_str(), "b");
+    }
+
+    #[test]
+    fn get_next_voice_holds_the_rate_limit_when_the_clock_goes_backwards() {
+        let mut mgr = VoiceNotificationManager::new();
+        mgr.queue_voice("a", 5, VoiceCategory::Coaching, 0).unwrap();
+        mgr.queue_voice("b", 4, VoiceCategory::Coaching, 0).unwrap();
+        assert!(mgr.get_next_voice(100_000).is_some());
+        // The clock jumps back (wrap or a switched time source). The elapsed
+        // time must read as zero — holding the 2 s cooldown — not as a wrapped
+        // ~4e9 ms that serves a message immediately.
+        assert!(mgr.get_next_voice(50_000).is_none());
     }
 
     #[test]

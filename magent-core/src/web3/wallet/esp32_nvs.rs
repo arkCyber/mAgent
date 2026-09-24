@@ -265,6 +265,8 @@ pub fn load_wallet<N: esp_idf_svc::nvs::NvsDefault>(
     // Update last accessed
     if let Some(ref mut entry) = index.wallets[slot] {
         entry.last_accessed = (esp_timer_get_time() / 1_000_000) as u64;
+        // Best-effort: the timestamp is advisory. A failed write leaves it
+        // stale but must not fail a load whose keystore read still succeeds.
         let _ = save_index(nvs, &index);
     }
 

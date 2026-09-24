@@ -5,6 +5,16 @@
 //! capabilities over BLE 5.0.
 //!
 //! ## GATT Service Structure
+
+// SCAFFOLD: this module defines the intended API surface for the nRF52840
+// build, but most of it is not yet driven by `main.rs` (the platform is
+// documented in the README as "compiles, scaffold only"). The resulting
+// `dead_code` warnings are always-on noise that would mask a *real* new
+// warning, so they are silenced here rather than at each item — deliberately
+// scoped to the scaffold modules, so `main.rs` (the live path) stays strict.
+// Inventory + rationale: docs/BACKLOG.md, "nRF52840 scaffold warning debt".
+#![allow(dead_code)]
+
 //!
 //! **Service UUID: 0x1850 (mAgent Configuration Service)**
 //!

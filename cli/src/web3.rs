@@ -141,6 +141,10 @@ pub enum Web3CliError {
     /// Argon2id key derivation failed (low memory, parameter out
     /// of range, OS RNG unavailable, …).
     Kdf(String),
+    /// Bad user input on a key-derivation path (malformed hex, a
+    /// missing `--from-seed`, …). Kept separate from [`Self::Kdf`]
+    /// so the message doesn't blame Argon2id for a typo in a seed.
+    Usage(String),
     /// ChaCha20-Poly1305 encrypt/decrypt failed. The only realistic
     /// cause is a wrong passphrase (auth-tag mismatch) — we
     /// collapse the AEAD error into a friendly diagnostic.
@@ -195,6 +199,7 @@ impl std::fmt::Display for Web3CliError {
                 write!(f, "vault I/O error on {}: {}", path.display(), source)
             }
             Web3CliError::Kdf(msg) => write!(f, "Argon2id KDF failed: {}", msg),
+            Web3CliError::Usage(msg) => write!(f, "{}", msg),
             Web3CliError::Aead(msg) => write!(f, "vault decrypt failed: {}", msg),
             Web3CliError::Core(kind) => write!(f, "{}", kind),
             Web3CliError::VerificationFailed { reason } => {
@@ -614,7 +619,7 @@ impl<'a> Web3Cmd<'a> {
             let pk = core::PublicKey::from_bytes(&bytes)?;
             ("pubkey", pk.did_key().as_str())
         } else {
-            return Err(Web3CliError::Kdf(
+            return Err(Web3CliError::Usage(
                 "must pass either --from-seed <HEX> or --from-pubkey <HEX>".to_string(),
             ));
         };
@@ -627,9 +632,10 @@ impl<'a> Web3Cmd<'a> {
     }
 
     fn run_pubkey(&self, opts: &Web3PubkeyOptions, out: &mut Output) -> Result<(), Web3CliError> {
-        let hex_seed = opts.from_seed_hex.as_deref().ok_or_else(|| {
-            Web3CliError::Kdf("must pass --from-seed <HEX>".to_string())
-        })?;
+        let hex_seed = opts
+            .from_seed_hex
+            .as_deref()
+            .ok_or_else(|| Web3CliError::Usage("must pass --from-seed <HEX>".to_string()))?;
         let bytes = decode_hex(hex_seed)?;
         let id = core::Identity::from_secret_bytes(&bytes)?;
         let display = PubkeyDisplay {
@@ -680,24 +686,40 @@ impl<'a> Web3Cmd<'a> {
                     path: path.clone(),
                     source: e,
                 })?;
-                if out.kind() == OutputKind::Human {
-                    let _ = out.info(&format!(
-                        "wrote signed envelope ({} bytes) to {}",
-                        signed.to_json().len(),
-                        path.display()
-                    ));
+                match out.kind() {
+                    OutputKind::Human => {
+                        let _ = out.info(&format!(
+                            "wrote signed envelope ({} bytes) to {}",
+                            signed.to_json().len(),
+                            path.display()
+                        ));
+                    }
+                    // The envelope went to the file, so stdout is free.
+                    // Emit a confirmation so a `--json` consumer gets a
+                    // parseable result instead of an empty stream.
+                    OutputKind::Json => out.write_json_str(
+                        serde_json::json!({
+                            "action": "sign",
+                            "signer": entry.did,
+                            "output": path.display().to_string(),
+                            "bytes": signed.to_json().len(),
+                        })
+                        .to_string(),
+                    ),
                 }
             }
             None => {
-                // In human mode we print a minimal "signed with DID …
-                // envelope below" header so the user can confirm what
-                // they're piping into the next stage. In JSON mode
-                // the envelope IS the output — nothing else on
-                // stdout, per the global output convention.
+                // In human mode we print a minimal "signed with DID"
+                // header (to stderr) so the user can confirm what they're
+                // piping into the next stage. The envelope itself is the
+                // command's primary output, so it must reach stdout in
+                // *both* modes — `write_json_str` is a no-op in human
+                // mode, which made `sign … > env.json` produce an empty
+                // file despite the documented default of stdout.
                 if out.kind() == OutputKind::Human {
                     let _ = out.info(&format!("signed with did: {}", entry.did));
                 }
-                out.write_json_str(signed.to_json());
+                out.write_stdout_line(&signed.to_json());
             }
         }
         Ok(())
@@ -712,8 +734,18 @@ impl<'a> Web3Cmd<'a> {
         let payload = opts.payload.read()?;
         match core::verify_signed_message_detailed(&signed, &payload) {
             Ok(()) => {
-                if out.kind() == OutputKind::Human {
-                    let _ = out.info("verification OK");
+                match out.kind() {
+                    OutputKind::Human => {
+                        let _ = out.info("verification OK");
+                    }
+                    OutputKind::Json => out.write_json_str(
+                        serde_json::json!({
+                            "action": "verify",
+                            "ok": true,
+                            "signer": signed.signer,
+                        })
+                        .to_string(),
+                    ),
                 }
                 Ok(())
             }
@@ -775,7 +807,9 @@ impl<'a> Web3Cmd<'a> {
                 source: Some(e),
             }
         })?;
-        out.write_json_str(json);
+        // `export`'s whole purpose is to emit the record on stdout, so
+        // it must write in human mode too (see `write_stdout_line`).
+        out.write_stdout_line(&json);
         Ok(())
     }
 
@@ -786,8 +820,18 @@ impl<'a> Web3Cmd<'a> {
             return Err(Web3CliError::NotFound(name.to_string()));
         }
         save_vault(&vault_path, &vault)?;
-        if out.kind() == OutputKind::Human {
-            let _ = out.info(&format!("deleted identity {:?}", name));
+        match out.kind() {
+            OutputKind::Human => {
+                let _ = out.info(&format!("deleted identity {:?}", name));
+            }
+            OutputKind::Json => out.write_json_str(
+                serde_json::json!({
+                    "action": "delete",
+                    "name": name,
+                    "removed": true,
+                })
+                .to_string(),
+            ),
         }
         Ok(())
     }
@@ -1105,7 +1149,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, Web3CliError> {
 fn decode_hex(s: &str) -> Result<Vec<u8>, Web3CliError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     if !s.len().is_multiple_of(2) {
-        return Err(Web3CliError::Kdf(
+        return Err(Web3CliError::Usage(
             "hex string must have an even number of digits".to_string(),
         ));
     }
@@ -1124,7 +1168,7 @@ fn hex_nibble(c: u8) -> Result<u8, Web3CliError> {
         b'0'..=b'9' => Ok(c - b'0'),
         b'a'..=b'f' => Ok(c - b'a' + 10),
         b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(Web3CliError::Kdf(format!(
+        _ => Err(Web3CliError::Usage(format!(
             "invalid hex digit: '{}'",
             c as char
         ))),

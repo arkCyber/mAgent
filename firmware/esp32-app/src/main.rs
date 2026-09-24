@@ -53,7 +53,9 @@ mod core_affinity;
 mod latency_metrics;
 mod link_adapters;
 mod local_tools;
+mod nvs_flash;
 mod rt_watchdog;
+mod text_util;
 mod web_admin;
 mod at_dispatch;
 mod device_key;
@@ -64,14 +66,13 @@ mod ping;
 mod llm;
 #[cfg(feature = "lua")]
 mod lua_task;
-#[cfg(feature = "ble")]
-mod ble_config;
-#[cfg(feature = "ble")]
-mod ble_at;
-#[cfg(feature = "ble")]
-mod ble_wallet;
 #[cfg(feature = "wifi")]
 mod sntp_sync;
+// Not gated on `wifi`: the supervisor's `#[cfg(not(feature = "wifi"))]` fallback
+// arms name `ConnectionQuality`, so gating the module here made those arms
+// unreachable *and* un-compilable. The module depends only on `esp-idf-svc`,
+// which is an unconditional dependency.
+mod wifi_manager;
 
 use core::convert::TryFrom;
 use core::time::Duration;
@@ -90,6 +91,12 @@ use magent_core::{
 };
 
 use link_adapters::UartAdapter;
+// PATCHED (MicroAgent): the ingress gateway registers UART0 *and* (on the
+// ESP32-S3) the native USB-Serial/JTAG console behind this sum type.
+use link_adapters::EspIngressLink;
+// PATCHED (MicroAgent): native USB-Serial/JTAG console adapter (S3 only).
+#[cfg(all(feature = "uart", feature = "board-s3"))]
+use link_adapters::UsbSerialAdapter;
 
 /// Shared "current task" handle: the ingress thread writes UART commands
 /// here; the agent thread drains the latest one and executes it against real
@@ -209,6 +216,41 @@ type IngressUartParts = (
 #[cfg(not(feature = "uart"))]
 type IngressUartParts = ((), (), ());
 
+/// The ESP32-S3 native USB-Serial/JTAG peripheral + its D-/D+ pins, handed to
+/// the ingress thread so the *same* console the operator watches the boot log
+/// on can also carry commands (`AT…`, natural-language agent tasks).
+///
+/// Why this is needed: unlike the C61 DevKit (whose console goes through a
+/// USB-UART bridge wired to UART0), the S3 boards expose the chip's native USB
+/// peripheral to the host. Without this adapter, UART0 ingress only sees bytes
+/// on the physical U0RXD pin and USB-console input is silently dropped.
+#[cfg(all(feature = "uart", feature = "board-s3"))]
+type IngressUsbParts = (
+    esp_idf_svc::hal::usb_serial::USB_SERIAL<'static>,
+    esp_idf_svc::hal::gpio::Gpio19<'static>, // USB D-
+    esp_idf_svc::hal::gpio::Gpio20<'static>, // USB D+
+);
+
+/// Physical links handed from platform bring-up to the ingress thread.
+///
+/// `uart` is UART0 (both boards); `usb` is the native USB-Serial/JTAG console
+/// (S3 only).
+struct IngressLinks {
+    uart: Option<IngressUartParts>,
+    #[cfg(all(feature = "uart", feature = "board-s3"))]
+    usb: Option<IngressUsbParts>,
+}
+
+impl Default for IngressLinks {
+    fn default() -> Self {
+        Self {
+            uart: None,
+            #[cfg(all(feature = "uart", feature = "board-s3"))]
+            usb: None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Boot diagnostics
 // ---------------------------------------------------------------------------
@@ -299,6 +341,20 @@ static LEAKED_BOXES: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLoc
 /// boot (or for the current link to drop on its own). `swap(false)` is the
 /// consume operation, so each request triggers exactly one reconnect.
 pub static WIFI_RECONNECT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Set by `AT+CWQAP` and consumed by the Wi-Fi supervisor, which owns the only
+/// `BlockingWifi` handle. The dispatcher runs on the AT/ingress thread and has
+/// no radio handle, so it cannot call `esp_wifi_disconnect()` itself — before
+/// this flag existed `AT+CWQAP` merely logged "deferred to next boot" and left
+/// the link up.
+pub static WIFI_DISCONNECT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Set by `AT+CWLAP` (and by `AT+CWJAP` before a reconnect) to request an
+/// immediate scan. The supervisor performs the scan and fills [`LAST_SCAN`];
+/// the client re-reads `AT+CWLAP` to get the result. Without this the scan was
+/// only refreshed on the reconnect path, so `AT+CWLAP` on a healthy link could
+/// only ever return a stale cache (or "scan-started" forever).
+pub static WIFI_SCAN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Cached summary of the most recent Wi-Fi scan, produced by the supervisor
 /// when the STA is disconnected (the case where `AT+CWLAP` is most useful for
@@ -566,8 +622,12 @@ fn check_and_advance_crash_counter() -> bool {
 /// Mark the current boot as stable (called after the board has been up a
 /// while), resetting the crash-loop counter.
 fn mark_stable_boot() {
-    let _ = nvs_save_string(NVS_KEY_BOOT_COUNT, &0u32.to_string());
-    log::info!("[safety] boot considered stable — crash counter reset");
+    if nvs_save_string(NVS_KEY_BOOT_COUNT, &0u32.to_string()).is_err() {
+        // Don't claim the reset happened: the counter survives in NVS.
+        log::warn!("[safety] boot stable but crash counter reset failed (NVS write error)");
+    } else {
+        log::info!("[safety] boot considered stable — crash counter reset");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +799,48 @@ fn rssi_now(wifi: &mut BlockingWifi<EspWifi<'_>>) -> i32 {
 /// singleton) is already held by `EspWifi` at this point, so a second
 /// `take()` inside this function returns `ESP_ERR_INVALID_STATE` and the
 /// WiFi would be silently skipped ("no SSID in NVS").
+/// Scan for access points and cache the result for `AT+CWLAP`.
+///
+/// Returns a short human-readable summary for the caller's log line. Shared by
+/// the reconnect path (which scans opportunistically while disconnected) and
+/// the on-demand `AT+CWLAP` request, so both produce byte-identical cache
+/// contents — a client cannot tell which path filled it.
+fn refresh_scan_cache(wifi: &mut BlockingWifi<EspWifi<'_>>) -> String {
+    match wifi.scan() {
+        Ok(aps) => {
+            let mut lines = String::new();
+            for ap in aps.iter().take(20) {
+                // An SSID is 32 bytes that *anyone in radio range* chooses, CR
+                // and LF included. `AT+CWLAP` replays this cache into a
+                // CRLF-framed AT response, so a raw line break would end the
+                // line early and let the rest of the name be read as a forged
+                // `+CME ERROR` line. Escape at the point the name enters, so
+                // the reply and the log below are both safe.
+                lines.push_str(&format!(
+                    "({},{})\n",
+                    magent_core::at::escape_wire(ap.ssid.as_str()).as_str(),
+                    ap.signal_strength
+                ));
+            }
+            *LAST_SCAN.lock().unwrap_or_else(|e| e.into_inner()) = Some(lines);
+            let mut visible = String::new();
+            for ap in aps.iter().take(10) {
+                visible.push_str(&format!(
+                    "{}({}) ",
+                    magent_core::at::escape_wire(ap.ssid.as_str()).as_str(),
+                    ap.signal_strength
+                ));
+            }
+            log::info!("[wifi-sup] visible APs: {}", visible.trim_end());
+            format!("{} APs visible", aps.len())
+        }
+        Err(e) => {
+            log::warn!("[wifi-sup] scan failed: {e}");
+            format!("scan failed: {e}")
+        }
+    }
+}
+
 fn connect_wifi(
     wifi: &mut BlockingWifi<EspWifi<'_>>,
     ssid: &str,
@@ -1009,6 +1111,10 @@ fn connect_wifi(
 /// case) uses a growing backoff so we don't scan in a tight loop. The shared
 /// `net_up` flag also feeds the SNTP supervisor so it stops polling while
 /// there is no link.
+///
+/// ENHANCEMENT (2026-09-17): integrated with the new `wifi_manager` module
+/// for production-grade auto-reconnect with exponential backoff, signal
+/// quality monitoring, and detailed statistics.
 fn run_wifi_supervisor(
     wifi: &'static mut BlockingWifi<EspWifi<'static>>,
     status: WifiStatusHandle,
@@ -1017,8 +1123,60 @@ fn run_wifi_supervisor(
     net_up: Arc<AtomicBool>,
 ) {
     log::info!("[wifi-sup] supervisor thread started (ssid={ssid})");
+
+    // AT+CWRECONNCFG policy (NVS `mag_at:reconn_int` / `reconn_rep`), read once
+    // at supervisor start. Before 2026-09-23 the dispatcher wrote these keys but
+    // nothing consumed them — the supervisor used hard-coded constants — so an
+    // operator's `AT+CWRECONNCFG=5,100` was persisted and then silently
+    // ignored. 0 keeps the built-in behaviour (interval: adaptive caps;
+    // repeat: unlimited attempts).
+    let reconn_interval_s: u64 = nvs_load_string("mag_at:reconn_int")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let reconn_repeat: u32 = nvs_load_string("mag_at:reconn_rep")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    if reconn_interval_s > 0 || reconn_repeat > 0 {
+        log::info!(
+            "[wifi-sup] reconnect policy from NVS: interval={}s repeat={}",
+            reconn_interval_s,
+            if reconn_repeat == 0 {
+                "unlimited".to_string()
+            } else {
+                reconn_repeat.to_string()
+            }
+        );
+    }
+
+    // ENHANCEMENT (2026-09-17): 创建WiFi管理器实例
+    #[cfg(feature = "wifi")]
+    let manager = {
+        use crate::wifi_manager::{WifiManager, WifiManagerConfig};
+        let mgr_config = WifiManagerConfig {
+            // `repeat` = 0 → unlimited retries (embedded default); a positive
+            // value caps attempts and drives the manager into its `Failed`
+            // state so it stops re-associating with a dead AP.
+            max_retries: reconn_repeat,
+            initial_backoff: Duration::from_secs(2),
+            // `interval` = 0 keeps the built-in 60s ceiling; otherwise it is
+            // the operator's chosen maximum gap between attempts.
+            max_backoff: if reconn_interval_s > 0 {
+                Duration::from_secs(reconn_interval_s)
+            } else {
+                Duration::from_secs(60)
+            },
+        };
+        Arc::new(WifiManager::new(mgr_config))
+    };
+
     let mut was_up: Option<bool> = None;
     let mut downs: u32 = 0;
+    // Reconnect attempts made during the current outage. Reset on every LINK
+    // UP (and on an explicit `AT+CWJAP`). Enforces `AT+CWRECONNCFG`'s `repeat`
+    // bound — `downs` counts *drop episodes*, not attempts, so it cannot.
+    let mut reconnect_attempts: u32 = 0;
+    // Guards the give-up log so it prints once per outage, not every tick.
+    let mut gave_up_logged = false;
     let mut last_heartbeat = 0u64;
     // FAULT-TOLERANCE (2026-08-27): last time we printed the user-facing
     // "hotspot not on 2.4GHz" hint, so it repeats only every ~2 min instead
@@ -1026,6 +1184,11 @@ fn run_wifi_supervisor(
     let mut last_ap_hint = 0u64;
     // Last time we ran a cached scan for `AT+CWLAP` (throttled to 60s).
     let mut last_scan_ms = 0u64;
+    // Set by `AT+CWQAP`; cleared by `AT+CWJAP`. While true the supervisor
+    // leaves the radio down instead of running its reconnect path — otherwise
+    // the `if !connected` block below would re-associate within one tick and
+    // CWQAP would appear to do nothing.
+    let mut reconnect_suppressed = false;
     loop {
         std::thread::sleep(Duration::from_secs(3));
         let now = now_ms();
@@ -1046,6 +1209,41 @@ fn run_wifi_supervisor(
             connect_wifi(&mut *wifi, &ssid, &pass, &status);
             was_up = None;
             downs = 0;
+            reconnect_attempts = 0;
+            gave_up_logged = false;
+            // Re-arm auto-reconnect: an explicit connect request overrides a
+            // previous `AT+CWQAP`.
+            reconnect_suppressed = false;
+        }
+
+        // `AT+CWQAP` — drop the link and clear the reconnect state machine so
+        // the auto-reconnect logic does not immediately re-associate. The
+        // operator re-arms it with `AT+CWJAP` (or `AT+CWAUTOCONN=1` + reboot).
+        if WIFI_DISCONNECT_REQUESTED.swap(false, Ordering::AcqRel) {
+            log::warn!("[wifi-sup] AT+CWQAP — disconnecting");
+            if let Err(e) = wifi.disconnect() {
+                log::warn!("[wifi-sup] disconnect failed: {e}");
+            } else {
+                // Without the reset the manager would see "was Connected, now
+                // down" on the next tick and reconnect immediately, making
+                // AT+CWQAP look like a no-op.
+                #[cfg(feature = "wifi")]
+                manager.reset();
+                publish_wifi_state(&status, &ssid, 0, None, 0, 0, now_ms());
+                was_up = None;
+                downs = 0;
+                reconnect_suppressed = true;
+                log::info!("[wifi-sup] disconnected (auto-reconnect suppressed)");
+            }
+        }
+
+        // `AT+CWLAP` — scan on demand, bypassing the 60s opportunistic-scan
+        // throttle, so a client sees live results instead of a stale cache
+        // (or "scan-started" forever).
+        if WIFI_SCAN_REQUESTED.swap(false, Ordering::AcqRel) {
+            log::info!("[wifi-sup] AT+CWLAP — on-demand scan");
+            let summary = refresh_scan_cache(&mut *wifi);
+            log::info!("[wifi-sup] on-demand scan: {summary}");
         }
 
         let connected = wifi.is_connected().unwrap_or(false);
@@ -1056,7 +1254,25 @@ fn run_wifi_supervisor(
             .ok()
             .map(|i| i.ip.to_string())
             .filter(|s| !s.is_empty() && s != "0.0.0.0");
-        let rssi = wifi.wifi_mut().get_rssi().unwrap_or(0);
+
+        // ENHANCEMENT (2026-09-17): 使用WiFi管理器获取信号强度和质量
+        #[cfg(feature = "wifi")]
+        let (rssi, quality) = {
+            use crate::wifi_manager::ConnectionQuality;
+            // One FFI read shared by both the AT+CWSTATE snapshot and the
+            // quality grade. A failed read is `Unknown`, not a fabricated
+            // "Excellent" — see `ConnectionQuality`.
+            let r = manager.get_rssi(&mut *wifi);
+            let q = r.map_or(ConnectionQuality::Unknown, ConnectionQuality::from_rssi);
+            (r, q)
+        };
+        #[cfg(not(feature = "wifi"))]
+        let (rssi, quality) = {
+            use crate::wifi_manager::ConnectionQuality;
+            (wifi.wifi_mut().get_rssi().ok(), ConnectionQuality::Unknown)
+        };
+        // AT+CWSTATE carries a plain `i32`; 0 remains the "unknown" sentinel.
+        let rssi_i32 = rssi.unwrap_or(0);
 
         // FAULT-TOLERANCE: publish the link-up bit for the SNTP supervisor.
         // Having a non-loopback IP means DHCP completed, so outbound UDP
@@ -1073,7 +1289,7 @@ fn run_wifi_supervisor(
             &ssid,
             if ip.is_some() { 5 } else if connected { 3 } else { 4 },
             ip.as_deref(),
-            rssi,
+            rssi_i32,
             0,
             now,
         );
@@ -1082,7 +1298,7 @@ fn run_wifi_supervisor(
         match was_up {
             None => {
                 log::info!(
-                    "[wifi-sup] initial state: connected={connected} ip={} rssi={rssi} dBm",
+                    "[wifi-sup] initial state: connected={connected} ip={} rssi={rssi_i32} dBm",
                     ip.as_deref().unwrap_or("none")
                 );
                 downs = 0;
@@ -1090,14 +1306,21 @@ fn run_wifi_supervisor(
             Some(true) if !connected => {
                 downs += 1;
                 log::warn!(
-                    "[wifi-sup] LINK DOWN (consecutive={downs}) ip={} rssi={rssi} dBm - reconnecting",
+                    "[wifi-sup] LINK DOWN (consecutive={downs}) ip={} rssi={rssi_i32} dBm - reconnecting",
                     ip.as_deref().unwrap_or("none")
                 );
+
+                // ENHANCEMENT (2026-09-17): 使用WiFi管理器的自动重连
+                #[cfg(feature = "wifi")]
+                if let Err(e) = manager.check_and_reconnect(&mut *wifi) {
+                    log::warn!("[wifi-sup] 自动重连失败: {:?}", e);
+                }
             }
             Some(false) if connected => {
                 downs = 0;
+                reconnect_attempts = 0;
                 log::info!(
-                    "[wifi-sup] LINK UP ip={} rssi={rssi} dBm",
+                    "[wifi-sup] LINK UP ip={} rssi={rssi_i32} dBm",
                     ip.as_deref().unwrap_or("none")
                 );
             }
@@ -1105,16 +1328,38 @@ fn run_wifi_supervisor(
         }
         was_up = Some(connected);
 
+        // ENHANCEMENT (2026-09-17): 信号质量监控和告警
+        if connected && quality.should_warn() {
+            log::warn!(
+                "[wifi-sup] ⚠️ 信号质量差: {:?} (RSSI: {} dBm)",
+                quality,
+                rssi_i32
+            );
+        }
+
         // Heartbeat while up: periodic RSSI/IP so an operator can watch drift.
+        // Also emits the reconnect-manager counters (connects / disconnects /
+        // retries) that `AT+CWSTATE` reports — this is what the removed
+        // `wifi_manager::wifi_monitor_loop` used to do, folded into the
+        // supervisor so there is one loop instead of two.
         if connected && now - last_heartbeat > 60_000 {
             last_heartbeat = now;
+            #[cfg(feature = "wifi")]
+            let stats = manager.get_state_summary();
+            #[cfg(not(feature = "wifi"))]
+            let stats = String::new();
             log::info!(
-                "[wifi-sup] heartbeat ip={} rssi={rssi} dBm",
+                "[wifi-sup] heartbeat ip={} rssi={rssi_i32} dBm [{stats}]",
                 ip.as_deref().unwrap_or("none")
             );
         }
 
-        if !connected {
+        // `AT+CWRECONNCFG`'s `repeat` bound: once the operator's attempt budget
+        // is spent for this outage, stop re-associating and wait for an
+        // explicit `AT+CWJAP=` (or a reboot) instead of retrying forever.
+        let attempts_exhausted = reconn_repeat > 0 && reconnect_attempts >= reconn_repeat;
+
+        if !connected && !reconnect_suppressed && !attempts_exhausted {
             // FAULT-TOLERANCE (2026-08-27): classify the last drop reason so a
             // wrong-password AUTH_FAIL isn't hammered (it can never succeed),
             // an absent AP backs off harder, and transient drops retry normally.
@@ -1129,6 +1374,15 @@ fn run_wifi_supervisor(
             } else {
                 std::cmp::min(3u64 << downs.min(3), TRANSIENT_MAX_BACKOFF_S)
             };
+            // `AT+CWRECONNCFG` interval caps the gap for the adaptive paths
+            // (the credential path keeps its long, deliberate backoff — an
+            // operator interval must not turn a wrong password into a hammer).
+            let backoff: u64 = if reconn_interval_s > 0 && !cred_error {
+                backoff.min(reconn_interval_s)
+            } else {
+                backoff
+            };
+            reconnect_attempts = reconnect_attempts.saturating_add(1);
 
             if cred_error {
                 log::warn!(
@@ -1155,26 +1409,25 @@ fn run_wifi_supervisor(
                 // scans again internally anyway).
                 if now.saturating_sub(last_scan_ms) > 60_000 {
                     last_scan_ms = now;
-                    match wifi.scan() {
-                        Ok(aps) => {
-                            let mut lines = String::new();
-                            for ap in aps.iter().take(20) {
-                                lines.push_str(&format!(
-                                    "({},{})\n",
-                                    ap.ssid.as_str(),
-                                    ap.signal_strength
-                                ));
-                            }
-                            *LAST_SCAN.lock().unwrap_or_else(|e| e.into_inner()) = Some(lines);
-                            log::info!("[wifi-sup] cached scan: {} APs visible", aps.len());
-                        }
-                        Err(e) => log::warn!("[wifi-sup] scan failed: {e}"),
-                    }
+                    // Throttled here to once per 60s to avoid hammering the
+                    // radio with back-to-back scans (connect_wifi scans again
+                    // internally anyway). An explicit `AT+CWLAP` bypasses the
+                    // throttle — see the WIFI_SCAN_REQUESTED block above.
+                    log::info!("[wifi-sup] cached scan: {}", refresh_scan_cache(&mut *wifi));
                 }
                 connect_wifi(&mut *wifi, &ssid, &pass, &status);
             }
             log::warn!("[wifi-sup] backoff {backoff}s before next attempt");
             std::thread::sleep(Duration::from_secs(backoff));
+        } else if !connected && attempts_exhausted && !reconnect_suppressed && !gave_up_logged {
+            gave_up_logged = true;
+            log::error!(
+                "[wifi-sup] reconnect attempt budget spent ({reconnect_attempts}/{reconn_repeat} \
+                 per AT+CWRECONNCFG) — giving up until an operator runs AT+CWJAP= or reboots"
+            );
+        }
+        if connected {
+            gave_up_logged = false;
         }
     }
 }
@@ -1404,7 +1657,7 @@ fn open_stored_wifi_pass(stored: &str) -> Result<String, &'static str> {
 /// into the gateway as `IngressSource::Other`. TRACE: REQ-SAFE-002.
 fn run_ingress(
     identity: Identity,
-    uart_parts: Option<IngressUartParts>,
+    links: IngressLinks,
     task_handle: TaskHandle,
     reply_outbox: TaskHandle,
     heartbeat: Heartbeat,
@@ -1423,9 +1676,14 @@ fn run_ingress(
     // we use `esp_idf_svc::hal::uart::UartDriver`. The driver borrows
     // `'static` GPIO pins taken from `Peripherals`, so the gateway's
     // adapter type is `UartDriver<'static>`.
-    let mut gw: IngressGateway<UartAdapter<esp_idf_svc::hal::uart::UartDriver<'static>>> =
-        IngressGateway::new(IngressMode::Signed);
+    let mut gw: IngressGateway<EspIngressLink> = IngressGateway::new(IngressMode::Signed);
     gw.set_signer(identity);
+
+    // PATCHED (MicroAgent): adapter index → link name, in registration order.
+    // The gateway reports every frame's `IngressSource::Rs232.port`, so this
+    // table lets the reply path answer back out of the link the command
+    // arrived on (UART0 vs. the USB console) instead of hard-coding adapter 0.
+    let mut link_ports: std::vec::Vec<&'static str> = std::vec::Vec::new();
 
     // Build a UART adapter on UART0 (wired to the USB-UART bridge on the
     // C61 DevKit). UART0 pins: TX=GPIO11, RX=GPIO10 (U0TXD/U0RXD). The
@@ -1440,7 +1698,7 @@ fn run_ingress(
         use esp_idf_svc::hal::uart::{self, UartDriver};
         use esp_idf_svc::hal::units::Hertz;
 
-        if let Some((uart0, tx, rx)) = uart_parts {
+        if let Some((uart0, tx, rx)) = links.uart {
             let config = uart::config::Config::new().baudrate(Hertz(115_200));
             match UartDriver::new(
                 uart0,
@@ -1452,7 +1710,9 @@ fn run_ingress(
             ) {
                 Ok(u) => {
                     let adapter = UartAdapter::new(u, "UART0");
-                    let _ = gw.register(adapter);
+                    if gw.register(link_adapters::EspIngressLink::Uart(adapter)).is_ok() {
+                        link_ports.push("UART0");
+                    }
                     log::info!("[ingress] UART0 registered");
                 }
                 Err(e) => {
@@ -1464,9 +1724,40 @@ fn run_ingress(
         }
     }
 
+    // PATCHED (MicroAgent): ESP32-S3 native USB-Serial/JTAG console as a
+    // *second* ingress link. The console log output already mirrors to this
+    // peripheral, so registering it makes the console the operator is watching
+    // bidirectional — commands typed there reach the AT dispatcher / agent,
+    // and replies go back out of the same link. Non-fatal if it fails (e.g.
+    // the console already owns the driver): UART0 ingress keeps working.
+    #[cfg(all(feature = "uart", feature = "board-s3"))]
+    {
+        use esp_idf_svc::hal::usb_serial::{self, UsbSerialDriver};
+
+        if let Some((usb_serial, d_min, d_plus)) = links.usb {
+            let config = usb_serial::config::Config::new()
+                .tx_buffer_size(1024)
+                .rx_buffer_size(1024);
+            match UsbSerialDriver::new(usb_serial, d_min, d_plus, &config) {
+                Ok(driver) => {
+                    let adapter = UsbSerialAdapter::new(driver, "USB-JTAG");
+                    if gw.register(link_adapters::EspIngressLink::Usb(adapter)).is_ok() {
+                        link_ports.push("USB-JTAG");
+                    }
+                    log::info!("[ingress] USB-Serial/JTAG console registered");
+                }
+                Err(e) => log::warn!(
+                    "[ingress] USB-Serial/JTAG unavailable ({e}) — AT over the USB console disabled"
+                ),
+            }
+        }
+    }
+
     #[cfg(not(feature = "uart"))]
     {
-        let _ = uart_parts;
+        // No UART link in this build; keep the bundle alive so the field isn't
+        // flagged as never-read.
+        let _ = links.uart;
         log::info!("[ingress] uart feature disabled — running in dummy mode");
     }
 
@@ -1484,16 +1775,22 @@ fn run_ingress(
     // agent-routed end-to-end latency. `None` when no agent command is in flight.
     let mut agent_cmd_at: Option<u64> = None;
 
+    // PATCHED (MicroAgent): adapter index the next reply must be sent to.
+    // Updated whenever a frame arrives, so a command typed on the USB console
+    // is answered on the USB console (and an UART0 command on UART0).
+    let mut reply_link: usize = 0;
+
     loop {
         heartbeat.beat();
         rt_watchdog::feed();
 
         // PATCHED (MicroAgent): drain any agent reply and send it back to the
-        // host over the UART link (bidirectional communication). Adapter index
-        // 0 is the UART adapter registered below.
+        // host over the link the command came in on (`reply_link` — UART0 or
+        // the USB-Serial/JTAG console), so a USB-console command is answered on
+        // the USB console.
         if let Ok(mut guard) = reply_outbox.lock() {
             if let Some(reply) = guard.take() {
-                match gw.send_to_adapter(0, reply.as_bytes()) {
+                match gw.send_to_adapter(reply_link, reply.as_bytes()) {
                     Ok(()) => log::info!("[ingress] reply sent to host: {reply}"),
                     Err(e) => log::warn!("[ingress] reply send failed: {e}"),
                 }
@@ -1527,6 +1824,16 @@ fn run_ingress(
                 );
                 if let Some(envelope) = &frame.envelope_json {
                     log::info!("[ingress] signed envelope: {envelope}");
+                }
+                // PATCHED (MicroAgent): remember which physical link this
+                // command came in on so the reply (AT data line, `+CMDER:<n>`,
+                // or agent RESULT) goes back out of the same one.
+                if let magent_core::communication::link::IngressSource::Rs232 { port } = &frame.source
+                {
+                    let name = port.as_str();
+                    if let Some(idx) = link_ports.iter().position(|p| *p == name) {
+                        reply_link = idx;
+                    }
                 }
                 // Try AT first; anything not-AT (e.g. "read the
                 // temperature") falls through to the agent's ReAct
@@ -1715,9 +2022,18 @@ fn run_agent_loop(
         .and_then(|c| c.with_max_iterations(20))
         // REQ-SCHED-001 / mem-1: the memory budget scales with the board. The
         // C61 (2 MB PSRAM) stays at 512 KiB; the S3 (8 MB octal, via the
-        // `s3-8mb-psram` feature) uses the larger 2 MiB dynamic-context budget.
-        // (The embedded MiniAgent is heapless-bounded, so this is a headroom
-        // ceiling — not a request for the agent to actually consume it.)
+        // `s3-8mb-psram` feature) uses the larger 2 MiB budget. These reach the
+        // agent's `BudgetEnforcer` limits (iteration + memory) as of the
+        // 2026-09-23 wiring; before that `MiniAgent::new` ignored both fields and
+        // always used the crate defaults (50 iterations / 50 KiB), so the
+        // `with_max_iterations(20)` above silently did nothing.
+        //
+        // Caveat: the memory *limit* only binds if something calls
+        // `BudgetEnforcer::consume_memory`, which no production path does today —
+        // the real device context bound is the heapless conversation
+        // (`MAX_CONVERSATION_MESSAGES` × `MAX_BUFFER_SIZE` ≈ 40 KiB; see the
+        // `MiniAgent::new` note below). So this value is a configured ceiling,
+        // not an enforced one.
         .and_then(|c| c.with_max_memory(magent_core::MAX_DYNAMIC_CONTEXT_BYTES as u32))
         .ok();
     let Some(config) = config else {
@@ -1732,10 +2048,14 @@ fn run_agent_loop(
     };
     dtrace("agent:config-built");
 
-    // MiniAgent is heap-allocated (Box) so its large conversation buffers
-    // (20 × 8 KiB = up to 160 KiB) live on the 2 MB PSRAM heap, NOT on the
-    // 96 KiB agent-thread stack. This is what makes the larger MAX_BUFFER_SIZE
-    // / MAX_CONVERSATION_MESSAGES safe.
+    // MiniAgent is heap-allocated (`Box`) so its conversation buffers live on
+    // the PSRAM heap, NOT on the agent-thread stack. The embedded conversation
+    // is count-bounded, not byte-bounded: `MAX_CONVERSATION_MESSAGES` (20)
+    // messages of `String<MAX_BUFFER_SIZE>` (`MAX_BUFFER_SIZE` = 2 KiB, not the
+    // 8 KiB this comment used to claim), so at most ~20 × 2 KiB ≈ 40 KiB — not
+    // 160 KiB. It is never byte-GC'd on device: `gc_to_budget` /
+    // `MAX_DYNAMIC_CONTEXT_BYTES` run in the host `RealAgentRunner`, not in
+    // `MiniAgent` (see the `with_max_memory` note above).
     let mut agent = match MiniAgent::new(config).map(Box::new) {
         Ok(a) => a,
         Err(e) => {
@@ -1754,6 +2074,80 @@ fn run_agent_loop(
     // with no network at all.
     agent.set_tool_handler(&local_tools::Esp32ToolHandler);
     dtrace("agent:tool-handler-ok");
+
+    // PATCHED (MicroAgent): advertise the on-device *network* tools to the LLM.
+    //
+    // `Esp32ToolHandler` has always executed `fetch_web` (and now also
+    // `get_weather` / `get_news`), but the agent's tool registry is what
+    // `MiniAgent::build_llm_system_prompt` lists as "Available tools:" — and it
+    // only contained the hardware/sensor set. The cloud LLM therefore never
+    // learned that it could reach the network, so weather/news questions were
+    // answered from (stale) parametric memory instead of live data. Registering
+    // them closes that gap; `ToolType::WebFetch` has no simulation, so the
+    // handler above is the only executor.
+    {
+        use magent_core::tools::{Tool, ToolType};
+
+        // (name, description) — description is what the LLM sees, so it carries
+        // the argument grammar the executor parses (`key=value`).
+        const WEB_TOOLS: &[(&str, &str)] = &[
+            (
+                "fetch_web",
+                "HTTP GET an http(s) URL, return a short text preview. args: url=<https://...>",
+            ),
+            (
+                "get_weather",
+                "Live current weather for a city. args: city=<name> (e.g. Beijing / Shanghai)",
+            ),
+            (
+                "get_news",
+                "Today's news headlines (60s digest). args: limit=<1-8> (default 3)",
+            ),
+            (
+                "get_flight_price",
+                "Cheapest fares between two cities. args: from=<IATA>,to=<IATA>[,date=YYYY-MM]",
+            ),
+        ];
+        for (name, desc) in WEB_TOOLS {
+            // `Tool::name` is `String<32>` and `Tool::description` `String<128>`.
+            // `try_from(..).unwrap_or_default()` would silently produce an EMPTY
+            // description for an over-long one — and `ToolRegistry::describe`
+            // skips empty descriptions, so the tool would vanish from the LLM
+            // prompt with no diagnostic (this is exactly how `get_flight_price`
+            // disappeared once). Report it loudly instead.
+            let (name_h, desc_h) = (
+                heapless::String::<32>::try_from(*name),
+                heapless::String::<128>::try_from(*desc),
+            );
+            match (name_h, desc_h) {
+                (Ok(n), Ok(d)) => {
+                    let tool = Tool {
+                        name: n,
+                        description: d,
+                        tool_type: ToolType::WebFetch,
+                    };
+                    if let Err(e) = agent.tools().register(tool) {
+                        log::warn!("[agent] network tool '{name}' registration failed: {e}");
+                    }
+                }
+                _ => log::error!(
+                    "[agent] network tool '{name}' NOT registered: name must fit 32 B ({} B) \
+                     and description 128 B ({} B) — the LLM will not see this tool",
+                    name.len(),
+                    desc.len()
+                ),
+            }
+        }
+        log::info!(
+            "[agent] registered {} on-device network tool(s) for the LLM: {}",
+            WEB_TOOLS.len(),
+            WEB_TOOLS
+                .iter()
+                .map(|(n, _)| *n)
+                .collect::<std::vec::Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // Install the DeepSeek chat-LLM backend when configured (via AT+LLMCFG
     // or the build-time default). The backend is leaked so it can be held as
@@ -1847,6 +2241,8 @@ fn run_agent_loop(
     // critically low.
     let boot_ms = now_ms();
     let mut last_health_log = boot_ms;
+    // One-shot guard for the boot-time LLM tool-inventory log (see below).
+    let mut logged_tool_inventory = false;
     const LOW_HEAP_WARN: u32 = 64 * 1024;
 
     loop {
@@ -1859,19 +2255,17 @@ fn run_agent_loop(
         // the task came from a real UART command so we can reply over UART.
         let pending = task_handle.lock().ok().and_then(|mut g| g.take());
         let from_uart = pending.is_some();
-        // BLE-fed chat payload (set by the BLE SYS_CMD handler in ble_config).
-        #[cfg(feature = "ble")]
-        let ble_task = crate::ble_config::BLE_AGENT_TASK
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take());
-        #[cfg(feature = "ble")]
-        let from_ble = ble_task.is_some();
-        #[cfg(not(feature = "ble"))]
-        let (ble_task, _from_ble) = (None::<String>, false);
-        let task = ble_task
-            .or(pending)
-            .unwrap_or_else(|| "read sensor temperature".to_string());
+        let task = pending;
+        // PATCHED (MicroAgent): distinguish an *internal* heartbeat run (no
+        // operator command pending) from a real command. The internal task must
+        // stay on-device: sending "read sensor temperature" to the cloud LLM
+        // every idle cycle would bill a round trip roughly every 5 s, and a
+        // pre-Wi-Fi failure would set the agent's LLM-skip backoff — which then
+        // answered the operator's first commands from the local heuristic
+        // (observed on hardware: "你好" and "北京天气" degraded to a temperature
+        // read after boot).
+        let internal_self_test = task.is_none();
+        let task = task.unwrap_or_else(|| "read sensor temperature".to_string());
 
         // PATCHED (MicroAgent): `MiniAgent::run` is an `async fn` (it
         // awaits the LLM and tool futures). On a bare esp-idf-svc
@@ -1903,6 +2297,20 @@ fn run_agent_loop(
         // reducing the agent's internal-DRAM footprint.
         let hw_before =
             unsafe { esp_idf_sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) };
+        // Internal heartbeat → local tools + heuristic only (no cloud call);
+        // a real command → full ReAct with the cloud LLM.
+        agent.set_llm_local_only(internal_self_test);
+        // PATCHED (MicroAgent): log the tool inventory once per boot. This is
+        // what the LLM actually sees as "Available tools:", so it is the only
+        // trustworthy answer to "why doesn't the model use tool X?" — asking the
+        // model to recite the list does not work, because its reply is bounded by
+        // `max_tokens` and gets cut mid-list. (An over-long `Tool::description`
+        // used to be silently replaced by an empty string, which made a tool
+        // disappear from the prompt entirely.)
+        if !logged_tool_inventory {
+            logged_tool_inventory = true;
+            log::info!("[agent] LLM tool inventory ({} tools):\n{}", agent.tools().count(), agent.tools().describe());
+        }
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             futures::executor::block_on(std::boxed::Box::pin(agent.run(&task)))
         }));
@@ -1919,22 +2327,10 @@ fn run_agent_loop(
         match outcome {
             Ok(Ok(result)) => {
                 log::info!("[agent] result({task}): {result}");
-                // Bidirectional replies: a UART-fed command replies over the
-                // UART outbox; a BLE-fed chat payload replies via the BLE
-                // SYS_RSP path (see ble_config::agent_reply_for).
+                // A UART-fed command replies over the UART outbox.
                 if from_uart {
                     if let Ok(mut guard) = reply_outbox.lock() {
                         *guard = Some(std::format!("RESULT[{task}]: {result}"));
-                    }
-                }
-                #[cfg(feature = "ble")]
-                if from_ble {
-                    if let Ok(mut guard) = crate::ble_config::BLE_AGENT_REPLY.lock() {
-                        // HARDENING (audit-2026-08 fix type mismatch):
-                        // `result` is `String<MAX_BUFFER_SIZE>` (heapless) but
-                        // `BLE_AGENT_REPLY` expects `Option<String>` (std).
-                        // Convert via `to_string()`.
-                        *guard = Some(result.as_str().to_string());
                     }
                 }
             }
@@ -2024,7 +2420,7 @@ fn setup_platform(
     safe_mode: bool,
     wifi_status: &WifiStatusHandle,
 ) -> (
-    Option<IngressUartParts>,
+    IngressLinks,
     Option<&'static mut BlockingWifi<EspWifi<'static>>>,
 ) {
     use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -2036,7 +2432,7 @@ fn setup_platform(
         }
         Err(e) => {
             log::warn!("[wifi] event loop unavailable ({e}) — running without Wi-Fi");
-            return (None, None);
+            return (IngressLinks::default(), None);
         }
     };
 
@@ -2095,14 +2491,14 @@ fn setup_platform(
         }
         Err(e) => {
             log::warn!("[wifi] peripherals unavailable ({e}) — running without Wi-Fi/UART");
-            return (None, None);
+            return (IngressLinks::default(), None);
         }
     };
     let nvs_partition = match default_nvs() {
         Some(n) => n,
         None => {
             log::warn!("[wifi] NVS partition unavailable — running without Wi-Fi");
-            return (None, None);
+            return (IngressLinks::default(), None);
         }
     };
 
@@ -2113,13 +2509,27 @@ fn setup_platform(
     #[cfg(not(feature = "uart"))]
     let ingress_uart: Option<IngressUartParts> = None;
 
+    // PATCHED (MicroAgent): the ESP32-S3 native USB-Serial/JTAG peripheral +
+    // D-/D+ pins are claimed here (see `IngressUsbParts`) and carried to the
+    // ingress thread; everything below may bail out early, so `links` holds
+    // whatever physical ingress link(s) are available.
+    let links = IngressLinks {
+        uart: ingress_uart,
+        #[cfg(all(feature = "uart", feature = "board-s3"))]
+        usb: Some((
+            peripherals.usb_serial,
+            peripherals.pins.gpio19,
+            peripherals.pins.gpio20,
+        )),
+    };
+
     // Crash-loop recovery: in safe mode skip Wi-Fi entirely — the board is
     // rebooting repeatedly and Wi-Fi bring-up (with its 30s association wait)
     // is the most likely thing to keep it in the loop. Serve UART + local tools
     // only, so an operator can connect and diagnose.
     if safe_mode {
         log::warn!("[wifi] safe mode — skipping Wi-Fi init (crash-loop recovery)");
-        return (ingress_uart, None);
+        return (links, None);
     }
 
     // PATCHED (MicroAgent): `AT+CWMODE` — refuse to bring up the
@@ -2133,7 +2543,7 @@ fn setup_platform(
         log::warn!(
             "[wifi] AT+CWMODE={cwmode} — only station (1) is implemented; skipping Wi-Fi"
         );
-        return (ingress_uart, None);
+        return (links, None);
     }
 
     // PATCHED (MicroAgent): `AT+CWAUTOCONN` — when the operator set
@@ -2151,7 +2561,7 @@ fn setup_platform(
         log::warn!("[wifi] AT+CWAUTOCONN=0 — skipping blocking connect");
         // Still return ingress_uart so the console is up; we just
         // don't try to join an AP this boot.
-        return (ingress_uart, None);
+        return (links, None);
     }
 
     let mut wifi_handle: Option<&'static mut BlockingWifi<EspWifi<'static>>> = None;
@@ -2195,7 +2605,7 @@ fn setup_platform(
         Err(e) => log::warn!("[wifi] EspWifi::new failed: {e}"),
     }
 
-    (ingress_uart, wifi_handle)
+    (links, wifi_handle)
 }
 
 /// Worker-thread stacks stay in internal DRAM.
@@ -2294,55 +2704,9 @@ fn main() {
     // from build-time env vars when the operator hasn't set `AT+LLMCFG`.
     provision_llm_config();
 
-    // STABILITY (stability-2026-08): initialize BLE *before* Wi-Fi bring-up.
-    // On this RAM-limited C61 (~134 KiB internal DRAM), the Bluedroid host's
-    // `btm_ble_init` allocates FreeRTOS mutexes/queues from internal DRAM.
-    // When Wi-Fi is initialized first it eats ~56 KiB of that internal DRAM,
-    // leaving ~44 KiB — too little for BLE's allocations, so the stack asserts
-    // (`adv_rpt_queue != NULL` / `xQueueSemaphoreTake`), panics, and the board
-    // crash-loops into safe mode (which also prevents the agent thread from
-    // ever starting). BLE does not need the sysloop/peripherals that Wi-Fi
-    // bring-up creates, so we init it here while internal DRAM is still fresh
-    // (~100 KiB). Wi-Fi is attempted afterwards and remains non-fatal if the
-    // remaining DRAM is too tight (setup_platform returns None).
-    #[cfg(feature = "ble")]
-    {
-        use crate::ble_config::shared_ble_server;
-
-        log::info!("[ble] Creating BLE server...");
-        // Use the process-wide shared server so the AT dispatcher
-        // (`AT+BLE=ON/OFF/STATE`) can reach the *same* instance and drive
-        // advertising state live. This replaces the previous local
-        // `BleServer::new()` that the AT path could never touch.
-        let server = shared_ble_server();
-        let mut ble_server = server.lock().unwrap_or_else(|e| e.into_inner());
-        log::info!("[ble] BLE server created, device name: {}", ble_server.device_name());
-
-        log::info!("[ble] Calling init()...");
-        match ble_server.init() {
-            Ok(_) => {
-                log::info!("[ble] init() succeeded, state: {:?}", ble_server.get_state());
-
-                log::info!("[ble] Calling start_advertising()...");
-                match ble_server.start_advertising() {
-                    Ok(_) => {
-                        log::info!("[ble] start_advertising() succeeded");
-                    }
-                    Err(e) => {
-                        log::error!("[ble] start_advertising() failed: {:?}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("[ble] init() failed: {:?}", e);
-            }
-        }
-    }
-
-    #[cfg(not(feature = "ble"))]
-    {
-        log::info!("[ble] BLE feature not enabled (add 'ble' to features for BLE support)");
-    }
+    // BLE REMOVED (2026-09-20): the Bluedroid stack needed ~244 KB of
+    // contiguous DMA-capable internal DRAM, which neither target can spare
+    // alongside Wi-Fi + the agent threads. See `docs/BACKLOG.md`.
 
     // Shared Wi-Fi status snapshot published by the supervisor thread and
     // read by the AT dispatcher so `AT+CWSTATE` reports the real link.
@@ -2352,7 +2716,7 @@ fn main() {
     // Wi-Fi) is now NON-FATAL — see `setup_platform`. If Wi-Fi can't be set up
     // the firmware still boots and runs the agent/ingress threads (local tools
     // + UART don't need network). Returns the UART parts for the ingress thread.
-    let (ingress_uart, wifi_handle) = setup_platform(
+    let (ingress_links, wifi_handle) = setup_platform(
         wifi_ssid.as_deref().unwrap_or(""),
         wifi_pass.as_deref().unwrap_or(""),
         safe_mode,
@@ -2408,11 +2772,6 @@ fn main() {
             log::warn!("[webadmin] thread spawn failed - no admin server");
         }
     }
-
-    // PATCHED (MicroAgent): Initialize BLE GATT server for mAgent-Man
-    // (moved BEFORE Wi-Fi bring-up for stability — see the block above
-    // `provision_llm_config`; keeping the old slot would re-init BLE after
-    // Wi-Fi has consumed internal DRAM and crash-loop the board).
 
     // PATCHED (MicroAgent): time-sync handle. The supervisor (below)
     // records samples; the AT dispatcher queries the canonical
@@ -2540,7 +2899,7 @@ fn main() {
         move || {
             run_ingress(
                 identity_clone,
-                ingress_uart,
+                ingress_links,
                 ingress_task,
                 ingress_reply,
                 ingress_hb_for_thread,
@@ -2682,14 +3041,24 @@ fn main() {
             }
         }
         // PATCHED (MicroAgent): heartbeat-based hang detection — a thread that
-        // hasn't beaten for >15s is stalled (not crashed), which a panic
+        // hasn't beaten for `STALE_MS` is stalled (not crashed), which a panic
         // handler wouldn't catch. We log loudly so an operator / watchdog can
         // act.
-        if agent_hb.stale(15_000) {
-            log::error!("[health] agent-thread heartbeat stale (>15s) — possible hang");
+        //
+        // `STALE_MS` (30 s) is deliberately above the worst-case *legitimate*
+        // agent gap: one cloud-LLM round trip (10 s cap) plus one on-device
+        // network tool (DNS+TCP+TLS+read, up to ~15 s on a phone hotspot) is
+        // ~25 s, during which the agent thread cannot beat — it is busy, not
+        // hung. With the previous 15 s threshold every weather/news task
+        // produced a burst of false "possible hang" errors, which drowned out
+        // real ones. The real-time hang detector is `rt_watchdog` (18 s, fed
+        // inside the blocking hops); this monitor is the coarse backstop.
+        const STALE_MS: u64 = 30_000;
+        if agent_hb.stale(STALE_MS) {
+            log::error!("[health] agent-thread heartbeat stale (>{STALE_MS} ms) — possible hang");
         }
-        if ingress_hb.stale(15_000) {
-            log::error!("[health] ingress-thread heartbeat stale (>15s) — possible hang");
+        if ingress_hb.stale(STALE_MS) {
+            log::error!("[health] ingress-thread heartbeat stale (>{STALE_MS} ms) — possible hang");
         }
     }
 }

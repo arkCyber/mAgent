@@ -279,7 +279,19 @@ impl OllamaClient {
 
         let content_end = match json[content_start..].find("\",\"") {
             Some(pos) => content_start + pos,
-            None => json.len() - 2,
+            None => {
+                // No closing `","` — treat the content as running to the end
+                // of the response minus the trailing `"}`. `json.len() - 2` is
+                // a raw *byte* offset: a reply that ends in a multi-byte
+                // character (any non-English answer) puts it inside a code
+                // point, and the slice below then panics with "byte index N is
+                // not a char boundary". Clamp back to a boundary.
+                let mut end = json.len().saturating_sub(2);
+                while end > content_start && !json.is_char_boundary(end) {
+                    end -= 1;
+                }
+                end
+            }
         };
 
         let content = &json[content_start..content_end];
@@ -529,6 +541,17 @@ mod tests {
     fn parse_response_missing_content_is_error() {
         let c = OllamaClient::new("http://h", "m", 1000).unwrap();
         assert!(c.parse_response(r#"{"error":"boom"}"#).is_err());
+    }
+
+    /// A reply whose content is the last field and ends in multi-byte text
+    /// used to panic: the `json.len() - 2` fallback lands inside a code point,
+    /// and slicing there aborts with "not a char boundary".
+    #[test]
+    fn parse_response_with_trailing_multibyte_content_does_not_panic() {
+        let c = OllamaClient::new("http://h", "m", 1000).unwrap();
+        // No closing `","` after the content, so the fallback path is taken.
+        let resp = c.parse_response(r#"{"content":"温度"#).unwrap();
+        assert!(resp.message.content.starts_with("温"));
     }
 
     #[test]

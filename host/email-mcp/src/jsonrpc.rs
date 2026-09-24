@@ -54,14 +54,16 @@ impl Request {
 ///   parse-error response and keeps serving.
 pub async fn dispatch(raw: &str, registry: &ToolRegistry) -> Result<Option<Value>, anyhow::Error> {
     let req = Request::parse(raw)?;
-    let id = req.id.clone();
 
     // Notifications get no reply. We log them at debug level so
     // operators can trace the protocol without spamming info logs.
-    if id.is_none() {
+    // Binding the `Some` case here (rather than checking `is_none` and
+    // re-`expect`ing below) keeps the reply path from ever panicking if
+    // this guard is moved.
+    let Some(id) = req.id.clone() else {
         log::debug!("notification: method={} params={}", req.method, req.params);
         return Ok(None);
-    }
+    };
 
     let result = match req.method.as_str() {
         "initialize" => handle_initialize(req.params),
@@ -71,7 +73,6 @@ pub async fn dispatch(raw: &str, registry: &ToolRegistry) -> Result<Option<Value
         other => Err(anyhow::anyhow!("unknown method: {other}")),
     };
 
-    let id = id.expect("id was Some above");
     Ok(Some(match result {
         Ok(value) => json!({
             "jsonrpc": "2.0",

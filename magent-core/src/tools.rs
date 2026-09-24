@@ -15,15 +15,37 @@ use serde::{Deserialize, Serialize};
 /// Maximum number of tools
 const MAX_TOOLS: usize = 16;
 
+/// Largest prefix of `s` that is at most `max_bytes` long **and ends on a
+/// UTF-8 character boundary**.
+///
+/// A bare `&s[..max_bytes]` panics ("byte index is not a char boundary")
+/// whenever the cut lands inside a multi-byte code point — the common case,
+/// not the rare one, for the Chinese/emoji/accented payloads that arrive via
+/// LLM tool arguments and sensor labels.
+fn clamp_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// A real-hardware tool handler.
 ///
 /// A chip layer (firmware / host) implements this to back `ToolRegistry`
 /// tools with actual hardware (GPIO, sensors, flash, ...). Returning `None`
-/// from [`Self::handle`] means "not handled — fall back to the built-in
-/// simulated value", so a handler can cover just the tools it can drive.
+/// from [`Self::handle`] means "this target cannot run that tool": the
+/// registry reports the failure to the agent rather than substituting a
+/// simulated value (see [`ToolRegistry::execute`]). A handler therefore has
+/// to cover every tool it advertises; one it cannot drive is refused, not
+/// faked.
 pub trait ToolHandler {
     /// Attempt to execute `call` against real hardware. Return `Some(result)`
-    /// to override the built-in simulated executor, or `None` to fall back to it.
+    /// for a tool this target can run, or `None` for one it cannot — the
+    /// registry will not fall back to a simulated value.
     fn handle(&self, call: &ToolCall) -> Option<ToolResult>;
 }
 
@@ -31,7 +53,9 @@ pub trait ToolHandler {
 pub struct ToolRegistry {
     tools: Vec<Tool, MAX_TOOLS>,
     /// Optional real-hardware handler consulted before the simulated
-    /// executors. `None` (the default) keeps the original mock behaviour.
+    /// executors. `None` (the default) keeps the original mock behaviour;
+    /// `Some` marks a real target, where an uncovered tool is refused rather
+    /// than simulated.
     handler: Option<&'static dyn ToolHandler>,
 }
 
@@ -295,6 +319,29 @@ impl ToolRegistry {
             if let Some(result) = handler.handle(call) {
                 return Ok(result);
             }
+
+            // A handler is installed, so this registry backs a *real* target.
+            // The simulated executors below fabricate plausible success for
+            // hardware the target may not have at all: `flash_write` answers
+            // "Wrote N bytes to address X" without persisting a byte,
+            // `ble_send` answers "Sent N bytes via BLE" on a firmware that has
+            // no BLE stack, and the vital-sign sensors answer with invented
+            // numbers. The agent then reports that to the user as fact — the
+            // tool list in the LLM prompt even names them, so it will call
+            // them. A tool the target cannot actually run has to say so.
+            //
+            // Only registered names reach here; an unknown tool still gets the
+            // `MissingField` error below.
+            if self.tools.iter().any(|t| t.name == call.name) {
+                let mut msg = heapless::String::<64>::new();
+                let _ = msg.push_str("not implemented on this target");
+                return Ok(ToolResult {
+                    tool_name: call.name.clone(),
+                    data: heapless::String::new(),
+                    success: false,
+                    error: Some(msg),
+                });
+            }
         }
 
         // Find tool
@@ -317,6 +364,14 @@ impl ToolRegistry {
             ToolType::ReadEcg => self.execute_read_sensor(&call.arguments).await,
             ToolType::VoiceOutput => self.execute_voice_output(&call.arguments).await,
             ToolType::SendNotification => self.execute_send_notification(&call.arguments).await,
+            // Network tools have no simulation: they are only meaningful when a
+            // real-hardware handler (see `set_handler`) executed them above. If
+            // we get here the target registered a web tool without a handler —
+            // surface that as a configuration error instead of inventing a body.
+            ToolType::WebFetch => Err(AgentError::ConfigurationError {
+                field: "tool",
+                reason: crate::error::ConfigError::NotConfigured,
+            }),
         }
     }
 
@@ -342,8 +397,7 @@ impl ToolRegistry {
         // truncation to look like a panic, so we just clamp — the
         // LLM doesn't need byte-level accuracy to know what was said.
         let room = result.capacity() - result.len();
-        let take = core::cmp::min(text.len(), room);
-        let _ = result.push_str(&text[..take]);
+        let _ = result.push_str(clamp_utf8(text, room));
 
         Ok(ToolResult {
             tool_name: heapless::String::try_from("voice_output").unwrap(),
@@ -372,8 +426,7 @@ impl ToolRegistry {
         let _ = result.push_str(priority);
         let _ = result.push_str("): ");
         let room = result.capacity() - result.len();
-        let take = core::cmp::min(text.len(), room);
-        let _ = result.push_str(&text[..take]);
+        let _ = result.push_str(clamp_utf8(text, room));
 
         Ok(ToolResult {
             tool_name: heapless::String::try_from("send_notification").unwrap(),
@@ -468,16 +521,11 @@ impl ToolRegistry {
                  truncating to 240 chars",
                 value.len()
             );
-            // HARDENING (audit-2026-08): truncate at the largest *character*
-            // boundary at or below 240 bytes. A raw `&value[..240]` would
-            // panic if a multi-byte UTF-8 codepoint (e.g. `°`) straddled the
-            // cut, which would kill the worker thread instead of producing a
-            // truncated result.
-            let mut end = 240;
-            while end > 0 && !value.is_char_boundary(end) {
-                end -= 1;
-            }
-            &value[..end]
+            // Truncate at the largest character boundary at or below 240
+            // bytes: a raw `&value[..240]` would panic if a multi-byte
+            // codepoint (e.g. `°`) straddled the cut, killing the worker
+            // thread instead of producing a truncated result.
+            clamp_utf8(value, 240)
         } else {
             value
         };
@@ -667,19 +715,45 @@ impl ToolRegistry {
     /// Tools without a description are skipped. This is what the
     /// built-in tools populate, so in practice the registry is always
     /// fully described.
-    pub fn describe(&self) -> String<1024> {
-        let mut out = String::<1024>::new();
+    /// PATCHED (MicroAgent): capacity 1024 → 2048 B and **never truncate
+    /// silently**.
+    ///
+    /// The caller uses this string as the "Available tools:" section of the LLM
+    /// system prompt. With the built-in hardware pack plus four network tools
+    /// (`fetch_web`, `get_weather`, `get_news`, `get_flight_price`) the list is
+    /// ~1.06 kB, so the previous 1 kB buffer dropped the *last* tool without a
+    /// word — the model then truthfully answered "I don't have that tool".
+    /// Each entry is now committed only if it fits as a whole (a half-entry could
+    /// never be parsed by the model anyway) and any omission is logged.
+    pub fn describe(&self) -> String<2048> {
+        let mut out = String::<2048>::new();
+        let mut dropped = 0usize;
         for tool in self.tools.iter() {
             if tool.description.is_empty() {
                 continue;
             }
-            if !out.is_empty() {
-                let _ = out.push('\n');
+            let before = out.len();
+            let fits = {
+                let mut ok = true;
+                if !out.is_empty() {
+                    ok &= out.push('\n').is_ok();
+                }
+                ok &= out.push_str("- ").is_ok();
+                ok &= out.push_str(tool.name.as_str()).is_ok();
+                ok &= out.push_str(": ").is_ok();
+                ok &= out.push_str(tool.description.as_str()).is_ok();
+                ok
+            };
+            if !fits {
+                out.truncate(before);
+                dropped += 1;
             }
-            let _ = out.push_str("- ");
-            let _ = out.push_str(tool.name.as_str());
-            let _ = out.push_str(": ");
-            let _ = out.push_str(tool.description.as_str());
+        }
+        if dropped > 0 {
+            log::warn!(
+                "[tools] describe(): {dropped} tool(s) omitted — the description buffer (2048 B) is full; \
+                 the LLM prompt will not advertise them"
+            );
         }
         out
     }
@@ -734,6 +808,13 @@ pub enum ToolType {
     VoiceOutput = 8,
     /// Send notification
     SendNotification = 9,
+    /// Network fetch (HTTP GET) — e.g. `fetch_web` / `get_weather` /
+    /// `get_news`. These have no simulation: they are executed by the
+    /// target's real-hardware [`ToolHandler`] (the ESP32 firmware implements
+    /// them over `esp_http_client`; the host CLI over its own HTTP stack), so
+    /// a registry that advertises one without a handler fails loudly instead of
+    /// returning a fabricated body.
+    WebFetch = 10,
 }
 
 /// Sensor type
@@ -779,6 +860,38 @@ mod tests {
     use super::*;
     use crate::error::try_heapless;
     use crate::tools::{Tool, ToolType};
+
+    #[test]
+    fn clamp_utf8_returns_short_input_verbatim() {
+        assert_eq!(clamp_utf8("hello", 100), "hello");
+        assert_eq!(clamp_utf8("", 0), "");
+        // Exactly at the limit is still "fits".
+        assert_eq!(clamp_utf8("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn clamp_utf8_never_lands_inside_a_codepoint() {
+        // Each `°` is 2 bytes; `天` is 3. Ask for a cut in the middle of one.
+        let s = "°°°°"; // 8 bytes
+        assert_eq!(clamp_utf8(s, 3), "°"); // byte 3 is inside the 2nd char
+        let t = "天天地"; // 3 + 3 + 3
+        assert_eq!(clamp_utf8(t, 4), "天");
+        assert_eq!(clamp_utf8(t, 1), "");
+    }
+
+    /// The actual bug: `execute_voice_output` / `execute_send_notification`
+    /// did `&text[..min(text.len(), room)]`. A Chinese utterance longer than
+    /// the 256-byte buffer pushed the cut inside a 3-byte code point and
+    /// panicked the worker thread.
+    #[test]
+    fn voice_output_with_long_chinese_text_does_not_panic() {
+        let text = "温度".repeat(200); // 1200 bytes, well past the 256-byte cap
+        let out = clamp_utf8(&text, 256);
+        assert!(out.len() <= 256);
+        assert!(text.starts_with(out));
+        // Every returned byte must be valid UTF-8 (i.e. we cut on a boundary).
+        assert!(core::str::from_utf8(out.as_bytes()).is_ok());
+    }
 
     /// Build a populated registry identical to what
     /// `register_builtin_tools` produces, so we can exercise
@@ -1311,5 +1424,87 @@ mod tests {
         let out = run_async(r.execute(&make_call("send_notification", "text=hi,priority=weird")))
             .unwrap();
         assert!(out.data.as_str().contains("priority=normal"));
+    }
+
+    /// A real-target handler that covers exactly one tool, like the ESP32
+    /// firmware's `Esp32ToolHandler` covers GPIO/sensor/web but nothing else.
+    struct ReadSensorOnly;
+    static READ_SENSOR_ONLY: ReadSensorOnly = ReadSensorOnly;
+
+    impl ToolHandler for ReadSensorOnly {
+        fn handle(&self, call: &ToolCall) -> Option<ToolResult> {
+            if call.name.as_str() == "read_sensor" {
+                Some(ToolResult {
+                    tool_name: call.name.clone(),
+                    data: String::try_from("real: 21.5C").unwrap(),
+                    success: true,
+                    error: None,
+                })
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn real_target_handler_result_wins_over_simulation() {
+        let mut r = populated_registry();
+        r.set_handler(&READ_SENSOR_ONLY);
+        let out = run_async(r.execute(&make_call("read_sensor", "sensor=temperature"))).unwrap();
+        assert!(out.success);
+        assert_eq!(out.data.as_str(), "real: 21.5C");
+    }
+
+    #[test]
+    fn real_target_refuses_to_simulate_unhandled_hardware_tools() {
+        // Regression: with a handler installed, an uncovered tool fell through
+        // to the simulated executor and reported fabricated success — e.g.
+        // `flash_write` answered "Wrote 5 bytes to address 2048" while nothing
+        // was persisted, and `ble_send` answered "Sent 5 bytes via BLE" on a
+        // firmware with no BLE stack at all. The LLM prompt lists these tools,
+        // so the agent would relay that invented success to the user.
+        let mut r = populated_registry();
+        r.set_handler(&READ_SENSOR_ONLY);
+
+        for (tool, args) in [
+            ("flash_write", "address=2048,data=hello"),
+            ("flash_read", "address=2048,length=64"),
+            ("ble_send", "data=hello,characteristic=default"),
+            ("voice_output", "text=hi"),
+            ("send_notification", "text=hi"),
+        ] {
+            let out = run_async(r.execute(&make_call(tool, args))).unwrap();
+            assert!(!out.success, "{tool} must not report success");
+            assert_eq!(out.tool_name.as_str(), tool);
+            assert_eq!(
+                out.error.as_deref(),
+                Some("not implemented on this target"),
+                "{tool} must say why"
+            );
+        }
+    }
+
+    #[test]
+    fn real_target_unknown_tool_is_still_a_missing_field_error() {
+        // Only *registered* tools get the "not implemented" result; a name the
+        // registry never heard of keeps the original error.
+        let mut r = populated_registry();
+        r.set_handler(&READ_SENSOR_ONLY);
+        let err = run_async(r.execute(&make_call("no_such_tool", ""))).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::AgentError::ConfigurationError { field: "tool", .. }
+        ));
+    }
+
+    #[test]
+    fn simulated_registry_without_handler_still_answers() {
+        // The simulation fallback is the host/test behaviour and must be
+        // untouched when no real-target handler is installed.
+        let r = populated_registry();
+        let out =
+            run_async(r.execute(&make_call("flash_write", "address=2048,data=hello"))).unwrap();
+        assert!(out.success);
+        assert_eq!(out.data.as_str(), "Wrote 5 bytes to address 2048");
     }
 }

@@ -119,8 +119,12 @@ impl std::fmt::Display for PromptError {
             PromptError::DirIo { path, source } => {
                 write!(f, "prompts directory {}: {}", path.display(), source)
             }
+            // This variant carries JSON parse failures for any file
+            // the store reads — a stored prompt record, an `import`
+            // file, or a `--vars-from` object — so the message can't
+            // assume it was a prompt.
             PromptError::Parse { path, source } => {
-                write!(f, "could not parse {} as a prompt: {}", path.display(), source)
+                write!(f, "could not parse {}: {}", path.display(), source)
             }
             PromptError::UnsupportedSchema { path, found, supported } => {
                 write!(
@@ -875,17 +879,36 @@ impl<'a> SetPromptCmd<'a> {
 
     fn run_export(&self, name: &str, out: &mut Output) -> Result<(), PromptError> {
         let record = load(name)?;
-        // Always write the raw prompt text to stdout — export is a
-        // piping command and JSON envelopes would force downstream
-        // tools to parse them. The metadata (if anyone needs it)
-        // is available via `show`.
-        let stdout = out.stdout_writer();
-        stdout
-            .write_all(record.prompt.as_bytes())
-            .map_err(|source| PromptError::Write {
-                path: PathBuf::from("<stdout>"),
-                source,
-            })?;
+        // Human mode writes the raw prompt text to stdout — export is a
+        // piping command and a JSON envelope would force downstream
+        // tools to parse it (`magent set-prompt export X | magent run
+        // -p -`). JSON mode must still honour `--json`'s contract of
+        // valid JSON on stdout, so it emits an envelope instead. The
+        // metadata (if anyone needs it) is available via `show`.
+        match out.kind() {
+            OutputKind::Json => {
+                // Mirror `summary export` / `web3 export` / `config
+                // export`, which emit the record itself rather than a
+                // bespoke envelope — so `export` and `show` agree in
+                // JSON mode just as they do for the summary store.
+                let pretty = serde_json::to_string_pretty(&record).map_err(|source| {
+                    PromptError::Parse {
+                        path: PathBuf::from(name),
+                        source,
+                    }
+                })?;
+                out.write_json_str(pretty);
+            }
+            OutputKind::Human => {
+                let stdout = out.stdout_writer();
+                stdout
+                    .write_all(record.prompt.as_bytes())
+                    .map_err(|source| PromptError::Write {
+                        path: PathBuf::from("<stdout>"),
+                        source,
+                    })?;
+            }
+        }
         Ok(())
     }
 

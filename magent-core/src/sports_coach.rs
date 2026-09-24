@@ -361,6 +361,14 @@ impl SportsCoach {
         self.state = ExerciseState::WarmUp;
         self.session_duration_s = 0;
         self.high_hr_streak = 0;
+        // The interval gates in `update` test `session_duration_s - last_*_s`.
+        // Leaving the timestamps from the previous session behind makes that
+        // subtraction wrap on the very first update of a new session — an
+        // "attempt to subtract with overflow" panic in debug, and a spurious
+        // "overdue" in release that fires an encouragement and a breathing
+        // correction the instant the session starts.
+        self.last_encouragement_s = 0;
+        self.last_breathing_correction_s = 0;
 
         let msg = CoachingMessage::new(
             CoachingMessageType::StartExercise,
@@ -542,7 +550,10 @@ impl SportsCoach {
 
         // Real-time breathing correction when running too fast
         if (zone == HeartRateZone::Peak || zone == HeartRateZone::Danger)
-            && self.session_duration_s - self.last_breathing_correction_s > 30
+            && self
+                .session_duration_s
+                .saturating_sub(self.last_breathing_correction_s)
+                > 30
         {
             self.last_breathing_correction_s = self.session_duration_s;
             let correction = match self.breathing_pattern {
@@ -555,7 +566,11 @@ impl SportsCoach {
         }
 
         // Encouragement at regular intervals
-        if self.session_duration_s - self.last_encouragement_s > 180 {
+        if self
+            .session_duration_s
+            .saturating_sub(self.last_encouragement_s)
+            > 180
+        {
             self.last_encouragement_s = self.session_duration_s;
             let encouragement = self.generate_encouragement(zone);
             let msg = CoachingMessage::new(CoachingMessageType::Encouragement, encouragement, 3);
@@ -902,6 +917,33 @@ mod tests {
         assert!(msgs
             .iter()
             .any(|m| m.msg_type == CoachingMessageType::Warning));
+    }
+
+    #[test]
+    fn restarting_a_session_resets_the_interval_timers() {
+        let mut coach = SportsCoach::new();
+        coach.start_session();
+        // The 180 s encouragement gate fires during the first session, leaving
+        // a non-zero `last_encouragement_s` behind.
+        coach.update(&hr_data(120, 0), None, 200);
+        assert!(coach
+            .get_messages()
+            .iter()
+            .any(|m| m.msg_type == CoachingMessageType::Encouragement));
+
+        // A second session restarts the clock at zero. Had `start_session` left
+        // the timestamp from the first session in place, `181 - 200` would wrap
+        // — an overflow panic in debug, and "not yet due" in release — so the
+        // encouragement would not appear until 381 s into the new session.
+        coach.start_session();
+        coach.update(&hr_data(120, 0), None, 181);
+        assert!(
+            coach
+                .get_messages()
+                .iter()
+                .any(|m| m.msg_type == CoachingMessageType::Encouragement),
+            "a restarted session must measure its interval from zero"
+        );
     }
 
     #[test]

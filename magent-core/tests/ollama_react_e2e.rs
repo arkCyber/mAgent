@@ -74,6 +74,18 @@ fn spawn_mock_ollama() -> (String, Arc<AtomicUsize>, Arc<AtomicBool>) {
 
 /// Serve a single HTTP/1.1 request and close the connection.
 fn handle_client(stream: &mut TcpStream, chat_calls: &Arc<AtomicUsize>) {
+    // The listener is non-blocking so the accept loop can poll `stop`, but on
+    // macOS/BSD an accepted socket *inherits* O_NONBLOCK. Without this the
+    // first `read` below races the client: if the request bytes have not
+    // landed in the kernel buffer yet it returns `WouldBlock`, which the
+    // `Err(_) => return` arm treats as fatal, and the handler closes the
+    // connection without ever writing a response (surfacing as a sporadic
+    // "error sending request" in the test). Restore blocking mode per-stream.
+    let _ = stream.set_nonblocking(false);
+    // Bound the wait so a client that connects and sends nothing cannot hang
+    // the accept loop forever.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
     // Read the request head (until the blank line separating headers+body).
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -85,6 +97,16 @@ fn handle_client(stream: &mut TcpStream, chat_calls: &Arc<AtomicUsize>) {
                 if find_header_end(&buf).is_some() {
                     break;
                 }
+            }
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Incomplete request within the timeout: drop it rather than
+                // spinning or blocking the whole accept loop.
+                return;
             }
             Err(_) => return,
         }

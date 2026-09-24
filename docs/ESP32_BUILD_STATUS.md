@@ -63,7 +63,8 @@ Both scripts wrap the exact env the ESP toolchain needs (`MCU`, `CC`/`CXX`,
 - ✅ `magent-core` host tests (1200+ across unit + integration targets)
 - ✅ `magent` CLI, `magent-simulator`, `magent-tools`, MCP executors
 - ✅ `magent-esp32-app` for **both** C61 and S3
-- ✅ ESP32-C61 on-HW: AT/UART, Wi-Fi, BLE, HTTP, TLS, OTA, web_admin
+- ✅ ESP32-C61 on-HW: AT/UART, Wi-Fi, HTTP, TLS, OTA, web_admin
+  (BLE removed 2026-09-20 — `AT+BLE=…` answers `+CMDER:9`; see `docs/BACKLOG.md`)
 - ✅ ESP32-S3 on-HW: Wi-Fi STA, HTTP dashboard, DeepSeek cloud LLM, PSRAM
 
 ## Build/tool warnings

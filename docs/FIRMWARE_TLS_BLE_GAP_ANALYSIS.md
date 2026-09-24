@@ -152,20 +152,22 @@ boundary, which is what lets BLE coexist with WiFi + the agent.
 
 ### 3.2 BLE channel security & missing control surface
 
-**Status 2026-08-31 (BLE DISABLED — product decision):**
+**Status 2026-09-20 (BLE REMOVED — supersedes the 2026-08-31 "disabled" note):**
 
-* 🔴 **BLE is turned OFF** — the Bluedroid BLE controller needs ~244 KB of
-  contiguous internal-DMA DRAM (`ESP_ERR_NO_MEM 257` on the S3) and the product
-  doesn't use BLE, so `CONFIG_BT_ENABLED=n` in `sdkconfig.defaults` and the
-  `ble` cargo feature removed from `build-s3.sh`. This frees internal DRAM for
-  the agent + Wi-Fi. `ble_config.rs`/`ble_at.rs`/`ble_wallet.rs` are excluded by
-  `#[cfg(feature = "ble")]` (and the AT+BLE dispatch returns `+CMDER:9` when BLE
-  is off). The BLE AT+BLE control + pairing/encryption code below remains for
-  future re-enablement on a platform that can host the controller.
-* ✅ **`AT+BLE=ON/OFF/STATE`** — implemented (shared `BleServer` + `ble_dispatch`),
-  available when the `ble` feature is re-enabled.
-* ✅ **Pairing/encryption** (`BLE_REQUIRE_ENCRYPTION`) — implemented, opt-in.
-* 🔶 **BLE wallet service (0x1851)** — still reserved dead code.
+* ⛔ **BLE is gone, not gated.** The Bluedroid controller needs ~244 KB of
+  contiguous internal-DMA DRAM (`ESP_ERR_NO_MEM 257` on the S3; it asserts in
+  `btm_ble_init` on the C61). Leaving it behind a feature flag kept ~2 100 lines
+  of service code that could not be compiled, let alone exercised, so it was
+  deleted outright: the `ble` cargo feature, `ble_config.rs` / `ble_at.rs` /
+  `ble_wallet.rs` / `ble_gatt.rs`, the `#[cfg(feature = "ble")]` paths, and
+  `CONFIG_BT_*=y` in both `sdkconfig.*.defaults` files. `AT+BLE=…` now answers
+  `+CMDER:9` unconditionally. See the *BLE removed outright* entry in
+  `docs/BACKLOG.md`; the deleted service is recoverable from git history
+  (`src/ble_config.rs` as of commit `77d9f3d`).
+* The `AT+BLE` control, pairing/encryption (`BLE_REQUIRE_ENCRYPTION`) and wallet
+  service (0x1851) notes below describe code that **no longer exists in the
+  tree** — they are kept only as a record of what a future re-enablement
+  (NimBLE, or an explicit internal-DRAM budget) would have to rebuild.
 
 **S3 stability fixes (2026-08-31, verified on hardware — final values):**
 * 🔧 **agent-thread stack 96/128 → 32 KiB** — measured `uxTaskGetStackHighWaterMark`

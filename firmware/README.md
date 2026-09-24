@@ -147,7 +147,6 @@ firmware/
 │   ├── src/
 │   │   ├── main.rs             # Entry point, event loop, board switch
 │   │   ├── at_dispatch.rs      # AT (Hayes / ESP-AT subset) parser + handlers
-│   │   ├── ble_at.rs / ble_config.rs / ble_gatt.rs / ble_wallet.rs
 │   │   ├── link_adapters.rs    # UART/RS232/SPI ingress adapters
 │   │   ├── llm.rs              # DeepSeek backend + cross-core LLM worker
 │   │   ├── local_tools.rs      # On-device GPIO / temperature tool handler
@@ -156,7 +155,9 @@ firmware/
 │   │   ├── core_affinity.rs    # FreeRTOS core + priority profiles (S3)
 │   │   ├── rt_watchdog.rs      # Real-time watchdog isolation (S3)
 │   │   ├── sntp_sync.rs        # SNTP time synchronisation
+│   │   ├── wifi_manager.rs     # STA reconnect: backoff + RSSI quality
 │   │   ├── ping.rs / lua_task.rs / blockchain_transport.rs
+│   │   ├── ota.rs              # OTA upgrade (stream → verify → boot part)
 │   │   └── device_key.rs
 │   ├── Cargo.toml · build.rs · rust-toolchain.toml
 │   ├── sdkconfig.defaults          # S3 (quad-PSRAM dev board) config

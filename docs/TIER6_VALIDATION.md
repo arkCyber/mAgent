@@ -34,7 +34,7 @@
 |---|---|---|
 | Boot | flash + reset | `[magent] v… booting`, no panic, no crash-loop into safe mode |
 | AT / UART | `AT+GMR`, `AT+IDENT?`, `AT+CIPSTAMAC?` | `+GMR`, `+IDENT:<pubkey>`, real MAC |
-| BLE | `--features ble` build + scan | scanner sees `mAgent` (0x1850); `SYS_CMD`→`SYS_RSP` round-trip |
+| BLE | `AT+BLE=ON` | `+CMDER:9` (BLE removed 2026-09-20 — negative check only) |
 | HTTP | `AT+HTTPGET=http://<host>/` | `+CMDER:0`/`OK`, 200 body, no hang |
 | TLS | `AT+HTTPGET=https://example.com/` | 200 body over TLS (dev build: insecure certs) |
 | Blockchain | agent `get_balance` tool | real RPC response (via `EspIdfTransport`) |
@@ -72,15 +72,15 @@ cd firmware/esp32-app && ./flash-c61.sh && espflash monitor
 - The new `blockchain_transport.rs` (`EspIdfTransport`) must produce a real RPC
   response, not a placeholder error. Watch the tool result / `[blockchain]` logs.
 
-## 4. BLE (`--features ble`)
+## 4. BLE — REMOVED, nothing to validate
 
-```bash
-cargo build --release --features ble   # then flash-c61.sh
-```
-- BLE scanner sees `mAgent`, service `0x1850`.
-- Write `AT+IDENT?` to **SYS_CMD (0x2A08)**; read **SYS_RSP (0x2A09)** → the IDENT
-  line. This proves the `dispatch_at_command` channel.
-- Security note: this channel is unauthenticated today (see `SECURITY.md`).
+BLE was deleted from the firmware on 2026-09-20 (no `ble` feature, no BLE
+source; `CONFIG_BT_*=n`). The Bluedroid controller needs ~244 KB of contiguous
+DMA-capable internal DRAM, which neither board can supply alongside Wi-Fi + the
+agent threads. See the *BLE removed outright* entry in `docs/BACKLOG.md`.
+
+The only BLE-surfacing check left is negative: `AT+BLE=ON` must answer
+`+CMDER:9`, not `OK`.
 
 ## 5. OTA
 

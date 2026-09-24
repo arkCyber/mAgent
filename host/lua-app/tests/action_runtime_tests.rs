@@ -426,3 +426,74 @@ fn app_runtime_tick_returns_correct_index_sequence() {
     }
     assert_eq!(app.tick_count(), 5);
 }
+
+/// `uptime_ms()` reflects wall-clock time since the runtime was constructed,
+/// even when `tick()` is never called.
+#[test]
+fn uptime_ms_grows_without_ticks() {
+    use std::time::Duration;
+    let (app, _) = new_runtime();
+    let u0 = app.uptime_ms();
+    std::thread::sleep(Duration::from_millis(5));
+    let u1 = app.uptime_ms();
+    assert!(
+        u1 >= u0,
+        "uptime must be monotonically non-decreasing: u0={u0}, u1={u1}"
+    );
+}
+
+/// `tick()` refreshes the watchdog timestamp even when the handler returns
+/// an error — the stale flag reflects "loop stopped being driven", not
+/// "loop has bugs".
+#[test]
+fn failed_tick_still_refreshes_watchdog() {
+    use std::time::Duration;
+    let (mut app, _) = new_runtime();
+    app.boot("function on_tick() error('always') end").unwrap();
+
+    // Drive 3 ticks (all error); the watchdog must refresh each time.
+    for _ in 0..3 {
+        let _ = app.tick().unwrap_err();
+    }
+    // Just-ticked ⇒ not stale at 100ms window.
+    assert!(!app.is_stale(Duration::from_millis(100)));
+
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        app.is_stale(Duration::from_millis(5)),
+        "stale must fire once the driver loop stops"
+    );
+}
+
+/// `stop_flag()` returns a *shared* handle: an external thread can request
+/// stop without owning the runtime.
+#[test]
+fn stop_flag_is_shared_across_threads() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let (mut app, _) = new_runtime();
+    app.boot("function on_tick() return '' end").unwrap();
+
+    let flag = app.stop_flag();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        flag.store(true, Ordering::Release);
+    });
+
+    // Block until either the thread sets the flag or we hit max_ticks.
+    let ticks = app.run_until_stop(Duration::from_millis(2), Some(10_000));
+    handle.join().unwrap();
+    assert!(ticks >= 1, "must run at least one tick");
+    assert!(app.is_stop_requested(), "external thread must have set flag");
+}
+
+/// `request_stop()` is idempotent and survives multiple invocations without
+/// affecting the running loop until it actually runs.
+#[test]
+fn request_stop_is_idempotent() {
+    let (app, _) = new_runtime();
+    app.request_stop();
+    app.request_stop();
+    app.request_stop();
+    assert!(app.is_stop_requested());
+}

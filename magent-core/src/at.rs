@@ -19,15 +19,21 @@
 //! * **Bounded memory.** The parser writes into caller-supplied
 //!   `heapless::Vec` / `heapless::String` and never allocates on the
 //!   heap.
-//! * **Crash-loop awareness.** The firmware-side dispatcher carries an
-//!   `AtState { echo: bool, last_cmd_ticks }` value that the
-//!   UART task ticks on each line; if the watchdog sees stale state
-//!   for >500 ms while a line is in flight, it forces a
-//!   `+CMDER:7 (timeout)` response and clears the parser.
-//! * **Audit trail.** Every successful command line is logged
-//!   with `(uptime_ms, command, result_code, elapsed_us)` by the
-//!   firmware-side dispatcher; the parser itself only emits a
-//!   `Result<AtCommand>` value and lets the caller format logs.
+//! * **Bounded work per line.** There is no per-line state machine to get
+//!   stuck: `parse_line` is a single O(n) pass with no backtracking and no
+//!   allocation, so a malformed or truncated line terminates by returning an
+//!   error, never by looping. A line that fails to parse is answered with the
+//!   matching `+CMDER:<n>` and dropped — it is **not** rerouted to the agent
+//!   (firmware `main.rs`, the `Err(e) =>` arm). Hang detection is not in this
+//!   layer: on device the ESP32's real-time hang detector is `rt_watchdog`
+//!   (18 s, hardware task WDT), independent of AT parsing.
+//! * **Audit trail.** The parser emits only a `Result<AtCommand>` and lets
+//!   the caller log. The ESP32 dispatcher wraps every command in
+//!   `at_dispatch::dispatch`, which writes one
+//!   `[at] op=<name> kind=<kind> -> <outcome> (t=<now_ms>ms)` line
+//!   (`firmware/esp32-app/src/at_dispatch.rs`). It carries no separate
+//!   elapsed-time or result-code column here; command→reply latency is
+//!   recorded separately as `latency_metrics::at_dispatch()` / `e2e_reply()`.
 //!
 //! # Wire-format conformance
 //!
@@ -275,18 +281,31 @@ pub enum AtOp {
     /// `AT+LLMCFG?` / `AT+LLMCFG=<model>,<api_key>` — set / query the
     /// LLM backend parameters (model name + API key) used by the agent.
     LlmCfg,
+    /// `AT+FLIGHTCFG=<provider>,<token>` / `AT+FLIGHTCFG?` — configure the
+    /// flight-price data provider used by the on-device `get_flight_price` tool.
+    FlightCfg,
     /// `AT+TIME?` — report the current wall-clock time as ISO 8601
     /// UTC plus the source (SNTP / BLE CTS / NONE).
     Time,
-    /// `AT+NTPSYNC` — force an immediate SNTP re-sync (ESP32 only;
-    /// nRF52 returns +CMDER:9 unsupported).
+    /// `AT+NTPSYNC` — force an immediate SNTP re-sync.
+    ///
+    /// ESP32 only. The nRF52 firmware ships no AT command surface at all (its
+    /// `src/` has no dispatcher and never calls this parser), so it neither
+    /// implements this nor answers `+CMDER:9` — it has nothing to answer with.
+    /// The `+CMDER:<n>` codes are the ESP32 dispatcher's.
     NtpSync,
     /// `AT+TIMEZONE?` / `=offset_minutes` — query / set the
     /// operator-supplied UTC offset used for human-readable display
     /// (does NOT affect the canonical Unix-seconds value).
     Timezone,
     /// `AT+BLE?` / `AT+BLE=<ON|OFF|STATE>` — query / control the BLE
-    /// peripheral (ESP32 only; nRF52 returns unsupported).
+    /// peripheral.
+    ///
+    /// ESP32 only, and on the ESP32 it is a refusal, not a feature: BLE was
+    /// removed from that firmware 2026-09-20, so the verb is still parsed for
+    /// command-surface compatibility but always answers `+CMDER:9`
+    /// (`at_dispatch.rs`). The nRF52, which does have a BLE stack, ships no AT
+    /// dispatcher, so this op is unreachable there.
     Ble,
     /// `AT+LUAAPP=<base64>` / `AT+LUAAPP?` — set / query the operator-provided
     /// Lua application source. The source is **URL-safe base64** (no `+`/`/`)
@@ -330,6 +349,7 @@ impl AtOp {
             AtOp::HttpGet => "+HTTPGET",
             AtOp::Ota => "+OTA",
             AtOp::LlmCfg => "+LLMCFG",
+            AtOp::FlightCfg => "+FLIGHTCFG",
             AtOp::Time => "+TIME",
             AtOp::NtpSync => "+NTPSYNC",
             AtOp::Timezone => "+TIMEZONE",
@@ -849,6 +869,7 @@ fn classify_op(kw: &[u8]) -> Option<(AtOp, AtCommandKind)> {
         b"HTTPGET" => (AtOp::HttpGet, AtCommandKind::Set),
         b"OTA" => (AtOp::Ota, AtCommandKind::Set),
         b"LLMCFG" => (AtOp::LlmCfg, AtCommandKind::Set),
+        b"FLIGHTCFG" => (AtOp::FlightCfg, AtCommandKind::Set),
         b"TIME" => (AtOp::Time, AtCommandKind::Query),
         b"NTPSYNC" => (AtOp::NtpSync, AtCommandKind::Execute),
         b"TIMEZONE" => (AtOp::Timezone, AtCommandKind::Set),
@@ -1037,6 +1058,48 @@ fn hex_digit(c: u8) -> Option<u8> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
+}
+
+/// Escape `s` so it can be embedded *inside* a `+CMD:...` response line
+/// without breaking the wire framing.
+///
+/// The framing is `\r\n`-terminated (see [`build_response`]), so a raw CR or
+/// LF anywhere in the payload ends the line early and lets the rest be read as
+/// a *separate* response — which is how a hostile value forges an AT reply.
+/// `"` and `\` are escaped too, so the value can also be wrapped in quotes
+/// (ESP-AT's own convention) without the quotes being breakable.
+///
+/// Two of the three callers in the firmware carry data the operator chose
+/// (`AT+CWJAP` SSID, `AT+CWHOSTNAME`), and one carries data the *network*
+/// chose (the DHCP-assigned IP reported by `AT+IFCONFIG`). `AT+CWLAP` feeds
+/// this the SSIDs of every nearby AP, which anyone in radio range controls —
+/// an SSID is 32 arbitrary bytes, CR included.
+///
+/// Truncation is all-or-nothing per escape: if the remaining two characters
+/// of one input char do not both fit, nothing is written. Emitting the
+/// backslash alone would leave a *dangling* escape that swallows the frame's
+/// terminating CR, turning a truncated value into a framing break.
+pub fn escape_wire(s: &str) -> String<128> {
+    let mut out: String<128> = String::new();
+    for c in s.chars() {
+        let escaped: &str = match c {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            other => {
+                if out.push(other).is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+        if out.len() + escaped.len() > out.capacity() {
+            break;
+        }
+        let _ = out.push_str(escaped);
+    }
+    out
 }
 
 /// Build a stable response string into a caller-provided buffer.
@@ -1581,6 +1644,63 @@ mod tests {
         assert_eq!(validate_mac(b"a:bb:cc:dd:ee:fff"), None);
         // Empty input.
         assert_eq!(validate_mac(b""), None);
+    }
+
+    #[test]
+    fn escape_wire_neutralises_frame_breaks() {
+        // A lone CR is the dangerous case: `str::lines()` splits on LF only,
+        // so a CR in the middle of an SSID survives into the response and ends
+        // the line early for any CR-terminated AT parser.
+        assert_eq!(escape_wire("evil\r+CME ERROR:99").as_str(), "evil\\r+CME ERROR:99");
+        assert_eq!(escape_wire("a\nb").as_str(), "a\\nb");
+        assert_eq!(escape_wire("a\r\nb").as_str(), "a\\r\\nb");
+        // Quote / backslash are escaped so a quoted field cannot be broken out of.
+        assert_eq!(escape_wire("say \"hi\"").as_str(), "say \\\"hi\\\"");
+        assert_eq!(escape_wire("back\\slash").as_str(), "back\\\\slash");
+        // An escaped value must never contain a raw CR or LF.
+        assert!(!escape_wire("a\rb\nc").as_str().contains(['\r', '\n']));
+    }
+
+    #[test]
+    fn escape_wire_passes_other_text_through() {
+        assert_eq!(escape_wire("mAgent-ESP32-S3").as_str(), "mAgent-ESP32-S3");
+        assert_eq!(escape_wire("wifi-网络-5G").as_str(), "wifi-网络-5G");
+        assert_eq!(escape_wire("").as_str(), "");
+    }
+
+    /// On overflow the function must stop *between* escapes. Emitting the
+    /// backslash without its payload char would leave a dangling escape that
+    /// swallows the frame's terminating CR — a truncated value would then
+    /// break framing even though every char was escaped.
+    #[test]
+    fn escape_wire_never_leaves_a_dangling_backslash() {
+        // A prefix of plain chars shifts the escape alignment, so which escape
+        // straddles the 128-byte cap depends on the prefix length; sweep it.
+        for pad in 0..8usize {
+            let mut s: String<200> = String::new();
+            for _ in 0..pad {
+                let _ = s.push('x');
+            }
+            for _ in 0..70 {
+                let _ = s.push('"');
+            }
+            let out = escape_wire(s.as_str());
+            assert!(!out.as_str().ends_with('\\'), "pad={pad} -> {out:?}");
+            assert!(out.len() <= out.capacity());
+        }
+    }
+
+    #[test]
+    fn escape_wire_stays_within_capacity_for_max_length_ssid() {
+        // The longest real input is a 32-byte SSID; fully escaped it is 64
+        // bytes, so the 128-byte cap must never truncate a legal value.
+        let mut ssid: String<32> = String::new();
+        for _ in 0..32 {
+            let _ = ssid.push('\r');
+        }
+        let out = escape_wire(ssid.as_str());
+        assert_eq!(out.len(), 64);
+        assert!(!out.as_str().contains(['\r', '\n']));
     }
 
     #[test]

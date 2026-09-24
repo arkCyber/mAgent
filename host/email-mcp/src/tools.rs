@@ -35,6 +35,55 @@ impl ToolDescriptor {
     }
 }
 
+/// Fallback `limit` when the caller omits it. Matches the `default` in the
+/// advertised input schemas.
+const DEFAULT_LIMIT: u32 = 20;
+/// Advertised `limit` bounds (`minimum` / `maximum` in the input schemas).
+const MIN_LIMIT: u32 = 1;
+const MAX_LIMIT: u32 = 200;
+
+/// Read and range-check the `limit` argument.
+///
+/// MCP clients do not validate `inputSchema` for us, and the value ends up in
+/// the *text* of an IMAP command: `limit == 0` produced an empty sequence set
+/// (`FETCH  UID …`, a protocol error surfaced as an opaque server reply), and a
+/// value ≥ 2³² wrapped through `as u32` — asking for 4294967296 messages
+/// returned **zero** rather than an error. We reject out-of-range values rather
+/// than clamp so the caller sees the mistake.
+fn limit_arg(args: &Value) -> Result<u32, anyhow::Error> {
+    let Some(raw) = args.get("limit") else {
+        return Ok(DEFAULT_LIMIT);
+    };
+    if raw.is_null() {
+        return Ok(DEFAULT_LIMIT);
+    }
+    let n = raw
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("`limit` must be a non-negative integer, got {raw}"))?;
+    if !(MIN_LIMIT as u64..=MAX_LIMIT as u64).contains(&n) {
+        anyhow::bail!("`limit` must be between {MIN_LIMIT} and {MAX_LIMIT}, got {n}");
+    }
+    Ok(n as u32)
+}
+
+/// Read and range-check a `uid` argument.
+///
+/// Same rationale as [`limit_arg`]: `uid` is interpolated into the IMAP
+/// command, and `as u32` silently truncated a UID ≥ 2³² (e.g. 4294967296 → 0,
+/// which is not a valid IMAP UID at all).
+fn uid_arg(args: &Value) -> Result<u32, anyhow::Error> {
+    let raw = args
+        .get("uid")
+        .ok_or_else(|| anyhow::anyhow!("missing `uid`"))?;
+    let n = raw
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("`uid` must be a non-negative integer, got {raw}"))?;
+    u32::try_from(n)
+        .ok()
+        .filter(|u| *u >= 1)
+        .ok_or_else(|| anyhow::anyhow!("`uid` must be an integer in 1..=4294967295, got {n}"))
+}
+
 /// Tool registry — owns the catalogue and a handle to the shared
 /// [`AppState`] (config + lazy IMAP/SMTP sessions).
 pub struct ToolRegistry {
@@ -170,7 +219,7 @@ impl ToolRegistry {
     // -----------------------------------------------------------------
 
     async fn tool_list_inbox(&self, args: Value) -> Result<String, anyhow::Error> {
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as u32;
+        let limit = limit_arg(&args)?;
         self.state.ensure_imap().await?;
         let mut guard = self.state.imap.lock().await;
         let session = guard
@@ -182,10 +231,7 @@ impl ToolRegistry {
     }
 
     async fn tool_get_email(&self, args: Value) -> Result<String, anyhow::Error> {
-        let uid = args
-            .get("uid")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("missing `uid`"))? as u32;
+        let uid = uid_arg(&args)?;
         self.state.ensure_imap().await?;
         let mut guard = self.state.imap.lock().await;
         let session = guard
@@ -201,7 +247,7 @@ impl ToolRegistry {
             .get("query")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("missing `query`"))?;
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as u32;
+        let limit = limit_arg(&args)?;
         self.state.ensure_imap().await?;
         let mut guard = self.state.imap.lock().await;
         let session = guard
@@ -235,10 +281,7 @@ impl ToolRegistry {
     }
 
     async fn tool_mark_read(&self, args: Value) -> Result<String, anyhow::Error> {
-        let uid = args
-            .get("uid")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("missing `uid`"))? as u32;
+        let uid = uid_arg(&args)?;
         self.state.ensure_imap().await?;
         let mut guard = self.state.imap.lock().await;
         let session = guard
@@ -246,5 +289,58 @@ impl ToolRegistry {
             .ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
         session.mark_read(uid).await?;
         Ok(json!({ "status": "marked_read", "uid": uid }).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limit_defaults_when_absent_or_null() {
+        assert_eq!(limit_arg(&json!({})).unwrap(), DEFAULT_LIMIT);
+        assert_eq!(limit_arg(&json!({ "limit": null })).unwrap(), DEFAULT_LIMIT);
+    }
+
+    /// `limit: 0` used to reach the IMAP layer as an empty sequence set
+    /// (`FETCH  UID FLAGS ENVELOPE`), which the server rejects with an opaque
+    /// BAD rather than the caller's mistake.
+    #[test]
+    fn limit_zero_is_rejected() {
+        let err = limit_arg(&json!({ "limit": 0 })).unwrap_err();
+        assert!(err.to_string().contains("between 1 and 200"), "got: {err}");
+    }
+
+    /// `limit` used to be narrowed with `as u32`: 2³² wrapped to 0, so asking
+    /// for 4294967296 messages returned none.
+    #[test]
+    fn limit_above_u32_max_is_rejected_not_wrapped() {
+        let err = limit_arg(&json!({ "limit": 4_294_967_296u64 })).unwrap_err();
+        assert!(err.to_string().contains("between 1 and 200"), "got: {err}");
+    }
+
+    #[test]
+    fn limit_accepts_the_advertised_range() {
+        assert_eq!(limit_arg(&json!({ "limit": 1 })).unwrap(), 1);
+        assert_eq!(limit_arg(&json!({ "limit": 200 })).unwrap(), 200);
+    }
+
+    #[test]
+    fn limit_non_integer_is_rejected() {
+        assert!(limit_arg(&json!({ "limit": "5" })).is_err());
+        assert!(limit_arg(&json!({ "limit": -1 })).is_err());
+    }
+
+    #[test]
+    fn uid_rejects_zero_out_of_range_and_missing() {
+        assert!(uid_arg(&json!({})).is_err());
+        assert!(uid_arg(&json!({ "uid": 0 })).is_err());
+        assert!(uid_arg(&json!({ "uid": 4_294_967_296u64 })).is_err());
+        assert!(uid_arg(&json!({ "uid": "7" })).is_err());
+        assert_eq!(uid_arg(&json!({ "uid": 1 })).unwrap(), 1);
+        assert_eq!(
+            uid_arg(&json!({ "uid": 4_294_967_295u64 })).unwrap(),
+            u32::MAX
+        );
     }
 }

@@ -17,7 +17,9 @@ espflash flash target/riscv32imac-esp-espidf/release/magent-esp32-app --monitor
 - **Architecture**: RISC-V with compressed instructions (RVC)
 - **RAM**: 320 KB SRAM + 512 KB PSRAM
 - **Flash**: 8 MB
-- **Wireless**: Wi-Fi 6 (802.11ax), BLE 5.3
+- **Wireless**: Wi-Fi 6 (802.11ax). BLE was removed from this firmware on
+  2026-09-20 (the Bluedroid controller did not fit in internal DRAM — see
+  `docs/BACKLOG.md`); `AT+BLE=…` answers `+CMDER:9`.
 
 ## 🛠️ Environment Setup (macOS)
 
@@ -315,11 +317,14 @@ RAM (832 KB total):
 ### `Cargo.toml` Features
 ```toml
 [features]
-default = ["wifi"]
-wifi = []
-ble = []
-ota = []
-uart = []
+default    = ["wifi", "uart", "board-c61"]
+wifi       = []
+ota        = []
+uart       = []
+board-c61  = ["esp-println/esp32c6"]   # default board
+board-s3   = ["esp-println/esp32s3", "magent-core/s3-8mb-psram"]
+lua        = ["dep:magent-lua"]        # S3 only
+# There is deliberately NO `ble` feature — BLE was removed 2026-09-20.
 ```
 
 ### Environment Variables

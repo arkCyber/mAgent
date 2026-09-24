@@ -128,7 +128,15 @@ impl Flash for EspFlash {
     fn erase_sector(&mut self, address: u32) -> Result<(), Self::Error> {
         const SECTOR: usize = 4096;
         let sector = (address as usize / SECTOR) * SECTOR;
-        let end = (sector + SECTOR).min(self.data.len());
+        // Bounds first: with `sector` past the end the old code built the range
+        // `sector..end` with `sector > end` and panicked, despite the `Result`
+        // return promising `OutOfRange`. A partial overlap stays legal (the
+        // existing test erases sector 0 of a region smaller than one sector) and
+        // touches only the bytes inside the region.
+        let end = sector.saturating_add(SECTOR).min(self.data.len());
+        if sector >= end {
+            return Err(EspError::OutOfRange);
+        }
         for byte in &mut self.data[sector..end] {
             *byte = 0xFF;
         }
@@ -387,6 +395,10 @@ mod extra_tests {
         f.erase_sector(0).unwrap();
         f.read(0, &mut b).unwrap();
         assert_eq!(b[0], 0xFF);
+        // A sector wholly past the region is a clean error. Before the bounds
+        // check this built `8192..1024` and panicked instead of returning.
+        assert_eq!(f.erase_sector(8192), Err(EspError::OutOfRange));
+        assert_eq!(f.erase_sector(u32::MAX), Err(EspError::OutOfRange));
     }
 
     #[test]

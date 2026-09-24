@@ -141,22 +141,25 @@ For production units the repository ships a hardened provisioning path:
 > The exact eFuse/config values must be validated against the IDF version and
 > board before provisioning field units (REQ-FW-004, REQ-FW-005).
 
-## BLE command channel
+## Wireless command channel (historical)
 
-The BLE `SYS_CMD` characteristic (0x2A08) accepts **arbitrary AT commands** from
-any connected BLE client and dispatches them through the full AT engine
-(`dispatch_at_command`), replying on `SYS_RSP` (0x2A09). This includes
-destructive/privileged commands such as `AT+RESTORE` and `AT+OTA`. **There is no
-authentication or encryption on this channel today** — a device within BLE range
-that connects (e.g. default pairing) can reconfigure or reset the unit.
+Until 2026-09-20 there was a BLE `SYS_CMD` characteristic (0x2A08) that accepted
+**arbitrary AT commands** from any connected client — including privileged ones
+such as `AT+RESTORE` and `AT+OTA` — with **no authentication or encryption**.
+Any device in radio range that completed a (default, unauthenticated) pairing
+could reconfigure or factory-reset the unit.
 
-For untrusted deployments:
-- enable BLE pairing + link-layer encryption (see `ble_config`), or
-- restrict who may connect (whitelist / out-of-band pairing), or
-- build without the `ble` feature (default), where the firmware is UART-only.
+**That entire channel is gone.** BLE was removed from the firmware outright (the
+Bluedroid controller needed ~244 KB of contiguous DMA-capable internal DRAM that
+neither target can spare — see `docs/BACKLOG.md`). `AT+BLE=…` is still parsed for
+command-surface compatibility but uniformly answers `+CMDER:9`. There is no
+wireless command path; the `esp32-app` control plane is UART0 or the HTTP admin
+panel.
 
-Treat `SYS_CMD` as a control-plane channel that must be protected like the
-UART console.
+The surviving lesson applies to the channels that *do* remain: the control plane
+(UART0 ingress, the HTTP admin panel) accepts the same privileged command set,
+so treat it as a console — do not expose it to an untrusted network, and gate
+`AT+OTA` / `AT+RESTORE` behind physical access or network authentication.
 
 ## Bounty program
 

@@ -146,6 +146,20 @@ impl Output {
         }
     }
 
+    /// Write a raw payload line to stdout in *both* modes. Used by
+    /// commands whose payload *is* their stdout output (`magent web3
+    /// export`, `magent web3 sign` with no `--output`) so the
+    /// documented `… > out.json` redirection works identically in
+    /// human and JSON mode — `write_json_str` is a no-op in human
+    /// mode, which silently produced an empty file there.
+    ///
+    /// Unlike [`Self::write_human`] this appends a trailing newline
+    /// so the redirected stream stays line-oriented.
+    pub fn write_stdout_line(&mut self, payload: &str) {
+        let _ = self.stdout.write_all(payload.as_bytes());
+        let _ = self.stdout.write_all(b"\n");
+    }
+
     /// Write a JSON envelope payload (string form) to stdout. In
     /// Human mode this is a no-op so step-by-step output isn't
     /// interleaved with the envelope.
@@ -256,6 +270,20 @@ mod tests {
         let mut out = Output::new(OutputKind::Human, true);
         out.final_answer("done").unwrap();
         out.write_json(serde_json::json!({"iterations": 3})).unwrap();
+    }
+
+    #[test]
+    fn write_stdout_line_writes_in_both_modes() {
+        // Regression guard for `magent web3 export` / `web3 sign`
+        // (default stdout): their payload must reach stdout in human
+        // mode too. We can't capture process stdout from a unit test,
+        // so this exercises both modes to catch a future refactor that
+        // re-gates `write_stdout_line` on `OutputKind::Json` — which
+        // would silently empty `… > out.json` again.
+        let mut human = Output::new(OutputKind::Human, true);
+        human.write_stdout_line("{\"a\":1}");
+        let mut json = Output::new(OutputKind::Json, true);
+        json.write_stdout_line("{\"a\":1}");
     }
 
     #[test]

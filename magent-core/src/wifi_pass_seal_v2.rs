@@ -26,14 +26,14 @@
 //! DBO2 fixes all three:
 //!
 //!   * **Key stretching**: `cipher_key = HKDF-SHA256(device_key,
-//!     salt=nonce, info="dbo2/cipher/v1", L=32)`. Each entry
+//!     salt=nonce, info="magent/dbo2/cipher/v1", L=32)`. Each entry
 //!     uses a *per-entry* cipher key derived from the device key
 //!     and the nonce. Two entries with the same plaintext but
 //!     different nonces get completely independent cipher
 //!     streams.
 //!   * **Integrity**: `mac = HMAC-SHA256(mac_key, nonce || cipher)`
 //!     with `mac_key` derived from a *separate* HKDF output
-//!     (`info="dbo2/mac/v1"`). A flipped cipher bit fails the
+//!     (`info="magent/dbo2/mac/v1"`). A flipped cipher bit fails the
 //!     MAC check on open — there is no silent corruption.
 //!   * **Version prefix**: `"DBO2:" || hex(nonce) || hex(cipher)
 //!     || hex(mac)` so the dispatcher can dispatch by prefix.
@@ -43,7 +43,7 @@
 //! - Cipher:    HKDF-SHA256 → XOR-stream (same construction as
 //!              DBO1 but with per-entry cipher key)
 //! - MAC:       HMAC-SHA256 truncated to 16 bytes
-//! - Stretch:   HKDF info strings `"dbo2/cipher/v1"`, `"dbo2/mac/v1"`
+//! - Stretch:   HKDF info strings `"magent/dbo2/cipher/v1"`, `"magent/dbo2/mac/v1"`
 //!
 //! # Threat model (carried over from DBO1)
 //!

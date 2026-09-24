@@ -68,7 +68,7 @@ impl FullMessage {
     /// [`MAX_BODY_CHARS`] so we don't blow past LLM context windows.
     fn to_json(&self) -> serde_json::Value {
         let truncated = if self.body.len() > MAX_BODY_CHARS {
-            let mut s = self.body[..MAX_BODY_CHARS].to_string();
+            let mut s = self.body[..char_boundary_at(&self.body, MAX_BODY_CHARS)].to_string();
             s.push_str("\n... [truncated]");
             s
         } else {
@@ -83,6 +83,20 @@ impl FullMessage {
 
 /// Cap for body content returned to the LLM.
 const MAX_BODY_CHARS: usize = 8 * 1024;
+
+/// Largest byte index `<= max` that is a UTF-8 character boundary.
+///
+/// `MAX_BODY_CHARS` is a byte budget, but `&body[..MAX_BODY_CHARS]` panics
+/// when the cut lands inside a multi-byte code point. Any non-English email
+/// (Chinese, Cyrillic, an emoji, an accented name) hits this, so the plain
+/// slice turned "message too long" into "connection died".
+fn char_boundary_at(s: &str, max: usize) -> usize {
+    let mut i = max.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
 
 /// Lazily-opened IMAP session. We hold the post-login
 /// `Session` so the destructor sends LOGOUT when the session
@@ -314,4 +328,33 @@ fn extract_text_body(parsed: &mailparse::ParsedMail<'_>) -> Option<String> {
         None
     }
     walk(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn char_boundary_at_clamps_and_stays_on_a_boundary() {
+        let s = "天天地"; // 3 bytes per char
+        assert_eq!(char_boundary_at(s, 4), 3); // byte 4 is inside `地`
+        assert_eq!(char_boundary_at(s, 1), 0);
+        assert_eq!(char_boundary_at(s, 99), s.len());
+        assert!(s.is_char_boundary(char_boundary_at(s, 4)));
+    }
+
+    /// A body of non-ASCII text longer than the 8 KiB cap used to panic in
+    /// `to_json` via `&self.body[..MAX_BODY_CHARS]`.
+    #[test]
+    fn long_non_ascii_body_serialises_without_panicking() {
+        let body = "温".repeat(MAX_BODY_CHARS); // 3 bytes each → 3x over budget
+        let msg = FullMessage {
+            headers: HashMap::new(),
+            body,
+        };
+        let v = msg.to_json();
+        let out = v["body"].as_str().unwrap();
+        assert!(out.ends_with("... [truncated]"));
+        assert!(out.len() < MAX_BODY_CHARS + 32);
+    }
 }

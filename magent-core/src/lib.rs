@@ -417,10 +417,20 @@ pub const MAX_BUFFER_SIZE: usize = 2048;
 /// context before dropping the oldest. Buffers are on the PSRAM heap.
 pub const MAX_CONVERSATION_MESSAGES: usize = 20;
 
-/// Dynamic-context byte budget for the host conversation cache
-/// (REQ-SCHED-001 / mem-3). This is the `gc_to_budget` ceiling — the live
-/// `Vec<Message>` should be GC'd down to roughly this footprint so a long
-/// session or a huge tool dump cannot exhaust the PSRAM pool.
+/// Dynamic-context byte budget (REQ-SCHED-001 / mem-3).
+///
+/// Two consumers, on two different builds:
+/// * the **host** `RealAgentRunner` passes it to `conversation::gc_to_budget`,
+///   which drops the oldest non-system messages until the live `Vec<Message>`
+///   is under this many bytes — so a long session or a huge tool dump cannot
+///   exhaust the pool. This is the only place `gc_to_budget` is called.
+/// * the firmware passes it to `AgentConfig::with_max_memory`, which sets the
+///   agent's `BudgetEnforcer` memory limit. That limit only binds if something
+///   calls `consume_memory`; the embedded `MiniAgent` does not, and its
+///   conversation is count-bounded (`MAX_CONVERSATION_MESSAGES`) rather than
+///   byte-GC'd. So on a device this value is a configured ceiling, not an
+///   enforced one.
+///
 /// Default (C61, 2 MB PSRAM) is 512 KiB; the S3 8 MB profile raises it to
 /// 2 MiB while still leaving the rest of the pool for Wi-Fi / TLS / workers.
 #[cfg(feature = "s3-8mb-psram")]

@@ -491,3 +491,82 @@ fn piccolo_vm_surfaces_poisoned_agent_lock() {
         "error should mention the poisoned agent lock: {err}"
     );
 }
+
+// ===========================================================================
+// AppRuntime<PiccoloVm> end-to-end runtime behaviour (supervisor surface)
+// ===========================================================================
+
+/// `AppRuntime<PiccoloVm>::health()` reports tick_count, error_count,
+/// uptime_ms — same supervisor contract as the mlua path.  This proves the
+/// runtime trait is engine-agnostic, not just the dispatch surface.
+#[test]
+fn piccolo_runtime_health_snapshot() {
+    use magent_lua::hardware::SimHardware;
+    use magent_lua::piccolo_vm::PiccoloVm;
+    use magent_lua::runtime::AppRuntime;
+    use magent_lua::{install_mock_agent, SharedHardware};
+    use std::sync::{Arc, Mutex};
+
+    let hw: SharedHardware = Arc::new(Mutex::new(SimHardware::default()));
+    let agent = install_mock_agent("FAN_ON").unwrap();
+    let mut app = AppRuntime::new(PiccoloVm::new(hw.clone(), agent), hw);
+    app.boot("function on_tick() return 'FAN_ON' end").unwrap();
+
+    let t = app.tick().unwrap();
+    assert!(t.dispatched);
+
+    let h = app.health(std::time::Duration::from_millis(100));
+    assert_eq!(h.tick_count, 1);
+    assert_eq!(h.error_count, 0);
+    assert!(!h.stale);
+    assert!(h.last_error.is_none());
+}
+
+/// `AppRuntime<PiccoloVm>::reload()` must reset the supervisor counters
+/// (tick_count, error_count, last_error) — same contract as mlua.
+#[test]
+fn piccolo_runtime_reload_resets_counters() {
+    use magent_lua::hardware::SimHardware;
+    use magent_lua::piccolo_vm::PiccoloVm;
+    use magent_lua::runtime::AppRuntime;
+    use magent_lua::{install_mock_agent, SharedHardware};
+    use std::sync::{Arc, Mutex};
+
+    let hw: SharedHardware = Arc::new(Mutex::new(SimHardware::default()));
+    let mut app = AppRuntime::new(
+        PiccoloVm::new(hw.clone(), install_mock_agent("FAN_ON").unwrap()),
+        hw,
+    );
+    app.boot("function on_tick() error('boom') end").unwrap();
+    let _ = app.tick().unwrap_err();
+    let _ = app.tick().unwrap_err();
+
+    app.reload("function on_tick() return '' end").unwrap();
+    let h = app.health(std::time::Duration::from_millis(100));
+    assert_eq!(h.tick_count, 0, "reload resets tick_count");
+    assert_eq!(h.error_count, 0, "reload resets error_count");
+    assert!(h.last_error.is_none(), "reload clears last_error");
+}
+
+/// `run_until_stop` honours a pre-set stop flag on the pure-Rust engine
+/// (mirrors `mlua` test `run_until_stop_stops_immediately_when_stop_flag_pre_set`).
+#[test]
+fn piccolo_runtime_run_until_stop_pre_set_exits_immediately() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use magent_lua::hardware::SimHardware;
+    use magent_lua::piccolo_vm::PiccoloVm;
+    use magent_lua::runtime::AppRuntime;
+    use magent_lua::{install_mock_agent, SharedHardware};
+    use std::sync::{Arc, Mutex};
+
+    let hw: SharedHardware = Arc::new(Mutex::new(SimHardware::default()));
+    let mut app = AppRuntime::new(
+        PiccoloVm::new(hw.clone(), install_mock_agent("FAN_ON").unwrap()),
+        hw,
+    );
+    app.boot("function on_tick() return '' end").unwrap();
+    app.stop_flag().store(true, Ordering::Release);
+    let ticks = app.run_until_stop(Duration::ZERO, None);
+    assert_eq!(ticks, 0, "pre-set stop must skip the loop");
+}

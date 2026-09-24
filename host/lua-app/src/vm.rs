@@ -62,7 +62,20 @@ impl LuaVm {
     /// never exhausts a cumulative budget across many scripts.
     pub fn run_script(&self, script: &str) -> Result<()> {
         self.budget.reset();
-        self.lua.load(script).exec().map_err(LuaHostError::from)
+        // Text only. Without this, a script whose contents begin with the
+        // Lua bytecode signature (`\x1bLua`) is loaded as a *precompiled*
+        // chunk instead of being parsed — mlua's `set_mode` documents the
+        // consequence: "Lua does not check the consistency of the code
+        // inside binary chunks. Running maliciously crafted bytecode can
+        // crash the interpreter." That is the sandbox's stated threat model
+        // (an untrusted enterprise script) and this is the single choke
+        // point every script passes through, so the restriction belongs
+        // here rather than at each caller.
+        self.lua
+            .load(script)
+            .set_mode(mlua::ChunkMode::Text)
+            .exec()
+            .map_err(LuaHostError::from)
     }
 
     /// Whether a named global function is currently defined.

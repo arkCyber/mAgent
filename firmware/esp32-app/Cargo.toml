@@ -135,14 +135,16 @@ which = "4.4"
 # Features
 # ---------------------------------------------------------------------------
 # `wifi` — enable the Wi-Fi STA adapter (needed for LLM RPC).
-# `ble`  — enable BLE (ESP32-C61 supports BLE 5 only).
 # `ota`  — enable OTA partition support (controlled by sdkconfig.defaults).
+#
+# There is deliberately NO `ble` feature. The Bluedroid controller needs
+# ~244 KB of contiguous DMA-capable internal DRAM, which neither the C61
+# (~134 KiB) nor the S3 (~253 KiB free) can supply alongside Wi-Fi + the agent
+# threads. BLE was removed 2026-09-20; `AT+BLE=` now answers `+CMDER:9`. The
+# provisioning/transport channel is UART0 or `AT+CWJAP=`. See docs/BACKLOG.md.
 [features]
-# Default = USB-serial transport mode: BLE is DISABLED (the app talks to the
-# C61 over UART0 / USB). Re-enable BLE with `--features ble`.
 default = ["wifi", "uart", "board-c61"]
 wifi = []
-ble = []
 ota = []
 # UART0 adapter for ingress gateway. PATCHED (MicroAgent): enabled by default
 # so the ingress thread registers a real UART0 driver instead of running in
@@ -155,7 +157,7 @@ uart = []
 # Board / chip selection (compile-time switch)
 # ---------------------------------------------------------------------------
 # Exactly ONE of these must be enabled. They gate the chip-specific code
-# (BLE controller config, device name, `esp-println` chip feature, ...) so the
+# (device name, PSRAM profile, `esp-println` chip feature, ...) so the
 # same source builds for either chip. Default is the ESP32-C61 (RISC-V, 2MB
 # PSRAM). To build for the ESP32-S3 (Xtensa, 8MB PSRAM), enable `board-s3` and
 # build with `--target xtensa-esp32s3-espidf --features board-s3`.
@@ -165,11 +167,13 @@ board-c61 = ["esp-println/esp32c6"]   # ESP32-C61 (RISC-V, 160MHz, 2MB PSRAM)
 # ceiling rises from 1 MiB (C61) to 4 MiB — still bounded to prevent a runaway
 # LLM reply / context cache from exhausting the 8 MB pool (heap-blast guard).
 board-s3  = ["esp-println/esp32s3", "magent-core/s3-8mb-psram"]
-# Lua application host on the S3. OFF by default: `mlua`'s vendored Lua C
-# (`lua-src`) does not yet build for `xtensa-esp32s3-espidf` ("don't know how
-# to build Lua for xtensa-esp32s3-espidf"), so wiring it into `board-s3` would
-# break the S3 firmware build. Enable only once a Xtensa-compatible Lua engine
-# is used (or `mlua`/`lua-src` adds Xtensa support). See docs/LUA_SCRIPTING_S3.md.
+# Lua application host on the S3. OFF by default because the Lua VM is not yet
+# stable on hardware — it crashes Core0 even after the I2C pin fix
+# (firmware/esp32-app/build-s3.sh:17). It is NOT a build limitation: the
+# `magent-lua` dep above pins `default-features = false, features = ["piccolo"]`,
+# a pure-Rust engine with no vendored C, so `--features board-s3,wifi,uart,lua`
+# compiles cleanly for `xtensa-esp32s3-espidf` (unlike `mlua`, which cannot).
+# Enable once the on-device crash is root-caused. See docs/LUA_SCRIPTING_S3.md.
 lua = ["dep:magent-lua"]
 
 # ---------------------------------------------------------------------------
@@ -182,4 +186,8 @@ lua = ["dep:magent-lua"]
 # ESP-IDF v6 and are not safe to bindgen into the Rust bindings).
 # TRACE: REQ-FW-001.
 [package.metadata.esp-idf-sys]
-esp_idf_components = ["driver", "esp_adc", "esp_bt", "esp_http_server", "esp_event", "esp_hw_support", "esp_lcd", "esp_netif", "esp_phy", "esp_pm", "esp_rom", "esp_system", "esp_timer", "esp_wifi", "espcoredump", "esptool_py", "freertos", "hal", "heap", "log", "lwip", "mbedtls", "newlib", "nvs_flash", "nvs_secure", "port", "pthread", "riscv", "sdmmc", "soc", "spi_flash", "spiffs", "tcp_transport", "ulp", "vfs", "wear_levelling", "wifi_provisioning", "wpa_supplicant", "xtensa"]
+# NOTE: this key is documented "native builder only" (BUILD-OPTIONS.md) — the
+# `pio` driver used by the tracked builds ignores it entirely and derives the
+# component set from PlatformIO's kconfig. Kept accurate for a native build:
+# `bt` is absent because BLE was removed (2026-09-20, see docs/BACKLOG.md).
+esp_idf_components = ["driver", "esp_adc", "esp_http_server", "esp_event", "esp_hw_support", "esp_lcd", "esp_netif", "esp_phy", "esp_pm", "esp_rom", "esp_system", "esp_timer", "esp_wifi", "espcoredump", "esptool_py", "freertos", "hal", "heap", "log", "lwip", "mbedtls", "newlib", "nvs_flash", "nvs_secure", "port", "pthread", "riscv", "sdmmc", "soc", "spi_flash", "spiffs", "tcp_transport", "ulp", "vfs", "wear_levelling", "wifi_provisioning", "wpa_supplicant", "xtensa"]

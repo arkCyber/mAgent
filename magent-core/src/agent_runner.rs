@@ -1912,6 +1912,20 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         }
     }
 
+    /// Drop the LLM backend, so every response comes from the built-in
+    /// simulated responder.
+    ///
+    /// This is the **explicit** opt-in to simulation. Demos and tests use it to
+    /// exercise the ReAct loop with no model reachable. It is deliberately not
+    /// a fallback: `run()` now returns `Err` when a configured backend is
+    /// unreachable, because a fabricated answer is indistinguishable to the
+    /// caller from a real one.
+    pub fn without_backend(mut self) -> Self {
+        self.backend = None;
+        self.backend_enabled = false;
+        self
+    }
+
     /// Build a runner that uses the supplied tool `executor` and the
     /// provided `config` verbatim.
     pub fn with_config(executor: E, config: RunnerConfig) -> Self {
@@ -2093,10 +2107,13 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
                 }
             }
             TraceEvent::LlmResponse { body } => {
-                let display = if body.len() > 200 {
-                    &body[..200]
-                } else {
-                    &body
+                // Cut on a char boundary: `&body[..200]` panicked with "end byte
+                // index 200 is not a char boundary" whenever the model replied
+                // with multi-byte text (e.g. a Chinese answer). Same regression
+                // `cli::runner::truncate_utf8` exists to prevent.
+                let display = match floor_char_boundary(&body, 200) {
+                    Some(end) => &body[..end],
+                    None => body.as_str(),
                 };
                 println!("[LLM Response] {}", display);
             }
@@ -2187,11 +2204,16 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         }
     }
 
-    /// Force-disable the backend. The runner will fall back to
-    /// simulated responses for the rest of this run. The next
-    /// `run()` call will re-probe (if `probe_ollama_on_run` is true).
+    /// Force-disable the backend: nothing is sent to the LLM and every response
+    /// comes from the built-in simulated responder.
+    ///
+    /// This also clears `probe_ollama_on_run`, because otherwise the next
+    /// `run()` would probe the still-wired backend — and a failed probe is now
+    /// an error, not a silent fallback — turning an explicit "simulate this"
+    /// into `Err`. Disabling the backend is a decision, so it sticks.
     pub fn force_disable_backend(&mut self) {
         self.backend_enabled = false;
+        self.config.probe_ollama_on_run = false;
     }
 
     /// Reports whether the wired-up backend is Ollama specifically.
@@ -2206,7 +2228,6 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
     }
 
     /// Provider name of the wired-up backend, if any.
-    /// Provider name of the wired-up backend, if any.
     pub fn backend_provider(&self) -> Option<LlmProvider> {
         self.backend.as_ref().map(|b| b.provider())
     }
@@ -2214,20 +2235,59 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
     /// Run the ReAct loop on `task` until the assistant emits a
     /// terminal result, a budget is exhausted, or an unrecoverable
     /// error occurs. Returns the assistant's terminal payload.
+    ///
+    /// Starts from a clean conversation: any messages from a previous
+    /// `run` are dropped. Use [`Self::run_continuing`] to append to the
+    /// existing conversation instead.
     pub fn run(&mut self, task: &str) -> std::result::Result<String, String> {
-        self.reset();
+        self.run_inner(task, false)
+    }
+
+    /// Like [`Self::run`], but **keeps** the messages from previous runs
+    /// so the agent answers with the earlier turns in context
+    /// (multi-turn). Per-run state — the state machine and the
+    /// iteration / tool-call counters — is still reset, so budgets are
+    /// per task, not per session.
+    ///
+    /// This is what the CLI's REPL uses; `--repl` is documented as
+    /// "maintains conversation context across multiple turns", and plain
+    /// [`Self::run`] would wipe it every turn.
+    pub fn run_continuing(&mut self, task: &str) -> std::result::Result<String, String> {
+        self.run_inner(task, true)
+    }
+
+    fn run_inner(
+        &mut self,
+        task: &str,
+        keep_history: bool,
+    ) -> std::result::Result<String, String> {
+        if keep_history {
+            self.reset_run_state();
+        } else {
+            self.reset();
+        }
 
         self.emit_trace(TraceEvent::RunStart {
             task: task.to_string(),
         });
 
         // Probe the LLM backend — only on the first run, or when
-        // explicitly requested. After we know it is reachable we keep
-        // using it; if it isn't we stick with simulated responses.
+        // explicitly requested. After we know it is reachable we keep using it.
         if self.config.probe_ollama_on_run && !self.backend_enabled {
             if let Some(ref backend) = self.backend {
                 if backend.check_connection() {
                     self.backend_enabled = true;
+                } else {
+                    // A backend was configured but is unreachable. Fail here
+                    // rather than falling through to the simulated responder:
+                    // a device whose link dropped would otherwise report a
+                    // canned scripted answer as if the model had produced it.
+                    // The deliberate no-backend simulation path (nothing
+                    // configured) is unaffected.
+                    return Err(format!(
+                        "LLM backend unreachable ({}); refusing to fall back to simulated responses",
+                        backend.provider()
+                    ));
                 }
             }
         }
@@ -2255,7 +2315,11 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         // here, ahead of the user task, so the very first LLM call
         // already has the correct head.
         let system_prompt = self.build_system_prompt();
-        self.messages.push(Message::system(&system_prompt));
+        // `ensure_system_prompt` inserts at index 0 when the conversation
+        // is empty (the `run` case) and is a no-op when a matching system
+        // message is already there (the `run_continuing` case) — so a
+        // multi-turn session doesn't accumulate a system message per turn.
+        self.ensure_system_prompt(&system_prompt);
         self.messages.push(Message::user(task));
         self.state = AgentState::Thinking;
 
@@ -2379,18 +2443,14 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
                 match backend.chat_with_messages(&self.messages, self.config.sampling) {
                     Ok(r) => r,
                     Err(e) => {
-                        // The backend is unreachable. Push a fallback
-                        // hint at the tail so the next iteration (and
-                        // the user reading the trace) knows what
-                        // happened. The system prompt at the head
-                        // stays put — `ensure_system_prompt` will
-                        // reconcile any drift on the next `think()`.
-                        log::warn!(target: "magent.llm", "backend error: {}", e);
-                        self.messages.push(Message::system(&format!(
-                            "[fallback] LLM unreachable: {}",
-                            e
-                        )));
-                        self.generate_simulated_response()
+                        // Fail loudly. The previous code synthesised a
+                        // scripted "simulated" reply here, so an LLM call
+                        // that failed mid-run (link drop, timeout, HTTP
+                        // 5xx) was answered with a plausible fabricated
+                        // result the caller had no way to tell apart from
+                        // a real one.
+                        log::error!(target: "magent.llm", "backend error: {}", e);
+                        return Err(format!("LLM backend error: {e}"));
                     }
                 }
             } else {
@@ -2760,23 +2820,27 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         self.config.system_prompt = prompt;
     }
 
+    /// Reset the per-run state machine and counters, leaving the
+    /// conversation alone. Does **not** touch the runner configuration.
+    fn reset_run_state(&mut self) {
+        self.state = AgentState::Idle;
+        self.iteration = 0;
+        self.tool_call_count = 0;
+    }
+
     /// Reset the runner's per-run state (state machine, conversation,
     /// iteration / tool-call counters). Does **not** touch the
     /// runner configuration.
     fn reset(&mut self) {
-        self.state = AgentState::Idle;
+        self.reset_run_state();
         self.messages.clear();
-        self.iteration = 0;
-        self.tool_call_count = 0;
     }
 
     /// Reset the conversation history while keeping the system prompt.
     /// Useful for REPL mode when user wants to start fresh but keep config.
     pub fn reset_conversation(&mut self) {
-        self.state = AgentState::Idle;
+        self.reset_run_state();
         self.messages.retain(|m| m.role == Role::System);
-        self.iteration = 0;
-        self.tool_call_count = 0;
     }
 
     /// Current ReAct-loop state.
@@ -2875,13 +2939,42 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
                 return Ok(strip_code_fence(&msg.content));
             }
         }
-        Ok("Task completed".to_string())
+        // No assistant message carried any text. Reachable when every
+        // iteration produced a tool call and nothing else, and the loop then
+        // hit its iteration or tool-call budget. The old code returned the
+        // canned string "Task completed" here — a fabricated success for a
+        // run that never answered. Report the dead end instead.
+        Err(format!(
+            "run ended without a final answer: no assistant text was produced \
+             (iterations: {}/{}, tool calls: {}/{})",
+            self.iteration,
+            self.config.max_iterations,
+            self.tool_call_count,
+            self.config.max_tool_calls
+        ))
     }
 }
 
 #[inline]
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| haystack.contains(n))
+}
+
+/// Largest index `<= max` that is a UTF-8 character boundary, or `None` when
+/// the whole string fits.
+///
+/// `str::floor_char_boundary` is still unstable, so this mirrors
+/// `conversation::floor_char_boundary` (private there). Slicing a `&str` at a
+/// raw byte offset panics when the offset lands inside a multi-byte code point.
+fn floor_char_boundary(s: &str, max: usize) -> Option<usize> {
+    if s.len() <= max {
+        return None;
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    Some(i)
 }
 
 /// Pattern: on the first call, return a tool invocation with the given
@@ -2904,6 +2997,37 @@ fn tool_then_done(tool_count: usize, tool_name: &str, args_json: &str, done_msg:
 // pieces (JSON body builder, base-URL trimming, set_model, the trait
 // surface). End-to-end behaviour against the real DeepSeek API is
 // covered by manual smoke tests documented in `docs/`.
+
+#[cfg(test)]
+mod floor_char_boundary_tests {
+    use super::floor_char_boundary;
+
+    #[test]
+    fn returns_none_when_the_string_fits() {
+        assert_eq!(floor_char_boundary("abc", 200), None);
+        assert_eq!(floor_char_boundary("abc", 3), None);
+    }
+
+    #[test]
+    fn never_lands_inside_a_multibyte_codepoint() {
+        // "天气" is 3 bytes per char. Cutting at byte 4 must back off to 3.
+        let s = "天气";
+        let end = floor_char_boundary(s, 4).expect("longer than 4 bytes");
+        assert_eq!(end, 3);
+        assert_eq!(&s[..end], "天");
+    }
+
+    #[test]
+    fn truncating_a_long_chinese_body_does_not_panic() {
+        // Regression: the trace renderer sliced `&body[..200]`, which panicked
+        // with "end byte index 200 is not a char boundary" on a Chinese LLM
+        // reply whose 200th byte fell inside a character.
+        let body: std::string::String = "天气".repeat(300);
+        let end = floor_char_boundary(&body, 200).expect("body is longer");
+        assert!(body.is_char_boundary(end));
+        assert_eq!(body[..end].chars().count(), 66);
+    }
+}
 
 #[cfg(test)]
 mod deepseek_client_tests {
@@ -3864,6 +3988,117 @@ mod run_react_loop_tests {
         runner
     }
 
+    /// A backend that is never reachable and always errors if used.
+    struct DeadLlm;
+
+    impl LlmBackend for DeadLlm {
+        fn check_connection(&self) -> bool {
+            false
+        }
+
+        fn chat_with_messages(
+            &mut self,
+            _messages: &[Message],
+            _sampling: SamplingParams,
+        ) -> std::result::Result<String, String> {
+            Err("connection refused".to_string())
+        }
+
+        fn provider(&self) -> LlmProvider {
+            LlmProvider::Ollama
+        }
+
+        fn model(&self) -> &str {
+            "dead"
+        }
+
+        fn base_url(&self) -> &str {
+            "dead://llm"
+        }
+    }
+
+    #[test]
+    fn unreachable_backend_fails_instead_of_simulating() {
+        let mut runner = RealAgentRunner::new(SimulatorExecutor::new());
+        runner.set_backend(DeadLlm);
+        runner.config_mut().probe_ollama_on_run = true;
+
+        let err = runner
+            .run("read the temperature")
+            .expect_err("an unreachable configured backend must not simulate");
+        assert!(err.contains("unreachable"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn force_disable_backend_simulates_rather_than_erroring() {
+        let mut runner = RealAgentRunner::new(SimulatorExecutor::new());
+        runner.set_backend(DeadLlm);
+        runner.config_mut().probe_ollama_on_run = true;
+        runner.force_disable_backend();
+
+        // An explicit disable is a decision, not a probe failure: the run must
+        // still succeed against the scripted responder. Regression guard — the
+        // CLI's "fall back to simulated responses" paths depend on this.
+        let out = runner
+            .run("read the temperature")
+            .expect("explicitly disabled backend must simulate");
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn run_continuing_keeps_history_while_run_resets_it() {
+        // `--repl` documents "maintains conversation context across
+        // multiple turns"; `run` clears the history at the top of every
+        // call, so the REPL needs `run_continuing`.
+        let mut runner = RealAgentRunner::new(SimulatorExecutor::new());
+        runner.force_disable_backend();
+        runner.config_mut().compression = crate::conversation::CompressionPolicy::disabled();
+
+        runner.run("first task").unwrap();
+        let after_one = runner.messages().len();
+        assert!(after_one > 0);
+
+        runner.run_continuing("second task").unwrap();
+        let after_two = runner.messages().len();
+        assert!(
+            after_two > after_one,
+            "run_continuing dropped the earlier turn ({after_one} -> {after_two})"
+        );
+        // Exactly one system message, however many turns we run.
+        assert_eq!(
+            runner
+                .messages()
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .count(),
+            1,
+            "run_continuing accumulated duplicate system prompts"
+        );
+
+        // A plain `run` still starts clean.
+        runner.run("third task").unwrap();
+        assert_eq!(
+            runner.messages().len(),
+            after_one,
+            "run() should have discarded the accumulated history"
+        );
+    }
+
+    #[test]
+    fn mid_run_backend_error_propagates() {
+        // Probe off so the run gets past the start-of-run check and fails
+        // inside `think()` — the mid-run path.
+        let mut runner = RealAgentRunner::new(SimulatorExecutor::new());
+        runner.set_backend(DeadLlm);
+        runner.config_mut().probe_ollama_on_run = false;
+        runner.force_enable_backend();
+
+        let err = runner
+            .run("read the temperature")
+            .expect_err("a mid-run backend error must propagate");
+        assert!(err.contains("LLM backend error"), "unexpected error: {err}");
+    }
+
     #[test]
     fn run_completes_full_react_loop_with_mock_backend() {
         let mut runner = runner_with_mock(vec![
@@ -3928,5 +4163,22 @@ mod run_react_loop_tests {
         assert_eq!(runner.tool_call_count, 0);
         // It still returns a usable string rather than an error.
         assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn run_tool_only_exhaustion_errors_instead_of_faking_success() {
+        // Every reply is a tool call, so no assistant message ever carries
+        // text. When the tool-call budget runs out, `get_result` used to fall
+        // through to a canned "Task completed" — reporting success for a run
+        // that produced no answer at all. It must report the dead end.
+        let call = r#"{"tool":"read_sensor","args":{"sensor":"temp"}}"#.to_string();
+        let mut runner = runner_with_mock(vec![call; 20]);
+        runner.config_mut().max_tool_calls = 2;
+
+        let err = runner
+            .run("poll the sensor")
+            .expect_err("a tool-only run that exhausts its budget produced no answer");
+        assert_eq!(runner.tool_call_count, 2);
+        assert!(err.contains("without a final answer"), "got {err:?}");
     }
 }

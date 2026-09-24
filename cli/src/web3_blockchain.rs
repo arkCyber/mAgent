@@ -31,9 +31,7 @@ use std::vec::Vec;
 
 use serde::Serialize;
 
-use magent_core::error::Web3ErrorKind;
 use crate::output::{Output, OutputKind};
-use crate::web3::Web3CliError;
 
 /// Blockchain-related subcommands.
 #[derive(Debug, Clone)]
@@ -346,8 +344,12 @@ pub fn render_presentation(vp: &PresentationDisplay, out: &mut Output) {
 
 #[cfg(test)]
 mod tests {
+    // Only the tests below name these; keeping them at file scope made
+    // `cargo build --features web3,blockchain` warn "unused import".
+    use crate::web3::Web3CliError;
+    use magent_core::error::Web3ErrorKind;
+
     use super::*;
-    use std::io::Read;
 
     /// Helper: build a custom `Output` that writes to in-memory
     /// buffers rather than the real stdout/stderr. We can't

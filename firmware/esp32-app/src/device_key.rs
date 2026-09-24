@@ -196,8 +196,8 @@ pub const DEV_IDENTITY_STORED_MAX: usize = BTDK1_PREFIX.len() + wifi_pass_seal::
 /// Returns true if the value starts with the BTDK1 prefix.
 ///
 /// Not referenced by the boot path (which calls `open_dev_identity`
-/// directly); it exists as a host-testable prefix detector for the
-/// integration tests in `firmware/esp32-app/tests/`.
+/// directly), and has no caller anywhere in the tree — the `tests/` directory
+/// it was documented for does not exist. Kept as a public wire-format helper.
 #[allow(dead_code)]
 #[inline]
 pub fn is_sealed(stored: &str) -> bool {
@@ -341,15 +341,16 @@ fn hex_nibble(c: u8) -> Option<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests
+// Tests
 // ---------------------------------------------------------------------------
 //
-// The FFI-backed helpers (`read_btdk_material`, `derive_btdk`,
-// `seal_dev_identity`, `open_dev_identity`'s sealed branch) only
-// run on the ESP32 target. Tests for them live in
-// `firmware/esp32-app/tests/device_key_integration_tests.rs` which
-// is exercised by the hardware-in-the-loop CI job.
-//
-// We CAN exercise the wire-format detection (`is_sealed`) and the
-// error-class dispatch (`open_dev_identity` legacy failure modes)
-// here, because those don't touch FFI.
+// There are none. This module has **no test coverage**, and the comment block
+// that used to sit here claimed otherwise: it pointed at
+// `firmware/esp32-app/tests/device_key_integration_tests.rs` ("exercised by the
+// hardware-in-the-loop CI job") and said the wire-format helpers were covered
+// inline — but no `tests/` directory exists, and this crate is an `esp-idf` bin
+// that no host `cargo test` target can build, so neither set of tests has ever
+// run. The FFI helpers (`read_btdk_material`, `derive_btdk`,
+// `seal_dev_identity`, `open_dev_identity`'s sealed branch) therefore rely on
+// code review + the host-tested `magent-core` primitives they call
+// (`boot_key`, `wifi_pass_seal`). Tracked in `docs/BACKLOG.md`.

@@ -15,12 +15,17 @@ The boot log line `[wifi] connected — ip=...` confirms a real link.
 Usage:
     python3 tools/wifi_link_test.py "MySSID" "pass123"   # pass AP as args
     python3 tools/wifi_link_test.py                       # requires args or env (no creds committed)
+
+The serial device defaults to the C61 DevKit bridge; override it for the
+ESP32-S3's native USB console (which is a real ingress link since
+`UsbSerialAdapter` was added) with `MAGENT_PORT=/dev/cu.usbmodem101`.
 """
+import os
 import serial
 import sys
 import time
 
-PORT = "/dev/cu.usbserial-10"
+PORT = os.environ.get("MAGENT_PORT", "/dev/cu.usbserial-10")
 BAUD = 115200
 WAIT_BOOT_S = 40   # allow up to ~30s blocking Wi-Fi association at boot
 LISTEN_S = 8

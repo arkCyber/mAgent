@@ -10,9 +10,15 @@ cd "$DIR"
 
 S3_DEFAULTS="$DIR/sdkconfig.defaults"
 C61_DEFAULTS="$DIR/sdkconfig.c61.defaults"
-S3_SAVED="/tmp/sdkconfig.defaults.s3.backup"
+# A *unique* backup path: with a fixed one, two concurrent builds clobber each
+# other's copy and the EXIT trap restores the wrong contents, leaving the
+# tracked `sdkconfig.defaults` permanently holding the C61 config.
+S3_SAVED="$(mktemp "${TMPDIR:-/tmp}/magent-sdkconfig.defaults.s3.XXXXXX")"
 
-restore() { cp "$S3_SAVED" "$S3_DEFAULTS" 2>/dev/null || true; }
+restore() {
+    cp "$S3_SAVED" "$S3_DEFAULTS" 2>/dev/null || true
+    rm -f "$S3_SAVED"
+}
 trap restore EXIT
 
 # Save the S3 config, swap in the C61 config

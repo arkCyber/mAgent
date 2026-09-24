@@ -71,6 +71,12 @@ pub enum AdapterError {
     WouldBlock,
     /// Generic IO error from the underlying peripheral driver.
     Io,
+    /// The peripheral stopped accepting bytes mid-buffer, so only a prefix of
+    /// the frame was sent. Distinct from `Io` (which is a driver error): this
+    /// is a TX stall/timeout with a known partial-write. Returned instead of
+    /// `Ok(())` so a truncated AT/agent reply is reported as a send failure
+    /// rather than as "reply sent to host".
+    Truncated,
     /// Buffer handed to `poll` was zero-length. Caller bug.
     EmptyBuffer,
 }
@@ -84,6 +90,7 @@ impl core::fmt::Display for AdapterError {
             // `std::io::Error` would (`"operation would block"`).
             Self::WouldBlock => write!(f, "operation would block"),
             Self::Io => write!(f, "peripheral I/O error"),
+            Self::Truncated => write!(f, "peripheral stalled before the whole buffer was sent"),
             Self::EmptyBuffer => write!(f, "poll buffer was zero-length"),
         }
     }
@@ -103,6 +110,7 @@ impl embedded_io::Error for AdapterError {
             // (the inner driver returns `Ok(0)` for "no data").
             Self::WouldBlock => ErrorKind::Other,
             Self::Io => ErrorKind::Other,
+            Self::Truncated => ErrorKind::WriteZero,
             Self::EmptyBuffer => ErrorKind::InvalidInput,
         }
     }
@@ -230,15 +238,7 @@ where
         // (the firmware is `std`-only) and truncate to 16 bytes
         // (the magent-core field's capacity).
         let mut port = heapless::String::<16>::new();
-        let bytes = self.port.as_bytes();
-        let take = bytes.len().min(16);
-        // SAFETY-ish: `port` has capacity 16 and `bytes` is valid
-        // UTF-8 (we got it from a `std::string::String` constructed
-        // from `&str`), so `push_str` cannot fail here.
-        let _ = port.push_str(
-            core::str::from_utf8(&bytes[..take])
-                .unwrap_or("?"),
-        );
+        crate::text_util::push_str_truncated(&self.port, &mut port);
         IngressSource::Rs232 { port }
     }
 
@@ -486,15 +486,192 @@ where
         // adapter field) to `heapless::String<32>` (magent-core's
         // heapless 0.7 type for `IngressSource::Other::label`).
         let mut label = heapless::String::<32>::new();
-        let bytes = self.label.as_bytes();
-        let take = bytes.len().min(32);
-        let _ = label.push_str(
-            core::str::from_utf8(&bytes[..take]).unwrap_or("?"),
-        );
+        crate::text_util::push_str_truncated(&self.label, &mut label);
         IngressSource::Other { label }
     }
 
     fn is_connected(&self) -> bool {
         true
+    }
+}
+
+// ===========================================================================
+// Native USB-Serial/JTAG adapter (ESP32-S3)
+// ===========================================================================
+
+/// Adapter around the ESP32's **native** USB-Serial/JTAG console.
+///
+/// ## Why this exists
+///
+/// ESP32-S3 dev boards expose the chip's native USB peripheral
+/// (USB-Serial/JTAG, D-/D+ = GPIO19/20) to the host — there is no USB-UART
+/// bridge wired to the UART0 pins. The console log output is mirrored to that
+/// peripheral (`CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y`), so the
+/// operator *sees* everything on `/dev/cu.usbmodem*`, but the UART0 ingress
+/// adapter only reads the physical U0RXD pin: any command typed on the USB
+/// console (`AT+GMR`, `read the temperature`) used to be silently dropped.
+/// Registering this adapter as a second ingress link makes that very same
+/// console bidirectional — commands in, replies / `+CMDER:<n>` errors out.
+///
+/// ## Non-blocking contract
+///
+/// [`UartAdapter::poll`] can rely on `UartDriver::remaining_read`; the
+/// USB-Serial/JTAG driver has no "bytes available" query, so `poll` calls the
+/// driver with a **zero-tick timeout** (`delay::NON_BLOCK`). That returns
+/// `Ok(0)` when nothing is buffered instead of blocking — the blocking
+/// `embedded_io::Read` impl of the driver waits with `delay::BLOCK`, which
+/// would stall the ingress loop and trip its watchdog heartbeat.
+///
+/// Gated on `board-s3`: the C61 DevKit's console goes through a USB-UART
+/// bridge on UART0, so the UART0 adapter already covers it there.
+#[cfg(feature = "board-s3")]
+pub struct UsbSerialAdapter {
+    inner: esp_idf_svc::hal::usb_serial::UsbSerialDriver<'static>,
+    port: std::string::String,
+}
+
+#[cfg(feature = "board-s3")]
+impl UsbSerialAdapter {
+    /// Wrap the USB-Serial/JTAG driver. `port` is the human-readable
+    /// identifier used in logs / audit records (e.g. `"USB-JTAG"`).
+    pub fn new(inner: esp_idf_svc::hal::usb_serial::UsbSerialDriver<'static>, port: &str) -> Self {
+        Self {
+            inner,
+            port: std::string::String::from(port),
+        }
+    }
+}
+
+#[cfg(feature = "board-s3")]
+impl ErrorType for UsbSerialAdapter {
+    type Error = AdapterError;
+}
+
+#[cfg(feature = "board-s3")]
+impl LinkAdapter for UsbSerialAdapter {
+    type Error = AdapterError;
+
+    fn poll(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if buf.is_empty() {
+            return Err(AdapterError::EmptyBuffer);
+        }
+        // `NON_BLOCK` (0 ticks) = "hand back whatever is buffered right now".
+        match self.inner.read(buf, esp_idf_svc::hal::delay::NON_BLOCK) {
+            Ok(n) => Ok(n),
+            Err(_) => Err(AdapterError::Io),
+        }
+    }
+
+    fn send(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        // Bounded, non-blocking write loop: if the host is not draining the
+        // USB TX FIFO we give up after ~100 ms instead of blocking the ingress
+        // thread forever (the blocking `Write` impl waits with `delay::BLOCK`).
+        let mut offset = 0usize;
+        let mut stalls = 0u32;
+        while offset < buf.len() {
+            match self
+                .inner
+                .write(&buf[offset..], esp_idf_svc::hal::delay::NON_BLOCK)
+            {
+                Ok(0) => {
+                    stalls += 1;
+                    if stalls > 50 {
+                        log::warn!(
+                            "[ingress] USB-JTAG TX stalled after {offset}/{}B — dropping remainder",
+                            buf.len()
+                        );
+                        // Report the partial write as an error. Returning `Ok`
+                        // here made the caller log "reply sent to host" for a
+                        // reply whose tail was silently discarded — the host
+                        // would then act on a truncated AT/agent response.
+                        return Err(AdapterError::Truncated);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Ok(n) => {
+                    offset += n;
+                    stalls = 0;
+                }
+                Err(_) => return Err(AdapterError::Io),
+            }
+        }
+        Ok(())
+    }
+
+    fn source_kind(&self) -> IngressSource {
+        // Same `std::string::String` → `heapless::String<16>` bridge as
+        // `UartAdapter::source_kind`.
+        let mut port = heapless::String::<16>::new();
+        crate::text_util::push_str_truncated(&self.port, &mut port);
+        IngressSource::Rs232 { port }
+    }
+
+    fn is_connected(&self) -> bool {
+        // The USB peripheral is always attached on these dev boards; a real
+        // product could gate this on `UsbSerialDriver::is_connected()`.
+        true
+    }
+}
+
+// ===========================================================================
+// ESP32 ingress link (UART0 + native USB-Serial/JTAG)
+// ===========================================================================
+
+/// Sum type over the board's physical console links.
+///
+/// `IngressGateway` is generic over **one** adapter type, so a board that wants
+/// to accept commands on more than one link registers both behind this enum.
+/// Registration order defines the adapter index (0 = UART0, 1 =
+/// USB-Serial/JTAG) and `source_kind()` reports a distinct `Rs232` port name per
+/// variant, which the ingress loop uses to send each reply back out of the link
+/// the command arrived on.
+pub enum EspIngressLink {
+    /// UART0 — the external USB-UART bridge on the C61 DevKit.
+    Uart(UartAdapter<esp_idf_svc::hal::uart::UartDriver<'static>>),
+    /// Native USB-Serial/JTAG console — ESP32-S3 dev boards.
+    #[cfg(feature = "board-s3")]
+    Usb(UsbSerialAdapter),
+}
+
+impl ErrorType for EspIngressLink {
+    type Error = AdapterError;
+}
+
+impl LinkAdapter for EspIngressLink {
+    type Error = AdapterError;
+
+    fn poll(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        match self {
+            Self::Uart(a) => a.poll(buf),
+            #[cfg(feature = "board-s3")]
+            Self::Usb(a) => a.poll(buf),
+        }
+    }
+
+    fn send(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
+        match self {
+            Self::Uart(a) => a.send(buf),
+            #[cfg(feature = "board-s3")]
+            Self::Usb(a) => a.send(buf),
+        }
+    }
+
+    fn source_kind(&self) -> IngressSource {
+        match self {
+            Self::Uart(a) => a.source_kind(),
+            #[cfg(feature = "board-s3")]
+            Self::Usb(a) => a.source_kind(),
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        match self {
+            Self::Uart(a) => a.is_connected(),
+            #[cfg(feature = "board-s3")]
+            Self::Usb(a) => a.is_connected(),
+        }
     }
 }

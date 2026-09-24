@@ -250,11 +250,19 @@ impl<'a> TokenSink for BoundedTokenSink<'a> {
 /// every task; we retry the LLM after `LLM_SKIP_CALLS` so it re-arms the
 /// moment the network comes back.
 ///
+/// PATCHED (MicroAgent): lowered 5 → 2. Each LLM attempt is already retried
+/// once by the backend (`llm.rs`), so two consecutive failed attempts mean the
+/// uplink really is down; keeping the back-off at 5 muted the model for five
+/// further commands after a single ~20 s hotspot outage, and those tasks were
+/// then answered by the local heuristic (observed on hardware: a news question
+/// answered with a CPU temperature). Two keeps the recovery latency low while
+/// still avoiding a timeout-per-task while the link is genuinely gone.
+///
 /// Only used on embedded targets (nRF52 / ESP32 / generic embedded) where the
 /// agent has a real LLM backend; gated identically to its single call site so
 /// the constant isn't flagged as dead under the host `std`-only feature set.
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
-const LLM_SKIP_CALLS: u8 = 5;
+const LLM_SKIP_CALLS: u8 = 2;
 
 /// FEATURE (audit-2026-08 round-4): self-healing telemetry for the
 /// agent loop. Counts how many times the ReAct loop has hit each
@@ -284,9 +292,10 @@ pub struct AgentTelemetry {
     /// Execute-tool-phase errors (tool missing, tool failed). The
     /// second most common retry trigger.
     pub execute_errors: u32,
-    /// Watchdog trips (the iteration ran too long). One of these
-    /// usually precedes a reboot, so they deserve their own counter
-    /// rather than being folded into `runs_err`.
+    /// Operation timeouts (`AgentError::OperationTimeout`), named for the
+    /// watchdog because that is their usual cause on device. Not driven by
+    /// `safety::Watchdog` (a clockless latch that never trips on its own) or
+    /// by the iteration budget (which raises `IterationBudgetExhausted`).
     pub watchdog_trips: u32,
     /// LLM calls that failed and triggered the `LLM_SKIP_CALLS`
     /// backoff. Useful for spotting a flaky backend before the user
@@ -381,6 +390,15 @@ pub struct MiniAgent {
     /// periodically instead of blocking each task. 0 = try the LLM.
     #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
     llm_skip_remaining: u8,
+    /// When set, `think` never consults the cloud LLM for the current run.
+    ///
+    /// Used by the firmware for its **internal** heartbeat task (the idle loop's
+    /// `read sensor temperature`): that task is purely local by design, so
+    /// asking the model about it would (a) bill a cloud round trip every idle
+    /// cycle — ~17k calls/day on a 5 s loop — and (b) make a pre-Wi-Fi failure
+    /// engage the `LLM_SKIP_CALLS` backoff, which then muted the model for the
+    /// operator's first commands after boot.
+    llm_local_only: bool,
     #[cfg(feature = "monitoring")]
     monitor: Option<crate::monitoring::MonitoringManager>,
     /// FEATURE (audit-2026-08 round-4): self-healing telemetry.
@@ -518,10 +536,24 @@ impl MiniAgent {
         // an empty registry.
         register_builtin_tools(&mut tools);
 
+        // Build the budget from the *validated config*, not the crate defaults.
+        // `with_max_iterations` / `with_max_memory` used to be write-only — no
+        // production code read the fields — so the ESP32 firmware's
+        // `with_max_iterations(20)` / `with_max_memory(2 MiB)` were silently
+        // discarded and the ReAct loop ran with the crate default 50 iterations
+        // and a 50 KiB memory ceiling. Reading them here is what makes those
+        // builder calls mean anything. The time limit keeps the `with_defaults`
+        // value (10 s); `AgentConfig` has no time field.
+        let budget = BudgetEnforcer::new(
+            config.max_iterations as usize,
+            config.max_memory as usize,
+            10_000,
+        );
+
         Ok(Self {
             config,
             state: AgentState::Thinking,
-            budget: BudgetEnforcer::with_defaults(),
+            budget,
             watchdog: Watchdog::with_defaults(),
             skills: SkillsManager::new(max_skills),
             tools,
@@ -532,6 +564,7 @@ impl MiniAgent {
             llm: None,
             #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
             llm_skip_remaining: 0,
+            llm_local_only: false,
             #[cfg(feature = "monitoring")]
             monitor: None,
             // FEATURE (audit-2026-08 round-4): zero-init telemetry.
@@ -588,6 +621,19 @@ impl MiniAgent {
     #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
     pub fn set_llm_backend(&mut self, backend: &'static mut dyn LlmBackend) {
         self.llm = Some(backend);
+    }
+
+    /// Force the *next* runs (`run` / `run_inner`) to stay on-device: `think`
+    /// skips the cloud LLM entirely and uses the deterministic heuristic plus
+    /// the local tool handler.
+    ///
+    /// The firmware sets this for its internal heartbeat task so an idle board
+    /// never bills a cloud round trip, and so a pre-network failure cannot mute
+    /// the model for the operator's subsequent commands via the skip backoff.
+    /// TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R6.
+    #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+    pub fn set_llm_local_only(&mut self, local_only: bool) {
+        self.llm_local_only = local_only;
     }
 
     /// Run a task
@@ -781,12 +827,22 @@ impl MiniAgent {
         #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
         if self.llm_skip_remaining > 0 {
             self.llm_skip_remaining -= 1;
-        } else if self.llm.is_some() {
+        } else if self.llm.is_some() && !self.llm_local_only {
             let system = self.build_llm_system_prompt();
             if let Some(llm) = self.llm.as_deref_mut() {
                 match llm.complete(system.as_str(), task.as_str()) {
                     Ok(reply) => {
                         if let Some((tool, args)) = parse_llm_tool_call(&reply) {
+                            // PATCHED (MicroAgent): log the model's decision. Tool
+                            // selection was previously invisible on the device
+                            // console — an operator could only see the *result*,
+                            // which made "why did it read the temperature when I
+                            // asked for the weather?" impossible to answer.
+                            log::info!(
+                                "[agent] llm tool call: {} args={}",
+                                tool.as_str(),
+                                args.as_str()
+                            );
                             self.pending_tool = Some(ToolCall {
                                 name: heapless::String::try_from(tool.as_str()).unwrap_or_default(),
                                 arguments: heapless::String::try_from(args.as_str())
@@ -797,6 +853,11 @@ impl MiniAgent {
                             return Ok(());
                         }
                         // Plain-text answer — the task is complete.
+                        log::info!(
+                            "[agent] llm answer ({} B): {}",
+                            reply.len(),
+                            reply.as_str()
+                        );
                         self.add_message("assistant", reply.as_str())?;
                         self.state = AgentState::Finished;
                         return Ok(());
@@ -861,11 +922,32 @@ impl MiniAgent {
     fn build_llm_system_prompt(&self) -> String<MAX_BUFFER_SIZE> {
         let mut out = String::new();
         let _ = out.push_str(concat!(
-            "You are mAgent, an embedded AI agent. Use a tool when it helps, ",
-            "otherwise answer concisely. To call a tool reply with ONLY this JSON: ",
-            "{\"tool\":\"<name>\",\"args\":\"<key=value,...>\"}. Available tools:\n"
+            "You are mAgent, an embedded AI agent running on an ESP32-S3.\n",
+            "Always answer in the language the user wrote in (中文提问就用中文回答).\n",
+            "Reply in ONE of two ways:\n",
+            "1) Plain text — for greetings, small talk, explanations, or anything you ",
+            "already know. Never use JSON here.\n",
+            "2) A tool call, only when the request needs live or real-world data ",
+            "(weather, news, fetching a URL, reading a device sensor, writing a GPIO). ",
+            "Reply with ONLY this JSON and nothing else: ",
+            "{\"tool\":\"<name>\",\"args\":\"<key=value,...>\"}\n",
+            "Never invent live data (prices, availability, stock quotes, weather, ",
+            "news): if a tool could not fetch it, say plainly that you could not ",
+            "retrieve it and what you tried.\n",
+            "Available tools:\n"
         ));
-        let _ = out.push_str(self.tools.describe().as_str());
+        // PATCHED (MicroAgent): a tool the prompt does not mention is a tool the
+        // model cannot use — and it will honestly say so ("I don't have that
+        // tool"). Report an overflow instead of dropping the tail silently.
+        let tools = self.tools.describe();
+        if out.push_str(tools.as_str()).is_err() {
+            log::warn!(
+                "[agent] LLM system prompt buffer ({} B) too small for the {}-byte tool list — \
+                 the model will not see every tool",
+                MAX_BUFFER_SIZE,
+                tools.len()
+            );
+        }
         out
     }
 
@@ -1029,11 +1111,14 @@ impl MiniAgent {
             // `runs_err` still increments via the Drop guard.
             AgentState::Observing | AgentState::Finished => {}
         }
-        // Watchdog / iteration-budget exhaustion trips. The agent
-        // uses `OperationTimeout` for both: the watchdog's explicit
-        // trip and the iteration budget's per-loop timeout. We pick
-        // it out so the supervisor can show "agent timed out"
-        // rather than the generic "agent failed".
+        // Genuine operation timeouts. The counter is named for the watchdog
+        // because that is what a timeout usually means on device, but note the
+        // `safety::Watchdog` latch does **not** produce this error: it has no
+        // clock, and `MiniAgent` only ever feeds it. `OperationTimeout` is
+        // raised by a backend/transport that hit a real deadline; the
+        // iteration budget raises `IterationBudgetExhausted` and is *not*
+        // counted here. So this counter reflects backend timeouts only, and
+        // stays 0 on a target whose backend never times out.
         if matches!(err, AgentError::OperationTimeout { .. }) {
             self.telemetry.watchdog_trips = self.telemetry.watchdog_trips.saturating_add(1);
         }
@@ -1312,6 +1397,24 @@ mod tests {
         AgentConfig::new()
             .with_max_iterations(8)
             .expect("max_iterations")
+    }
+
+    #[test]
+    fn budget_limits_come_from_the_config() {
+        // `with_max_iterations` / `with_max_memory` must reach the enforcer.
+        // `MiniAgent::new` used to build `BudgetEnforcer::with_defaults()`
+        // unconditionally (50 iterations / 50 KiB), so the ESP32 firmware's
+        // `with_max_iterations(20)` and `with_max_memory(2 MiB)` were silently
+        // ignored. Assert the values are neither the crate defaults nor each
+        // other, so a regression to constant limits fails here.
+        let cfg = AgentConfig::new()
+            .with_max_iterations(7)
+            .expect("max_iterations")
+            .with_max_memory(1234)
+            .expect("max_memory");
+        let agent = MiniAgent::new(cfg).expect("agent");
+        assert_eq!(agent.budget().iteration_limit(), 7);
+        assert_eq!(agent.budget().memory_limit(), 1234);
     }
 
     #[test]

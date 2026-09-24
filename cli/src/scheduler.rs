@@ -701,15 +701,13 @@ fn execute_run_once(tasks: &[ScheduledTask], out: &mut Output) -> Result<(), Sch
     let mut state = load_state(&state_path)?;
     state.last_started_at = Some(now_secs());
 
-    if tasks.is_empty() {
-        let _ = out.trace_labeled("scheduler", "no tasks to run");
-        // Still save the state file so `last_started_at` lands on
-        // disk; this is useful for the `status` command.
-        save_state(&state_path, &state)?;
-        return Ok(());
-    }
-
     let total = tasks.len();
+    if total == 0 {
+        // Don't early-return: a CI `--json` caller still expects the
+        // `{"kind":"scheduler.run_once","ran":0,…}` envelope below,
+        // and the state file must be written for `status`.
+        let _ = out.trace_labeled("scheduler", "no tasks to run");
+    }
     for (i, task) in tasks.iter().enumerate() {
         let _ = out.trace_labeled(
             "scheduler",
@@ -735,11 +733,12 @@ fn execute_run_once(tasks: &[ScheduledTask], out: &mut Output) -> Result<(), Sch
             "state_path": state_path.display().to_string(),
             "tasks": state.tasks,
         });
-        // `final_answer` is the CLI's "the answer goes here" channel
-        // for both Human and JSON mode; using it keeps the rest of
-        // the output formatter happy.
-        let s = envelope.to_string();
-        let _ = out.final_answer(&s);
+        // `final_answer` only *stores* its argument in JSON mode (it
+        // expects a later `write_json` to flush the envelope), so using
+        // it here emitted nothing and the CI pipeline got an empty
+        // stream. `write_json_str` writes the pre-rendered envelope
+        // straight to stdout.
+        out.write_json_str(envelope.to_string());
     } else {
         let _ = out.trace_labeled(
             "scheduler",
@@ -879,7 +878,9 @@ fn execute_status(out: &mut Output) -> Result<(), SchedulerError> {
             "state_path": state_path.display().to_string(),
             "state": state,
         });
-        let _ = out.final_answer(&envelope.to_string());
+        // Same deferral trap as `run-once`: `final_answer` is stored,
+        // not written, in JSON mode — see the note there.
+        out.write_json_str(envelope.to_string());
         return Ok(());
     }
 
@@ -1194,7 +1195,21 @@ impl CronSpec {
             }
             let dom_match = self.doms.contains(&tm.day) || self.doms.len() == 31;
             let dow_match = self.dows.contains(&tm.dow) || self.dows.len() == 7;
-            if !(dom_match && dow_match) {
+            // POSIX/vixie cron: when *both* day fields are restricted
+            // (neither is `*`), the day matches if *either* matches. Only
+            // when one of them is `*` does the other alone govern. Combining
+            // them with `&&` — as this did — makes `0 0 1 * 1` mean "the 1st,
+            // but only when it is also a Monday", silently skipping ~11 of
+            // every 12 monthly runs. `len() == 31` / `len() == 7` is the
+            // "this field was `*`" test: `*` expands to the full range, and a
+            // restricted field that happens to list every value is
+            // indistinguishable from `*` (and behaves identically).
+            let day_match = if self.doms.len() == 31 || self.dows.len() == 7 {
+                dom_match && dow_match
+            } else {
+                dom_match || dow_match
+            };
+            if !day_match {
                 // Skip to 00:00 of the next day so the hour /
                 // minute re-checks have to earn their keep.
                 tm.hour = 0;
@@ -1624,10 +1639,6 @@ pub fn scheduler_help_text() -> String {
         "    --timezone <utc|local>   Force UTC or honour $MAGENT_TIMEZONE \
          (default: local, IANA name like Asia/Shanghai)."
     );
-    let _ = writeln!(
-        s,
-        "    --preset <NAME>          Use a built-in task list: audit | complete"
-    );
     let _ = writeln!(s);
     let _ = writeln!(s, "TASK FILE SCHEMA:");
     let _ = writeln!(s, "    {{");
@@ -1958,6 +1969,47 @@ mod tests {
         let spec = CronSpec::parse("0 0 1 * 1").unwrap();
         assert_eq!(spec.doms, vec![1]);
         assert_eq!(spec.dows, vec![1]);
+    }
+
+    #[test]
+    fn cron_dom_and_dow_are_or_combined_when_both_restricted() {
+        // The test above only inspects the parsed fields, so it passed while
+        // `next_after` combined the day fields with `&&` — i.e. `0 0 1 * 1`
+        // fired only on the 1st *when it was also a Monday*. This asserts the
+        // actual scheduling behaviour.
+        //
+        // Anchored on independently verifiable dates (`date -u -r`):
+        // 2024-01-01, 2024-01-08 and 2024-04-01 were all Mondays. `from` is
+        // 2024-01-01T00:00:**59**Z, deliberately the last second of the
+        // matching minute — `next_after` is second-precise, so starting one
+        // second past 00:00:00 would return 00:00:02 (still inside the
+        // matching 00:00 minute) rather than advancing to the next day.
+        // From there the next OR match is the next Monday, 2024-01-08. An AND
+        // matcher would instead return 2024-04-01, the first month-start that
+        // is *also* a Monday.
+        let spec = CronSpec::parse("0 0 1 * 1").unwrap();
+        let from = 1_704_067_259; // 2024-01-01T00:00:59Z
+        let next = spec.next_after(from, SchedulerTimezone::Utc);
+        assert_eq!(
+            next, 1_704_672_000, // 2024-01-08T00:00:00Z, a Monday
+            "dom/dow must be OR-combined (POSIX), not AND"
+        );
+        assert_ne!(
+            next, 1_711_929_600, // 2024-04-01T00:00:00Z — the AND answer
+            "AND semantics skips 11 of 12 monthly runs"
+        );
+    }
+
+    #[test]
+    fn cron_star_dom_pins_day_of_week_to_the_dow_field() {
+        // The complement of the OR rule: when dom is `*`, dow alone governs.
+        // 2024-01-01 was a Monday, so `0 0 * * 1` from the last second of that
+        // matching minute is the following Monday.
+        let spec = CronSpec::parse("0 0 * * 1").unwrap();
+        assert_eq!(
+            spec.next_after(1_704_067_259, SchedulerTimezone::Utc),
+            1_704_672_000 // 2024-01-08T00:00:00Z
+        );
     }
 
     #[test]

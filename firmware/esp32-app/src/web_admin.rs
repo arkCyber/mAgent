@@ -97,7 +97,8 @@ fn latency_json() -> String {
 }
 
 /// Human-readable label for an ESP-IDF `WIFI_REASON_*` code. Unknown codes
-/// fall back to the raw number so operators can still look them up.
+/// return the literal `"unknown"`; callers render the raw code separately, so
+/// the number is still available to look up.
 fn reason_label(reason: u32) -> &'static str {
     match reason {
         0 => "none",

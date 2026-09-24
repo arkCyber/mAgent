@@ -23,6 +23,18 @@ pub trait LlmBackend: Send + std::any::Any {
 The runner holds an `Option<Box<dyn LlmBackend>>` and flips it to
 `Some(...)` automatically the first time `check_connection()` succeeds.
 
+**An unreachable backend is an error, not a fallback.** `RealAgentRunner::new()`
+and `with_config()` wire an `OllamaClient` at `http://localhost:11434` by
+default, so "no model is running" is a normal state — and it used to be answered
+with a canned *simulated* reply that the caller could not tell apart from a real
+one. `run()` now returns `Err` in both failure cases:
+
+- the probe (`check_connection()`) fails at the start of the run;
+- `chat_with_messages()` fails mid-run (link drop, timeout, HTTP 5xx).
+
+If you *want* the scripted responder — demos, tests, offline ReAct-loop
+exercises — ask for it explicitly with `without_backend()`.
+
 `RealAgentRunner` exposes:
 
 | Method | Purpose |
@@ -30,8 +42,9 @@ The runner holds an `Option<Box<dyn LlmBackend>>` and flips it to
 | `backend_mut()` | Mutable access to the wired backend, if any |
 | `backend_provider()` | `Some(LlmProvider::Ollama / DeepSeek)` |
 | `set_backend(B)` | Swap in a different backend (resets the probe flag) |
+| `without_backend()` | **Explicit simulation mode.** Drops the backend so every response comes from the built-in scripted responder. No network, no error. |
 | `force_enable_backend()` | Skip the auto-probe and turn the backend on. No-op if no backend is wired up. |
-| `force_disable_backend()` | Turn the backend off (will re-probe on next `run()` if `probe_ollama_on_run` is true). |
+| `force_disable_backend()` | Turn the backend off (will re-probe on next `run()` if `probe_ollama_on_run` is true — and if that probe then fails, `run()` errors; set `probe_ollama_on_run: false` to stay in simulation). |
 | `using_backend()` | `true` if the probe succeeded |
 | `using_ollama()` | Kept for backwards compatibility; `true` only if the backend is Ollama |
 
@@ -123,7 +136,10 @@ magent run --provider deepseek --model deepseek-reasoner "Solve ..."
 1. `--api-key <KEY>` (highest priority)
 2. `DEEPSEEK_API_KEY` env var
 3. `OLLAMA_API_KEY` env var (symmetry / fallback)
-4. None → fall back to simulated reasoning
+4. None → the CLI explicitly runs in simulation (`force_disable_backend()` plus
+   `probe_ollama_on_run: false`). Note this is a deliberate opt-in at the CLI
+   layer, not a runner fallback: the runner itself errors when a *configured*
+   backend is unreachable.
 
 ### Wire format
 

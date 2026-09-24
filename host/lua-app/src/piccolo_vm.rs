@@ -690,7 +690,15 @@ fn v_to_owned_string(v: piccolo::Value<'_>) -> String {
 /// every capture should split the input with `string.find` instead).
 /// Unsupported patterns return `None`.
 fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
-    let start = (init.max(1) as usize).saturating_sub(1).min(s.len());
+    // `init` is a Lua 1-based index into a *byte* string. This shim holds a
+    // `&str`, so a script passing an index that lands inside a multi-byte
+    // code point would panic on the slice below. Back it up to the previous
+    // character boundary instead — real Lua would index the raw byte and
+    // return garbage, which is better than aborting the VM.
+    let mut start = (init.max(1) as usize).saturating_sub(1).min(s.len());
+    while start > 0 && !s.is_char_boundary(start) {
+        start -= 1;
+    }
     let s_tail = &s[start..];
 
     // Tokens are emitted for the entire pattern; `(...)` is encoded as a

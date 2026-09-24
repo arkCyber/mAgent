@@ -167,7 +167,8 @@ fn main() {
     // that don't (e.g. the S3, where `sdkconfig.s3.defaults` sets it =n) —
     // keeping the firmware linkable in both cases.
     println!("cargo:rustc-check-cfg=cfg(rt_wdt)");
-    detect_rt_wdt();
+    println!("cargo:rustc-check-cfg=cfg(ipv6_ping)");
+    detect_sdkconfig_cfgs();
 }
 
 /// Split a space-separated argument list while respecting single
@@ -194,18 +195,20 @@ fn split_args(s: &str) -> Vec<String> {
     out
 }
 
-/// Detect whether the effective ESP-IDF build has the Task Watchdog enabled
-/// (`CONFIG_ESP_TASK_WDT_EN=y`). If so, emit `cargo:rustc-cfg=rt_wdt` so
-/// `rt_watchdog.rs` compiles its `esp_task_wdt_*` calls; otherwise leave the
-/// cfg unset and `rt_watchdog` degrades to a no-op.
+/// Read the *effective* ESP-IDF sdkconfig and emit a `rustc-cfg` for each
+/// feature that changes which symbols bindgen generated. Both cfgs are
+/// best-effort: they select between two compile-able variants, so a failure to
+/// read the config simply leaves them unset rather than breaking the build.
 ///
-/// This keeps the firmware linkable on builds where the task WDT is disabled
-/// (notably the ESP32-S3: `sdkconfig.s3.defaults` sets
-/// `CONFIG_ESP_TASK_WDT_EN=n`, so `esp_task_wdt.c` is not compiled and the
-/// symbols are absent), while still arming the RT watchdog on builds that do
-/// enable it. **Best-effort**: any failure here simply leaves `rt_wdt` unset
-/// (watchdog off), never breaks the build.
-fn detect_rt_wdt() {
+/// * `rt_wdt` from `CONFIG_ESP_TASK_WDT_EN=y` — `rt_watchdog.rs` compiles its
+///   `esp_task_wdt_*` calls when set and degrades to a no-op otherwise. With the
+///   TWD disabled (the ESP32-S3: `sdkconfig.s3.defaults` sets it `=n`)
+///   `esp_task_wdt.c` is not compiled and the symbols are absent.
+/// * `ipv6_ping` from `CONFIG_LWIP_IPV6=y` — `ping.rs` compiles its IPv6-literal
+///   branch when set. With IPv6 off (the ESP32-C61 default) bindgen emits no
+///   `ip6_addr`/`ip6addr_aton` and `ip_addr_t` degenerates to `ip4_addr_t`, so
+///   the branch does not merely do nothing — it does not compile.
+fn detect_sdkconfig_cfgs() {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
 
     // Prefer paths derived from the esp-idf-sys link args (`-L <base>` where
@@ -253,12 +256,24 @@ fn detect_rt_wdt() {
     }
 
     for c in candidates {
-        if let Ok(text) = std::fs::read_to_string(&c) {
-            if text.contains("\"ESP_TASK_WDT_EN\": true") {
-                println!("cargo:rustc-cfg=rt_wdt");
-                return;
-            }
+        let Ok(text) = std::fs::read_to_string(&c) else {
+            continue;
+        };
+        // Task Watchdog: `rt_watchdog.rs` compiles its `esp_task_wdt_*` calls on
+        // builds that enable it and degrades to a no-op otherwise.
+        if text.contains("\"ESP_TASK_WDT_EN\": true") {
+            println!("cargo:rustc-cfg=rt_wdt");
         }
+        // lwIP IPv6: gates the IPv6 path in `ping.rs`. With `CONFIG_LWIP_IPV6=n`
+        // (the ESP32-C61 default) bindgen emits neither `ip6_addr` nor
+        // `ip6addr_aton`, and `ip_addr_t` degenerates to a plain `ip4_addr_t` —
+        // so the IPv6 branch is not merely dead, it does not compile. Emitting
+        // the cfg lets `ping.rs` build on either configuration instead of
+        // silently depending on which sdkconfig happens to be in place.
+        if text.contains("\"LWIP_IPV6\": true") {
+            println!("cargo:rustc-cfg=ipv6_ping");
+        }
+        return;
     }
 }
 

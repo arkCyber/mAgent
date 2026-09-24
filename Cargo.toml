@@ -13,6 +13,11 @@ members = [
 
     # Firmware crates — one per supported chip. Each one targets a
     # specific chip family and exposes a `main` / `#[entry]` function.
+    # Note: firmware targets use embedded-specific section attributes
+    # (#[link_section]) that fail on non-cross builds (e.g., Mach-O on macOS).
+    # They are excluded from default workspace tests and must be built
+    # with cross-compilation toolchains. See .github/workflows/ci.yml
+    # for the dedicated firmware build jobs.
     "firmware/nrf52-app",
     "firmware/esp32-app",
     "firmware/integration-test",
@@ -46,6 +51,30 @@ members = [
     # We add them as globs so a new example dropped under
     # `examples/` is automatically picked up by `cargo build` at
     # the workspace root.
+    "examples/*",
+]
+
+# ---------------------------------------------------------------------------
+# Default members for workspace-level commands
+# ---------------------------------------------------------------------------
+# Firmware crates are excluded from `cargo test --workspace` at the workspace
+# root because they require chip-specific cross-compilation toolchains and
+# contain platform-specific attributes (e.g., #[link_section]) that don't
+# compile on host targets. They have dedicated CI jobs (firmware-nrf52,
+# firmware-esp32c61, firmware-esp32s3) that build them with the correct
+# toolchains. This prevents "invalid Mach-O section specifier" errors on macOS
+# and similar issues on Linux when running workspace-wide tests.
+default-members = [
+    "magent-core",
+    "magent-hal",
+    "host/simulator",
+    "host/nrf52-simulator",
+    "host/email-mcp",
+    "host/mqtt-mcp",
+    "host/mcp-tool-executor",
+    "host/lua-app",
+    "cli",
+    "tools",
     "examples/*",
 ]
 

@@ -75,6 +75,9 @@ All four follow the standard `git`-style pattern:
 * `list` — print a table of every prompt (`NAME`, `PROVIDER`, `MODEL`, `TAGS`).
 * `delete <NAME>` — remove the file (no-op if it's already gone).
 * `export <NAME>` — print *just the prompt text* (pipeable into scripts).
+  Under `--json` it emits the full record (the same shape as `show`) so that
+  `--json` output is always valid JSON; the raw text stays byte-for-byte
+  identical in human mode.
 
 ### `template <NAME>`
 

@@ -109,7 +109,10 @@ pub struct GlobalFlags {
 /// The first positional argument selects the subcommand.
 #[derive(Debug, Clone)]
 pub enum Command {
-    /// `magent run [OPTIONS] <TASK>` — run an agent task (or REPL if no task).
+    /// `magent run [OPTIONS] <TASK>` — run a single agent task, or
+    /// `magent run --repl` for an interactive session. The CLI requires
+    /// an explicit `--repl`; a bare `magent run` with no task is a
+    /// usage error.
     Run(Box<RunOptions>),
     /// `magent run --help` / `magent help run` — print `run`-specific usage.
     RunHelp,
@@ -252,6 +255,13 @@ pub struct RunOptions {
     /// Gated on the `web3_app` feature.
     #[cfg(feature = "web3_app")]
     pub signed_output: Option<PathBuf>,
+    /// `--passphrase-env <VAR>` — name of the environment variable
+    /// holding the vault passphrase used to decrypt the `--signer`
+    /// identity. Defaults to `MAGENT_WEB3_PASSPHRASE`.
+    ///
+    /// Gated on the `web3_app` feature.
+    #[cfg(feature = "web3_app")]
+    pub passphrase_env: Option<String>,
     /// `--not-after <SECS>` — optional expiry window for the
     /// signed envelope. The verifier will reject an envelope whose
     /// `not_after_unix < now`. Helpful for time-boxed
@@ -278,45 +288,6 @@ pub struct RunOptions {
     pub verify_signed_path: Option<PathBuf>,
 }
 
-/// Options specific to `magent repl`.
-#[derive(Debug, Clone)]
-#[derive(Default)]
-pub struct ReplOptions {
-    /// Which LLM provider to use.
-    pub provider: String,
-    /// Model name.
-    pub model: String,
-    /// Ollama base URL.
-    pub ollama_url: String,
-    /// DeepSeek base URL.
-    pub deepseek_url: String,
-    /// API key for DeepSeek.
-    pub api_key: Option<String>,
-    /// Sampling temperature.
-    pub temperature: Option<f32>,
-    /// Sampling num_predict.
-    pub num_predict: Option<usize>,
-    /// Max iterations per turn.
-    pub max_iterations: Option<usize>,
-    /// Max tool calls per turn.
-    pub max_tool_calls: Option<usize>,
-    /// Max messages in conversation history.
-    pub max_messages: Option<usize>,
-    /// Max chars per tool result.
-    pub tool_max_chars: Option<usize>,
-    /// Path to a custom system prompt file.
-    pub prompt_file: Option<PathBuf>,
-    /// Name of a stored prompt.
-    pub prompt_name: Option<String>,
-    /// Suppress step-by-step output.
-    pub quiet: bool,
-    /// Skip LLM entirely.
-    pub mock: bool,
-    /// Topic for auto-saving summaries.
-    pub save_summary_topic: Option<String>,
-}
-
-
 /// Anything that can go wrong while parsing argv.
 #[derive(Debug)]
 pub enum ParseError {
@@ -330,6 +301,18 @@ pub enum ParseError {
     },
     /// `run` was given without a positional task.
     MissingTask,
+    /// `run --repl` was given a positional task. The REPL takes its
+    /// input interactively, so the task would be silently dropped.
+    ReplWithTask,
+    /// `--json` was combined with `run --repl`. The REPL streams an
+    /// interactive transcript to stdout, which is not a JSON
+    /// envelope, so the two are mutually exclusive.
+    ReplJsonIncompatible,
+    /// `--verify-signed` was combined with `run --repl`. Both are
+    /// terminal modes of `run` — verification returns before the REPL
+    /// is entered — so `--repl` would be silently dropped.
+    #[cfg(feature = "web3_app")]
+    ReplVerifySigned,
     /// `run` was given more than one positional argument.
     TooManyPositional { expected: usize, got: usize },
     /// An unrecognised flag was passed.
@@ -356,6 +339,19 @@ impl std::fmt::Display for ParseError {
             ParseError::MissingTask => write!(
                 f,
                 "'magent run' requires a task — e.g. `magent run \"Read the temperature\"` or `magent run --repl`"
+            ),
+            ParseError::ReplWithTask => write!(
+                f,
+                "`magent run --repl` is interactive and takes no task argument — drop the task, or omit --repl to run it once"
+            ),
+            ParseError::ReplJsonIncompatible => write!(
+                f,
+                "`magent run --repl` streams an interactive transcript and cannot emit a JSON envelope — drop --json"
+            ),
+            #[cfg(feature = "web3_app")]
+            ParseError::ReplVerifySigned => write!(
+                f,
+                "`magent run --repl` is interactive and `--verify-signed` only verifies an envelope (the REPL would never start) — pick one"
             ),
             ParseError::TooManyPositional { expected, got } => {
                 write!(f, "expected {} positional arg(s), got {}", expected, got)
@@ -436,7 +432,18 @@ impl Args {
             "run" => {
                 let opts = parse_run_args(after_first.iter().peekable())?;
                 let command = match opts {
-                    RunParseOutcome::Run(opts) => Command::Run(opts),
+                    RunParseOutcome::Run(opts) => {
+                        // The REPL writes an interactive transcript
+                        // straight to stdout, bypassing the `Output`
+                        // layer, so `--json` would yield prose on
+                        // stdout rather than a JSON envelope. Reject
+                        // the combination rather than break the
+                        // `--json ⇒ valid JSON on stdout` contract.
+                        if opts.repl_mode && global.json {
+                            return Err(ParseError::ReplJsonIncompatible);
+                        }
+                        Command::Run(opts)
+                    }
                     RunParseOutcome::Help => Command::RunHelp,
                 };
                 Ok(Args {
@@ -560,10 +567,18 @@ impl Args {
                     global,
                 })
             }
-            "version" => Ok(Args {
-                command: Command::Version,
-                global,
-            }),
+            "version" => {
+                // `version` takes no arguments. Global flags were already
+                // stripped by `extract_global_flags`, so anything left here
+                // is a typo we should reject rather than silently swallow.
+                if let Some(extra) = after_first.first() {
+                    return Err(ParseError::UnknownFlag(extra.clone()));
+                }
+                Ok(Args {
+                    command: Command::Version,
+                    global,
+                })
+            }
             other => Err(ParseError::UnknownFlag(other.to_string())),
         }
     }
@@ -714,8 +729,13 @@ fn parse_run_args<'a>(
                 continue;
             }
             // Handle `-m llama3.2` (separate arg) and `-mllama3.2` (attached).
-            let key = &stripped[..1];
-            let rest = &stripped[1..];
+            // Split off the first *character*, not the first byte: `&stripped[..1]`
+            // panics with "byte index 1 is not a char boundary" for a
+            // multi-byte short flag (`magent run -温…`), turning a bad CLI
+            // argument into a crash instead of an "unknown flag" error.
+            let key_len = stripped.chars().next().map_or(0, char::len_utf8);
+            let key = &stripped[..key_len];
+            let rest = &stripped[key_len..];
             if !rest.is_empty() {
                 // `-mllama3.2`
                 apply_short_flag(key, rest, &mut opts)?;
@@ -762,6 +782,22 @@ fn parse_run_args<'a>(
     //
     // `--verify-signed <PATH>` is a pure verification path that never
     // executes the agent, so it's exempt from the task requirement.
+    //
+    // `--repl` with a positional task is rejected rather than silently
+    // ignored: `execute()` enters the REPL as soon as `repl_mode` is
+    // set, so the task would never run and the user would be none the
+    // wiser.
+    if opts.repl_mode && !opts.task.is_empty() {
+        return Err(ParseError::ReplWithTask);
+    }
+    #[cfg(feature = "web3_app")]
+    if opts.repl_mode && opts.verify_signed_path.is_some() {
+        // `execute()` returns from the verify branch *before* it checks
+        // `repl_mode`, so the REPL would never start and `--repl` would be
+        // dropped without a word. Both are terminal modes of `run`, so
+        // refuse the combination rather than pick one silently.
+        return Err(ParseError::ReplVerifySigned);
+    }
     #[cfg(feature = "web3_app")]
     if opts.task.is_empty()
         && !opts.repl_mode
@@ -1346,11 +1382,13 @@ struct Web3SignFlags {
 
 #[cfg(feature = "web3")]
 fn parse_web3_sign_flags(args: &[String]) -> Result<Web3SignFlags, ParseError> {
-    let mut out = Web3SignFlags::default();
     // Default payload source is stdin so `cat file | magent web3 sign
     // alice` Just Works. The user can override with `--payload <FILE>`
     // (or `--payload -` to be explicit).
-    out.payload = PayloadSource::Stdin;
+    let mut out = Web3SignFlags {
+        payload: PayloadSource::Stdin,
+        ..Default::default()
+    };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1684,6 +1722,17 @@ fn parse_rfc3339(s: &str) -> Result<u64, String> {
     let bytes = normalized.as_bytes();
     if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
         return Err(format!("missing field separators in {:?}", s));
+    }
+    // Every field below is sliced at a fixed *byte* offset. The separator
+    // check above pins bytes 4/7/10/13/16 to ASCII, which happens to make
+    // `0..=17` boundary-safe — but nothing constrains bytes 17–18, so the
+    // seconds field and the `[19..]` tail are not. A multi-byte character
+    // there ("2026-08-11T09:00:日") puts `17..19` inside a code point and
+    // `&normalized[17..19]` aborts the process with "byte index 19 is not a
+    // char boundary". Require the fixed-width prefix to be ASCII up front;
+    // that also guarantees 19 is a boundary.
+    if !bytes[..19].is_ascii() {
+        return Err(format!("non-ASCII date/time fields in {:?}", s));
     }
     let year = slice_int(&normalized[0..4], "year")?;
     let month = slice_int(&normalized[5..7], "month")?;
@@ -2213,6 +2262,14 @@ fn parse_config_args<'a, I: Iterator<Item = &'a String>>(
             }
             config::ConfigAction::Validate
         }
+        Some("export") => {
+            if snapshot.len() != 1 {
+                return Err(ParseError::UnknownFlag(
+                    "`magent config export` takes no arguments".to_string(),
+                ));
+            }
+            config::ConfigAction::Export
+        }
         Some("get") => {
             if snapshot.len() != 2 {
                 return Err(ParseError::UnknownFlag(
@@ -2276,10 +2333,10 @@ fn apply_long_flag(key: &str, value: &str, opts: &mut RunOptions) -> Result<(), 
         "deepseek-url" | "deepseek" => opts.deepseek_url = value.to_string(),
         "api-key" => opts.api_key = Some(value.to_string()),
         "max-iterations" => {
-            opts.max_iterations = Some(parse_usize(key, value)?);
+            opts.max_iterations = Some(parse_usize_nonzero(key, value)?);
         }
         "max-tool-calls" => {
-            opts.max_tool_calls = Some(parse_usize(key, value)?);
+            opts.max_tool_calls = Some(parse_usize_nonzero(key, value)?);
         }
         "max-messages" => {
             opts.max_messages = Some(parse_usize(key, value)?);
@@ -2311,6 +2368,8 @@ fn apply_long_flag(key: &str, value: &str, opts: &mut RunOptions) -> Result<(), 
         "signer" => opts.sign_with_vault_identity = Some(value.to_string()),
         #[cfg(feature = "web3_app")]
         "signed-output" => opts.signed_output = Some(PathBuf::from(value)),
+        #[cfg(feature = "web3_app")]
+        "passphrase-env" => opts.passphrase_env = Some(value.to_string()),
         #[cfg(feature = "web3_app")]
         "not-after" => {
             let v = parse_usize(key, value)?;
@@ -2349,8 +2408,8 @@ fn apply_short_flag(key: &str, value: &str, opts: &mut RunOptions) -> Result<(),
         "m" => opts.model = value.to_string(),
         "u" => opts.ollama_url = value.to_string(),
         "k" => opts.api_key = Some(value.to_string()),
-        "i" => opts.max_iterations = Some(parse_usize("-i", value)?),
-        "t" => opts.max_tool_calls = Some(parse_usize("-t", value)?),
+        "i" => opts.max_iterations = Some(parse_usize_nonzero("-i", value)?),
+        "t" => opts.max_tool_calls = Some(parse_usize_nonzero("-t", value)?),
         "p" => opts.prompt_file = Some(PathBuf::from(value)),
         "e" => opts.email_tools = Some(value.to_string()),
         _ => return Err(ParseError::UnknownFlag(format!("-{}", key))),
@@ -2364,6 +2423,28 @@ fn parse_usize(flag: &str, value: &str) -> Result<usize, ParseError> {
         value: value.to_string(),
         expected: "a positive integer".to_string(),
     })
+}
+
+/// Like [`parse_usize`] but rejects `0`.
+///
+/// The ReAct runner tests its iteration cap *before* the first step
+/// (`iteration >= max_iterations`), so a cap of `0` permits zero steps
+/// and every run ends with "run ended without a final answer". The
+/// runtime has no "0 = no cap" sentinel (the core `MiniAgent` rejects
+/// `max_iterations == 0` outright for the same reason), so `-i 0` /
+/// `-t 0` are rejected here with a clear message rather than silently
+/// producing a guaranteed-failing run. `0 = off` remains valid only for
+/// `--max-messages` / `--tool-max-chars`, which keep [`parse_usize`].
+fn parse_usize_nonzero(flag: &str, value: &str) -> Result<usize, ParseError> {
+    let n = parse_usize(flag, value)?;
+    if n == 0 {
+        return Err(ParseError::InvalidValue {
+            flag: flag.to_string(),
+            value: value.to_string(),
+            expected: "a positive integer (>= 1)".to_string(),
+        });
+    }
+    Ok(n)
 }
 
 fn parse_f32(flag: &str, value: &str) -> Result<f32, ParseError> {
@@ -2469,7 +2550,6 @@ pub fn run_help_text() -> String {
     let _ = writeln!(s, "USAGE:");
     let _ = writeln!(s, "    magent run [OPTIONS] <TASK>    Run a single task");
     let _ = writeln!(s, "    magent run --repl [OPTIONS]   Interactive REPL mode (multi-turn)");
-    let _ = writeln!(s, "    magent run [OPTIONS]         Enter REPL if no task given");
     let _ = writeln!(s);
     let _ = writeln!(s, "OPTIONS:");
     let _ = writeln!(s, "    --provider <NAME>          LLM provider: ollama (default) | deepseek");
@@ -2485,7 +2565,7 @@ pub fn run_help_text() -> String {
     let _ = writeln!(s, "    --prompt-name <NAME>      Use a prompt stored via `set-prompt` (wins over --prompt)");
     let _ = writeln!(s, "    -q, --quiet                Suppress step-by-step output");
     let _ = writeln!(s, "    --mock                     Skip the LLM entirely (canned responses)");
-    let _ = writeln!(s, "    --repl                     Enter interactive REPL mode (multi-turn)");
+    let _ = writeln!(s, "    --repl                     Interactive REPL (multi-turn; takes no <TASK>, rejects --json / --verify-signed)");
     let _ = writeln!(s, "    --probe-ollama             Probe LLM on every run() call");
     let _ = writeln!(s, "    --temperature <F>          Sampling temperature (default 0.3)");
     let _ = writeln!(s, "    --num-predict <N>          LLM max_tokens (default 512)");
@@ -2514,6 +2594,10 @@ pub fn run_help_text() -> String {
     let _ = writeln!(
         s,
         "    --signed-output <PATH>     Where to write the signed envelope JSON"
+    );
+    let _ = writeln!(
+        s,
+        "    --passphrase-env <VAR>     Vault passphrase env var (default: MAGENT_WEB3_PASSPHRASE)"
     );
     let _ = writeln!(
         s,
@@ -2563,11 +2647,11 @@ pub fn set_prompt_help_text() -> String {
     let _ = writeln!(s, "    show   <NAME>             Print the JSON record (pretty)");
     let _ = writeln!(s, "    list                       List every stored prompt");
     let _ = writeln!(s, "    delete <NAME>             Remove the file (no-op if missing)");
-    let _ = writeln!(s, "    export <NAME>             Print just the prompt text (pipeable)");
+    let _ = writeln!(s, "    export <NAME>             Print just the prompt text (pipeable; full record under --json)");
     let _ = writeln!(s, "    import <PATH>             Read a JSON file and write it to the store");
     let _ = writeln!(s, "        [--name <NAME>]      Override the name field from the JSON");
     let _ = writeln!(s, "        [--force]            Overwrite an existing prompt with the same name");
-    let _ = writeln!(s, "    template <NAME>          Render a stored prompt with {{VAR}} placeholders");
+    let _ = writeln!(s, "    template <NAME>          Render a stored prompt with {{{{VAR}}}} placeholders");
     let _ = writeln!(s, "        [--var KEY=VALUE]    Bind a variable (repeatable; later wins)");
     let _ = writeln!(s, "        [--vars-from PATH]   Load variable bindings from a JSON object");
     #[cfg(feature = "web3_app")]
@@ -2835,6 +2919,7 @@ pub fn config_help_text() -> String {
     let _ = writeln!(s, "    reset [--yes]        Delete the config file (refuses without --yes)");
     let _ = writeln!(s, "    validate             Re-load and verify every field (CI-friendly exit codes)");
     let _ = writeln!(s, "    format               Re-serialise the file with canonical key order");
+    let _ = writeln!(s, "    export               Dump the JSON record to stdout (redirect-safe; both modes)");
     let _ = writeln!(s);
     let _ = writeln!(s, "KEY PATHS (most useful first):");
     let _ = writeln!(s, "    provider.default                       \"ollama\" | \"deepseek\"");
@@ -2912,6 +2997,46 @@ mod tests {
 
     fn argv<const N: usize>(items: [&str; N]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn rfc3339_offset_forms() {
+        // Anchor on the parser's own UTC reading and state the offsets
+        // relative to it, so the test asserts the *offset semantics* rather
+        // than restating a hand-computed epoch second.
+        let utc = parse_rfc3339("2026-08-11T09:00:00Z").unwrap();
+        // A space separator is normalised to `T`.
+        assert_eq!(parse_rfc3339("2026-08-11 09:00:00").unwrap(), utc);
+        // The trailing `Z` is optional.
+        assert_eq!(parse_rfc3339("2026-08-11T09:00:00").unwrap(), utc);
+        // `+01:00` means local time is one hour ahead of UTC.
+        assert_eq!(
+            parse_rfc3339("2026-08-11T09:00:00+01:00").unwrap(),
+            utc - 3600
+        );
+        assert_eq!(
+            parse_rfc3339("2026-08-11T09:00:00-05:30").unwrap(),
+            utc + 5 * 3600 + 1800
+        );
+
+        assert!(parse_rfc3339("2026-13-11T09:00:00").is_err(), "month 13");
+        assert!(parse_rfc3339("2026-02-30T09:00:00").is_err(), "Feb 30");
+        assert!(parse_rfc3339("short").is_err());
+        assert!(
+            parse_rfc3339("2026-08-11X09:00:00").is_err(),
+            "bad separator"
+        );
+    }
+
+    /// A multi-byte character in the seconds field used to abort the process:
+    /// the separator check pins bytes 4/7/10/13/16 to ASCII but says nothing
+    /// about 17–18, so `&normalized[17..19]` landed inside a code point and
+    /// `&str` indexing panicked with "byte index 19 is not a char boundary".
+    /// Reachable as `magent scheduler daemon --at 2026-08-11T09:00:日`.
+    #[test]
+    fn rfc3339_multibyte_in_time_fields_is_rejected_not_panicked() {
+        assert!(parse_rfc3339("2026-08-11T09:00:日").is_err());
+        assert!(parse_rfc3339("2026-08-11T09:00:00日").is_err());
     }
 
     #[test]
@@ -3048,9 +3173,68 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_short_flag_is_rejected_not_a_panic() {
+        // Regression: the short-option split used `&stripped[..1]` /
+        // `&stripped[1..]`, which panics with "byte index 1 is not a char
+        // boundary" when the flag character is multi-byte. A bad argument
+        // must produce a parse error, never a crash.
+        let err = Args::parse(&argv(["magent", "run", "-温度", "hi"])).unwrap_err();
+        assert!(
+            matches!(err, ParseError::UnknownFlag(_)),
+            "expected UnknownFlag, got {err:?}"
+        );
+    }
+
+    #[test]
     fn rejects_run_with_no_task() {
         let err = Args::parse(&argv(["magent", "run"])).unwrap_err();
         assert!(matches!(err, ParseError::MissingTask));
+    }
+
+    #[test]
+    fn repl_alone_parses_with_empty_task() {
+        let a = Args::parse(&argv(["magent", "run", "--repl"])).unwrap();
+        match a.command {
+            Command::Run(o) => {
+                assert!(o.repl_mode);
+                assert_eq!(o.task, "");
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn repl_with_task_is_rejected() {
+        // The task would otherwise be silently dropped: `execute()` enters
+        // the REPL as soon as `repl_mode` is set.
+        let err = Args::parse(&argv(["magent", "run", "--repl", "read the temp"])).unwrap_err();
+        assert!(matches!(err, ParseError::ReplWithTask), "got {err:?}");
+    }
+
+    #[test]
+    fn repl_with_json_is_rejected() {
+        // The REPL writes its transcript straight to stdout, so `--json`
+        // would put prose on stdout instead of a JSON envelope.
+        let e1 = Args::parse(&argv(["magent", "--json", "run", "--repl"])).unwrap_err();
+        assert!(matches!(e1, ParseError::ReplJsonIncompatible), "got {e1:?}");
+        let e2 = Args::parse(&argv(["magent", "run", "--repl", "--json"])).unwrap_err();
+        assert!(matches!(e2, ParseError::ReplJsonIncompatible), "got {e2:?}");
+    }
+
+    #[cfg(feature = "web3_app")]
+    #[test]
+    fn repl_with_verify_signed_is_rejected() {
+        // `execute()` returns from the verify branch before the REPL check,
+        // so the combination used to drop `--repl` silently.
+        let err = Args::parse(&argv([
+            "magent",
+            "run",
+            "--repl",
+            "--verify-signed",
+            "/tmp/x.json",
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, ParseError::ReplVerifySigned), "got {err:?}");
     }
 
     #[cfg(feature = "web3_app")]
@@ -3128,6 +3312,18 @@ mod tests {
             Args::parse(&argv(["magent", "--version"])).unwrap().command,
             Command::Version
         ));
+    }
+
+    #[test]
+    fn version_rejects_trailing_args() {
+        // Global flags are stripped before the subcommand arm runs, so
+        // `version --json` stays valid …
+        let a = Args::parse(&argv(["magent", "version", "--json"])).unwrap();
+        assert!(matches!(a.command, Command::Version));
+        assert!(a.global.json);
+        // … but a genuine typo must not be silently swallowed.
+        assert!(Args::parse(&argv(["magent", "version", "--bogus"])).is_err());
+        assert!(Args::parse(&argv(["magent", "version", "extra"])).is_err());
     }
 
     #[test]
@@ -3275,12 +3471,65 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_max_iterations() {
+        // `0` caps the loop at zero steps — the run then fails with
+        // "run ended without a final answer". Reject it at parse time.
+        for flag in ["--max-iterations", "-i"] {
+            let err = Args::parse(&argv(["magent", "run", flag, "0", "task"])).unwrap_err();
+            assert!(
+                matches!(err, ParseError::InvalidValue { .. }),
+                "{flag} 0 should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_zero_max_tool_calls() {
+        for flag in ["--max-tool-calls", "-t"] {
+            let err = Args::parse(&argv(["magent", "run", flag, "0", "task"])).unwrap_err();
+            assert!(
+                matches!(err, ParseError::InvalidValue { .. }),
+                "{flag} 0 should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_one_max_iterations() {
+        let a = Args::parse(&argv(["magent", "run", "-i", "1", "task"])).unwrap();
+        match a.command {
+            Command::Run(o) => assert_eq!(o.max_iterations, Some(1)),
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
     fn compression_defaults_match_library() {
         // The CLI defaults must mirror `CompressionPolicy::default()`
         // so users get a sensible out-of-the-box experience without
         // having to set both flags.
         assert_eq!(RunOptions::default().max_messages, None);
         assert_eq!(RunOptions::default().tool_max_chars, None);
+    }
+
+    /// The `--repl` line is the only place `run --help` states the REPL's
+    /// mode constraints, and each one the parser enforces (`ReplWithTask`,
+    /// `ReplJsonIncompatible`, `ReplVerifySigned`) has to be named there —
+    /// otherwise the flag looks combinable and the error is a surprise.
+    /// `--verify-signed` was added to the parser without updating this line.
+    #[test]
+    fn run_help_text_documents_repl_constraints() {
+        let h = run_help_text();
+        let line = h
+            .lines()
+            .find(|l| l.trim_start().starts_with("--repl"))
+            .unwrap_or_else(|| panic!("`--repl` is missing from run --help:\n{h}"));
+        for needle in ["no <TASK>", "--json", "--verify-signed"] {
+            assert!(
+                line.contains(needle),
+                "the `--repl` help line does not mention {needle:?}: {line}"
+            );
+        }
     }
 
     #[test]
@@ -3907,6 +4156,21 @@ mod tests {
     }
 
     #[test]
+    fn config_export() {
+        let a = Args::parse(&argv(["magent", "config", "export"])).unwrap();
+        assert!(matches!(
+            a.command,
+            Command::Config(config::ConfigAction::Export)
+        ));
+    }
+
+    #[test]
+    fn config_export_rejects_arguments() {
+        let e = Args::parse(&argv(["magent", "config", "export", "extra"])).unwrap_err();
+        assert!(matches!(e, ParseError::UnknownFlag(_)));
+    }
+
+    #[test]
     fn config_unknown_action_is_an_error() {
         let a = Args::parse(&argv(["magent", "config", "frobnicate"])).unwrap_err();
         assert!(matches!(a, ParseError::UnknownFlag(_)));
@@ -3924,6 +4188,8 @@ mod tests {
         assert!(h.contains("set"));
         assert!(h.contains("reset"));
         assert!(h.contains("format"));
+        assert!(h.contains("export"));
+        assert!(h.contains("validate"));
         assert!(h.contains("MAGENT_CONFIG_FILE"));
         assert!(h.contains("SECRETS"));
     }
@@ -4077,6 +4343,40 @@ mod tests {
     // ---------------------------------------------------------------
     // `magent web3 …` parser tests
     // ---------------------------------------------------------------
+    #[test]
+    fn config_doc_lists_every_action() {
+        // Same doc-drift guard as `summary_doc_lists_every_subcommand`:
+        // every action in `ConfigAction` must appear in both
+        // `config --help` and `docs/CONFIG.md`, so adding one forces an
+        // explicit decision about the doc. `export` was the action that
+        // motivated this — it shipped in the help text and `CONFIG.md`
+        // together, and this test keeps the two in lockstep.
+        let h = config_help_text();
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let doc_path = manifest_dir
+            .parent()
+            .expect("cli/ has a parent (workspace root)")
+            .join("docs")
+            .join("CONFIG.md");
+        let doc = std::fs::read_to_string(&doc_path)
+            .unwrap_or_else(|e| panic!("could not read {}: {}", doc_path.display(), e));
+        for action in [
+            "init", "where", "show", "list", "get", "set", "reset", "validate", "format",
+            "export",
+        ] {
+            assert!(
+                h.contains(action),
+                "config --help is missing action {:?}",
+                action
+            );
+            assert!(
+                doc.contains(action),
+                "docs/CONFIG.md is missing action {:?}",
+                action
+            );
+        }
+    }
+
     #[cfg(feature = "web3")]
     #[test]
     fn web3_help_routes() {

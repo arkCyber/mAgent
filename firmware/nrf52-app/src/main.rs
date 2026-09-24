@@ -10,11 +10,14 @@ mod sensors;
 mod power;
 mod watchdog;
 
+use core::cell::RefCell;
 use defmt::{info, debug, error};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use defmt_rtt as _;
 use embassy_executor::Executor;
 use embassy_nrf::config::Config as NrfConfig;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_alloc::Heap;
 // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R4 — replace `panic-probe`
 // with a reset-on-panic handler. The previous handler bkpt()'d in a
@@ -39,42 +42,69 @@ static HEAP: Heap = Heap::empty();
 
 static EXECUTOR: static_cell::StaticCell<Executor> = static_cell::StaticCell::new();
 
-// TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R3 — these globals are
-// initialised once from `main()` (a single-core context on the nRF52)
-// and then accessed from a single Embassy task (`main_task`,
-// `pool_size = 1` enforced at the bottom of this file). Embassy
-// guarantees only one task instance runs at a time on the executor,
-// and `main_task` / `agent_task` are the only consumers.
+// TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R3 — resolved 2026-09-20.
 //
-// TODO (FW-R3 follow-up): migrate to `static_cell::StaticCell<T>` so
-// the borrow checker enforces the exclusivity instead of this
-// comment. The `static mut` form here is only safe because Embassy
-// executes the two tasks cooperatively on a single core; a future
-// refactor that adds a second core (or a second `main_task` spawn)
-// would silently break the invariant.
+// These were `static mut` accessed through `unsafe` blocks whose only
+// justification was a comment ("Embassy serialises the two tasks on one
+// core"). That reasoning was sound but unenforced, and it made every
+// access site a `static_mut_refs` soundness lint: taking `&`/`&mut` to a
+// `static mut` is exactly the aliasing hazard Rust forbids. If a future
+// change added a second core or a second `main_task` spawn, the invariant
+// would break *silently*.
 //
-// SAFETY (FW-R3 status: documented, not yet refactored): these
-// `static mut` are touched only from `main_task` (WATCHDOG,
-// BLE_STATE, POWER_STATE) and from `agent_task` (AGENT), which are
-// declared at the bottom of this file with
-// `#[embassy_executor::task(pool_size = 1)]`. The executor's poll
-// loop serialises them on a single core, so the `unsafe { }` blocks
-// at the call sites are sound — but the comment on each unsafe
-// block still has to justify why that specific access is safe.
-static mut WATCHDOG: Option<watchdog::Watchdog> = None;
+// The exclusivity is now enforced by the type system instead: a
+// critical-section `Mutex` around a `RefCell`. `lock()` runs its closure
+// with interrupts masked, so the borrow can never overlap across the two
+// tasks, and the compiler — not a comment — upholds the invariant.
+//
+// No borrow is held across an `.await`: every `lock()` closure below is
+// synchronous. `RefCell` borrows are released at the end of the closure,
+// so a `borrow_mut()` panic is not reachable from the task interleaving.
+static WATCHDOG: Mutex<CriticalSectionRawMutex, RefCell<Option<watchdog::Watchdog>>> =
+    Mutex::new(RefCell::new(None));
 // `BleState` is an *enum* (Idle/Advertising/Connected/…); the struct that
 // carries the runtime connection fields is `BleStateManager`. The initial
-// literal below is written out explicitly (not via `new()`) so it stays a
-// const-compatible `static mut` initializer.
-static mut BLE_STATE: ble::BleStateManager = ble::BleStateManager {
-    state: ble::BleState::Idle,
-    connection_handle: None,
-    is_connected: false,
-    mtu: 23,
-    battery_level: 100,
-};
-static mut POWER_STATE: power::PowerState = power::PowerState { mode: power::PowerMode::Active, battery_level: 100, estimated_runtime_hours: 0.0, sleep_count: 0, wake_count: 0 };
-static mut AGENT: Option<MiniAgent> = None;
+// literal is written out explicitly rather than via `new()` so it stays a
+// `const` initializer.
+static BLE_STATE: Mutex<CriticalSectionRawMutex, RefCell<ble::BleStateManager>> =
+    Mutex::new(RefCell::new(ble::BleStateManager {
+        state: ble::BleState::Idle,
+        connection_handle: None,
+        is_connected: false,
+        mtu: 23,
+        battery_level: 100,
+    }));
+static POWER_STATE: Mutex<CriticalSectionRawMutex, RefCell<power::PowerState>> =
+    Mutex::new(RefCell::new(power::PowerState {
+        mode: power::PowerMode::Active,
+        battery_level: 100,
+        estimated_runtime_hours: 0.0,
+        sleep_count: 0,
+        wake_count: 0,
+    }));
+/// Holds the agent across an interrupt boundary.
+///
+/// `MiniAgent` owns a `dyn LlmBackend` and `dyn ToolHandler`, both of which are
+/// deliberately `!Send` (they are not required to be thread-safe on the host
+/// `std` build). A `static` must be `Sync`, so `Mutex<_, RefCell<Option<MiniAgent>>>`
+/// cannot be declared directly. This newtype carries the one assertion that
+/// makes it legal, in one auditable place.
+///
+/// SAFETY: the nRF52840 is single-core, and `AGENT` is reachable only through
+/// `AGENT.lock(..)`, which masks interrupts for the whole closure
+/// (`CriticalSectionRawMutex`). Nothing else can observe or mutate the value
+/// concurrently, so there is no cross-context data race for `Send`/`Sync` to
+/// guard against. Every lock closure is synchronous — no borrow is held across
+/// an `.await` — so the `RefCell` cannot be re-entered from a task interleave.
+///
+/// `Send` is needed as well as `Sync` because `embassy_sync`'s
+/// `blocking_mutex::Mutex<T>` is `Sync` only when `T: Send`, which is what a
+/// `static` declaration requires.
+struct AgentSlot(RefCell<Option<MiniAgent>>);
+unsafe impl Send for AgentSlot {}
+unsafe impl Sync for AgentSlot {}
+
+static AGENT: Mutex<CriticalSectionRawMutex, AgentSlot> = Mutex::new(AgentSlot(RefCell::new(None)));
 
 // =============================================================================
 // Configuration
@@ -108,9 +138,9 @@ fn main() -> ! {
     let _p = embassy_nrf::init(config);
 
     // Initialize static resources
-    unsafe {
-        WATCHDOG = Some(watchdog::Watchdog::new(&watchdog::WatchdogConfig::default()));
-    }
+    WATCHDOG.lock(|w| {
+        *w.borrow_mut() = Some(watchdog::Watchdog::new(&watchdog::WatchdogConfig::default()));
+    });
 
     // Initialize the AI Agent
     {
@@ -121,7 +151,7 @@ fn main() -> ! {
         match MiniAgent::new(agent_config) {
             Ok(agent) => {
                 info!("AI Agent initialized successfully");
-                unsafe { AGENT = Some(agent); }
+                AGENT.lock(|a| *a.0.borrow_mut() = Some(agent));
             }
             Err(e) => {
                 error!("Failed to initialize AI Agent: {:?}", e);
@@ -161,36 +191,57 @@ async fn main_task() {
     loop {
         cycle_count += 1;
 
-        // SAFETY: Only this task accesses these statics
-        unsafe {
-            // Feed watchdog
-            if let Some(ref mut w) = WATCHDOG {
-                w.feed(WATCHDOG_TIMEOUT_MS as u64);
+        // Feed watchdog.
+        //
+        // `feed` takes the *current time*, not the timeout: it stores
+        // `last_feed = current_time_ms` and `remaining_ms`/`check_timeout`
+        // subtract from it. Passing `WATCHDOG_TIMEOUT_MS` here (a constant)
+        // made `last_feed` equal the timeout, so `remaining_ms` computed
+        // `0` elapsed and the status line always printed the full
+        // `60000ms remaining` — a countdown that could not count. The
+        // monotonic clock the loop already sleeps on drives it now, so the
+        // figure decreases across the 5 s cycle.
+        let now_ms = Instant::now().as_millis();
+        WATCHDOG.lock(|w| {
+            if let Some(wd) = w.borrow_mut().as_mut() {
+                wd.feed(now_ms);
             }
+        });
 
-            // Simulate battery drain
-            if cycle_count % 60 == 0 {
-                battery_level = battery_level.saturating_sub(1);
-            }
-            POWER_STATE.battery_level = battery_level;
+        // Placeholder battery figure. There is no SAADC reading here — the
+        // number starts at 75 and ticks down on a cycle counter, so it is a
+        // liveness indicator, not a measurement. It is labelled `(simulated)`
+        // everywhere it is logged below rather than being presented as a
+        // reading the hardware did not take.
+        if cycle_count % 60 == 0 {
+            battery_level = battery_level.saturating_sub(1);
+        }
+        POWER_STATE.lock(|p| p.borrow_mut().battery_level = battery_level);
 
-            // Get BLE status
-            let ble_status = ble::connection_status(&BLE_STATE);
+        // Get BLE status
+        let ble_status = BLE_STATE.lock(|s| ble::connection_status(&s.borrow()));
 
-            // Log periodic status
-            if cycle_count % 5 == 0 {
-                let watchdog_remaining = WATCHDOG.as_ref()
-                    .map(|w| w.remaining_ms(WATCHDOG_TIMEOUT_MS as u64))
-                    .unwrap_or(0);
+        // Log periodic status
+        if cycle_count % 5 == 0 {
+            let now_ms = Instant::now().as_millis();
+            let watchdog_remaining = WATCHDOG.lock(|w| {
+                w.borrow()
+                    .as_ref()
+                    .map(|wd| wd.remaining_ms(now_ms))
+                    .unwrap_or(0)
+            });
+            let agent_ready = AGENT.lock(|a| a.0.borrow().is_some());
 
-                info!("========================================");
-                info!("[MAIN] Cycle #{} | Battery: {}%", cycle_count, battery_level);
-                info!("[MAIN] BLE: {}", ble_status);
-                info!("[MAIN] Watchdog: {}ms remaining", watchdog_remaining);
-                info!("[MAIN] Agent: {}",
-                    if AGENT.is_some() { "Ready" } else { "Not initialized" });
-                info!("========================================");
-            }
+            info!("========================================");
+            info!(
+                "[MAIN] Cycle #{} | Battery: {}% (simulated)",
+                cycle_count, battery_level
+            );
+            info!("[MAIN] BLE: {}", ble_status);
+            info!("[MAIN] Watchdog: {}ms remaining", watchdog_remaining);
+            info!("[MAIN] Agent: {}",
+                if agent_ready { "Ready" } else { "Not initialized" });
+            info!("========================================");
         }
 
         // Simulate agent work
@@ -208,41 +259,26 @@ async fn main_task() {
 async fn agent_task() {
     info!("[AGENT] AI Agent task started");
 
-    // Create a simple test task
-    let test_tasks = [
-        "Read the temperature sensor",
-        "Check battery level",
-        "Read heart rate",
-        "Report system status",
-    ];
-
-    let mut task_index = 0;
-
+    // SCAFFOLD — and it now says so out loud.
+    //
+    // `MiniAgent` is constructed in `main`, but driving it needs an
+    // `LlmBackend`, which this target has none of: no network stack, no local
+    // model, no tool handler. The previous version of this task looped over
+    // four canned task strings and logged `Running task: <task>`,
+    // `Agent is running` and `Budget check passed` without ever calling the
+    // agent — three claims of work that never happened, written to the
+    // device's real log where an operator (or a log-ingest tool) reads them
+    // as fact. Until a backend exists, report readiness once and stay quiet.
+    let mut announced = false;
     loop {
-        // Check if agent is initialized
-        let agent_ready = unsafe { AGENT.is_some() };
-
-        if agent_ready {
-            // Run a test task
-            let task = test_tasks[task_index % test_tasks.len()];
-            info!("[AGENT] Running task: {}", task);
-
-            // SAFETY: Only this task accesses AGENT
-            unsafe {
-                if let Some(ref mut _agent) = AGENT {
-                    // Note: The actual async run would require LLM backend
-                    // For now, we just demonstrate the agent is working
-                    info!("[AGENT] Agent is running");
-                    info!("[AGENT] Budget check passed");
-                }
-            }
-
-            task_index += 1;
-        } else {
-            info!("[AGENT] Waiting for initialization...");
+        if !announced && AGENT.lock(|a| a.0.borrow().is_some()) {
+            info!(
+                "[AGENT] MiniAgent ready; agent loop is a scaffold (no LLM backend wired), no task is run"
+            );
+            announced = true;
         }
 
-        // Wait before next agent iteration
+        // Wait before the next readiness check.
         Timer::after(Duration::from_millis(AGENT_TASK_INTERVAL_MS)).await;
     }
 }

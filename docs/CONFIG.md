@@ -68,7 +68,13 @@ magent config set <KEY> <VALUE>    Write a single key
 magent config reset [--yes]        Delete the config file (refuses without --yes)
 magent config validate             Re-load and verify every field (CI-friendly exit codes)
 magent config format               Re-serialise the file with canonical key order
+magent config export               Dump the JSON record to stdout (redirect-safe)
 ```
+
+`config export` writes the resolved record to **stdout** in both modes, so
+`magent config export > backup.json` produces a real file. (`config show`
+renders its human output to stderr for display, so it is not redirect-safe;
+use `export` when you want to pipe or save the record.)
 
 ### Example session
 

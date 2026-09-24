@@ -11,9 +11,17 @@
 //! - A bounded HTTP timeout prevents a dead server from hanging the caller.
 //! - The image is written in small chunks (no large heap buffer), so it works
 //!   within the RAM-limited C61 task-stack budget.
-//! - Every failure path either aborts the OTA handle (freeing ESP-IDF's OTA
-//!   state) or returns without touching the boot partition, so a failed update
-//!   can never brick the running firmware.
+//! - Every failure path up to `esp_ota_end` aborts the OTA handle, freeing the
+//!   `ota_ops_entry_t` that `esp_ota_begin` heap-allocates (the pre-`esp_ota_end`
+//!   paths used to return without it, leaking one entry per failed attempt).
+//!   `esp_ota_end` itself consumes the handle — it `free()`s the entry on *all*
+//!   of its return paths, including image-verification failure — so that path
+//!   must **not** abort. Either way the boot partition is untouched, so a failed
+//!   update can never brick the running firmware.
+//! - Only one OTA runs at a time. `esp_ota_begin` rejects a *conflict with the
+//!   running partition* but happily opens a second handle on the same inactive
+//!   slot, so two `AT+OTA` commands would interleave two writers into one image
+//!   (and each erases the whole slot). `OTA_IN_PROGRESS` rejects the overlap.
 //! - Requires an OTA-capable partition table (`ota_0`/`ota_1` + `otadata`). The
 //!   stock `partitions.csv` provides this; an OTA-only table is required for
 //!   anti-rollback (see `docs/BACKLOG.md`).
@@ -48,6 +56,7 @@
 //! `AEROSPACE_AUDIT_FIRMWARE_2026_09_22.md` (planned follow-up) will
 //! re-audit this module against the gate.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use embedded_svc::http::client::Client as HttpClient;
@@ -60,6 +69,40 @@ const OTA_CHUNK: usize = 2048;
 /// Bounded HTTP request timeout (seconds).
 const OTA_TIMEOUT_S: u64 = 30;
 
+/// Held while an OTA is streaming.
+///
+/// `AT+OTA` spawns a worker thread per invocation, and `esp_ota_begin` only
+/// rejects a conflict with the *running* partition — a second handle on the same
+/// inactive slot is granted. Two concurrent updates would therefore interleave
+/// writes into one image, each having erased the whole slot, and whichever
+/// finished first would `esp_ota_set_boot_partition` + `esp_restart` into an
+/// image the other was still writing. ESP-IDF supports one OTA at a time; the
+/// second command is refused instead.
+static OTA_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Releases `OTA_IN_PROGRESS` on every exit from `perform_ota`.
+///
+/// The success path reboots inside `perform_ota` and so never drops this — which
+/// is correct, since the flag is process state and the process is going away.
+struct OtaSession;
+
+impl Drop for OtaSession {
+    fn drop(&mut self) {
+        OTA_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+/// Free the `ota_ops_entry_t` that `esp_ota_begin` allocated for `handle`.
+///
+/// Ignoring the return code is deliberate: this only runs on an error path whose
+/// original failure is the one worth reporting, and `esp_ota_abort` on a live
+/// handle is infallible in practice (`esp_ota_ops.c`).
+fn abort_handle(handle: esp_idf_sys::esp_ota_handle_t) {
+    // SAFETY: the caller guarantees `handle` came from a successful
+    // `esp_ota_begin` and has not been consumed by `esp_ota_end`.
+    let _ = unsafe { esp_idf_sys::esp_ota_abort(handle) };
+}
+
 /// TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R2 — first-pass URL check.
 /// Returns `true` only for `https://` URLs. Plain `http://` is
 /// rejected so a network-level attacker cannot intercept the image
@@ -68,7 +111,7 @@ const OTA_TIMEOUT_S: u64 = 30;
 /// host allowlist yet, so the function only catches the
 /// plaintext-HTTP case for now. Production deployments must extend
 /// this with an explicit `cfg`/`compile-time!` allowlist.
-fn validate_ota_url(url: &str) -> bool {
+pub(crate) fn validate_ota_url(url: &str) -> bool {
     url.starts_with("https://")
 }
 
@@ -85,6 +128,18 @@ pub fn perform_ota(url: &str) -> Result<(), String> {
             "OTA: refusing non-HTTPS URL {url:?} (FW-R2 hardening, see docstring)"
         ));
     }
+    // Refuse to start a second update while one is in flight — see
+    // `OTA_IN_PROGRESS`. Claimed before `esp_ota_begin` so the whole
+    // erase-then-stream sequence is serialised.
+    if OTA_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("OTA: another update is already in progress".into());
+    }
+    // Released on every `return` below. On success `esp_restart` never returns,
+    // so the flag stays set — the process is rebooting anyway.
+    let _session = OtaSession;
     // 1) Confirm the running app is valid so anti-rollback accepts the next
     //    update. Ignore errors — this is a best-effort precondition.
     // SAFETY: `esp_ota_mark_app_valid_cancel_rollback` takes no pointers.
@@ -120,25 +175,44 @@ pub fn perform_ota(url: &str) -> Result<(), String> {
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
         ..Default::default()
     };
-    let conn = EspHttpConnection::new(&cfg).map_err(|e| format!("OTA: conn: {e}"))?;
+    let conn = match EspHttpConnection::new(&cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            // `esp_ota_begin` already heap-allocated the ops entry (and
+            // erased the slot at `OTA_SIZE_UNKNOWN`), so it must be freed.
+            abort_handle(handle);
+            return Err(format!("OTA: conn: {e}"));
+        }
+    };
     let mut client = HttpClient::wrap(conn);
-    let request = client
-        .request(Method::Get, url, &[])
-        .map_err(|e| format!("OTA: request: {e}"))?;
-    let mut response = request.submit().map_err(|e| format!("OTA: submit: {e}"))?;
+    let request = match client.request(Method::Get, url, &[]) {
+        Ok(r) => r,
+        Err(e) => {
+            abort_handle(handle);
+            return Err(format!("OTA: request: {e}"));
+        }
+    };
+    let mut response = match request.submit() {
+        Ok(r) => r,
+        Err(e) => {
+            abort_handle(handle);
+            return Err(format!("OTA: submit: {e}"));
+        }
+    };
     if response.status() != 200 {
-        // SAFETY: handle was successfully created above; abort frees its state.
-        let _ = unsafe { esp_idf_sys::esp_ota_abort(handle) };
+        abort_handle(handle);
         return Err(format!("OTA: HTTP status {}", response.status()));
     }
 
     let mut chunk = [0u8; OTA_CHUNK];
     loop {
-        let n = response.read(&mut chunk).map_err(|e| {
-            // SAFETY: abort a live handle on read failure; ignore abort's result.
-            let _ = unsafe { esp_idf_sys::esp_ota_abort(handle) };
-            format!("OTA: read: {e}")
-        })?;
+        let n = match response.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) => {
+                abort_handle(handle);
+                return Err(format!("OTA: read: {e}"));
+            }
+        };
         if n == 0 {
             break;
         }
@@ -147,14 +221,15 @@ pub fn perform_ota(url: &str) -> Result<(), String> {
             esp_idf_sys::esp_ota_write(handle, chunk.as_ptr() as *const core::ffi::c_void, n)
         };
         if rc != esp_idf_sys::ESP_OK {
-            // SAFETY: abort a live handle on write failure.
-            let _ = unsafe { esp_idf_sys::esp_ota_abort(handle) };
+            abort_handle(handle);
             return Err(format!("OTA: esp_ota_write failed (0x{:x})", rc));
         }
     }
 
     // 5) Finalise — `esp_ota_end` verifies the image (magic + checksums).
-    // SAFETY: `handle` is live; `esp_ota_end` consumes it (do not reuse).
+    // SAFETY: `handle` is live; `esp_ota_end` consumes it and `free()`s the ops
+    // entry on every return path (see `esp_ota_ops.c`), so it must not be
+    // aborted afterwards — that would be a double free.
     let rc = unsafe { esp_idf_sys::esp_ota_end(handle) };
     if rc != esp_idf_sys::ESP_OK {
         return Err(format!("OTA: image verification failed (0x{:x})", rc));

@@ -62,6 +62,14 @@ pub const LLM_MODEL_MAX: usize = 64;
 /// cap in `llmcfg_dispatch`).
 pub const LLM_API_KEY_MAX: usize = 128;
 
+/// Maximum provider-name length accepted by `AT+FLIGHTCFG=`
+/// (`travelpayouts` / `kiwi` today; the cap leaves room for future providers).
+pub const FLIGHT_PROVIDER_MAX: usize = 16;
+
+/// Maximum provider token length accepted by `AT+FLIGHTCFG=` (travelpayouts
+/// tokens are ~32 hex chars; Kiwi Tequila keys are 32).
+pub const FLIGHT_TOKEN_MAX: usize = 128;
+
 /// Maximum URL length accepted by AT+HTTPGET=.
 pub const HTTPGET_URL_MAX: usize = 512;
 
@@ -406,6 +414,131 @@ fn is_ascii_whitespace(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0x0b)
 }
 
+/// Why an agent-facing web fetch must refuse `host`, or `None` when it is a
+/// legitimate public target.
+///
+/// This is the **single** SSRF classifier for the web tools. Both the host
+/// `magent_core::web` module and the firmware's on-device tools (`fetch_web`,
+/// `get_weather`, `get_news`, `get_flight_price`, via
+/// `local_tools::http_get_once`) route through it, so the two cannot drift into
+/// disagreeing about what is reachable — which is how the device ended up with
+/// no guard at all while the host had one.
+///
+/// The URL an agent fetches is model-generated, and once a fetched page's text
+/// re-enters the conversation its instructions are attacker-controlled. Without
+/// this check the agent can be steered into reading the device's own HTTP
+/// server, a LAN service, or the cloud-metadata endpoint (`169.254.169.254`)
+/// and echo the body back out — where the next turn may ship it to the cloud
+/// LLM.
+///
+/// `allow_private` permits RFC1918 / ULA ranges (the host tools' explicit
+/// opt-in); loopback and link-local are refused regardless, since neither is
+/// ever a legitimate fetch target.
+///
+/// **Documented limitation:** only literal addresses and the `localhost` /
+/// `.local` names are classified. A hostname that merely *resolves* to a
+/// private address is not caught, because this function never performs DNS;
+/// closing that needs the connection pinned to the vetted address, which the
+/// HTTP client does not expose.
+/// Split an `http://` / `https://` URL into `(host, port)`, with `host`
+/// borrowed from `url`.
+///
+/// The one authority parser for both the host web tools and the firmware's
+/// on-device tools, so neither can drift into disagreeing about what the host
+/// actually is. The port defaults to 443 for `https://` and 80 otherwise, and
+/// any `user:pass@` userinfo is discarded.
+///
+/// The unbracketed-IPv6 case is why this is a shared function rather than a
+/// line of inline splitting. A naive split on the *last* colon turns
+/// `http://::1/` into host `":"`, port `1`; the socket layer then re-glues
+/// those into `::1` and connects to loopback, while
+/// [`public_fetch_target_refusal`] is handed `":"`, which parses as neither
+/// v4 nor v6 and is therefore waved through — the SSRF guard silently
+/// skipped. A lone colon cannot be caught by the classifier, so the fix has
+/// to live here: an authority carrying several colons without brackets is
+/// kept whole and handed to the classifier, which does recognise it.
+///
+/// Returns `None` for a non-http(s) scheme or an empty authority.
+pub fn parse_http_authority(url: &str) -> Option<(&str, u16)> {
+    let (rest, default_port) = match url.strip_prefix("https://") {
+        Some(r) => (r, 443),
+        // `?` covers the non-http(s) scheme: no prefix, no authority.
+        None => (url.strip_prefix("http://")?, 80),
+    };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if authority.is_empty() {
+        return None;
+    }
+    // RFC 3986 requires brackets around an IPv6 literal, but a lax caller can
+    // still produce one without; its final hextet must not be read as a port.
+    let unbracketed_v6 = !authority.starts_with('[') && authority.matches(':').count() > 1;
+    if !unbracketed_v6 {
+        if let Some(idx) = authority.rfind(':') {
+            let (host, port_str) = (&authority[..idx], &authority[idx + 1..]);
+            if !host.is_empty() {
+                if let Ok(port) = port_str.parse::<u16>() {
+                    return Some((host, port));
+                }
+            }
+        }
+    }
+    Some((authority, default_port))
+}
+
+/// Why an agent-facing web fetch must refuse `host`, or `None` when it is a
+/// legitimate public target.
+///
+/// This is the **single** SSRF classifier for the web tools. Both the host
+/// `magent_core::web` module and the firmware's on-device tools (`fetch_web`,
+/// `get_weather`, `get_news`, `get_flight_price`, via
+/// `local_tools::http_get_once`) route through it, so the two cannot drift into
+/// disagreeing about what is reachable — which is how the device ended up with
+/// no guard at all while the host had one.
+///
+/// The URL an agent fetches is model-generated, and once a fetched page's text
+/// re-enters the conversation its instructions are attacker-controlled. Without
+/// this check the agent can be steered into reading the device's own HTTP
+/// server, a LAN service, or the cloud-metadata endpoint (`169.254.169.254`)
+/// and echo the body back out — where the next turn may ship it to the cloud
+/// LLM.
+///
+/// `allow_private` permits RFC1918 / ULA ranges (the host tools' explicit
+/// opt-in); loopback and link-local are refused regardless, since neither is
+/// ever a legitimate fetch target.
+///
+/// **Documented limitation:** only literal addresses and the `localhost` /
+/// `.local` names are classified. A hostname that merely *resolves* to a
+/// private address is not caught, because this function never performs DNS;
+/// closing that needs the connection pinned to the vetted address, which the
+/// HTTP client does not expose.
+pub fn public_fetch_target_refusal(host: &str, allow_private: bool) -> Option<&'static str> {
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
+        return Some("refusing loopback/mDNS host");
+    }
+    // A bracketed IPv6 literal (`[::1]`) arrives with its brackets.
+    let lit = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = lit.parse::<core::net::Ipv4Addr>() {
+        // `is_link_local` covers 169.254.0.0/16 — APIPA *and* the
+        // 169.254.169.254 cloud-metadata endpoint.
+        if ip.is_loopback() || ip.is_link_local() || (!allow_private && ip.is_private()) {
+            return Some("refusing non-public address");
+        }
+    }
+    if let Ok(ip) = lit.parse::<core::net::Ipv6Addr>() {
+        // `::ffff:127.0.0.1` is loopback wearing a v6 spelling; grade the
+        // embedded v4 rather than the wrapper.
+        let mapped_blocked = ip.to_ipv4_mapped().is_some_and(|v4| {
+            v4.is_loopback() || v4.is_link_local() || (!allow_private && v4.is_private())
+        });
+        if ip.is_loopback() || ip.is_unicast_link_local() || mapped_blocked {
+            return Some("refusing non-public address");
+        }
+    }
+    None
+}
+
 /// Validate the inputs of an `AT+LLMCFG=<model>,<api_key>` SET request.
 ///
 /// # Validation rules
@@ -466,6 +599,85 @@ pub fn validate_llmcfg_set(cmd: &AtCommand<'_>) -> Result<LlmCfgValidated, AtOut
     api_key.push_str(key_str).map_err(|_| AtOutcome::error(8))?;
 
     Ok(LlmCfgValidated { model, api_key })
+}
+
+/// Validated payload of an `AT+FLIGHTCFG=` set request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlightCfgValidated {
+    /// Provider id (1..=FLIGHT_PROVIDER_MAX bytes, lower-cased).
+    pub provider: heapless::String<FLIGHT_PROVIDER_MAX>,
+    /// Provider token / API key (1..=FLIGHT_TOKEN_MAX bytes, no whitespace).
+    pub token: heapless::String<FLIGHT_TOKEN_MAX>,
+}
+
+/// Supported flight-price providers. Kept as a closed set so a typo cannot
+/// silently configure a provider the firmware has no client for.
+pub const FLIGHT_PROVIDERS: &[&str] = &["travelpayouts", "kiwi"];
+
+/// Validate `AT+FLIGHTCFG=<provider>,<token>`.
+///
+/// Rules (mirroring [`validate_llmcfg_set`]):
+/// 1. Provider: one of [`FLIGHT_PROVIDERS`] (case-insensitive), no control bytes.
+/// 2. Token: `1..=FLIGHT_TOKEN_MAX` bytes, valid UTF-8, no NUL, no control
+///    bytes and no ASCII whitespace (a real token never contains a space;
+///    allowing one invites accidental key-splitting / log-framing issues).
+///
+/// `+CMDER:4` = missing/malformed argument, `+CMDER:7` = unknown provider,
+/// `+CMDER:8` = length violation.
+pub fn validate_flightcfg_set(cmd: &AtCommand<'_>) -> Result<FlightCfgValidated, AtOutcome> {
+    let mut prov_dec: heapless::Vec<u8, FLIGHT_PROVIDER_MAX> = heapless::Vec::new();
+    let mut tok_dec: heapless::Vec<u8, FLIGHT_TOKEN_MAX> = heapless::Vec::new();
+
+    let prov_src = cmd
+        .args
+        .first()
+        .map(|a| arg_bytes_decoded(a, &mut prov_dec))
+        .transpose()
+        .map_err(|_| AtOutcome::error(4))?
+        .ok_or_else(|| AtOutcome::error(4))?;
+    let tok_src = cmd
+        .args
+        .get(1)
+        .map(|a| arg_bytes_decoded(a, &mut tok_dec))
+        .transpose()
+        .map_err(|_| AtOutcome::error(8))?
+        .ok_or_else(|| AtOutcome::error(4))?;
+
+    if prov_src.is_empty() || prov_src.len() > FLIGHT_PROVIDER_MAX {
+        return Err(AtOutcome::error(8));
+    }
+    if prov_src.iter().any(|&c| c == 0 || is_control_byte(c)) {
+        return Err(AtOutcome::error(4));
+    }
+    let prov_str = core::str::from_utf8(prov_src).map_err(|_| AtOutcome::error(4))?;
+
+    if tok_src.is_empty() || tok_src.len() > FLIGHT_TOKEN_MAX {
+        return Err(AtOutcome::error(8));
+    }
+    if tok_src
+        .iter()
+        .any(|&c| c == 0 || is_control_byte(c) || is_ascii_whitespace(c))
+    {
+        return Err(AtOutcome::error(4));
+    }
+    let tok_str = core::str::from_utf8(tok_src).map_err(|_| AtOutcome::error(4))?;
+
+    // Normalise the provider to lower-case so `Travelpayouts` / `KIWI` work.
+    let mut provider: heapless::String<FLIGHT_PROVIDER_MAX> = heapless::String::new();
+    for c in prov_str.chars() {
+        provider
+            .push(c.to_ascii_lowercase())
+            .map_err(|_| AtOutcome::error(8))?;
+    }
+    if !FLIGHT_PROVIDERS.contains(&provider.as_str()) {
+        // Unknown provider: refuse rather than store something unusable.
+        return Err(AtOutcome::error(7));
+    }
+
+    let mut token: heapless::String<FLIGHT_TOKEN_MAX> = heapless::String::new();
+    token.push_str(tok_str).map_err(|_| AtOutcome::error(8))?;
+
+    Ok(FlightCfgValidated { provider, token })
 }
 
 // ---------------------------------------------------------------------------
@@ -625,20 +837,6 @@ mod tests {
         let c = cmd_token(AtOp::CwJap, &[b"", b"x"]);
         let err = validate_cwjap_set(&c).unwrap_err();
         assert!(matches!(err, AtOutcome::Error { code: 8 }));
-    }
-
-    /// Helper: build an oversized arg via a static array.
-    fn make_oversized(n: usize, fill: u8) -> &'static [u8] {
-        // Use a `static` to keep the lifetime working without
-        // leaking anything. The const block creates an
-        // initializer but the array's contents depend on `n` and
-        // `fill` — fall back to a fixed-length array of the
-        // maximum we test against, plus a sentinel byte to mark
-        // the actual length.
-        const OVERSIZE: [u8; 96] = [0x41; 96];
-        let _ = n;
-        let _ = fill;
-        &OVERSIZE[..96]
     }
 
     #[test]
@@ -879,14 +1077,6 @@ mod tests {
         let c = cmd_token(AtOp::Timezone, &[]);
         let err = validate_timezone_set(&c).unwrap_err();
         assert!(matches!(err, AtOutcome::Error { code: 4 }));
-    }
-
-    /// Touch the unused helper to suppress dead-code warnings on
-    /// the test build (in case someone reads it as a public API).
-    #[test]
-    fn make_oversized_helper_smoke_test() {
-        let s = make_oversized(96, b'A');
-        assert_eq!(s.len(), 96);
     }
 
     // ---------------------------------------------------------------------
@@ -1538,5 +1728,129 @@ mod tests {
         let c = cmd_named(AtOp::HttpGet, b"url", b"x");
         let err = validate_httpget_set(&c).unwrap_err();
         assert!(matches!(err, AtOutcome::Error { code: 8 }));
+    }
+
+    #[test]
+    fn parse_http_authority_basics() {
+        assert_eq!(
+            parse_http_authority("https://example.com/p?q=1"),
+            Some(("example.com", 443))
+        );
+        assert_eq!(
+            parse_http_authority("http://example.com:8080/x"),
+            Some(("example.com", 8080))
+        );
+        // Userinfo is discarded, so the guard sees the real host.
+        assert_eq!(
+            parse_http_authority("http://user:pass@10.0.0.1/x"),
+            Some(("10.0.0.1", 80))
+        );
+        assert_eq!(parse_http_authority("ftp://example.com/"), None);
+        assert_eq!(parse_http_authority("http://"), None);
+        assert_eq!(parse_http_authority("http:///path"), None);
+    }
+
+    #[test]
+    fn parse_http_authority_keeps_bracketed_ipv6_intact() {
+        assert_eq!(parse_http_authority("http://[::1]/"), Some(("[::1]", 80)));
+        assert_eq!(
+            parse_http_authority("http://[fe80::1]:8080/"),
+            Some(("[fe80::1]", 8080))
+        );
+    }
+
+    /// `http://::1/` used to parse as host `":"`, port `1` — a hostname the
+    /// classifier cannot identify, while the socket layer re-glued the pair
+    /// back into `::1` and dialled loopback. The literal must stay whole.
+    #[test]
+    fn parse_http_authority_keeps_unbracketed_ipv6_intact() {
+        assert_eq!(parse_http_authority("http://::1/"), Some(("::1", 80)));
+        assert_eq!(
+            parse_http_authority("http://::ffff:127.0.0.1/"),
+            Some(("::ffff:127.0.0.1", 80))
+        );
+        assert_eq!(
+            parse_http_authority("http://2001:db8::1/x"),
+            Some(("2001:db8::1", 80))
+        );
+    }
+
+    /// End-to-end: the pairing that matters is `parse_http_authority` feeding
+    /// `public_fetch_target_refusal` — an unbracketed loopback authority must
+    /// reach the classifier as a literal it recognises.
+    #[test]
+    fn unbracketed_ipv6_loopback_survives_the_full_guard() {
+        for url in ["http://::1/", "http://[::1]/", "http://::ffff:127.0.0.1/"] {
+            let (host, _) = parse_http_authority(url).expect("parses");
+            assert!(
+                public_fetch_target_refusal(host, true).is_some(),
+                "{url} parsed to {host:?}, which the guard must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn public_fetch_refuses_loopback_names() {
+        for h in ["localhost", "LOCALHOST", "foo.localhost", "printer.local"] {
+            assert!(
+                public_fetch_target_refusal(h, false).is_some(),
+                "{h} must be refused"
+            );
+            assert!(
+                public_fetch_target_refusal(h, true).is_some(),
+                "{h} must be refused even with allow_private"
+            );
+        }
+    }
+
+    #[test]
+    fn public_fetch_refuses_loopback_and_link_local_v4() {
+        for h in ["127.0.0.1", "127.8.8.8", "169.254.169.254", "169.254.1.1"] {
+            assert!(
+                public_fetch_target_refusal(h, true).is_some(),
+                "{h} must be refused even with allow_private"
+            );
+        }
+    }
+
+    #[test]
+    fn public_fetch_refuses_private_v4_unless_allowed() {
+        for h in ["10.0.0.1", "172.16.0.1", "192.168.1.1"] {
+            assert!(
+                public_fetch_target_refusal(h, false).is_some(),
+                "{h} must be refused by default"
+            );
+            assert!(
+                public_fetch_target_refusal(h, true).is_none(),
+                "{h} should be allowed when allow_private is set"
+            );
+        }
+    }
+
+    #[test]
+    fn public_fetch_refuses_v6_loopback_link_local_and_mapped() {
+        for h in ["[::1]", "::1", "[fe80::1]", "[::ffff:127.0.0.1]"] {
+            assert!(
+                public_fetch_target_refusal(h, true).is_some(),
+                "{h} must be refused even with allow_private"
+            );
+        }
+        // A v4-mapped private address follows the same allow_private rule as
+        // its embedded v4.
+        assert!(public_fetch_target_refusal("[::ffff:192.168.0.1]", false).is_some());
+        assert!(public_fetch_target_refusal("[::ffff:192.168.0.1]", true).is_none());
+    }
+
+    #[test]
+    fn public_fetch_allows_public_targets() {
+        for h in ["example.com", "8.8.8.8", "1.1.1.1", "[2606:4700:4700::1111]"] {
+            assert!(
+                public_fetch_target_refusal(h, false).is_none(),
+                "{h} should be allowed"
+            );
+        }
+        // A name that merely ends in "local" as a substring is not mDNS —
+        // only the `.local` suffix is.
+        assert!(public_fetch_target_refusal("localhost.evil.com", false).is_none());
     }
 }

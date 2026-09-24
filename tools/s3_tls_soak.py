@@ -6,10 +6,12 @@ for TLS memory errors / hangs / panics. This is the acceptance gate for
 REQ-NET-001 (docs/TIER6_VALIDATION.md): repeated verified HTTPS handshakes
 with no memory error and no hang.
 
-IMPORTANT — physical UART0 required: the firmware's ingress gateway binds
-UART0 (the physical GPIO TX/RX pins, e.g. GPIO43/44 on the ESP32-S3), NOT the
-native USB-serial console. Connect a USB-UART adapter to those pins and pass
-its device here. Sending on the USB console will NOT reach the ingress.
+IMPORTANT — serial link: the firmware's ingress gateway binds UART0 (physically
+GPIO11/GPIO10 in this build), so on boards whose console goes through a USB-UART
+bridge wired to UART0 (e.g. the ESP32-C61 DevKit) this harness must be pointed at
+that bridge. On the **ESP32-S3** the native USB console is registered as a second
+ingress link (`UsbSerialAdapter` in `link_adapters.rs`), so `/dev/cu.usbmodem*`
+works directly — no external USB-TTL adapter on the UART0 pins is needed.
 
 Usage:
     python3 tools/s3_tls_soak.py <PORT> [--iterations N] [--url URL]

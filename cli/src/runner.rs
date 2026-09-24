@@ -33,17 +33,23 @@
 //! ## Provider selection
 //!
 //! Default is Ollama (local). Switch with `--provider deepseek`; the
-//! API key comes from `--api-key`, `DEEPSEEK_API_KEY`, or
+//! API key comes from `--api-key`, the env var named by the config's
+//! `provider.<name>.api_key_env` (`DEEPSEEK_API_KEY` by default), or
 //! `OLLAMA_API_KEY` (in that priority order).
 //!
 //! Configuration precedence (later wins):
 //!
 //! 1. Built-in defaults baked into the binary.
-//! 2. `~/.config/magent/magent.json` (managed by `magent config`).
-//! 3. Environment variables (`OLLAMA_HOST`, `DEEPSEEK_API_KEY`, …).
-//! 4. CLI flags (`--provider`, `--model`, `--temperature`, …).
+//! 2. The config file (see [`crate::config::config_path`]).
+//! 3. CLI flags (`--provider`, `--model`, `--temperature`, …).
 //!
-//! See [`apply_config_overrides`] for the implementation.
+//! There is **no** general environment-variable layer for `run` —
+//! `OLLAMA_HOST` and friends do not override the URL or model here
+//! (`magent doctor` reads its own `OLLAMA_HOST` / `MAGENT_PROVIDER` /
+//! … — see [`crate::cli::doctor_help_text`]). The only env vars `run`
+//! consumes are the API-key ones above.
+//!
+//! See `apply_config_overrides` for step 2.
 
 use std::collections::VecDeque;
 use std::io;
@@ -70,8 +76,6 @@ use magent_core::web3_app::{
 };
 #[cfg(feature = "web3_app")]
 use crate::web3 as web3_cli;
-#[cfg(feature = "web3")]
-use crate::blockchain_executor::BlockchainExecutor;
 
 use crate::email_executor::CompositeExecutor;
 
@@ -97,6 +101,12 @@ pub enum RunError {
     /// verification step failed (tamper, expired, …). Surfaced
     /// by the runner for symmetry with `SignedEnvelope` above.
     VerifySignedEnvelope(String),
+    /// `--repl` was requested while the output is in JSON mode. The
+    /// explicit `--json` flag is refused by the parser
+    /// (`ParseError::ReplJsonIncompatible`), but `io.json_default = true`
+    /// only becomes known once the config file is loaded — so the same
+    /// conflict has to be caught here, before the transcript starts.
+    ReplJsonMode,
 }
 
 impl std::fmt::Display for RunError {
@@ -107,6 +117,12 @@ impl std::fmt::Display for RunError {
             RunError::Io(e) => write!(f, "i/o error: {}", e),
             RunError::SignedEnvelope(msg) => write!(f, "signed envelope: {}", msg),
             RunError::VerifySignedEnvelope(msg) => write!(f, "verify envelope: {}", msg),
+            RunError::ReplJsonMode => write!(
+                f,
+                "`magent run --repl` streams an interactive transcript and cannot emit a JSON \
+                 envelope — set `io.json_default` to false (`magent config set io.json_default \
+                 false`) or drop --json"
+            ),
         }
     }
 }
@@ -349,15 +365,34 @@ fn apply_config_overrides(
         opts.num_predict = Some(n);
         report.applied.push(format!("num_predict={}", n));
     }
-    // Runner caps. `max_iterations = 0` is a legitimate "no cap"
-    // (the runner interprets it as such), so we honour it too.
+    // Runner caps. Unlike `--max-messages` / `--tool-max-chars`, `0` is
+    // NOT a "no cap" sentinel here: the runner checks `iteration >=
+    // max_iterations` before its first step, so a configured 0 yields a
+    // run that never starts and fails with "run ended without a final
+    // answer". The CLI flag path rejects 0 at parse time; a hand-edited
+    // config that carries 0 is surfaced as a warning so the operator
+    // sees why the run is about to fail instead of a bare budget line.
     if opts.max_iterations.is_none() {
         let m = config.runner.max_iterations;
+        if m == 0 {
+            report.warnings.push(
+                "runner.max_iterations is 0 — the run will make no progress; \
+                 set it to >= 1 (see `magent config validate`)"
+                    .to_string(),
+            );
+        }
         opts.max_iterations = Some(m);
         report.applied.push(format!("max_iterations={}", m));
     }
     if opts.max_tool_calls.is_none() {
         let m = config.runner.max_tool_calls;
+        if m == 0 {
+            report.warnings.push(
+                "runner.max_tool_calls is 0 — the run will make no progress; \
+                 set it to >= 1 (see `magent config validate`)"
+                    .to_string(),
+            );
+        }
         opts.max_tool_calls = Some(m);
         report.applied.push(format!("max_tool_calls={}", m));
     }
@@ -579,11 +614,6 @@ impl<'a> RunCmd<'a> {
             return verify_signed_report(path, out);
         }
 
-        // ─── REPL mode: when --repl flag is set or no task is provided ───
-        if self.opts.repl_mode || self.opts.task.is_empty() {
-            return self.execute_repl(out);
-        }
-
         // Cache the output mode so the runner's trace sink can
         // suppress events under `--json` without holding a
         // reference to `out` (which has non-`'static` stdout /
@@ -658,6 +688,26 @@ impl<'a> RunCmd<'a> {
             }
         }
 
+        // ─── REPL mode: `--repl`, or (library callers only) no task ───
+        // Deliberately *after* the config-file layer and the prompt
+        // resolution above, so `magent run --repl` sees the same
+        // provider / model / URLs and the same `--prompt-name` hints as
+        // `magent run "<task>"`. Short-circuiting here (before this
+        // point) made the two spellings of "run an agent" disagree.
+        //
+        // The `task.is_empty()` half is unreachable from the binary (the
+        // parser rejects a bare `magent run`) but kept for callers that
+        // build `RunOptions` directly and rely on the documented
+        // "empty task ⇒ REPL" behaviour.
+        if self.opts.repl_mode || self.opts.task.is_empty() {
+            // Hand the REPL the prompt and config we already resolved,
+            // so it can't drift from the one-shot path (it used to
+            // re-resolve the prompt and re-derive the API key from
+            // `--api-key` alone, ignoring `DEEPSEEK_API_KEY` and the
+            // configured `api_key_env`).
+            return self.execute_repl(out, &system_prompt, &config);
+        }
+
         // ─── 2. Build the runner + executor ──────────────────────────────
         let mut runner = build_runner(self.opts, system_prompt, out, output_kind)?;
 
@@ -713,14 +763,23 @@ impl<'a> RunCmd<'a> {
             } else {
                 self.opts.model.clone()
             };
-            let ds = DeepSeekClient::try_with_endpoint(
-                &self.opts.deepseek_url,
-                &model,
-                &key,
-            )
-            .expect(
-                "resolve_api_key returned a non-empty key, so try_with_endpoint should succeed",
-            );
+            // `try_with_endpoint` only rejects a key that is empty after
+            // trimming, and `resolve_api_key_with_config` trims every source
+            // before returning — so this arm is unreachable in practice. Take
+            // it as a graceful fallback rather than an `expect`: an
+            // unreachable panic that also depends on a helper's trimming
+            // discipline is a tripwire waiting for a refactor.
+            let Some(ds) = DeepSeekClient::try_with_endpoint(&self.opts.deepseek_url, &model, &key)
+            else {
+                out.warn(
+                    "DeepSeek API key was blank after trimming — falling back to simulated reasoning.",
+                )?;
+                runner.config_mut().probe_ollama_on_run = false;
+                let task = self.opts.task.clone();
+                out.trace_labeled("Task", &task)?;
+                let result = runner.run(&task).map_err(RunError::Agent)?;
+                return finalize_report(&mut runner, "mock", &result, self.opts, out);
+            };
             let connected = ds.check_connection();
             runner.set_backend(ds);
             if connected {
@@ -847,11 +906,75 @@ impl<'a> RunCmd<'a> {
     }
 
     /// Execute REPL mode: interactive multi-turn conversation.
-    fn execute_repl(&self, _out: &mut Output) -> Result<RunReport, RunError> {
+    fn execute_repl(
+        &self,
+        out: &mut Output,
+        system_prompt: &str,
+        cfg: &crate::config::ConfigRecord,
+    ) -> Result<RunReport, RunError> {
         use std::io::{self, Write};
         use std::sync::Arc;
 
+        // `--json` + `--repl` is refused by the parser, but the config's
+        // `io.json_default` reaches the same state without any flag: the
+        // REPL writes its transcript straight to stdout and never calls
+        // `Output::write_json`, so JSON mode would promise an envelope and
+        // deliver prose. Fail before the banner — and before anything else
+        // touches stdout — rather than break that contract silently.
+        if out.kind() == OutputKind::Json {
+            return Err(RunError::ReplJsonMode);
+        }
+
+        // Flags only the one-shot path can honour. Everything below is
+        // consumed by `execute()` *after* the REPL dispatch above returns:
+        // `--load-summary` at step 3.5, and `save_summary_after_run` /
+        // `sign_after_run` inside `finalize_report`. So `magent run --repl
+        // --save-summary demo` used to accept the flag and silently write
+        // nothing — not even the "no summary named …" warning the one-shot
+        // path emits for a bad topic.
+        let mut ignored: Vec<&str> = Vec::new();
+        if self.opts.load_summary_topic.is_some() {
+            ignored.push("--load-summary");
+        }
+        if self.opts.save_summary_topic.is_some() {
+            ignored.push("--save-summary");
+        }
+        #[cfg(feature = "web3_app")]
+        {
+            if self.opts.sign_with_vault_identity.is_some() {
+                ignored.push("--sign/--signer");
+            }
+            if self.opts.signed_output.is_some() {
+                ignored.push("--signed-output");
+            }
+            // The validity window and the passphrase env var are read only
+            // by `sign_run_report` / the vault lookup inside
+            // `sign_after_run`, which the REPL never reaches — the same
+            // reason `--sign` is listed above. They used to be the signing
+            // flags that vanished without a word.
+            if self.opts.not_before_unix.is_some() {
+                ignored.push("--not-before");
+            }
+            if self.opts.not_after_unix.is_some() {
+                ignored.push("--not-after");
+            }
+            if self.opts.passphrase_env.is_some() {
+                ignored.push("--passphrase-env");
+            }
+        }
+        if !ignored.is_empty() {
+            out.warn(&format!(
+                "--repl ignores {}: no effect in an interactive session",
+                ignored.join(", ")
+            ))?;
+        }
+
         let executor = CompositeExecutor::new(self.opts.email_tools.as_deref());
+        // Same catalog the one-shot path installs, derived from the same
+        // executor — so the `tools` command, the prompt, and what the
+        // executor can actually run can't diverge.
+        let tool_descriptions =
+            optional_tool_descriptions(self.opts.email_tools.is_some(), executor.has_blockchain());
 
         // Resolve defaults
         let provider = if self.opts.provider.is_empty() {
@@ -885,11 +1008,11 @@ impl<'a> RunCmd<'a> {
         let max_messages = self.opts.max_messages.unwrap_or(32);
         let tool_max_chars = self.opts.tool_max_chars.unwrap_or(800);
 
-        // Load system prompt
-        let system_prompt = match crate::prompt::resolve_for_run(self.opts) {
-            Ok(r) => r.text,
-            Err(_) => RunnerConfig::default().system_prompt,
-        };
+        // The system prompt was already resolved (and any provider/model
+        // hints applied) by `execute()` before it dispatched here, so we
+        // just take it — re-resolving would only re-read the file and
+        // reintroduce the fallback the caller has already ruled out.
+        let system_prompt = system_prompt.to_string();
 
         let config = RunnerConfig {
             max_iterations,
@@ -905,7 +1028,7 @@ impl<'a> RunCmd<'a> {
                 max_messages,
                 tool_content_max_chars: tool_max_chars,
             },
-            tool_descriptions: Vec::new(),
+            tool_descriptions,
             trace_sink: None,
         };
 
@@ -914,8 +1037,15 @@ impl<'a> RunCmd<'a> {
             runner.force_disable_backend();
             "mock".to_string()
         } else if provider == "deepseek" {
-            if let Some(key) = &self.opts.api_key {
-                if let Some(ds) = DeepSeekClient::try_with_endpoint(&deepseek_url, &model, key) {
+            // Same key resolution as the one-shot path: `--api-key`, then
+            // the configured `api_key_env`, then `OLLAMA_API_KEY`. Only
+            // checking `self.opts.api_key` (as this used to) meant
+            // `DEEPSEEK_API_KEY=… magent run --repl --provider deepseek`
+            // announced "no API key" and silently simulated while the
+            // identical `run "<task>"` connected for real.
+            let key = resolve_api_key_with_config(&self.opts.api_key, &provider, cfg);
+            if let Some(key) = key {
+                if let Some(ds) = DeepSeekClient::try_with_endpoint(&deepseek_url, &model, &key) {
                     if ds.check_connection() {
                         runner.set_backend(ds);
                         runner.force_enable_backend();
@@ -944,14 +1074,26 @@ impl<'a> RunCmd<'a> {
             }
         };
 
-        // Install trace sink
+        // Install trace sink. `--quiet` drops the per-step trace
+        // (`ReplTraceSink`) exactly as it does on the one-shot path, where
+        // `OutputTraceSink` checks the same flag; the `LogSink` stays so
+        // `RUST_LOG` output is unaffected.
         let shared = Arc::new(SharedTraceSink::new());
-        shared.install(Box::new(ReplTraceSink));
+        if !self.opts.quiet {
+            shared.install(Box::new(ReplTraceSink));
+        }
         shared.install(Box::new(LogSink));
         runner.set_trace_sink(Some(shared));
 
-        // Initialize REPL session
-        let mut session = ReplSession::default();
+        // Initialize REPL session. The backend label is pinned to what the
+        // banner just printed, so `backend` / `stats` report the same thing
+        // the welcome box does. Deriving it from `using_ollama()` instead
+        // made a live DeepSeek session claim "mock/deepseek" —
+        // indistinguishable from the simulated fallback.
+        let mut session = ReplSession {
+            backend: backend_label.clone(),
+            ..ReplSession::default()
+        };
 
         // Print welcome banner
         print_welcome_banner(&backend_label, &model);
@@ -961,7 +1103,12 @@ impl<'a> RunCmd<'a> {
             print!("\n❯ ");
             io::stdout().flush().map_err(RunError::Io)?;
 
-            let input = read_line_with_history("", &session);
+            let input = match read_repl_line("") {
+                Some(line) => line,
+                // EOF (e.g. piped stdin, or Ctrl-D): exit instead of
+                // spinning forever re-reading an empty line.
+                None => break,
+            };
 
             // Skip empty input
             if input.trim().is_empty() {
@@ -977,8 +1124,12 @@ impl<'a> RunCmd<'a> {
                     session.add_to_history(task.clone());
                     session.task_count += 1;
 
-                    // Run the task
-                    match runner.run(&task) {
+                    // `run_continuing`, not `run`: `--repl` is documented as
+                    // keeping context across turns ("maintains conversation
+                    // context across multiple turns"), and `run` clears the
+                    // history at the top of every call — which made every
+                    // REPL turn a fresh, context-free conversation.
+                    match runner.run_continuing(&task) {
                         Ok(result) => {
                             println!("\n{}", result);
                         }
@@ -986,17 +1137,22 @@ impl<'a> RunCmd<'a> {
                             eprintln!("\n✗ Error: {}", e);
                         }
                     }
+                    // The runner resets its counters per `run()`, so fold
+                    // this task's usage into the session totals now.
+                    session.total_iterations += runner.iteration();
+                    session.total_tool_calls += runner.tool_call_count();
                 }
             }
         }
 
         println!("\n\nGoodbye! 👋");
 
-        // Return a summary report
+        // Return a summary report. Iterations / tool calls are session
+        // totals (the runner's own counters only cover the last task).
         Ok(RunReport {
             answer: "REPL session ended".to_string(),
-            iterations: runner.iteration(),
-            tool_calls: runner.tool_call_count(),
+            iterations: session.total_iterations,
+            tool_calls: session.total_tool_calls,
             provider: backend_label,
             using_ollama: runner.using_ollama(),
             state: "Finished".to_string(),
@@ -1155,17 +1311,18 @@ fn sign_after_run(
             .unwrap_or_else(|_| "default".to_string()),
     };
 
-    // Resolve the passphrase resolver. We mirror the dispatch
-    // logic in `cli/src/main.rs` for the `web3` subcommand
-    // here — the user can either set `MAGENT_WEB3_PASSPHRASE`
-    // or override with `--passphrase-env <NAME>` (the runner
-    // accepts a `--passphrase-env` for parity; default is
-    // `MAGENT_WEB3_PASSPHRASE`).
-    let passphrase_env = std::env::var("MAGENT_WEB3_PASSPHRASE_ENV")
-        .unwrap_or_else(|_| "MAGENT_WEB3_PASSPHRASE".to_string());
+    // Resolve the passphrase. Priority mirrors the `web3`
+    // subcommand: `--passphrase-env <VAR>` wins, then
+    // `$MAGENT_WEB3_PASSPHRASE_ENV`, then the default
+    // `MAGENT_WEB3_PASSPHRASE`.
+    let passphrase_env = opts
+        .passphrase_env
+        .clone()
+        .or_else(|| std::env::var("MAGENT_WEB3_PASSPHRASE_ENV").ok())
+        .unwrap_or_else(|| "MAGENT_WEB3_PASSPHRASE".to_string());
     let passphrase = std::env::var(&passphrase_env).map_err(|_| {
         format!(
-            "passphrase env var ${} is not set (use --passphrase-env or export it)",
+            "passphrase env var ${} is not set (export it, or pass --passphrase-env <VAR>)",
             passphrase_env
         )
     })?;
@@ -1529,6 +1686,35 @@ impl RunReport {
 /// parameter is still useful for the high-level pre-run banner
 /// (`out.trace_labeled("Backend", …)`) that lives outside the
 /// ReAct loop.
+/// The optional-tool catalog handed to the LLM: the Email MCP tools (only
+/// when `--email-tools` is on) plus the blockchain tools (only when the
+/// executor actually carries a blockchain backend).
+///
+/// Shared by the one-shot path and the REPL so the two cannot disagree
+/// about which tools exist. The REPL used to construct its `RunnerConfig`
+/// with an empty `tool_descriptions`, so it *listed* the email/blockchain
+/// tools via the `tools` command while the model was never told about
+/// them — and therefore could never call one.
+///
+/// `blockchain_enabled` is the *executor's* answer
+/// ([`CompositeExecutor::has_blockchain`]), not just "the `web3` feature is
+/// compiled in": `CompositeExecutor::new(None)` yields `SimulatorOnly` with
+/// no blockchain backend, and advertising `send_transaction` to the model
+/// in that state only produces a `ConfigurationError` when it is called.
+fn optional_tool_descriptions(
+    email_tools_enabled: bool,
+    blockchain_enabled: bool,
+) -> Vec<(String, String)> {
+    let mut all: Vec<(String, String)> = Vec::new();
+    if email_tools_enabled {
+        all.extend(CompositeExecutor::email_tool_descriptions());
+    }
+    if blockchain_enabled {
+        all.extend(CompositeExecutor::blockchain_tool_descriptions());
+    }
+    all
+}
+
 pub fn build_runner(
     opts: &RunOptions,
     system_prompt: String,
@@ -1589,16 +1775,15 @@ pub fn build_runner(
         ),
     )?;
 
+    // `has_blockchain` (not merely "web3 compiled in") decides the
+    // blockchain half of the catalog, so the model is never told about a
+    // tool the executor cannot run. Read it before the executor is moved.
+    let blockchain_enabled = executor.has_blockchain();
     let mut runner = RealAgentRunner::with_config(executor, config);
 
-    // Inject email tool descriptions so the LLM knows about mcp__email__*.
-    let mut all_descriptions: Vec<(String, String)> = Vec::new();
-    if email_tools_enabled {
-        all_descriptions.extend(CompositeExecutor::email_tool_descriptions());
-    }
-    // Inject blockchain tool descriptions so the LLM knows about
-    // get_balance / send_transaction / etc.
-    all_descriptions.extend(CompositeExecutor::blockchain_tool_descriptions());
+    // Inject email + blockchain tool descriptions so the LLM knows about
+    // mcp__email__* / get_balance / send_transaction / etc.
+    let all_descriptions = optional_tool_descriptions(email_tools_enabled, blockchain_enabled);
     if !all_descriptions.is_empty() {
         runner.config_mut().set_tool_descriptions(all_descriptions);
     }
@@ -2289,16 +2474,18 @@ mod tests {
         assert_eq!(endpoint_model(&cfg, "ollama"), None);
     }
 
-    #[cfg(feature = "web3")]
+    #[cfg(all(feature = "web3", feature = "email-tools"))]
     #[test]
     fn build_runner_injects_blockchain_tool_descriptions() {
-        // When the web3/blockchain feature is on, the runner should
-        // expose `get_balance` (and friends) to the LLM via
-        // `tool_descriptions`. Without this, the LLM would not know
-        // it can call the blockchain tools.
+        // `--email-tools` wires the blockchain executor (see
+        // `CompositeExecutor::new`), and only then may the runner expose
+        // `get_balance` (and friends) to the LLM. Without this the LLM
+        // would not know it can call the blockchain tools.
+        use crate::blockchain_executor::BlockchainExecutor;
         use crate::output::OutputKind;
         let opts = RunOptions {
             task: "noop".to_string(),
+            email_tools: Some(String::new()),
             ..Default::default()
         };
         let mut out = Output::new(OutputKind::Human, true);
@@ -2320,18 +2507,35 @@ mod tests {
 
     #[cfg(feature = "web3")]
     #[test]
-    fn build_runner_without_blockchain_email_tools_has_no_descriptions() {
-        // If neither web3 nor email-tools is enabled, the runner should
-        // not carry any extra tool descriptions (the LLM still gets the
-        // built-in simulator tools via the ToolExecutor wiring).
+    fn build_runner_without_email_tools_has_no_optional_descriptions() {
+        // Regression: with only the `web3` feature compiled in — no
+        // `--email-tools` — the executor is `SimulatorOnly`, so there is
+        // no blockchain backend to route `get_balance` to. Advertising it
+        // to the LLM only led it to call a tool that answers with
+        // `ConfigurationError`.
         use crate::output::OutputKind;
         let opts = RunOptions {
             task: "noop".to_string(),
             ..Default::default()
         };
         let mut out = Output::new(OutputKind::Human, true);
-        let _ = build_runner(&opts, "system prompt".to_string(), &mut out, OutputKind::Human);
+        let runner = match build_runner(&opts, "system prompt".to_string(), &mut out, OutputKind::Human)
+        {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        assert!(
+            runner.config().tool_descriptions.is_empty(),
+            "no optional tools runnable, yet the LLM was told about: {:?}",
+            runner
+                .config()
+                .tool_descriptions
+                .iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>()
+        );
     }
+
 }
 
 // ============================================================================
@@ -2340,14 +2544,27 @@ mod tests {
 
 /// REPL session state
 struct ReplSession {
-    /// Command history for navigation
+    /// Task history for the `history` command. Only tasks are recorded —
+    /// built-in commands are never pushed — so `retry` can treat the last
+    /// entry as the previous task.
     history: VecDeque<String>,
     /// Current history position (for up/down arrow navigation)
     history_pos: usize,
     /// Number of tasks executed
     task_count: usize,
+    /// Sum of every task's LLM iterations. The runner zeroes its own
+    /// counter at the start of each `run()`, so the session total has to be
+    /// accumulated here — `stats` labels it "Total", and showing only the
+    /// last run's count under that label was wrong.
+    total_iterations: usize,
+    /// Sum of every task's tool calls, accumulated like [`Self::total_iterations`].
+    total_tool_calls: usize,
     /// Session start time
     start_time: std::time::Instant,
+    /// Backend label shown in the welcome banner (e.g. `ollama`,
+    /// `deepseek (mock fallback)`), reused by `backend` / `stats` so
+    /// they never contradict it.
+    backend: String,
 }
 
 impl Default for ReplSession {
@@ -2356,7 +2573,10 @@ impl Default for ReplSession {
             history: VecDeque::new(),
             history_pos: 0,
             task_count: 0,
+            total_iterations: 0,
+            total_tool_calls: 0,
             start_time: std::time::Instant::now(),
+            backend: String::new(),
         }
     }
 }
@@ -2438,19 +2658,66 @@ fn handle_repl_command(
     session: &mut ReplSession,
 ) -> ReplCommandResult {
     let parts: Vec<&str> = input.split_whitespace().collect();
-    let cmd = parts.first().copied().unwrap_or("");
+    let raw_cmd = parts.first().copied().unwrap_or("");
+    // Accept a leading `/` (e.g. `/help`) — the slash form users expect
+    // from other REPLs. The dispatcher only ever matched the bare token,
+    // so `/help` used to fall through to "Unknown command".
+    let cmd = raw_cmd.strip_prefix('/').unwrap_or(raw_cmd);
     let args: Vec<&str> = parts[1..].to_vec();
 
     match cmd.to_lowercase().as_str() {
-        "" => ReplCommandResult::Continue,
+        // A built-in command must be the whole line, with `alias` the one
+        // exception (it has an argument form). Matching on the *first word*
+        // alone let ordinary tasks be hijacked by a command name — "reset
+        // the temperature sensor" silently reset the conversation, "clear
+        // the flash" cleared the screen, "tools list" printed the catalog —
+        // which also made `help`'s "Any other input is treated as a task"
+        // untrue.
+        _ if parts.len() > 1 && !cmd.eq_ignore_ascii_case("alias") => {
+            // A leading `/` is the explicit command sigil, so a slash line
+            // with arguments is never a task. The message must not say
+            // "unknown command" for a name that *is* a command (`/help
+            // extra` used to report `Unknown command: /help`), so it names
+            // the whole-line rule instead.
+            if input.starts_with('/') {
+                println!(
+                    "{} is not a command form: a built-in command must be on a line by itself. \
+                     Type 'help' for available commands.",
+                    raw_cmd
+                );
+                ReplCommandResult::Continue
+            } else {
+                ReplCommandResult::RunTask(input.to_string())
+            }
+        }
+        "" => {
+            // The only way to reach this arm is a lone `/`: the loop skips
+            // blank input, and `strip_prefix('/')` empties nothing else.
+            // It used to return silently while its sibling `/nosuch`
+            // reported an unknown command, so the command sigil with no
+            // command was the one slash line that did nothing at all.
+            if input.starts_with('/') {
+                println!(
+                    "Unknown command: {}. Type 'help' for available commands.",
+                    raw_cmd
+                );
+            }
+            ReplCommandResult::Continue
+        }
         "help" | "?" => {
             print_repl_help();
             ReplCommandResult::Continue
         }
         "quit" | "exit" | "q" => ReplCommandResult::Stop,
         "clear" | "cls" => {
-            print!("\x1B[2J\x1B[H");
-            let _ = std::io::stdout().flush();
+            // Only write the escape sequence to a terminal — a redirected
+            // or piped stdout would otherwise collect raw `ESC[2J` bytes
+            // in its transcript.
+            use std::io::IsTerminal as _;
+            if std::io::stdout().is_terminal() {
+                print!("\x1B[2J\x1B[H");
+                let _ = std::io::stdout().flush();
+            }
             ReplCommandResult::Continue
         }
         "reset" => {
@@ -2476,7 +2743,11 @@ fn handle_repl_command(
             println!("\n📊 Context:");
             println!("  Messages:     {}", msgs);
             println!("  Approx tokens: ~{}", tokens);
-            println!("  Size:         ~{} chars", tokens * 4);
+            // `approx_tokens` is `bytes / 4`, so the old `tokens * 4` was a
+            // *byte* count wearing a "chars" label — wrong for any
+            // multi-byte text (~3× over for CJK). Report the runner's own
+            // byte estimate (which also counts per-message overhead).
+            println!("  Size:         ~{} bytes", runner.approx_total_bytes());
             ReplCommandResult::Continue
         }
         "session" => {
@@ -2488,13 +2759,13 @@ fn handle_repl_command(
             ReplCommandResult::Continue
         }
         "backend" => {
-            let using = if runner.using_ollama() { "ollama" } else { "mock/deepseek" };
-            println!("\n🔧 Backend: {}", using);
+            println!("\n🔧 Backend: {}", backend_display(&session.backend));
             ReplCommandResult::Continue
         }
         "retry" | "rerun" => {
-            // Get last task from history and run it again
-            if let Some(last_task) = session.history.iter().rev().find(|h| !h.starts_with('/')) {
+            // History holds only tasks (built-in commands are never
+            // pushed), so the most recent entry *is* the previous task.
+            if let Some(last_task) = session.history.back() {
                 println!("Retrying: {}", last_task);
                 ReplCommandResult::RunTask(last_task.clone())
             } else {
@@ -2504,12 +2775,15 @@ fn handle_repl_command(
         }
         "alias" => {
             if args.is_empty() {
+                // Must match the dispatcher arms above — `stats` is a
+                // command of its own, not an alias, and `retry|rerun`
+                // were missing from this list entirely.
                 println!("\n📝 Aliases:");
-                println!("  help, ?     - Show this help");
+                println!("  help, ?       - Show this help");
                 println!("  quit, exit, q - Exit REPL");
-                println!("  clear, cls  - Clear screen");
-                println!("  hist        - Show history");
-                println!("  stats       - Show session stats");
+                println!("  clear, cls    - Clear screen");
+                println!("  history, hist - Show task history");
+                println!("  retry, rerun  - Run the previous task again");
             } else {
                 println!("Aliases are fixed shortcuts for commands.");
             }
@@ -2518,31 +2792,104 @@ fn handle_repl_command(
         "prompt" => {
             println!("\n📋 System prompt (first message):");
             let messages = runner.messages();
-            if !messages.is_empty() {
-                let content = &messages[0].content;
+            // Before the first task the prompt lives only in the runner's
+            // config — `ensure_system_prompt` inserts it into the
+            // conversation on the first `think()` — so `messages` is empty
+            // and this used to answer "(no messages)" for a session that
+            // plainly has a prompt. Fall back to the configured prompt.
+            let content = if messages.is_empty() {
+                runner.config().system_prompt.as_str()
+            } else {
+                messages[0].content.as_str()
+            };
+            if content.is_empty() {
+                println!("  (no messages)");
+            } else {
                 let preview = if content.len() > 300 {
-                    format!("{}\n...[truncated]", &content[..300])
+                    // `&content[..300]` panics when byte 300 falls inside a
+                    // multi-byte code point (a non-ASCII system prompt).
+                    format!("{}\n...[truncated]", truncate_utf8(content, 300))
                 } else {
-                    content.clone()
+                    content.to_string()
                 };
                 println!("\n{}\n", preview);
-            } else {
-                println!("  (no messages)");
             }
             ReplCommandResult::Continue
         }
         "env" => {
+            // Only variables the CLI actually consults. The old list named
+            // `OLLAMA_URL` and `MAGENT_CONFIG`, which nothing reads — the
+            // config file is located via `MAGENT_CONFIG_FILE` /
+            // `MAGENT_CONFIG_DIR` (see `config::resolve_path`), and the
+            // Ollama URL comes from `--ollama-url` or the config file.
+            // The store overrides are likewise real: `MAGENT_PROMPTS_DIR`
+            // relocates the `--prompt-name` store the REPL honours, and
+            // `MAGENT_SUMMARIES_DIR` the `--load-summary` /
+            // `--save-summary` one.
             println!("\n🌐 Environment:");
-            println!("  OLLAMA_URL:     {}", std::env::var("OLLAMA_URL").unwrap_or_else(|_| "not set".into()));
-            println!("  DEEPSEEK_API_KEY: {}", if std::env::var("DEEPSEEK_API_KEY").is_ok() { "***" } else { "not set" });
-            println!("  MAGENT_CONFIG:  {}", std::env::var("MAGENT_CONFIG").unwrap_or_else(|_| "default".into()));
+            println!("  Config");
+            env_row("MAGENT_CONFIG_FILE:", env_or("MAGENT_CONFIG_FILE"));
+            env_row("MAGENT_CONFIG_DIR:", env_or("MAGENT_CONFIG_DIR"));
+            env_row("XDG_CONFIG_HOME:", env_or("XDG_CONFIG_HOME"));
+            println!("  Stores");
+            env_row("MAGENT_PROMPTS_DIR:", env_or("MAGENT_PROMPTS_DIR"));
+            env_row("MAGENT_SUMMARIES_DIR:", env_or("MAGENT_SUMMARIES_DIR"));
+            env_row("XDG_DATA_HOME:", env_or("XDG_DATA_HOME"));
+            println!("  Credentials");
+            env_row("OLLAMA_API_KEY:", env_or_secret("OLLAMA_API_KEY"));
+            env_row("DEEPSEEK_API_KEY:", env_or_secret("DEEPSEEK_API_KEY"));
+            env_row("MAGENT_AGENT_IDENTITY:", env_or("MAGENT_AGENT_IDENTITY"));
+            // The two passphrase sources `sign_after_run` consults. They
+            // were missing while `MAGENT_AGENT_IDENTITY` — read at the same
+            // place — was listed, so the signing story looked half-told.
+            env_row(
+                "MAGENT_WEB3_PASSPHRASE_ENV:",
+                env_or("MAGENT_WEB3_PASSPHRASE_ENV"),
+            );
+            env_row(
+                "MAGENT_WEB3_PASSPHRASE:",
+                env_or_secret("MAGENT_WEB3_PASSPHRASE"),
+            );
             ReplCommandResult::Continue
         }
         _ if input.starts_with('/') => {
-            println!("Unknown command: {}. Type 'help' for available commands.", cmd);
+            println!(
+                "Unknown command: {}. Type 'help' for available commands.",
+                raw_cmd
+            );
             ReplCommandResult::Continue
         }
         _ => ReplCommandResult::RunTask(input.to_string()),
+    }
+}
+
+/// Value of `name` for the REPL `env` listing, or `not set`.
+fn env_or(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| "not set".into())
+}
+
+/// Like [`env_or`] but redacts the value — for secrets we only need to
+/// report presence.
+fn env_or_secret(name: &str) -> String {
+    if std::env::var(name).is_ok() {
+        "set (***)".into()
+    } else {
+        "not set".into()
+    }
+}
+
+/// One indented `label value` row of the REPL `env` listing.
+fn env_row(label: &str, value: String) {
+    println!("    {:<24}{}", label, value);
+}
+
+/// The backend label for `backend` / `stats`, defaulting to `unknown`
+/// for a `ReplSession` built without going through `execute_repl`.
+fn backend_display(label: &str) -> &str {
+    if label.is_empty() {
+        "unknown"
+    } else {
+        label
     }
 }
 
@@ -2567,14 +2914,18 @@ fn print_repl_help() {
     println!("║  Info & Debug                                                ║");
     println!("║  ─────────────────────────────────────────────────────────  ║");
     println!("║  stats         Show session statistics                       ║");
-    println!("║  history       Show command history                         ║");
+    println!("║  history, hist Show task history                            ║");
     println!("║  tools         List available tools                         ║");
     println!("║  session       Show session info                            ║");
     println!("║  backend       Show current LLM backend                     ║");
     println!("║  env           Show environment variables                   ║");
+    println!("║  alias         List the command aliases                     ║");
     println!("║                                                                ║");
     println!("║  Any other input is treated as a task for the agent.        ║");
-    println!("║  Use ↑/↓ arrows to navigate command history.                ║");
+    println!("║  A leading `/` is accepted: `/help` == `help`.              ║");
+    println!("║  A command must be on a line by itself — `reset the feed`   ║");
+    println!("║  is a task, not `reset`. (`alias` alone takes an argument.) ║");
+    println!("║  Type 'history' to list previous tasks.                     ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
 }
 
@@ -2583,9 +2934,10 @@ fn print_repl_stats(runner: &RealAgentRunner<CompositeExecutor>, session: &ReplS
     let duration = session.session_duration();
     let msgs = runner.messages().len();
     let tokens = runner.approx_total_tokens();
-    let iterations = runner.iteration();
-    let tool_calls = runner.tool_call_count();
-    let using = if runner.using_ollama() { "Ollama" } else { "Mock/DeepSeek" };
+    // Session totals, not the runner's per-run counters.
+    let iterations = session.total_iterations;
+    let tool_calls = session.total_tool_calls;
+    let using = backend_display(&session.backend);
 
     println!("\n╔══════════════════════════════════════════════════════════════╗");
     println!("║                       Session Statistics                     ║");
@@ -2600,7 +2952,7 @@ fn print_repl_stats(runner: &RealAgentRunner<CompositeExecutor>, session: &ReplS
     println!("║  ─────────────────────────────────────────────────────────  ║");
     println!("║  Messages:      {:>6}                                      ║", msgs);
     println!("║  Approx tokens:  {:>6}                                      ║", tokens);
-    println!("║  Size:          ~{:>6} chars                              ║", tokens * 4);
+    println!("║  Size:          ~{:>6} bytes                              ║", runner.approx_total_bytes());
     println!("║                                                                ║");
     println!("║  Agent State                                                 ║");
     println!("║  ─────────────────────────────────────────────────────────  ║");
@@ -2610,15 +2962,18 @@ fn print_repl_stats(runner: &RealAgentRunner<CompositeExecutor>, session: &ReplS
     println!("╚══════════════════════════════════════════════════════════════╝");
 }
 
-/// Print command history
+/// Print task history
 fn print_repl_history(session: &ReplSession) {
-    println!("\n📜 Command history:");
+    println!("\n📜 Task history:");
     if session.history.is_empty() {
         println!("  (empty)");
     } else {
         for (i, cmd) in session.history.iter().enumerate() {
             let preview = if cmd.len() > 60 {
-                format!("{}...", &cmd[..60])
+                // Reachable directly: type a 60+-byte non-ASCII command into
+                // the REPL, then `/history` — `&cmd[..60]` panics if byte 60
+                // lands mid-character.
+                format!("{}...", truncate_utf8(cmd, 60))
             } else {
                 cmd.clone()
             };
@@ -2627,55 +2982,83 @@ fn print_repl_history(session: &ReplSession) {
     }
 }
 
-/// Print available tools in REPL
+/// Print available tools in REPL.
+///
+/// Generated from [`magent_core::ollama::TOOL_DEFINITIONS`] — the same
+/// catalog the LLM is handed — instead of hand-written prose, so the REPL
+/// can't advertise a tool that doesn't exist. (It used to list a
+/// `ble_scan()` implemented nowhere, and sensor names the host executor
+/// doesn't back.)
 fn print_repl_tools() {
     println!("\n╔══════════════════════════════════════════════════════════════╗");
     println!("║                     Available Tools                          ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║                                                                ║");
-    println!("║  Sensor Tools                                                  ║");
-    println!("║  ─────────────────────────────────────────────────────────  ║");
-    println!("║  read_sensor(sensor)                                          ║");
-    println!("║      Sensors: temperature, humidity, accelerometer,             ║");
-    println!("║               pressure, heart_rate, light, battery            ║");
-    println!("║                                                                ║");
-    println!("║  GPIO Tools                                                   ║");
-    println!("║  ─────────────────────────────────────────────────────────  ║");
-    println!("║  write_gpio(pin, state)                                      ║");
-    println!("║      Control GPIO pin (0-31), state: high/low/toggle           ║");
-    println!("║                                                                ║");
-    println!("║  Flash Memory                                                  ║");
-    println!("║  ─────────────────────────────────────────────────────────  ║");
-    println!("║  flash_read(address)                                         ║");
-    println!("║  flash_write(address, data)                                   ║");
-    println!("║      Read/write to flash memory                               ║");
-    println!("║                                                                ║");
-    println!("║  Bluetooth LE                                                 ║");
-    println!("║  ─────────────────────────────────────────────────────────  ║");
-    println!("║  ble_scan()                                                  ║");
-    println!("║  ble_send(data)                                               ║");
-    println!("║      Scan and send data via Bluetooth LE                       ║");
-    println!("║                                                                ║");
-    println!("║  Email Tools (--email-tools)                                  ║");
-    println!("║  ─────────────────────────────────────────────────────────  ║");
-    println!("║  email_list()           - List emails                         ║");
-    println!("║  email_read(id)         - Read specific email                ║");
-    println!("║  email_send(to, subj)  - Send email                         ║");
+    for (name, description, params) in magent_core::ollama::TOOL_DEFINITIONS {
+        let signature = if params.is_empty() {
+            format!("{}()", name)
+        } else {
+            let names: Vec<&str> = params.iter().map(|(p, _, _)| *p).collect();
+            format!("{}({})", name, names.join(", "))
+        };
+        println!("║  {}", signature);
+        println!("║      {}", description);
+    }
+    // The optional backends supply their own catalogs, so reuse them
+    // rather than hand-writing names (the previous static list named
+    // tools that don't exist, e.g. `email_send`, and omitted the
+    // blockchain ones entirely). Each returns an empty list when its
+    // feature is off, so no `#[cfg]` is needed here.
+    //
+    // Both are labelled with their requirement: the blockchain executor
+    // is auto-wired inside `CompositeExecutor::new`'s `--email-tools`
+    // branch, so without that flag `get_balance` & co. are listed here but
+    // unrunnable — the exact divergence this listing exists to avoid.
+    let email = CompositeExecutor::email_tool_descriptions();
+    if !email.is_empty() {
+        println!("║  ── Email MCP tools (require `--email-tools`) ──");
+        for (name, _) in email {
+            println!("║  {}", name);
+        }
+    }
+    let chain = CompositeExecutor::blockchain_tool_descriptions();
+    if !chain.is_empty() {
+        println!("║  ── Blockchain tools (require `--email-tools`) ──");
+        for (name, _) in chain {
+            println!("║  {}", name);
+        }
+    }
     println!("╚══════════════════════════════════════════════════════════════╝");
 }
 
-/// Simple readline-like input with history navigation
-fn read_line_with_history(prompt: &str, _session: &ReplSession) -> String {
+/// Read one line of REPL input.
+///
+/// Plain `read_line`: it does **not** put the terminal into raw mode,
+/// so there is no line editing, no in-line history recall, and arrow
+/// keys arrive as literal escape sequences (which would be submitted
+/// as a task). Real line editing is a backlogged enhancement; the
+/// session's `history` is available to the user via the `history`
+/// command instead.
+fn read_repl_line(prompt: &str) -> Option<String> {
     print!("{}", prompt);
     let _ = std::io::stdout().flush();
 
     let stdin = io::stdin();
     let mut line = String::new();
 
-    // Simple line reading (no fancy readline, but basic functionality works)
-    if stdin.read_line(&mut line).is_ok() {
-        line.trim().to_string()
-    } else {
-        String::new()
+    match stdin.read_line(&mut line) {
+        // `read_line` returns Ok(0) at EOF — signal the caller to stop.
+        Ok(0) => None,
+        Ok(_) => Some(line.trim().to_string()),
+        // A decode error is **not** EOF. `read_line` reads the line's bytes
+        // off the stream before trying to validate them, so the offending
+        // bytes are already consumed: report and return an empty line
+        // (which the loop skips) so one stray non-UTF-8 byte — a pasted
+        // binary blob, a mis-encoded pipe — does not silently end the
+        // session. Treating the old `Err(_) => None` as EOF did exactly
+        // that, discarding the rest of the input with no message.
+        Err(e) => {
+            eprintln!("\n  ✗ Input error (line skipped): {}", e);
+            Some(String::new())
+        }
     }
 }

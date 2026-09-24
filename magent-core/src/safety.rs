@@ -91,10 +91,19 @@ impl BudgetEnforcer {
     /// Check and consume memory budget
     pub fn consume_memory(&self, bytes: usize) -> Result<()> {
         let used = self.memory_budget.fetch_add(bytes, Ordering::SeqCst);
-        if used + bytes > self.memory_limit {
+        // `used + bytes` must not be evaluated unchecked: a request near
+        // `usize::MAX` (a length read straight off a wire, say) wraps to a small
+        // sum that slips under `memory_limit`, so the guard would *accept* the
+        // very allocation it exists to reject while the counter above has
+        // already wrapped. Overflow is treated as "exceeds".
+        let over = match used.checked_add(bytes) {
+            Some(total) => total > self.memory_limit,
+            None => true,
+        };
+        if over {
             self.memory_budget.fetch_sub(bytes, Ordering::SeqCst);
             return Err(AgentError::MemoryBudgetExhausted {
-                used: used + bytes,
+                used: used.saturating_add(bytes),
                 limit: self.memory_limit,
             });
         }
@@ -144,7 +153,19 @@ impl BudgetEnforcer {
     }
 }
 
-/// Watchdog timer interface
+/// Watchdog *heartbeat latch* — not a timer.
+///
+/// This type stores a single boolean: whether the last event was a `feed()` or
+/// a `simulate_timeout()`. It has no clock and no access to a hardware WDT, so
+/// it cannot decide on its own that a deadline has passed — the only ways to
+/// move `fed` to `false` are an explicit `simulate_timeout()` (test-only) call.
+/// Calling it a "timer" would overstate what it does; see `needs_feed`.
+///
+/// Real timeout enforcement lives in the firmware, which owns a clock and the
+/// hardware counter: `firmware/esp32-app/src/rt_watchdog.rs` arms the ESP-IDF
+/// task watchdog (panic-on-trigger) and `firmware/nrf52-app/src/watchdog.rs`
+/// wraps the nRF WDT. `MiniAgent` keeps this latch purely as a per-iteration
+/// heartbeat marker (`feed()` at the top of the ReAct loop).
 pub struct Watchdog {
     fed: Cell<bool>,
     timeout_ms: u32,
@@ -164,19 +185,31 @@ impl Watchdog {
         Self::new((crate::WATCHDOG_TIMEOUT_SECS * 1000) as u32)
     }
 
-    /// Feed the watchdog (reset timer)
+    /// Mark the heartbeat: clear the "needs feed" flag.
+    ///
+    /// This does not touch a hardware counter — see the type docs. On real
+    /// hardware the equivalent reset is `rt_watchdog::feed()` (ESP32) or
+    /// `watchdog::Watchdog::feed()` in the nRF52 firmware.
     pub fn feed(&self) {
         self.fed.set(true);
-        // In real implementation, this would reset the hardware watchdog
-        // For now, we simulate it
     }
 
-    /// Check if watchdog needs feeding
+    /// Report whether a `simulate_timeout()` has happened since the last
+    /// `feed()`, and nothing more.
+    ///
+    /// Nothing in production calls this: `feed()` is the only writer of the
+    /// flag on a running device, so the answer is `false` outside tests. It
+    /// exists so a supervisor or test can observe the latch; a real
+    /// "has the loop stalled?" decision must come from a clock (the firmware
+    /// WDT), which this type does not have.
     pub fn needs_feed(&self) -> bool {
         !self.fed.get()
     }
 
-    /// Simulate watchdog timeout (for testing)
+    /// Latch the "needs feed" state, as a real timeout would.
+    ///
+    /// Test/simulation hook: there is no clock here to trip it for real, so
+    /// this is how a test drives the latch into the tripped state.
     pub fn simulate_timeout(&self) {
         self.fed.set(false);
     }
@@ -252,10 +285,15 @@ impl MemoryGuard {
     /// Allocate memory from guard
     pub fn allocate(&self, size: usize) -> Result<()> {
         let current = self.used.load(Ordering::SeqCst);
-        if current + size > self.capacity {
+        // As in `BudgetEnforcer::consume_memory`: an unchecked `current + size`
+        // wraps for a near-`usize::MAX` request, turning an over-capacity
+        // allocation into one the guard waves through. Saturating keeps the
+        // reported `attempted` meaningful and any overflow over the limit.
+        let total = current.saturating_add(size);
+        if total > self.capacity {
             return Err(AgentError::BufferOverflow {
                 capacity: self.capacity,
-                attempted: current + size,
+                attempted: total,
             });
         }
         self.used.fetch_add(size, Ordering::SeqCst);
@@ -299,7 +337,9 @@ impl FaultDetector {
 
     /// Create with default threshold
     pub fn with_defaults() -> Self {
-        Self::new(10) // 10 errors before fault
+        // `report_error` compares the pre-increment count, so the fault is
+        // raised by the report *after* the threshold is reached (the 11th here).
+        Self::new(10)
     }
 
     /// Report an error
@@ -370,6 +410,28 @@ mod tests {
         assert_eq!(b.memory_usage(), 0);
         b.reset_memory();
         assert_eq!(b.memory_usage(), 0);
+    }
+
+    #[test]
+    fn budget_enforcer_rejects_overflowing_memory_request() {
+        // A request that wraps `used + bytes` must be rejected, not accepted on
+        // the wrapped sum. Before the fix `40 + usize::MAX` wrapped below the
+        // limit and the guard returned Ok.
+        let b = BudgetEnforcer::new(10, 100, 1000);
+        assert!(b.consume_memory(40).is_ok());
+        let err = b.consume_memory(usize::MAX).unwrap_err();
+        assert!(matches!(err, AgentError::MemoryBudgetExhausted { .. }));
+        // The rejected request must not have disturbed the counter.
+        assert_eq!(b.memory_usage(), 40);
+    }
+
+    #[test]
+    fn memory_guard_rejects_overflowing_allocation() {
+        let g = MemoryGuard::new(100);
+        assert!(g.allocate(40).is_ok());
+        let err = g.allocate(usize::MAX).unwrap_err();
+        assert!(matches!(err, AgentError::BufferOverflow { .. }));
+        assert_eq!(g.usage(), 40);
     }
 
     #[test]

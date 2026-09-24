@@ -8,7 +8,10 @@
 //!
 //! NOTE: these targets (RISC-V / Xtensa 32-bit) have no 64-bit atomics, so we
 //! store timings in `u32` microseconds — ample here (u32 wraps only after
-//! ~71 minutes) — and keep the average as a signed running mean.
+//! ~71 minutes) — and keep the average as a signed running mean. Two narrowings
+//! apply: the counters saturate at `u32::MAX` (~71 min) and the mean's input at
+//! `i32::MAX` (~35.8 min), so an over-range sample is clamped monotone rather
+//! than wrapping to a tiny value or flipping the mean negative. See `record`.
 //!
 //! TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R6 — the dual-core S3 firmware
 //! records from both Core 0 (agent worker) and Core 1 (AT ingress). On
@@ -58,7 +61,14 @@ impl TimingChannel {
 
     /// Record a duration in microseconds.
     pub fn record(&self, us: u64) {
-        let us = us as u32;
+        // Saturate before narrowing. A duration above ~71 min would wrap the
+        // `u32` min/max counters — and, worse, `us as i32` below turns any
+        // value above `i32::MAX` µs (~35.8 min) *negative*, which permanently
+        // drags the signed running mean below the true average. Clamping keeps
+        // an over-range sample monotone instead of inverting it. The module
+        // doc's "wraps only after ~71 minutes" covers the u32 counters but not
+        // this signed reinterpretation, which flips twice as early.
+        let us = us.min(u32::MAX as u64) as u32;
         // TRACE: AEROSPACE-AUDIT-2026-09-15 §6 FW-R6 — Release on the
         // count fetch_add pairs with the Acquire load in `report()` /
         // `sample()`, so a Core-1 producer's bump is visible to a
@@ -86,8 +96,9 @@ impl TimingChannel {
             }
         }
         // Running average (signed so a below-average sample stays correct):
-        // avg += (x - avg) / n.
-        let x = us as i32;
+        // avg += (x - avg) / n. Clamp to `i32::MAX` so the reinterpretation
+        // cannot go negative for an over-range sample (see the note above).
+        let x = us.min(i32::MAX as u32) as i32;
         let n = n as i32;
         let mut avg = self.avg_us.load(Ordering::Acquire);
         loop {

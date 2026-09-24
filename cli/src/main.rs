@@ -144,7 +144,17 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Version => {
-            println!("magent {}", VERSION);
+            // Route through `out` so `--json` stays valid JSON. This
+            // used to `println!` unconditionally, so `magent --json
+            // version` emitted the bare text `magent 0.1.0` — not JSON,
+            // and a `| jq` consumer choked on it.
+            if matches!(out.kind(), OutputKind::Json) {
+                out.write_json_str(
+                    serde_json::json!({ "name": "magent", "version": VERSION }).to_string(),
+                );
+            } else {
+                out.write_human(&format!("magent {}\n", VERSION));
+            }
             ExitCode::SUCCESS
         }
         Command::Run(mut opts) => match RunCmd::new(&mut opts).execute(&mut out) {

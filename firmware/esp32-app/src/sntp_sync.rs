@@ -362,11 +362,19 @@ pub fn run_sntp_supervisor<F>(
             }
             if let Ok(Some(wall)) = read_rtc_unix() {
                 if record_sample(&handle, wall, 0, now).is_ok() {
+                    // Do NOT claim a sync, and do NOT advance `last_sync_ms`.
+                    // No NTP exchange happened here — we only reset the IDF
+                    // daemon's status so it re-polls (within ~30 s) and
+                    // re-recorded the *current* RTC reading, which may still be
+                    // the pre-sync value. Advancing `last_sync_ms` would defer
+                    // the real periodic re-sync (the `elapsed_since_sync`
+                    // check below) by up to `RESYNC_INTERVAL_S` — precisely
+                    // after an operator asked for a *fresher* clock.
                     log::info!(
-                        "[sntp] force-sync recorded: wall_unix={} monotonic_ms={}",
+                        "[sntp] force-sync: re-poll requested; recorded current RTC \
+                         wall_unix={} monotonic_ms={} (no NTP exchange yet)",
                         wall, now
                     );
-                    last_sync_ms = now;
                 }
             } else {
                 log::warn!("[sntp] force-sync: RTC not yet synced");

@@ -174,70 +174,87 @@ pub fn truncate_tool_content(msg: &mut Message, max_chars: usize) -> bool {
 }
 
 /// Slice the message list to at most `max_messages` entries. The
-/// system prompt (if present) and the **oldest** user request are
-/// always kept so the LLM still knows the original task; everything
-/// else is taken from the tail (newest messages win).
+/// **current** turn's user request is always kept (the task anchor, so
+/// the LLM never loses the question it is being asked) and system
+/// messages are kept at the head — unless the budget is too small to
+/// hold both, in which case the oldest system messages are dropped
+/// first. Everything else is taken from the tail (newest messages win).
 ///
 /// Returns the number of messages dropped.
+///
+/// The anchor is the **last** user message, not the first. `run()` pushes
+/// exactly one user message, so the two coincide; `run_continuing()` —
+/// used by the CLI REPL, its only production caller — appends one per
+/// turn, and there the current turn's request is the one that must
+/// survive. Anchoring on the *oldest* user message instead pinned the
+/// session's first task forever, so a window too small to hold a full
+/// turn kept that stale task and the current turn's answers while
+/// dropping the question those answers belonged to (at
+/// `max_messages == 2`, the current task was dropped before the model
+/// ever saw it).
 pub fn slice_messages(messages: &mut Vec<Message>, max_messages: usize) -> usize {
     if max_messages == 0 || messages.len() <= max_messages {
         return 0;
     }
 
     let original_len = messages.len();
-    // `drop_count` is the number of messages we'll evict from the
-    // middle of the conversation. Currently unused after the
-    // algorithm below was simplified to anchor on the first system
-    // and first user message; kept as a debug aid in case future
-    // work needs to log eviction ratios.
-    let _drop_count = original_len - max_messages;
 
     // Find the first index that is *not* a system message. We want to
     // keep system messages at the head even when slicing.
-    let preserved_system = messages
+    let mut preserved_system = messages
         .iter()
         .take_while(|m| m.role == Role::System)
         .count();
 
-    // The oldest user message is the one we want to keep as the
-    // "task anchor" so the LLM never loses the original request.
-    let preserved_user = if messages
+    // The task anchor: the **last** user message (see the doc comment).
+    // `next_back` on the double-ended iterator keeps this O(1) memory.
+    let mut anchor = messages
         .iter()
+        .enumerate()
         .skip(preserved_system)
-        .any(|m| m.role == Role::User)
-    {
-        1
-    } else {
-        0
-    };
+        .filter(|(_, m)| m.role == Role::User)
+        .map(|(i, _)| i)
+        .next_back();
 
-    let preserved_head = preserved_system + preserved_user;
-    if preserved_head >= max_messages {
-        // Pathological case: budget exhausted by the system prompt and
-        // task anchor alone. We always keep the user task (the most
-        // important piece) and drop the head of the system messages
-        // to make room. If `max_messages` is 0, we can't keep
-        // anything — fall back to an empty list.
-        if max_messages == 0 {
-            messages.clear();
-            return original_len;
-        }
-        let keep = max_messages - 1; // reserve 1 slot for the user task
-        let drop_system = preserved_system.saturating_sub(keep);
+    // If the preserved system head alone would fill the budget, shed the
+    // *oldest* system messages to make room for the task anchor (the one
+    // message the LLM cannot recover from losing). Trimming the tail below
+    // then enforces the cap.
+    //
+    // This used to `drain(..drop_system)` and `return` — skipping the tail
+    // trim entirely — so with a single system prompt and `max_messages <= 2`
+    // it dropped **nothing** and the list grew past its documented cap.
+    let reserved = usize::from(anchor.is_some());
+    if preserved_system + reserved > max_messages {
+        let drop_system = preserved_system + reserved - max_messages;
         messages.drain(..drop_system);
-        return original_len - messages.len();
+        preserved_system -= drop_system;
+        anchor = anchor.map(|a| a - drop_system);
     }
 
-    let tail_budget = max_messages - preserved_head;
-    if original_len - preserved_head <= tail_budget {
-        // Nothing to drop from the tail — keep everything.
-        return 0;
+    let len = messages.len();
+    let budget = max_messages - preserved_system;
+    if len - preserved_system <= budget {
+        // Everything after the system head fits — nothing else to drop.
+        return original_len - len;
     }
 
-    // Build the new list: preserved head + tail.
+    let tail_start = len - budget;
     let mut new_messages: Vec<Message> = Vec::with_capacity(max_messages);
-    new_messages.extend(messages[..preserved_head].iter().cloned());
-    new_messages.extend(messages[original_len - tail_budget..].iter().cloned());
+    new_messages.extend(messages[..preserved_system].iter().cloned());
+    match anchor {
+        // The newest `budget` messages do not reach back to the current
+        // task, so keep it plus the newest `budget - 1` messages that
+        // follow it. `anchor < len - budget` means at least `budget`
+        // messages follow, so the anchor and the tail cannot overlap.
+        Some(a) if a < tail_start => {
+            new_messages.push(messages[a].clone());
+            new_messages.extend(messages[len - (budget - 1)..].iter().cloned());
+        }
+        _ => {
+            new_messages.extend(messages[tail_start..].iter().cloned());
+        }
+    }
     *messages = new_messages;
     original_len - messages.len()
 }
@@ -468,6 +485,32 @@ mod tests {
     }
 
     #[test]
+    fn slice_enforces_cap_when_budget_is_barely_above_the_head() {
+        // One system prompt + the task anchor exactly fill a budget of 2.
+        // The head alone must not short-circuit the tail trim: this used to
+        // drop nothing and leave the list above its cap.
+        let mut v: Vec<Message> = vec![system("SYS"), user("task")];
+        for i in 0..10 {
+            v.push(assistant(&format!("a{i}")));
+        }
+        let dropped = slice_messages(&mut v, 2);
+        assert_eq!(v.len(), 2, "cap not enforced (dropped={dropped})");
+        assert_eq!(dropped, 10);
+        assert_eq!(v[0].content, "SYS");
+        assert!(v
+            .iter()
+            .any(|m| m.role == Role::User && m.content == "task"));
+    }
+
+    #[test]
+    fn slice_drops_system_when_budget_is_one_and_keeps_the_task() {
+        let mut v: Vec<Message> = vec![system("SYS"), user("task"), assistant("a")];
+        let dropped = slice_messages(&mut v, 1);
+        assert_eq!(v.len(), 1, "cap not enforced (dropped={dropped})");
+        assert_eq!(v[0].content, "task");
+    }
+
+    #[test]
     fn slice_noop_when_within_budget() {
         let mut v = vec![user("a"), assistant("b"), tool("c1", "c")];
         assert_eq!(slice_messages(&mut v, 10), 0);
@@ -491,10 +534,12 @@ mod tests {
         // System prompt is always at the top.
         assert_eq!(v[0].role, Role::System);
         assert_eq!(v[0].content, "SYS");
-        // Original task survives.
-        assert!(v
-            .iter()
-            .any(|m| m.role == Role::User && m.content == "orig task"));
+        // The **newest** user message is the anchor (the current turn's
+        // request), not the oldest one.
+        assert!(
+            v.iter().any(|m| m.role == Role::User && m.content == "u2"),
+            "the current turn's request was dropped: {v:?}"
+        );
     }
 
     #[test]
@@ -531,6 +576,54 @@ mod tests {
         assert!(v
             .iter()
             .any(|m| m.role == Role::User && m.content == "orig task"));
+    }
+
+    #[test]
+    fn slice_keeps_the_current_task_in_a_multi_turn_session() {
+        // The REPL appends one user message per turn. A window that is too
+        // small to reach back to the *first* task must keep the *current*
+        // one instead: anchoring on the oldest user message kept "task A"
+        // and an answer to "task B" while dropping the question, so the
+        // model was asked nothing.
+        let mut v = vec![
+            system("SYS"),
+            user("task A"),
+            assistant("aA"),
+            user("task B"),
+            assistant("aB"),
+            tool("c1", "t1"),
+        ];
+        let dropped = slice_messages(&mut v, 4);
+        assert_eq!(v.len(), 4);
+        assert_eq!(dropped, 2);
+        assert_eq!(v[0].content, "SYS");
+        assert!(
+            v.iter()
+                .any(|m| m.role == Role::User && m.content == "task B"),
+            "the current turn's task was dropped: {v:?}"
+        );
+    }
+
+    #[test]
+    fn slice_keeps_the_current_task_at_a_two_message_cap() {
+        // Regression: at `--max-messages 2` the old anchor pinned "task A"
+        // (plus the system prompt) and the current task never reached the
+        // model at all.
+        let mut v = vec![
+            system("SYS"),
+            user("task A"),
+            assistant("aA"),
+            user("task B"),
+        ];
+        let dropped = slice_messages(&mut v, 2);
+        assert_eq!(v.len(), 2);
+        assert_eq!(dropped, 2);
+        assert_eq!(v[0].content, "SYS");
+        assert_eq!(
+            v.last().unwrap().content,
+            "task B",
+            "the model was asked the stale task instead of the current one: {v:?}"
+        );
     }
 
     #[test]

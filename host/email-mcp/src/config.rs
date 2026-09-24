@@ -6,7 +6,7 @@
 //! the wider MCP ecosystem (Claude Desktop, Cursor, VS Code all
 //! support `${ENV_VAR}` substitution in their JSON config).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -65,8 +65,7 @@ impl Config {
         if let Some(path) = default_toml_path() {
             if path.exists() {
                 let raw = std::fs::read_to_string(&path)?;
-                let toml: TomlConfig = toml::from_str(&raw).unwrap_or_default();
-                return Self::merge(env_cfg, toml);
+                return Self::from_toml(&raw, &path);
             }
         }
 
@@ -98,18 +97,27 @@ impl Config {
         }
     }
 
-    fn merge(_env: Option<Self>, toml: TomlConfig) -> Result<Self, anyhow::Error> {
-        let imap_host = toml.imap.host.ok_or_else(|| anyhow::anyhow!("email-mcp.toml missing imap.host"))?;
-        let smtp_host = toml.smtp.host.ok_or_else(|| anyhow::anyhow!("email-mcp.toml missing smtp.host"))?;
-        let user = toml.user.ok_or_else(|| anyhow::anyhow!("email-mcp.toml missing user"))?;
-        let password = toml.password.ok_or_else(|| anyhow::anyhow!("email-mcp.toml missing password"))?;
+    /// Parse the TOML fallback and resolve it into a [`Config`].
+    ///
+    /// A malformed file must report the *syntax* error. It previously went
+    /// through `toml::from_str(..).unwrap_or_default()`, so a typo produced an
+    /// empty struct and surfaced as "email-mcp.toml missing imap.host" — which
+    /// sends the operator looking for a field that is right there in the file.
+    fn from_toml(raw: &str, path: &Path) -> Result<Self, anyhow::Error> {
+        let toml: TomlConfig = toml::from_str(raw)
+            .map_err(|e| anyhow::anyhow!("{}: invalid TOML: {e}", path.display()))?;
+        Self::merge(toml, path)
+    }
+
+    fn merge(toml: TomlConfig, path: &Path) -> Result<Self, anyhow::Error> {
+        let missing = |key: &str| anyhow::anyhow!("{}: missing `{key}`", path.display());
         Ok(Self {
-            imap_host,
+            imap_host: toml.imap.host.ok_or_else(|| missing("imap.host"))?,
+            smtp_host: toml.smtp.host.ok_or_else(|| missing("smtp.host"))?,
+            user: toml.user.ok_or_else(|| missing("user"))?,
+            password: toml.password.ok_or_else(|| missing("password"))?,
             imap_port: toml.imap.port.unwrap_or(993),
-            smtp_host,
             smtp_port: toml.smtp.port.unwrap_or(587),
-            user,
-            password,
         })
     }
 }
@@ -134,4 +142,54 @@ fn default_toml_path() -> Option<PathBuf> {
     p.push("magent");
     p.push("email-mcp.toml");
     Some(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const P: &str = "email-mcp.toml";
+
+    #[test]
+    fn valid_toml_resolves() {
+        let cfg = Config::from_toml(
+            r#"
+            user = "a@example.com"
+            password = "s3cret"
+            [imap]
+            host = "imap.example.com"
+            port = 143
+            [smtp]
+            host = "smtp.example.com"
+            "#,
+            Path::new(P),
+        )
+        .expect("valid config");
+        assert_eq!(cfg.imap_host, "imap.example.com");
+        assert_eq!(cfg.imap_port, 143);
+        assert_eq!(cfg.smtp_host, "smtp.example.com");
+        assert_eq!(cfg.smtp_port, 587); // default
+    }
+
+    /// A syntax error used to be swallowed by `unwrap_or_default()`, so the
+    /// operator saw "missing `imap.host`" for a file that *has* `imap.host`.
+    #[test]
+    fn malformed_toml_reports_the_syntax_error() {
+        let err = Config::from_toml("user = =\n", Path::new(P)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid TOML"), "got: {msg}");
+        assert!(
+            !msg.contains("missing"),
+            "misreported as a missing field: {msg}"
+        );
+    }
+
+    #[test]
+    fn well_formed_but_incomplete_toml_names_the_missing_key() {
+        let err = Config::from_toml("user = \"a@example.com\"\n", Path::new(P)).unwrap_err();
+        assert!(
+            err.to_string().contains("missing `imap.host`"),
+            "got: {err}"
+        );
+    }
 }

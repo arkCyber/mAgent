@@ -32,7 +32,9 @@ tools, and a bidirectional UART command interface.
 - **Resource Limits**: Strict memory, time, and iteration budgets
 - **Input Validation**: All inputs validated with bounds checking
 - **Fault Tolerance**: Graceful degradation, watchdog integration
-- **Secure Communication**: Encrypted BLE/Thread with certificate validation
+- **Secure Communication**: certificate-validated HTTPS on the ESP32 path
+  (mbedTLS + the compiled-in CA bundle, `CONFIG_ESP_TLS_INSECURE=n` by
+  default)
 - **Power Management**: Low-power states, battery monitoring
 - **Real-time Guarantees**: Bounded execution time for all operations
 
@@ -84,9 +86,18 @@ below 64 KiB.
 
 | Platform | Architecture | Status | Build Command | Notes |
 |----------|--------------|--------|---------------|-------|
-| **nRF52840** | ARM Cortex-M4F | ✅ Ready | `cargo build -p magent-nrf52-app --release --target thumbv7em-none-eabihf` | Primary smartwatch platform, BLE 5.3 |
+| **nRF52840** | ARM Cortex-M4F | ⚠️ Compiles, scaffold only | `cargo build -p magent-nrf52-app --release --target thumbv7em-none-eabihf` | **Builds and boots, but is not a working agent yet** — see the caveat below. This is *not* the primary platform despite the ordering here; the ESP32-S3 is. |
 | **ESP32-C61** | RISC-V 32-bit | ✅ Ready + Verified on HW | `cd firmware/esp32-app && ./build-c61.sh` | Wi-Fi 6 + BLE 5.0, std (esp-idf-svc), real local tools, bidirectional UART |
 | ESP32-C3/C6 | RISC-V 32-bit | 🔄 Compatible | Use ESP32-C61 config | Same architecture |
+
+> **nRF52840 path caveat (2026-09 audit).** The crate compiles and the task
+> graph runs, but the functionality is scaffolded rather than implemented:
+> `agent_task` logs a fixed list of strings and never drives `MiniAgent`
+> (`firmware/nrf52-app/src/main.rs`); BLE calls are log-only with no
+> `sd_*` SoftDevice calls (`ble.rs`); there is no SAADC battery sampling
+> (`main.rs` simulates battery drain with a counter); and the watchdog is a
+> software counter that never feeds the hardware WDT. Treat it as a porting
+> starting point, not a shippable target.
 | **ESP32-S3** | Xtensa LX7 | ✅ Verified on HW (stable, flagship) | `cd firmware/esp32-app && ./build-s3.sh` | 4MB flash + 4MB quad PSRAM; WiFi STA + DeepSeek cloud LLM + HTTP dashboard verified stable on HW (long-run soak, no leak); TLS T1/T2 (SSL buffers→PSRAM); BLE off (internal-DRAM); Lua off (WiFi PHY esp_timer UAF) |
 
 ## 🏗️ Project Structure
@@ -162,10 +173,10 @@ MicroAgent/
 │   │   ├── Cargo.toml · memory.x · build.rs · .cargo/config.toml
 │   ├── esp32-app/          # ESP32 firmware (esp-idf-svc, std) — C61 + S3 boards
 │   │   ├── src/main.rs      # Entry point, event loop
-│   │   ├── src/{at_dispatch,ble_at,ble_config,ble_gatt,ble_wallet,
-│   │   │        device_key,link_adapters,llm,local_tools,sntp_sync,
-│   │   │        web_admin,latency_metrics,core_affinity,rt_watchdog,
-│   │   │        ping,lua_task,blockchain_transport}.rs
+│   │   ├── src/{at_dispatch,device_key,link_adapters,llm,local_tools,
+│   │   │        sntp_sync,web_admin,wifi_manager,latency_metrics,
+│   │   │        core_affinity,rt_watchdog,ping,lua_task,
+│   │   │        blockchain_transport,ota}.rs
 │   │   ├── Cargo.toml · build.rs · sdkconfig.defaults · sdkconfig.s3.defaults
 │   │   │        · sdkconfig.c61.defaults · partitions.s3.csv
 │   │   │        · build-c61.sh · build-s3.sh · flash-c61.sh · flash-s3.sh
@@ -205,17 +216,37 @@ MicroAgent/
 
 ## 🔒 Security
 
-- **BLE Encryption**: AES-128/256 CCM encryption
-- **Secure Pairing**: Certificate-based authentication
-- **Message Authentication**: Authentication tags for all messages
-- **Security Levels**: None, Low, Medium, High
+> **Status of this section (2026-09 audit).** Several items below were
+> previously stated as delivered capabilities; they are library-level
+> building blocks that the shipped firmware does not yet call. The list now
+> reflects what the code actually does — see `docs/BACKLOG.md` for the work
+> items.
+
+- **HTTPS**: certificate-verified on the ESP32 path (mbedTLS + CA bundle);
+  `CONFIG_ESP_TLS_INSECURE` defaults to `n`. Plain HTTP is still permitted
+  for LAN bring-up (`CONFIG_ESP_HTTP_CLIENT_ALLOW_HTTP_FOR_TESTS=y`).
+- **BLE link security**: `BLE_REQUIRE_ENCRYPTION` gates writes to `SYS_CMD`,
+  `WIFI_PASS` and `LLM_API_KEY` behind an encrypted (bonded) link.
+- **Wi-Fi passphrase at rest**: sealed with a device-bound key (DBO2) before
+  being written to NVS — a raw flash dump does not reveal the passphrase.
+- **Message authentication**: HMAC-SHA-256 tags via `SecurityManager` on
+  `web3` builds. On builds without `web3` this now **fails closed** rather
+  than returning a fake tag.
+- **Crypto at rest (`SecurityManager`)**: real AES-128-GCM on `web3` builds.
+  On embedded builds without `web3` it **fails closed** — it no longer passes
+  plaintext through. Note that the firmware does not currently instantiate
+  `SecurityManager`; this is a library capability, not an active on-device
+  path.
+- **Security Levels**: None, Low, Medium, High (configuration surface).
 
 ## 💾 Flash Management
 
-- **Wear Leveling**: Dynamic, Static, and Hybrid strategies
-- **Wear Monitoring**: Real-time wear level calculation
-- **Wear Detection**: Automatic worn-out detection
-- **Extended Lifetime**: Up to 10x flash lifetime extension
+- **Wear Leveling** (`magent-core/src/wear_leveling.rs`): Dynamic, Static, and
+  Hybrid strategies, with wear monitoring and worn-out detection.
+  > **Not yet wired in**: nothing outside the module's own tests constructs a
+  > `WearLeveler`. The ESP32 firmware stores configuration in ESP-IDF NVS,
+  > which does its own wear levelling; this module is currently unused.
+  > Treat the "10x lifetime" figure as a design target, not a measured result.
 
 ## 🔧 Build Instructions
 

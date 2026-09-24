@@ -180,7 +180,14 @@ impl Flash for NrfFlash {
     fn erase_sector(&mut self, address: u32) -> Result<(), Self::Error> {
         const SECTOR: usize = 4096;
         let sector = (address as usize / SECTOR) * SECTOR;
-        let end = (sector + SECTOR).min(self.data.len());
+        // Same defect as `EspFlash::erase_sector`: a sector beyond the region
+        // produced the range `sector..end` with `sector > end` — a panic rather
+        // than the `OutOfRange` this `Result` advertises. A partial overlap
+        // remains legal and touches only in-region bytes.
+        let end = sector.saturating_add(SECTOR).min(self.data.len());
+        if sector >= end {
+            return Err(NrfError::OutOfRange);
+        }
         for byte in &mut self.data[sector..end] {
             *byte = 0xFF;
         }
@@ -403,6 +410,10 @@ mod tests {
         f.erase_sector(0).unwrap();
         f.read(8, &mut buf[..2]).unwrap();
         assert_eq!(&buf[..2], &[0xFF, 0xFF]);
+        // A sector wholly past the region is a clean error, not the panic the
+        // unchecked `sector..end` range used to produce.
+        assert_eq!(f.erase_sector(8192), Err(NrfError::OutOfRange));
+        assert_eq!(f.erase_sector(u32::MAX), Err(NrfError::OutOfRange));
     }
 
     #[test]

@@ -166,6 +166,11 @@ const MAX_COMPACT_ENTRIES: usize = 256;
 /// locate `value_len` at `1 + key_len` regardless of key size.
 const KV_HEADER_MAX: usize = 1 + 32 + 2;
 
+/// Maximum value length `set` will accept. Enforced on write and on
+/// header parse, so `entry_size` can never exceed `3 + 32 + 256 + 2 = 293`
+/// — comfortably inside the 512-byte scan buffers every reader uses.
+const MAX_VALUE_LEN: usize = 256;
+
 /// Decoded header of a single KV entry.
 ///
 /// The wire format is `[key_len:u8][key: key_len][value_len:u16 LE]
@@ -187,6 +192,16 @@ struct KvHeader {
 /// bytes. Returns `None` for end-of-store (`buf[0] == 0xFF`, i.e. erased)
 /// or a corrupt length (`0` or `> 32`), signalling the caller to stop
 /// scanning.
+///
+/// `value_len` must also be rejected above [`MAX_VALUE_LEN`]. It is a
+/// full `u16` read straight out of flash, so without this check a
+/// corrupt-but-plausible header (valid key, garbage value length) yields
+/// an `entry_size` up to `3 + 32 + 65535 + 2 = 65572`. Callers size
+/// their read buffers at 512 bytes and slice with the header's lengths,
+/// so such a header would panic with an out-of-range slice instead of
+/// surfacing `StorageError::CorruptedData`. Every writer enforces the
+/// 256-byte cap in `set`, so an over-long `value_len` is always
+/// corruption — same policy as the `key_len` check above.
 fn parse_kv_header(buf: &[u8]) -> Option<KvHeader> {
     if buf.len() < KV_HEADER_MAX {
         return None;
@@ -197,6 +212,9 @@ fn parse_kv_header(buf: &[u8]) -> Option<KvHeader> {
     }
     let value_off = 1 + key_len as usize;
     let value_len = u16::from_le_bytes([buf[value_off], buf[value_off + 1]]) as usize;
+    if value_len > MAX_VALUE_LEN {
+        return None; // corrupt value length (writers cap at MAX_VALUE_LEN)
+    }
     Some(KvHeader {
         key_len: key_len as usize,
         value_len,
@@ -209,6 +227,15 @@ where
     F: NorFlash,
 {
     /// Create a new KV store
+    ///
+    /// Precondition: `base_address` must be **sector-aligned**, and the store's
+    /// region must end on a sector boundary. Every scan here bounds itself by
+    /// `FlashStorage::capacity()` treated as a *length* from `base_address`, and
+    /// `compact` reclaims space with [`Self::erase_all`], which erases whole
+    /// sectors: with an unaligned `base_address` the first erased sector starts
+    /// *before* the store, taking unrelated flash with it. Every current caller
+    /// passes 0, where both hold trivially — the constraint is recorded here
+    /// because violating it destroys a neighbour's data rather than failing.
     pub fn new(storage: FlashStorage<F>, base_address: u32) -> Self {
         Self {
             storage,
@@ -232,9 +259,15 @@ where
 
         let mut offset: u32 = 0;
         let mut buf = [0u8; 512];
+        // Bound the scan by the region the store actually owns. A hardcoded
+        // 64 KiB (as this was) walks past the end of a smaller region once the
+        // store fills it, so the next header read faults and a plain lookup on
+        // a *full* store reports `StorageReadFailed` — a hardware fault — where
+        // the answer is simply "key absent". `set` and `collect_live` already
+        // bound themselves with `capacity`; this now matches them.
+        let capacity = self.storage.capacity() as u32;
 
-        while offset < 65536 {
-            // Scan up to 64KB
+        while offset < capacity {
             // HARDENING (audit-2026-08 H1): previously a flash read
             // error here was silently absorbed (`break` -> return
             // `Ok(None)`), so a transient I/O fault on header byte 0
@@ -254,10 +287,6 @@ where
             };
             let key_len = hdr.key_len;
             let value_len = hdr.value_len;
-            if value_len > 256 {
-                offset += hdr.entry_size as u32;
-                continue;
-            }
             let entry_size = hdr.entry_size;
 
             // Read full entry
@@ -326,7 +355,7 @@ where
             });
         }
 
-        if value.len() > 256 {
+        if value.len() > MAX_VALUE_LEN {
             return Err(AgentError::InputValidationFailed {
                 field: "value",
                 reason: crate::error::ValidationError::TooLong,
@@ -551,8 +580,12 @@ where
         let mut valid_entries = 0;
         let mut corrupted_entries = 0;
         let mut used_space = 0;
+        // As in `get`: scan only the region the store owns, not a hardcoded
+        // 64 KiB — otherwise a store whose capacity is smaller faults once it
+        // fills, and the reported figures are taken over bytes it does not own.
+        let capacity = self.storage.capacity() as u32;
 
-        while offset < 65536 {
+        while offset < capacity {
             // HARDENING (audit-2026-08 H1): propagate read failures
             // so `get_stats` reports incomplete data only on success
             // (with the partial-counts caveat) rather than silently
@@ -605,7 +638,11 @@ where
             deleted_entries: 0,
             corrupted_entries,
             used_space,
-            free_space: 65536 - used_space,
+            // `capacity - used_space`, not `65536 - used_space`: the hardcoded
+            // constant reported a nonsensical free space for any region that
+            // was not exactly 64 KiB, and would underflow outright (panicking
+            // under debug overflow checks) once `used_space` passed 64 KiB.
+            free_space: (capacity as usize).saturating_sub(used_space),
         })
     }
 }
@@ -735,7 +772,15 @@ mod tests {
                 return Err(MockErr);
             }
             let start = address as usize;
-            let end = (start + buf.len()).min(self.data.len());
+            // The previous revision clamped `end` to `data.len()` and *then*
+            // tested `end > data.len()` — a guard that could never fire. An
+            // out-of-range read therefore fell through to `copy_from_slice`
+            // with a short source slice and panicked, instead of returning the
+            // error the real HAL flash returns. Leaving `end` unclamped keeps
+            // the double honest about the boundary it is meant to model.
+            let Some(end) = start.checked_add(buf.len()) else {
+                return Err(MockErr);
+            };
             if end > self.data.len() {
                 return Err(MockErr);
             }
@@ -895,6 +940,29 @@ mod tests {
     }
 
     #[test]
+    fn lookup_on_a_full_store_is_a_clean_miss_not_a_read_fault() {
+        // Each entry is 3 + 1 + 250 + 2 = 256 bytes, so exactly 16 fill the
+        // 4096-byte mock region and the scan cursor lands exactly on capacity.
+        let mut kv = empty_kv();
+        let value = [0x41u8; 250];
+        for i in 0..16u8 {
+            let key = alloc::format!("{}", (b'a' + i) as char);
+            kv.set(&key, &value).expect("entry fits");
+        }
+
+        // The store is full. The scan used to keep going to a hardcoded 64 KiB,
+        // reading a header one byte past the end of the region: a lookup for an
+        // absent key returned `StorageReadFailed` (a hardware fault) instead of
+        // a clean miss.
+        assert_eq!(kv.get("z").unwrap(), None);
+        // The same hardcoded bound made the stats scan fault on a full store.
+        let stats = kv.get_stats().unwrap();
+        assert_eq!(stats.valid_entries, 16);
+        assert_eq!(stats.used_space, 4096);
+        assert_eq!(stats.free_space, 0);
+    }
+
+    #[test]
     fn delete_of_missing_key_is_ok() {
         let mut kv = empty_kv();
         assert!(
@@ -1007,6 +1075,69 @@ mod tests {
         let val: Vec<u8> = (0..=255u16).map(|i| (i & 0xFF) as u8).collect();
         kv.set("bin", &val).unwrap();
         assert_eq!(&kv.get("bin").unwrap().unwrap()[..], val.as_slice());
+    }
+
+    // -----------------------------------------------------------------
+    // Corrupt `value_len` in a parsed header (audit-2026-09)
+    // -----------------------------------------------------------------
+    //
+    // `value_len` is a full `u16` read out of flash. A header with a valid
+    // key length but a garbage value length used to yield an `entry_size`
+    // up to 65572, which the 512-byte scan buffers in `collect_live` and
+    // `get_stats` sliced straight through — panicking with an
+    // out-of-range slice on corrupt flash instead of surfacing the
+    // module's typed "corrupted" outcome. Writers cap values at
+    // `MAX_VALUE_LEN`, so an over-long `value_len` is always corruption.
+
+    /// Build a corrupt entry at `addr`: a plausible 1-byte key `"k"` with
+    /// `value_len = 0xFFFF`, i.e. an `entry_size` of 65541 — far past both
+    /// the 512-byte buffer and any legitimate entry.
+    fn write_corrupt_value_len(kv: &mut KvStore<MockFlash>, addr: usize) {
+        kv.storage.flash.data[addr] = 1; // key_len = 1
+        kv.storage.flash.data[addr + 1] = b'k';
+        kv.storage.flash.data[addr + 2] = 0xFF; // value_len = 0xFFFF (LE)
+        kv.storage.flash.data[addr + 3] = 0xFF;
+    }
+
+    #[test]
+    fn get_stats_tolerates_corrupt_value_len_without_panicking() {
+        let mut kv = empty_kv();
+        write_corrupt_value_len(&mut kv, 0);
+        // The corrupt header ends the scan (same policy as a corrupt
+        // key_len), so the store reports empty rather than panicking.
+        let stats = kv.get_stats().unwrap();
+        assert_eq!(stats.total_entries, 0);
+        assert_eq!(stats.corrupted_entries, 0);
+    }
+
+    #[test]
+    fn collect_live_tolerates_corrupt_value_len_without_panicking() {
+        let mut kv = empty_kv();
+        write_corrupt_value_len(&mut kv, 0);
+        // `delete` runs `collect_live` over the whole store; the corrupt
+        // header must stop the scan, not blow the buffer.
+        kv.delete("k").unwrap();
+        // No live entry survived, so nothing is rewritten.
+        assert!(matches!(kv.get("k"), Ok(None)));
+        assert_eq!(kv.get_stats().unwrap().total_entries, 0);
+    }
+
+    #[test]
+    fn parse_kv_header_rejects_value_len_above_max() {
+        let mut buf = [0u8; KV_HEADER_MAX];
+        buf[0] = 1;
+        buf[1] = b'k';
+        buf[2] = 0xFF;
+        buf[3] = 0xFF;
+        assert!(parse_kv_header(&buf).is_none());
+
+        // A boundary value of exactly MAX_VALUE_LEN is still accepted.
+        let max = MAX_VALUE_LEN as u16;
+        buf[2] = (max & 0xFF) as u8;
+        buf[3] = (max >> 8) as u8;
+        let hdr = parse_kv_header(&buf).expect("MAX_VALUE_LEN must parse");
+        assert_eq!(hdr.value_len, MAX_VALUE_LEN);
+        assert_eq!(hdr.entry_size, 3 + 1 + MAX_VALUE_LEN + 2);
     }
 }
 

@@ -15,11 +15,10 @@
 //! `local_tools.rs`). **Wired:** GPIO I/O, internal die temperature, free
 //! heap, PWM output (LEDC — per-pin lazy channels), ADC input (oneshot,
 //! ADC1 GPIO1..=10), I2C master (I2C_NUM_0, register read/write, SDA/SCL pins
-//! via `I2C_SDA_PIN`/`I2C_SCL_PIN`), persistent flash (NVS-backed, address →
-//! keyed blob), and BLE TX (pushes to the connected client's SYS_RSP via the
-//! firmware `ble_config` GATT server — enabled with the `ble` feature). Every
-//! operation returns an explicit `Err` (never a panic) when its hardware isn't
-//! present / connected.
+//! via `I2C_SDA_PIN`/`I2C_SCL_PIN`), and persistent flash (NVS-backed, address
+//! → keyed blob). Every operation returns an explicit `Err` (never a panic)
+//! when its hardware isn't present / connected. `ble_send` always returns
+//! `Err`: BLE was removed from the firmware (see `docs/BACKLOG.md`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -63,7 +62,6 @@ probe("pwm",    function() hardware.pwm_set(1, 50) return "duty=50%" end)
 probe("i2c",    function() return hardware.i2c_read(0x38, 0x0F, 1) end)
 probe("gpio",   function() hardware.gpio_write(2, 1) return "p2=1" end)
 probe("flash",  function() hardware.flash_write(0x100, "HELLO") return hardware.flash_read(0x100, 5) end)
-probe("ble",    function() hardware.ble_send("lua-ok") return "sent" end)
 
 -- Enterprise control loop example: overheat -> drive the fan.
 local temp = hardware.sensor_read("temp")
@@ -361,30 +359,11 @@ fn i2c_read_device(addr: u8, reg: u8, len: usize) -> Result<Vec<u8>, String> {
 // ---------------------------------------------------------------------------
 // Flash (NVS-backed)
 // ---------------------------------------------------------------------------
-// Persistent storage mapped to ESP-IDF NVS. `flash_write(addr, data)` stores a
-// blob under key `flash_<addr:08x>`; `flash_read` reads it back (up to `len`);
-// `flash_erase_sector` removes the key. NVS keys are <=15 chars, so
-// `flash_` + 8 hex digits + NUL = 15 — fits. NVS is already initialised by
-// `main::init_default_nvs()` before the Lua task starts, so we just `nvs_open`
-// here (no `nvs_flash_init`, which would conflict with the esp-idf-svc wrapper).
-const NVS_NAMESPACE: &[u8] = b"magent_lua\0";
-
-/// Open the `magent_lua` NVS namespace read-write.
-fn nvs_open_rw() -> Result<sys::nvs_handle_t, String> {
-    let mut handle: sys::nvs_handle_t = 0;
-    // SAFETY: raw ESP-IDF NVS open; `NVS_NAMESPACE` is a NUL-terminated C string.
-    let r = unsafe {
-        sys::nvs_open(
-            NVS_NAMESPACE.as_ptr() as *const core::ffi::c_char,
-            sys::nvs_open_mode_t_NVS_READWRITE,
-            &mut handle,
-        )
-    };
-    if r != 0 {
-        return Err(format!("nvs_open err={r}"));
-    }
-    Ok(handle)
-}
+// Persistent storage mapped to ESP-IDF NVS by `crate::nvs_flash`:
+// `flash_write(addr, data)` stores a blob under key `flash_<addr:08x>`,
+// `flash_read` reads it back (up to `len`), `flash_erase_sector` removes the
+// key. The same store backs the agent's `flash_read` / `flash_write` tools, so
+// this module keeps no copy of the address->key scheme.
 
 // ---------------------------------------------------------------------------
 // App source (operator-updatable `main.lua` stored in NVS)
@@ -396,7 +375,7 @@ const NVS_APP_KEY: &[u8] = b"main.lua\0";
 
 /// Read the operator-provided `main.lua` from NVS, if present.
 fn nvs_read_app_source() -> Result<Option<String>, String> {
-    let handle = nvs_open_rw()?;
+    let handle = crate::nvs_flash::open_rw()?;
     let mut required: usize = 0;
     // SAFETY: raw ESP-IDF NVS blob length query; returns an `esp_err_t`.
     let q = unsafe {
@@ -459,7 +438,7 @@ fn load_app_source() -> String {
 /// single NVS value or the write fails.
 #[allow(dead_code)] // operator-update entry point; wired from an ingress/AT command
 pub fn set_lua_app_source(source: &str) -> Result<(), String> {
-    let handle = nvs_open_rw()?;
+    let handle = crate::nvs_flash::open_rw()?;
     // SAFETY: raw ESP-IDF NVS blob set; returns an `esp_err_t`.
     let r = unsafe {
         sys::nvs_set_blob(
@@ -484,94 +463,12 @@ pub fn lua_app_source_len() -> Option<usize> {
     nvs_read_app_source().ok().flatten().map(|s| s.len())
 }
 
-/// NVS key for a flash address: `flash_%08x` (14 chars + NUL).
-fn nvs_key(addr: u32) -> [core::ffi::c_char; 15] {
-    // `c_char` is `u8` on Xtensa/ESP-IDF and `i8` on x86_64 — stay portable.
-    let mut key = [0 as core::ffi::c_char; 15];
-    let s = format!("flash_{addr:08x}");
-    for (dst, b) in key.iter_mut().zip(s.as_bytes()) {
-        *dst = *b as core::ffi::c_char;
-    }
-    key
-}
+use crate::nvs_flash::{read as flash_read_device, write as flash_write_device};
 
-fn flash_write_device(addr: u32, data: &[u8]) -> Result<(), String> {
-    let handle = nvs_open_rw()?;
-    let key = nvs_key(addr);
-    // SAFETY: raw ESP-IDF NVS blob set; returns an `esp_err_t`.
-    let r = unsafe {
-        sys::nvs_set_blob(
-            handle,
-            key.as_ptr(),
-            data.as_ptr() as *const core::ffi::c_void,
-            data.len(),
-        )
-    };
-    let c = if r == 0 { unsafe { sys::nvs_commit(handle) } } else { r };
-    // SAFETY: raw ESP-IDF NVS handle close (safe even after a failed op).
-    unsafe { sys::nvs_close(handle) };
-    if c != 0 {
-        return Err(format!("flash_write(addr=0x{addr:08x}) err={c}"));
-    }
-    Ok(())
-}
-
-fn flash_read_device(addr: u32, len: usize) -> Result<Vec<u8>, String> {
-    let handle = nvs_open_rw()?;
-    let key = nvs_key(addr);
-    // First query the stored length (out_value=NULL, length=0).
-    let mut required: usize = 0;
-    // SAFETY: raw ESP-IDF NVS blob length query; returns an `esp_err_t`.
-    let q = unsafe {
-        sys::nvs_get_blob(handle, key.as_ptr(), std::ptr::null_mut(), &mut required)
-    };
-    if q == sys::ESP_ERR_NVS_NOT_FOUND {
-        // SAFETY: raw ESP-IDF NVS handle close.
-        unsafe { sys::nvs_close(handle) };
-        return Err(format!("flash_read(addr=0x{addr:08x}): key not found"));
-    }
-    if q != 0 {
-        // SAFETY: raw ESP-IDF NVS handle close.
-        unsafe { sys::nvs_close(handle) };
-        return Err(format!("flash_read(addr=0x{addr:08x}) query err={q}"));
-    }
-    if required == 0 {
-        // SAFETY: raw ESP-IDF NVS handle close.
-        unsafe { sys::nvs_close(handle) };
-        return Ok(Vec::new());
-    }
-    let mut buf = vec![0u8; len.min(required)];
-    let mut out_len = buf.len();
-    // SAFETY: raw ESP-IDF NVS blob read; returns an `esp_err_t`.
-    let r = unsafe {
-        sys::nvs_get_blob(
-            handle,
-            key.as_ptr(),
-            buf.as_mut_ptr() as *mut core::ffi::c_void,
-            &mut out_len,
-        )
-    };
-    // SAFETY: raw ESP-IDF NVS handle close.
-    unsafe { sys::nvs_close(handle) };
-    if r != 0 {
-        return Err(format!("flash_read(addr=0x{addr:08x}) err={r}"));
-    }
-    buf.truncate(out_len);
-    Ok(buf)
-}
-
+/// `flash_erase_sector` takes an *address*; the shared store keys by address,
+/// so this is a thin alias rather than a sector erase.
 fn flash_erase_sector_device(addr: u32) -> Result<(), String> {
-    let handle = nvs_open_rw()?;
-    let key = nvs_key(addr);
-    // SAFETY: raw ESP-IDF NVS key erase; returns an `esp_err_t`.
-    let r = unsafe { sys::nvs_erase_key(handle, key.as_ptr()) };
-    let c = if r == 0 { unsafe { sys::nvs_commit(handle) } } else { r };
-    // SAFETY: raw ESP-IDF NVS handle close.
-    unsafe { sys::nvs_close(handle) };
-    if c != 0 {
-        return Err(format!("flash_erase_sector(addr=0x{addr:08x}) err={c}"));
-    }
-    Ok(())
+    crate::nvs_flash::erase(addr)
 }
 
 impl HardwareBackend for Esp32Hardware {
@@ -685,19 +582,11 @@ impl HardwareBackend for Esp32Hardware {
         pwm_set_duty(pin, duty)
     }
 
-    // `data` is consumed only in the `ble`-feature branch.
-    #[cfg_attr(not(feature = "ble"), allow(unused_variables))]
-    fn ble_send(&mut self, data: &[u8]) -> std::result::Result<(), String> {
-        // Push to the connected BLE client on SYS_RSP via the firmware's GATT
-        // server (`ble_config`). Only available when built with `--features ble`.
-        #[cfg(feature = "ble")]
-        {
-            return crate::ble_config::ble_send_payload(data);
-        }
-        #[cfg(not(feature = "ble"))]
-        {
-            Err("ble_send: firmware built without the `ble` feature".into())
-        }
+    fn ble_send(&mut self, _data: &[u8]) -> std::result::Result<(), String> {
+        // No BLE radio in this firmware (removed 2026-09-20 — see
+        // `docs/BACKLOG.md`). Always an error so a Lua app that tries to use
+        // the channel fails loudly instead of silently dropping the payload.
+        Err("ble_send: this firmware has no BLE support".into())
     }
 
     fn power_set(&mut self, _profile: u8) -> std::result::Result<(), String> {
@@ -708,7 +597,9 @@ impl HardwareBackend for Esp32Hardware {
 
 /// Build and run the Lua application runtime on a dedicated thread.
 ///
-/// The non-`Send` `AppRuntime` (it owns the sandboxed `mlua::Lua`) is
+/// The non-`Send` `AppRuntime` (it owns the sandboxed Lua interpreter —
+/// `PiccoloVm` on this target, since `magent-lua` is built with
+/// `--features piccolo` because `mlua` cannot build for Xtensa) is
 /// constructed **inside** the spawned closure, so the closure only captures
 /// `Send` values and `std::thread` accepts it. Everything is created on the
 /// new thread and never moved across it.

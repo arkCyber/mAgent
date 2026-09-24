@@ -367,8 +367,10 @@ impl<'a> SummaryCmd<'a> {
     fn delete(&self, topic: &str, out: &mut Output) -> Result<(), SummaryCmdError> {
         let store = FileSummaryStore::open_default();
         store.delete(topic).map_err(SummaryCmdError::Core)?;
-        if out.kind() == OutputKind::Human {
-            out.write_human(&format!("deleted summary {:?}\n", topic));
+        match out.kind() {
+            OutputKind::Human => out.write_human(&format!("deleted summary {:?}\n", topic)),
+            OutputKind::Json => out
+                .write_json_str(serde_json::json!({ "topic": topic, "deleted": true }).to_string()),
         }
         Ok(())
     }
@@ -387,11 +389,9 @@ impl<'a> SummaryCmd<'a> {
             })
         })?;
         // `export` writes the raw JSON to stdout regardless of
-        // `--json` because its job is to feed another command.
-        // We use `out.write_human` as a "raw bytes" channel here
-        // because the export payload shouldn't go through any
-        // pretty-printing or wrapping.
-        out.write_human(&format!("{}\n", json));
+        // `--json` because its job is to feed another command, so
+        // the payload must reach stdout in *both* modes.
+        out.write_stdout_line(&json);
         Ok(())
     }
 
@@ -408,7 +408,9 @@ impl<'a> SummaryCmd<'a> {
                 source: e.to_string(),
             })
         })?;
-        out.write_human(&format!("{}\n", json));
+        // `load` feeds another command with the head/tail window, so
+        // like `export` it must emit to stdout in both modes.
+        out.write_stdout_line(&json);
         Ok(())
     }
 

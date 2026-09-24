@@ -46,7 +46,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::format;
 use std::io::Read;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::string::{String, ToString};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -363,53 +362,24 @@ fn is_html_content_type(ct: &str) -> bool {
 /// metadata 169.254.169.254), or - unless [ALLOW_PRIVATE_NETWORKS]
 /// is set - RFC1918 private networks. This is the SSRF guard for the
 /// web tools.
+///
+/// The host/address classification itself lives in
+/// [`crate::at_validate::public_fetch_target_refusal`] so the host tools and the
+/// firmware's on-device tools (`fetch_web` et al.) share one implementation;
+/// this wrapper only does the URL-shape checks the firmware's URL parser has
+/// already done by the time it calls the classifier.
 fn validate_fetch_url(url: &str) -> Result<(), String> {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(format!("refusing non-http(s) URL: {url}"));
-    }
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or("");
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("").to_string();
-    let host: &str = match authority.rsplit_once('@') {
-        Some((_, h)) => h,
-        None => authority.as_str(),
+    let host = match crate::at_validate::parse_http_authority(url) {
+        Some((h, _port)) => h,
+        None if url.starts_with("http://") || url.starts_with("https://") => {
+            return Err(format!("URL has no host: {url}"))
+        }
+        None => return Err(format!("refusing non-http(s) URL: {url}")),
     };
-    if host.is_empty() {
-        return Err(format!("URL has no host: {url}"));
+    match crate::at_validate::public_fetch_target_refusal(host, ALLOW_PRIVATE_NETWORKS) {
+        Some(reason) => Err(format!("{reason}: {host}")),
+        None => Ok(()),
     }
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
-        return Err(format!("refusing loopback/mDNS host: {host}"));
-    }
-    let lit = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = lit.parse::<Ipv4Addr>() {
-        let blocked = ip.is_loopback()
-            || is_link_local_v4(ip)
-            || (!ALLOW_PRIVATE_NETWORKS && ip.is_private());
-        if blocked {
-            return Err(format!("refusing non-public address: {host}"));
-        }
-    }
-    if let Ok(ip) = lit.parse::<Ipv6Addr>() {
-        let v4_blocked = ip
-            .to_ipv4_mapped()
-            .map(|v4| {
-                v4.is_loopback()
-                    || is_link_local_v4(v4)
-                    || (!ALLOW_PRIVATE_NETWORKS && v4.is_private())
-            })
-            .unwrap_or(false);
-        let blocked = ip.is_loopback() || ip.is_unicast_link_local() || v4_blocked;
-        if blocked {
-            return Err(format!("refusing non-public address: {host}"));
-        }
-    }
-    Ok(())
-}
-
-/// 169.254.0.0/16 - APIPA plus the cloud metadata endpoint 169.254.169.254.
-fn is_link_local_v4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    o[0] == 169 && o[1] == 254
 }
 
 // ---------------------------------------------------------------------------

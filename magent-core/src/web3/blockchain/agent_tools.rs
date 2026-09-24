@@ -1737,7 +1737,7 @@ mod tests {
         let names = tools
             .iter()
             .map(|t| t.name.as_str())
-            .collect::<std::vec::Vec<_>>();
+            .collect::<alloc::vec::Vec<_>>();
         for expected in [
             "get_balance",
             "get_nonce",

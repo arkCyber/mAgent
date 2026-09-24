@@ -120,25 +120,35 @@ Get current memory usage.
 
 ### Watchdog
 
-Hardware watchdog timer interface.
+Software heartbeat latch. It has no clock and no hardware access, so it does
+not enforce a deadline: `feed()` clears the flag, and only the test hook
+`simulate_timeout()` sets it. Real timeout enforcement is in the firmware
+(`firmware/esp32-app/src/rt_watchdog.rs`, `firmware/nrf52-app/src/watchdog.rs`),
+which own a clock and the hardware counter.
 
 #### Methods
 
 ##### `new(timeout_ms: u32) -> Self`
 
-Create a new watchdog with specified timeout.
+Create a new watchdog holding the given nominal timeout (stored, reported via
+`timeout_ms`, not enforced).
 
 ##### `feed(&self)`
 
-Feed the watchdog (reset timer).
+Clear the "needs feed" flag. Does not reset a hardware counter.
 
 ##### `needs_feed(&self) -> bool`
 
-Check if watchdog needs feeding.
+Whether `simulate_timeout()` has been called since the last `feed()`. `false`
+on a running device, where `feed()` is the only writer.
+
+##### `simulate_timeout(&self)`
+
+Test/simulation hook: latch the tripped state, as a real timeout would.
 
 ##### `timeout_ms(&self) -> u32`
 
-Get timeout in milliseconds.
+Get the nominal timeout in milliseconds.
 
 ---
 

@@ -101,11 +101,27 @@ impl SimFlashStorage {
 
     /// Erase a sector (4KB)
     pub fn erase_sector(&mut self, sector: u32) -> Result<()> {
-        let start = sector as usize * 4096;
-        for i in 0..4096.min(65536 - start) {
-            self.data[start + i] = 0xFF;
+        // `65536 - start` underflowed for any out-of-range sector, and the
+        // subsequent `data[start + i]` indexed out of bounds — a panic in debug
+        // and in release alike, even though the `Result` return advertises a
+        // clean failure. A sector either lies wholly inside the region or is
+        // rejected.
+        let start = (sector as usize).saturating_mul(4096);
+        match start
+            .checked_add(4096)
+            .filter(|&end| end <= self.data.len())
+        {
+            Some(end) => {
+                for byte in &mut self.data[start..end] {
+                    *byte = 0xFF;
+                }
+                Ok(())
+            }
+            None => Err(AgentError::StorageWriteFailed {
+                address: u32::try_from(start).unwrap_or(u32::MAX),
+                reason: crate::error::StorageError::BadAddress,
+            }),
         }
-        Ok(())
     }
 }
 
@@ -793,6 +809,19 @@ mod tests {
             flash.write(65534, &[1, 2, 3]),
             Err(AgentError::StorageWriteFailed { .. })
         ));
+        // Erasing a sector outside the region is a clean error, not the panic
+        // the unchecked `65536 - start` used to produce. Sector 16 starts at
+        // exactly the end; `u32::MAX` exercises the multiply overflow path.
+        assert!(matches!(
+            flash.erase_sector(16),
+            Err(AgentError::StorageWriteFailed { .. })
+        ));
+        assert!(matches!(
+            flash.erase_sector(u32::MAX),
+            Err(AgentError::StorageWriteFailed { .. })
+        ));
+        // A valid erase still works after the rejections.
+        assert!(flash.erase_sector(15).is_ok());
     }
 
     #[test]

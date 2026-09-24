@@ -37,9 +37,10 @@
 | 平台 | 架构 | 频率 | RAM | Flash | 无线 | 状态 |
 |---|---|---|---|---|---|---|
 | **nRF52840** | ARM Cortex-M4F | 64 MHz | 256 KB | 1 MB | BLE 5.3 / Thread / Zigbee / 802.15.4 | ✅ Ready(主推,可穿戴) |
-| **ESP32-C61** | RISC-V 32-bit | 160 MHz | 320 KB + 512 KB PSRAM | 8 MB | Wi-Fi 6 + BLE 5.3 | ✅ Ready(联网) |
+| **ESP32-C61** | RISC-V 32-bit | 160 MHz | 320 KB + 512 KB PSRAM | 8 MB | Wi-Fi 6（BLE 已于 2026-09-20 移除） | ✅ Ready(联网) |
 | ESP32-C3 / C6 | RISC-V 32-bit | — | — | — | 同 C61 | 🔄 兼容(沿用 C61 配置) |
-| ESP32 / S3 | Xtensa LX6/LX7 | — | — | — | — | 🔄 进行中(需 Xtensa 工具链) |
+| ESP32-S3 | Xtensa LX7 | 240 MHz | 512 KB + 8 MB PSRAM | 4/8 MB | Wi-Fi + DeepSeek LLM | ✅ Ready(实机验证,见 `ESP32_S3_PORT_SUCCESS.md`) |
+| ESP32 (LX6) | Xtensa LX6 | — | — | — | — | 🔄 未验证(需 Xtensa 工具链) |
 
 二进制实测: nRF52840 **194 KB**( Flash 占用 18.9% / RAM ~2.3%), ESP32-C61 **607 KB**( Flash 占用 7.4%)。
 

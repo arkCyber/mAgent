@@ -49,6 +49,45 @@ impl LlmBackend for Esp32DeepSeekBackend {
         );
         let url = format!("{DEEPSEEK_BASE_URL}/chat/completions");
 
+        // PATCHED (MicroAgent): one bounded retry.
+        //
+        // The first HTTPS request after boot — and the odd later one — can fail
+        // with a TLS handshake error on a phone hotspot (`mbedtls_ssl_handshake
+        // returned -0x0050`). Without a retry a single flake makes `think()`
+        // fall back to the deterministic heuristic *and* sets
+        // `llm_skip_remaining = LLM_SKIP_CALLS (5)`, so the next five tasks are
+        // answered without the model at all — observed on real hardware as
+        // "你好" / "北京天气" silently degrading to a temperature read. Retrying
+        // once keeps a transient network hiccup from disabling the LLM for the
+        // following minute.
+        const ATTEMPTS: usize = 2;
+        let mut last_err: Option<AgentError> = None;
+        for attempt in 1..=ATTEMPTS {
+            // No-op on this worker: `rt_watchdog` only subscribes the Core-1
+            // real-time threads (the isolation design) and `feed()` is
+            // subscription-aware, so calling it here is safe and stays correct
+            // if the worker is ever subscribed.
+            crate::rt_watchdog::feed();
+            match self.post_chat(&url, &body) {
+                Ok(text) => return Ok(text),
+                Err(e) => {
+                    log::warn!(
+                        "[llm] deepseek request failed (attempt {attempt}/{ATTEMPTS}): {e:?}"
+                    );
+                    last_err = Some(e);
+                    if attempt < ATTEMPTS {
+                        std::thread::sleep(Duration::from_millis(300));
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| llm_err("deepseek: no attempt")))
+    }
+}
+
+impl Esp32DeepSeekBackend {
+    /// One `POST /chat/completions` round trip; returns the assistant text.
+    fn post_chat(&self, url: &str, body: &str) -> core::result::Result<String, AgentError> {
         let cfg = HttpConfig {
             // PATCHED (MicroAgent): keep this short — a hung HTTPS/TLS attempt
             // must not block the agent thread long enough to trip a watchdog.
@@ -67,10 +106,12 @@ impl LlmBackend for Esp32DeepSeekBackend {
             ("authorization", auth.as_str()),
         ];
         let mut request = client
-            .request(Method::Post, &url, &headers)
+            .request(Method::Post, url, &headers)
             .map_err(|e| llm_err(e))?;
         request.write_all(body.as_bytes()).map_err(|e| llm_err(e))?;
         request.flush().map_err(|e| llm_err(e))?;
+        // No-op on this unsubscribed worker (see `rt_watchdog::feed`).
+        crate::rt_watchdog::feed();
         let mut response = request.submit().map_err(|e| llm_err(e))?;
 
         let status = response.status();
@@ -85,6 +126,7 @@ impl LlmBackend for Esp32DeepSeekBackend {
         let mut buf = [0u8; 8192];
         let mut read = 0usize;
         while read < buf.len() {
+            crate::rt_watchdog::feed();
             match response.read(&mut buf[read..]) {
                 Ok(0) => break,
                 Ok(n) => read += n,

@@ -44,6 +44,19 @@ use tokio::sync::Mutex;
 /// Maximum length of a tool result string before we truncate it.
 const MAX_RESULT_CHARS: usize = 4096;
 
+/// Largest byte index `<= max` that is a UTF-8 character boundary.
+///
+/// `content[..MAX_RESULT_CHARS]` panics with "byte index is not a char
+/// boundary" whenever the cut lands inside a multi-byte code point — reachable
+/// with any non-ASCII MCP response (an email body, a non-English subject).
+fn char_boundary_at(s: &str, max: usize) -> usize {
+    let mut i = max.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Per-request timeout for the JSON-RPC round-trip.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -308,7 +321,8 @@ impl McpExecutor {
 
         // ── 4. Truncate if needed. ─────────────────────────────────────
         if content.len() > MAX_RESULT_CHARS {
-            let mut truncated = content[..MAX_RESULT_CHARS].to_string();
+            let mut truncated =
+                content[..char_boundary_at(&content, MAX_RESULT_CHARS)].to_string();
             truncated.push_str("… [truncated]");
             Ok(truncated)
         } else {
@@ -502,20 +516,22 @@ impl McpChild {
         //
         // The lock is held only for the duration of the write — no
         // await while holding it.
-        {
+        let write_result: std::io::Result<()> = {
             let mut stdin_guard = self.stdin.lock().await;
             let mut stdin = stdin_guard.take().expect("stdin already taken");
-            stdin
-                .write_all(line.as_bytes())
-                .await
-                .map_err(McpError::Io)?;
-            stdin
-                .write_all(b"\n")
-                .await
-                .map_err(McpError::Io)?;
-            stdin.flush().await.map_err(McpError::Io)?;
+            let r = async {
+                stdin.write_all(line.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                stdin.flush().await?;
+                Ok::<(), std::io::Error>(())
+            }
+            .await;
             // Hand the writer back before dropping the lock.
             *stdin_guard = Some(stdin);
+            r
+        };
+        if let Err(e) = write_result {
+            return Err(self.classify_pipe_error(e));
         }
 
         // ── READ ──────────────────────────────────────────────────────
@@ -545,7 +561,7 @@ impl McpChild {
                     let status = self.child.try_wait().ok().flatten();
                     return Err(McpError::ChildExited(status));
                 }
-                Ok(Err(e)) => return Err(McpError::Io(e)),
+                Ok(Err(e)) => return Err(self.classify_pipe_error(e)),
                 Err(_) => {
                     // Timeout: distinguish between "we timed out waiting"
                     // and "child exited during the wait" by inspecting
@@ -574,6 +590,30 @@ impl McpChild {
                 }
             }
         }
+    }
+
+    /// Classify an IO error raised on one of the child's pipes.
+    ///
+    /// A write to a child that has already died surfaces as EPIPE
+    /// ("Broken pipe"), which names the symptom rather than the cause. The
+    /// obvious fix — consult `try_wait()` — is not sufficient on its own,
+    /// because the process can be gone (its fds closed, hence the EPIPE) while
+    /// the exit has not been reaped yet, so `try_wait()` still answers `None`.
+    /// That is a genuine race, and it made this classification dependent on
+    /// scheduling.
+    ///
+    /// So: prefer a reaped status when there is one, and otherwise treat a
+    /// broken pipe as the child being unreachable — its stdin read end is
+    /// closed, so it cannot serve another request regardless. Anything else is
+    /// a real IO error and passes through unchanged.
+    fn classify_pipe_error(&mut self, e: std::io::Error) -> McpError {
+        if let Some(status) = self.child.try_wait().ok().flatten() {
+            return McpError::ChildExited(Some(status));
+        }
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            return McpError::ChildExited(None);
+        }
+        McpError::Io(e)
     }
 
     /// Return `true` if the child process has not yet exited.
@@ -637,13 +677,14 @@ impl McpToolExecutor {
     }
 
     /// Kill the underlying subprocess, if any.
+    ///
+    /// Best-effort: failures are dropped, because the child is spawned with
+    /// `kill_on_drop` and dies with the process regardless. Must be called
+    /// from *outside* an async context — it blocks on the shared runtime.
     pub fn shutdown(&self) {
-        // The result of `Handle::block_on` is a JoinHandle's Result<()>.
-        // We don't propagate failures here because the subprocess is already
-        // best-effort: callers that need a stronger guarantee should re-export
-        // a fallible variant from here.
+        let handle = tokio_runtime();
         #[allow(clippy::let_unit_value)]
-        let _ = tokio::runtime::Handle::current().block_on(self.inner.shutdown());
+        let _ = handle.block_on(self.inner.shutdown());
     }
 
     /// Synchronous one-shot: forward `tool` to the MCP subprocess.
@@ -660,9 +701,9 @@ impl McpToolExecutor {
 
 impl Default for McpToolExecutor {
     fn default() -> Self {
-        // Search `$PATH` first (works for `cargo install`), then fall
-        // back to the workspace `target/release/` path for developers
-        // running the binary from the repo root.
+        // Bare name, resolved via `$PATH` (works for `cargo install`).
+        // Developers running from the repo root should pass an explicit
+        // `target/release/magent-email-mcp` path instead.
         Self::new("magent-email-mcp")
     }
 }
@@ -873,6 +914,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shutdown_outside_a_tokio_runtime_does_not_panic() {
+        // The crate's documented use case is a plain `fn main()` with no
+        // `#[tokio::main]`, so `shutdown()` must tolerate the absence of a
+        // current runtime handle — `Handle::current()` panics in that case.
+        let exec = McpToolExecutor::new("true");
+        exec.shutdown();
+    }
+
     // ── Async tests (no subprocess) ────────────────────────────────────
     #[tokio::test]
     async fn execute_unknown_tool_returns_error() {
@@ -996,6 +1046,53 @@ mod tests {
             .await
             .expect_err("dead child should error");
         assert!(err.contains("crashed") || err.contains("exited"), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn long_non_ascii_result_is_truncated_without_panicking() {
+        // Regression: the cap used `content[..MAX_RESULT_CHARS]`, a raw byte
+        // index, which panics with "byte index 4096 is not a char boundary"
+        // on any non-ASCII response longer than the budget. "天" is 3 bytes,
+        // so 4096 lands mid-character.
+        let payload = "天".repeat(2000); // 6000 bytes > 4096
+        assert!(payload.len() > MAX_RESULT_CHARS);
+        assert!(!payload.is_char_boundary(MAX_RESULT_CHARS));
+
+        let script = format!(
+            r#"
+            read -r line
+            echo '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":"2024-11-05","serverInfo":{{"name":"mock","version":"0"}},"capabilities":{{"tools":{{}}}}}}}}'
+            read -r line
+            echo '{{"jsonrpc":"2.0","id":1,"result":{{"content":[{{"type":"text","text":"{payload}"}}],"isError":false}}}}'
+        "#
+        );
+        let dir = tempdir();
+        let path = dir.join("mock-mcp-cjk.sh");
+        std::fs::write(&path, script).expect("write mock script");
+
+        let exec = McpExecutor::new(format!("sh {}", path.display()));
+        let out = exec
+            .execute("mcp__email__anything", "{}")
+            .await
+            .expect("long non-ASCII result should not panic");
+
+        assert!(out.ends_with("… [truncated]"), "not truncated: {out:.40}");
+        // Truncated on a character boundary, and within the budget + marker.
+        assert!(out.is_char_boundary(out.len()));
+        assert!(out.len() <= MAX_RESULT_CHARS + "… [truncated]".len());
+
+        exec.shutdown().await;
+    }
+
+    #[test]
+    fn char_boundary_at_never_lands_inside_a_codepoint() {
+        let s = "天".repeat(10); // boundaries at multiples of 3
+        assert_eq!(char_boundary_at(&s, 4), 3);
+        assert_eq!(char_boundary_at(&s, 6), 6);
+        // Past the end clamps to the length rather than panicking.
+        assert_eq!(char_boundary_at(&s, 9999), s.len());
+        assert_eq!(char_boundary_at("", 5), 0);
+        assert_eq!(char_boundary_at("ascii", 3), 3);
     }
 
     // ── Helpers ────────────────────────────────────────────────────────

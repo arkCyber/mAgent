@@ -8,10 +8,10 @@
 //! subscribed, so network-induced blocking never trips the watchdog: that is
 //! the "isolation".
 //!
-//! The timeout (15s) exceeds the worst-case *designed* blocking of the RT
-//! threads (12s HTTPGET worker wait; 10s per LLM channel round-trip), and the
-//! LLM wait itself re-feeds the WDT every second, so a long multi-iteration
-//! ReAct task does not false-trip it either.
+//! The timeout (18s — see `RT_WDT_TIMEOUT_MS`) exceeds the worst-case
+//! *designed* blocking of the RT threads (12s HTTPGET worker wait; 10s per LLM
+//! channel round-trip), and the LLM wait itself re-feeds the WDT every second,
+//! so a long multi-iteration ReAct task does not false-trip it either.
 //!
 //! To avoid the main task (which IDLEs after spawning the worker threads)
 //! tripping the WDT, we set `CONFIG_ESP_TASK_WDT_INIT=n` so ESP-IDF does NOT
@@ -29,10 +29,14 @@
 ///
 /// `rt_wdt` is a `cargo:rustc-cfg` emitted by `build.rs` when the effective
 /// ESP-IDF build has `CONFIG_ESP_TASK_WDT_EN=y`. When the target disables the
-/// task watchdog (e.g. the ESP32-S3 `sdkconfig.s3.defaults` sets it =n, so
-/// `esp_task_wdt.c` is not compiled and the symbols are absent), the `rt_wdt`
-/// cfg is unset and this module degrades to a no-op — matching the config and
-/// keeping the firmware linkable.
+/// task watchdog, the `rt_wdt` cfg is unset and this module degrades to a
+/// no-op — matching the config and keeping the firmware linkable.
+///
+/// Which S3 overlay you build with decides this: `sdkconfig.defaults` (what
+/// `build-s3.sh` uses) sets `CONFIG_ESP_TASK_WDT_EN=y`, so the watchdog **is**
+/// armed on the linked quad-PSRAM board; `sdkconfig.s3.defaults` (the N8R8
+/// octal module, referenced by `flash-secure.sh` / `.cargo/config.toml`) sets
+/// it `=n`, so there it is a no-op.
 #[cfg(all(feature = "board-s3", rt_wdt))]
 const RT_WDT_TIMEOUT_MS: u32 = 18_000;
 
@@ -69,6 +73,19 @@ pub fn arm() -> bool {
     false
 }
 
+// Per-thread subscription flag.
+//
+// `subscribe_current` sets it for the calling task; `feed` only calls
+// `esp_task_wdt_reset` when it is set. The reset API is *per task*, so calling
+// it from an unsubscribed thread fails with
+// `E task_wdt: esp_task_wdt_reset(707): task not found` — and would otherwise
+// flood the console when shared helpers (e.g. the network-tool fetch and the
+// Core-0 LLM worker) call `feed()` defensively.
+#[cfg(all(feature = "board-s3", rt_wdt))]
+thread_local! {
+    static SUBSCRIBED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
 /// Subscribe the *current* task to the RT watchdog. Call at the top of each RT
 /// thread so the WDT monitors it. Best-effort.
 #[cfg(all(feature = "board-s3", rt_wdt))]
@@ -78,6 +95,7 @@ pub fn subscribe_current() {
     if rc != ESP_OK {
         log::warn!("[wdt] esp_task_wdt_add failed (0x{rc:x})");
     }
+    SUBSCRIBED.with(|s| s.set(rc == ESP_OK));
 }
 
 /// No-op when the task watchdog isn't compiled in.
@@ -87,9 +105,15 @@ pub fn subscribe_current() {}
 /// Reset (feed) the RT watchdog for the current task. Call on every RT loop
 /// iteration and during long blocking waits (e.g. the LLM channel wait) so a
 /// *designed* wait never looks like a hang.
+///
+/// Safe to call from any thread: on a task that never subscribed (the Core-0
+/// I/O workers are deliberately unsubscribed — see the module docs) this is a
+/// no-op instead of a failing `esp_task_wdt_reset`.
 #[cfg(all(feature = "board-s3", rt_wdt))]
 pub fn feed() {
-    unsafe { esp_idf_sys::esp_task_wdt_reset() };
+    if SUBSCRIBED.with(|s| s.get()) {
+        unsafe { esp_idf_sys::esp_task_wdt_reset() };
+    }
 }
 
 /// No-op when the task watchdog isn't compiled in.

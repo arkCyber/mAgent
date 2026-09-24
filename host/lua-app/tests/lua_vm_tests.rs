@@ -225,3 +225,29 @@ fn script_can_compute_but_not_touch_os() {
     )
     .unwrap();
 }
+
+#[test]
+fn precompiled_bytecode_chunk_is_rejected() {
+    // `.set_mode(ChunkMode::Text)` in `LuaVm::run_script`. mlua documents the
+    // hazard: "Lua does not check the consistency of the code inside binary
+    // chunks. Running maliciously crafted bytecode can crash the interpreter."
+    // A script whose contents *begin* with the Lua bytecode signature
+    // (`LUA_SIGNATURE` = `\x1bLua`) took the precompiled path by default, since
+    // mlua autodetects the mode. The sandbox's contract is that an untrusted
+    // enterprise script cannot escape or crash the host, so the chunk must be
+    // forced to be parsed as text.
+    //
+    // Only the 4-byte signature is needed: Lua's binary detection is a
+    // `memcmp` against `LUA_SIGNATURE`, so the loader takes the binary branch
+    // (and must then reject it) before it ever looks at the body. This keeps
+    // the test input valid UTF-8, which `run_script(&str)` requires.
+    let (vm, _) = new_vm();
+    let err = vm.run_script("\u{1b}Lua").unwrap_err();
+    match err {
+        LuaHostError::Lua(msg) => assert!(
+            msg.contains("mode"),
+            "expected a text-mode rejection naming the mode, got {msg:?}"
+        ),
+        other => panic!("expected LuaHostError::Lua, got {other:?}"),
+    }
+}

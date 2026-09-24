@@ -75,6 +75,15 @@ impl ToolExecutor for TestExecutor {
     }
 }
 
+/// Build a runner in *explicit* simulation mode (no LLM backend wired up).
+///
+/// Simulation is no longer a fallback: a runner with a configured but
+/// unreachable backend now makes `run()` return `Err` rather than fabricating a
+/// plausible answer. These tests want the scripted responder.
+fn simulated(executor: TestExecutor, config: RunnerConfig) -> RealAgentRunner<TestExecutor> {
+    RealAgentRunner::with_config(executor, config).without_backend()
+}
+
 // ============================================================================
 // nRF52840 Hardware Simulation Tests
 // ============================================================================
@@ -420,7 +429,7 @@ mod agent_tests {
     #[test]
     fn test_agent_initialization() {
         let executor = TestExecutor::new();
-        let runner = RealAgentRunner::new(executor);
+        let runner = simulated(executor, RunnerConfig::default());
 
         assert_eq!(runner.state(), AgentState::Idle);
         assert_eq!(runner.iteration(), 0);
@@ -430,7 +439,7 @@ mod agent_tests {
     #[test]
     fn test_read_temperature_sensor() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 verbose: false,
@@ -447,7 +456,7 @@ mod agent_tests {
     #[test]
     fn test_read_heart_rate() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 verbose: false,
@@ -462,7 +471,7 @@ mod agent_tests {
     #[test]
     fn test_control_led() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 verbose: false,
@@ -478,7 +487,7 @@ mod agent_tests {
     #[test]
     fn test_ble_notification() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 verbose: false,
@@ -494,7 +503,7 @@ mod agent_tests {
     #[test]
     fn test_flash_storage() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 verbose: false,
@@ -510,7 +519,7 @@ mod agent_tests {
     #[test]
     fn test_iteration_limit() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 max_iterations: 2,
@@ -527,7 +536,7 @@ mod agent_tests {
     #[test]
     fn test_multi_sensor_monitoring() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 verbose: false,
@@ -543,7 +552,7 @@ mod agent_tests {
     #[test]
     fn test_smart_home_scenario() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 verbose: false,
@@ -574,7 +583,7 @@ Think step by step. When done, respond with {"result": "..."}"#
     #[test]
     fn test_wearable_health_check() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 verbose: false,
@@ -939,7 +948,7 @@ mod integration_tests {
     #[test]
     fn test_full_agent_workflow() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 verbose: false,
@@ -966,7 +975,7 @@ mod integration_tests {
     #[test]
     fn test_smartwatch_scenario() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 verbose: false,
@@ -1003,7 +1012,7 @@ Your task is to monitor user health and send alerts if needed."#
     #[test]
     fn test_error_recovery() {
         let executor = TestExecutor::new();
-        let mut runner = RealAgentRunner::with_config(
+        let mut runner = simulated(
             executor,
             RunnerConfig {
                 verbose: false,

@@ -84,7 +84,7 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
 | `AT` | `OK` | Handshake. | No-op; used by scripts to verify the UART is alive. |
-| `ATE0` / `ATE1` | `OK` | Toggle local echo of received commands. State kept by the dispatcher. | We accept but the current firmware doesn't drive the UART echo register (the host already sees its own bytes). |
+| `ATE0` / `ATE1` | `OK` | Accepted for ESP-AT script compatibility. | **Accepted but inert** — the dispatcher answers `OK` via `AtOutcome::NoReply` (`AtOutcome::OK == AtOutcome::NoReply`) for either form (`AtOp::SetEcho { .. } => AtOutcome::NoReply`) and stores no echo state; the firmware never drives the UART echo register (the host already sees its own bytes). |
 | `AT+GMR` | `+GMR:…` `OK` | Reports firmware version, AT version, chip. | No IO. |
 | `AT+RST` | `OK` | **Live soft reset** — replies `OK`, then reboots via `esp_restart()` after ~200ms so the reply flushes. | Implemented 2026-08-27 (previously deferred). |
 | `AT+SYSRAM?` | `+SYSRAM:<bytes>` `OK` | Reports free heap (bytes). | `esp_get_free_heap_size()`. |
@@ -99,16 +99,16 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
 | `AT+CWMODE?` | `+CWMODE:<0..3>` `OK` | Wi-Fi mode. | Default 1 (Station). |
-| `AT+CWMODE=<0..3>` | `OK` | Persist mode to `mag_at:wifi_mode`. | Wi-Fi re-applied at next boot. |
-| `AT+CWJAP?` | `+CWJAP:"<ssid>",,0,0` `OK` | Currently-joined SSID (BSSID/RSSI/ch are placeholders until v0.3 reads `esp_wifi_sta_get_state()`). | Read-only. |
+| `AT+CWMODE=1` | `OK` | Persist mode to `mag_at:wifi_mode`. | The only mode this firmware implements; `setup_platform` reads the key at boot. |
+| `AT+CWMODE=2` / `=3` | `+CMDER:7` | **Refused** — SoftAP / dual-mode are unimplemented. | Previously returned `OK` while persisting a mode `setup_platform` then rejects, so the device silently came up with no Wi-Fi on the next boot. Now fails fast. |
 | `AT+CWJAP="ssid","pwd"` | `OK` | Persist credentials to NVS **and reconnect live** (no reboot) — the supervisor reloads them and re-associates immediately. | **Refused in `safe mode`** `+CMDER:4`. Validates SSID ≤32, pass ≤64, no NUL. Sealed with DBO2. |
 | `AT+CWJAP` | `OK` | Re-issue connect with last credentials. | Still deferred to next boot (use `AT+CWJAP=...` for a live connect). |
-| `AT+CWQAP` | `OK` | Disconnect. | Deferred to next boot in v0.2. |
-| `AT+CWLAP` | `+CWLAP:(<ssid>,<rssi>)...` `OK` | List APs from the supervisor's most recent scan (cached when the STA is disconnected). | Cached scan (2026-08-27); falls back to `+CWLAP:scan-started` if no scan has run yet. |
+| `AT+CWQAP` | `OK` | Disconnect **now** — the dispatcher raises a flag the supervisor consumes on its next tick, so the radio goes down and the reconnect path is suppressed until the next `AT+CWJAP=`. | No reboot required. |
+| `AT+CWLAP` | `+CWLAP:(<ssid>,<rssi>);(…)…` `OK` | List APs from the supervisor's most recent scan (cached when the STA is disconnected, re-scanned on demand if the cache is empty). | Entries are `;`-separated, capped at 20 APs; the line is bounded by `REPLY_LINE_MAX` (256 B) and a partial list ends with `...`. Falls back to `+CWLAP:scan-started` while the on-demand scan is in flight. |
 | `AT+CWSTATE?` | `+CWSTATE:<state>[,<ip>]` `OK` | Real Wi-Fi state + IP from the supervisor's live snapshot. | Codes: 0 idle, 1 connecting, 3 associated, 4 disconnected, 5 got-IP. (Previously hard-coded 4.) |
 | `AT+CWHOSTNAME?` / `="name"` | `+CWHOSTNAME:"…"` `OK` | Read/write hostname. | NVS `mag_at:hostname`. Max 32 bytes. |
 | `AT+CWAUTOCONN?` / `=0/1` | `+CWAUTOCONN:<0/1>` `OK` | Auto-connect at boot. | NVS `mag_at:autoconn`. |
-| `AT+CWRECONNCFG?` / `=<int>,<repeat>[,<now>]` | `+CWRECONNCFG:<int>,<repeat>` `OK` | Reconnection policy. ESP-AT bounds: interval ≤7200s, repeat ≤1000. | NVS `mag_at:reconn_int` + `mag_at:reconn_rep`. |
+| `AT+CWRECONNCFG?` / `=<int>,<repeat>[,<now>]` | `+CWRECONNCFG:<int>,<repeat>` `OK` | Reconnection policy. ESP-AT bounds: interval ≤7200s, repeat ≤1000. | NVS `mag_at:reconn_int` + `mag_at:reconn_rep`. **Consumed since 2026-09-23** (previously written but ignored): `interval` caps the reconnect backoff (not the credential-error backoff), `repeat` caps reconnect attempts, after which the supervisor stops until `AT+CWJAP=` or a reboot. Both are read once at supervisor start — a change takes effect on the next reboot. |
 | `AT+CWJAP?` | `+CWJAP:"<ssid>",,0,0,<seal-fmt>` `OK` | Currently-joined SSID + **seal format** of the stored password. `<seal-fmt>` is one of `NONE`, `DBO2`, `DBO1_LEGACY`, `PLAINTEXT_LEGACY`. | Read-only; the extra field lets an operator spot un-migrated entries. |
 | `AT+WIFIPASSUPGRADE?` | `+WIFIPASSUPGRADE:CURRENT` / `+WIFIPASSUPGRADE:LEGACY` / `+WIFIPASSUPGRADE:NO_ENTRY` `OK` | Reports whether `magent:wifi_pass` is already in the current (DBO2) wire format. | Idempotent; safe to run on any device. |
 | `AT+WIFIPASSUPGRADE=1` | `+WIFIPASSUPGRADE:MIGRATED` / `+WIFIPASSUPGRADE:CURRENT` `OK` | Re-seal an existing DBO1 / legacy plaintext entry under **DBO2** in place. Only the literal `=1` argument is accepted. | Idempotent. Re-opens the legacy entry, then writes a fresh DBO2 seal. Refuses with `+CMDER:7` if the stored entry can't be opened. |
@@ -117,9 +117,9 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
-| `AT+CIPSTAMAC?` | `+CIPSTAMAC:"aa:bb:cc:dd:ee:ff"` `OK` | Read the **real** station MAC via `esp_wifi_get_mac`. | Implemented 2026-08-27 (previously a hard-coded placeholder). |
+| `AT+CIPSTAMAC?` | `+CIPSTAMAC:aa:bb:cc:dd:ee:ff` `OK` | Read the **real** station MAC via `esp_wifi_get_mac`. | Implemented 2026-08-27 (previously a hard-coded placeholder). Note: no quotes around the value. |
 | `AT+CIPSTAMAC="aa:bb:cc:dd:ee:ff"` | `+CMDER:4` `ERROR` | Set station MAC. | Requires stopping the radio first; runtime MAC change not supported. |
-| `AT+MACRAND` | `+MACRAND:"aa:bb:cc:dd:ee:ff"` `OK` | Generate a random, locally-administered STA MAC (TRNG) and apply it via `esp_wifi_set_mac`. | Implemented 2026-08-28 (was `+CMDER:9`). Requires the Wi-Fi interface to be stopped (e.g. safe mode); otherwise `+CMDER:6`. |
+| `AT+MACRAND` | `+MACRAND:aa:bb:cc:dd:ee:ff` `OK` | Generate a random, locally-administered STA MAC (TRNG) and apply it via `esp_wifi_set_mac`. | Implemented 2026-08-28 (was `+CMDER:9`). Requires the Wi-Fi interface to be stopped (e.g. safe mode); otherwise `+CMDER:6`. No quotes around the value. |
 | `AT+IDENT?` | `+IDENT:<hex-pubkey>` `OK` | Ed25519 public key (did:key material) in hex. Returns `+IDENT:NO_IDENTITY` if absent. | Read-only; the firmware regenerates identity from hardware TRNG on first boot. |
 | `AT+IDENTROT` | `+IDENTROT:<hex-pubkey>` `OK` | Generate new Ed25519 seed from TRNG and overwrite NVS. | **Refused in `safe mode`**. Atomically persists hex-encoded 32-byte seed to `magent:dev_identity`. |
 
@@ -150,18 +150,19 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
-| `AT+OTA=<url>` | `+OTA:STARTED` `OK` | Stream the firmware image at `url` into the inactive OTA slot (`esp_ota_begin`/`write`/`end`), verify it, set it as the next boot target, and reboot. Runs on a worker thread. | Implemented 2026-08-28 (REQ-FW-005). Every failure aborts the OTA handle and leaves the running firmware untouched. Requires an `ota_0`/`ota_1` + `otadata` partition table. Logs `[ota] OTA completed / failed` on completion. |
+| `AT+OTA=<url>` | `+OTA:STARTED` `OK`, or `+CMDER:7` if the URL is rejected | Stream the firmware image at `url` into the inactive OTA slot (`esp_ota_begin`/`write`/`end`), verify it, set it as the next boot target, and reboot. Runs on a worker thread. | Implemented 2026-08-28 (REQ-FW-005). Since 2026-09-23 the URL is validated **synchronously** (must be `https://`), so a rejected URL returns `+CMDER:7` instead of a `+OTA:STARTED` that never starts. Remaining failures abort the OTA handle and leave the running firmware untouched. Requires an `ota_0`/`ota_1` + `otadata` partition table. Logs `[ota] OTA failed` on failure; the success arm is unreachable (`esp_restart` never returns). |
 
 ### 3.8 Additional implemented commands
 
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
-| `AT+BLE?` / `AT+BLE=<ON\|OFF\|STATE>` | `+BLE:<state>` / `OK` | Query / control BLE advertising state (`ON` start, `OFF` stop, `STATE`/`?` report). | Runs on the process-wide shared `BleServer` (`ble_config::shared_ble_server`) initialised at boot; `OFF` calls `esp_ble_gap_stop_advertising`. Built without `ble` feature → `+CMDER:9`. |
+| `AT+BLE?` / `AT+BLE=<ON\|OFF\|STATE>` | `+CMDER:9` | BLE was **removed from the firmware on 2026-09-20**. The verb is still parsed for command-surface compatibility, but always reports unsupported — it never answers `OK` for a radio that is not there. | See the *BLE removed outright* entry in `docs/BACKLOG.md`. Provision over UART0 (`AT+CWJAP=`, `AT+LLMCFG=`) or the web admin panel instead. |
 | `AT+HTTPGET=<url>` | `OK` / body | Issue an HTTP GET to verify outbound reachability. | TLS via mbedTLS + CA certificate bundle (worker thread). |
 | `AT+LLMCFG=<model>,<api_key>` | `OK` | Set / query the LLM backend parameters (DeepSeek). | NVS-backed (`mag_at:llm_model` / `mag_at:llm_api_key`). |
+| `AT+FLIGHTCFG=<provider>,<token>` | `OK` / `+FLIGHTCFG:<provider>,<masked>` | Set / query the flight-price provider used by the agent's `get_flight_price` tool. Providers: `travelpayouts` (token as query param) or `kiwi` (Tequila key, sent as an `apikey` header). | NVS-backed (`mag_at:flight_provider` / `mag_at:flight_token`); unknown provider → `+CMDER:7`, missing/short args → `+CMDER:4` / `:8`. The reply only ever shows the masked token. |
 | `AT+LUAAPP=<b64>` | `OK` | Upload the Lua app source (base64) for the S3 Lua host; `AT+LUAAPP?` reports length. | `lua` feature (S3 only). |
 | `AT+NTPSYNC` | `OK` | Force an SNTP time sync. | Requires network up (skipped in safe mode). |
-| `AT+TIME?` | `+TIME:…` | Report current wall-clock time (ISO 8601). | Via `sntp_sync`. |
+| `AT+TIME?` | `+TIME:<iso8601>,<wall_secs>,<source>` | Report current wall-clock time. First field is ISO 8601; second is Unix seconds; third is the sync source tag. | Via `sntp_sync`. Reports `+TIME:UNSYNCED` before the first sync, `+TIME:ERROR` if the RTC read fails. |
 | `AT+TIMEZONE=<zone>` | `OK` | Set the timezone. | NVS-backed. |
 
 ---
@@ -196,7 +197,7 @@ Two namespaces are used:
 | `mag_at` | `wifi_mode` | Last `AT+CWMODE=` | Dispatcher | `setup_platform` (rejects 2/3) |
 | `mag_at` | `hostname` | Last `AT+CWHOSTNAME=` | Dispatcher | `connect_wifi` → `sta_netif_mut().set_hostname()` |
 | `mag_at` | `autoconn` | Last `AT+CWAUTOCONN=` | Dispatcher | `setup_platform` (skips blocking connect when 0) |
-| `mag_at` | `reconn_int` / `reconn_rep` | Reconnect policy | Dispatcher | Reserved (v0.3 driver hook) |
+| `mag_at` | `reconn_int` / `reconn_rep` | Reconnect policy | Dispatcher writes; Wi-Fi supervisor reads (since 2026-09-23) | interval caps backoff, repeat caps attempts |
 | `mag_at` | `safemode` | Operator-forced safe mode | `AT+SAFEMODE=` | `read_at_safemode_flag()` (consumed then cleared) |
 | `mag_at` | `sysstore` | `AT+SYSSTORE` toggle | `AT+SYSSTORE=` | `provision_and_load_wifi_credentials` (gates env-var provisioning) |
 
@@ -241,11 +242,19 @@ If you find an AT command whose setting persists to NVS but does
 
 ### 5.3 Wi-Fi password sealing (DBO2, with DBO1 migration path)
 
-The `magent:wifi_pass` entry is **never** stored in plaintext. Every
-write — from `AT+CWJAP=`, from the env-var provisioning path on first
-boot, and from `AT+WIFIPASSUPGRADE=1` — runs the plaintext through
-`magent_core::wifi_pass_seal_v2` (the **DBO2** algorithm) first. A raw
-flash dump of NVS no longer reveals the WPA2 passphrase.
+Every write **made by the firmware** — from `AT+CWJAP=`, from the
+env-var provisioning path on first boot, and from
+`AT+WIFIPASSUPGRADE=1` — runs the plaintext through
+`magent_core::wifi_pass_seal_v2` (the **DBO2** algorithm) first, so a raw
+flash dump of NVS does not reveal the WPA2 passphrase.
+
+> **Caveat — a flash image written by hand bypasses this.** The reader
+> accepts a legacy plaintext entry (`OpenOutcome::LegacyPlaintext`) so that
+> devices provisioned before DBO2 keep working. If you provision by writing
+> an NVS partition image directly (see `docs/DEPLOYMENT_GUIDE.md` §6.1
+> method 2), the value lands in NVS **unsealed** and stays that way until
+> `AT+WIFIPASSUPGRADE=1` re-seals it. Run `AT+WIFIPASSUPGRADE?` after
+> field provisioning and confirm it reports `CURRENT`, not `LEGACY`.
 
 #### Wire format
 
@@ -261,24 +270,26 @@ DBO2:<12-byte nonce><N-byte ciphertext><16-byte MAC>
 
 All three fields are lowercase-ASCII hex (no separators), prefixed by
 the version tag `DBO2:`. The full payload is bounded by
-`wifi_pass_seal_v2::MAX_ENCODED_LEN = 253` bytes (prefix 5 + nonce 24 +
-ciphertext ≤ 192 + MAC 32).
+`wifi_pass_seal_v2::MAX_ENCODED_LEN = 189` bytes, i.e. prefix 5 +
+hex(nonce) 24 + hex(ciphertext) ≤ 128 + hex(MAC) 32 — derived from
+`MAX_PLAINTEXT = 64` and `MAC_LEN = 16`.
 
 #### Algorithm
 
 ```
 device_key  = 32-byte Ed25519 seed from magent:dev_identity
 nonce       = 12 fresh random bytes per write (HW TRNG)
-(cipher_key, mac_key) = HKDF-SHA256(
-    ikm  = device_key,
-    salt = nonce,
-    info = "magent-wifi-pass-seal-v2",
-    L    = 64,
-)
-cipher[i]  =  plain[i] XOR cipher_key[i % 32]
-mac        =  HMAC-SHA256( mac_key, nonce || ciphertext )[0..16]
-stored     =  "DBO2:" || hex(nonce) || hex(cipher) || hex(mac)
+prk         = HKDF-Extract(salt = nonce, ikm = device_key)
+cipher_key  = HKDF-Expand(prk, info = "magent/dbo2/cipher/v1", L = 32)
+mac_key     = HKDF-Expand(prk, info = "magent/dbo2/mac/v1",    L = 32)
+cipher[i]   =  plain[i] XOR cipher_key[i % 32]
+mac         =  HMAC-SHA256( mac_key, nonce || ciphertext )[0..16]
+stored      =  "DBO2:" || hex(nonce) || hex(cipher) || hex(mac)
 ```
+
+The two `info` strings are distinct domain-separation labels
+(`magent/dbo2/cipher/v1` and `magent/dbo2/mac/v1`), so the cipher key and
+the MAC key are independent.
 
 DBO2 strengthens DBO1 in two ways:
 
@@ -378,23 +389,47 @@ one boot session (e.g. a misbehaving provisioning script).
 
 ```sh
 #!/bin/sh
-# Provision 100 devices without rebuilding the firmware.
+# Provision one device without rebuilding the firmware.
+# Run per board (loop over device nodes for a batch).
 DEV=/dev/cu.usbserial-10
-for s in ssid list; do :; done
 
-send() { printf "$1\r\n" > "$DEV"; sleep 0.1; }
+# Open the port once and keep it open for both directions. A bare
+# `printf '...' > "$DEV"` reopens the tty for every write, which
+# discards whatever the device sent in between — so the script
+# could never see an error reply, let alone assert on it.
+stty -f "$DEV" 115200 cs8 -cstopb -parenb -clocal raw -echo
+exec 3<>"$DEV"
 
-send 'ATE0'                  # echo off (script friendly)
-send 'AT+GMR'                # verify firmware
-send 'AT+CWMODE=1'           # station mode
-send 'AT+CWAUTOCONN=1'       # auto-connect at next boot
-send 'AT+CWHOSTNAME="iot-001"'
-send 'AT+CWJAP="HomeWifi","hunter2"'
-send 'AT+CWRECONNCFG=5,100'  # retry every 5s up to 100 times
-send 'AT+SYSSTORE=1'        # persist
-send 'AT+IDENT?'             # record device public key on the server
-send 'AT+RST'                # reboot (effective on next cycle)
+# Send a command and require an expected reply. A write-then-sleep
+# script that never reads cannot tell "OK" from "+CMDER:8", which
+# is how a mis-provisioned fleet ships green.
+send() {                    # $1 = command, $2 = expected regex
+    printf '%s\r\n' "$1" >&3
+    IFS= read -r -t 5 line <&3 || { echo "TIMEOUT: $1" >&2; return 1; }
+    printf '>> %-24s => %s\n' "$1" "$line"
+    printf '%s' "$line" | grep -Eq "$2" || { echo "UNEXPECTED: $1 => $line" >&2; return 1; }
+}
+
+send 'ATE0'                     '^OK'            # echo off (script friendly)
+send 'AT+GMR'                   '^\+GMR:mAgent v'  # verify firmware
+send 'AT+CWMODE=1'              '^OK'            # station mode
+send 'AT+CWAUTOCONN=1'          '^OK'            # auto-connect at next boot
+send 'AT+CWHOSTNAME="iot-001"'  '^OK'
+send 'AT+CWJAP="HomeWifi","hunter2"' '^OK'       # seals + stores the password
+send 'AT+CWRECONNCFG=5,100'     '^OK'            # retry every 5s up to 100 times
+send 'AT+SYSSTORE=1'            '^OK'            # persist
+send 'AT+IDENT?'                '^\+IDENT:'      # record device key on the server
+send 'AT+RST'                   '^OK'            # reboot
+
+# Read back what actually stuck, rather than trusting the writes above.
+printf 'AT+CWJAP?\r\n' >&3 ; IFS= read -r -t 5 l <&3 ; echo "$l"   # expect ,DBO2
+printf 'AT+CWRECONNCFG?\r\n' >&3 ; IFS= read -r -t 5 l <&3 ; echo "$l"
+exec 3<&-
 ```
+
+> Note: `AT+CWJAP?` reports the seal format as its last field
+> (`...,DBO2`). A hand-written NVS image can leave the password in
+> plaintext until `AT+WIFIPASSUPGRADE=1` runs — see §5.3.
 
 ### 6.2 Field maintenance
 
@@ -402,7 +437,7 @@ send 'AT+RST'                # reboot (effective on next cycle)
 # Customer complains Wi-Fi stopped working. SSID changed?
 # Open the serial console (115 200 8N1) and:
 > AT+CWJAP?          # what does the device remember?
-+CWJAP:"OldWiFi",,0,0
++CWJAP:"OldWiFi",,0,0,DBO2
 OK
 > AT+CWJAP="NewWiFi","newpass"
 OK
@@ -422,10 +457,18 @@ OK
 OK                  # next boot will skip Wi-Fi
 > AT+RST
 OK
-# ... later, after fixing the upstream issue ...
-> AT+SAFEMODE=0
-OK
+# The flag is one-shot: `read_at_safemode_flag()` consumes it and
+# `clear_at_safemode_flag()` writes "0" back once it has been
+# applied, so Wi-Fi resumes on the *following* boot without any
+# operator action. `AT+SAFEMODE=0` before the reboot cancels it.
 ```
+
+Safe mode is also entered automatically: a boot counter counts
+consecutive resets, and after `CRASH_LOOP_THRESHOLD = 3` in a row
+the firmware treats it as a crash loop and boots with Wi-Fi
+skipped (`main.rs`). That auto-entry stays active for as long as
+the loop persists; it is not the same one-shot flag `AT+SAFEMODE=1`
+sets.
 
 ---
 
@@ -433,28 +476,30 @@ OK
 
 | Item | How to verify | Where |
 |---|---|---|
-| Parser handles all 28 verbs | Unit + integration tests | `magent-core::at`, `tests/at_tests.rs` |
+| Parser handles all 37 verbs | Unit + integration tests | `magent-core::at`, `tests/at_tests.rs` |
 | Dispatcher never panics on any input | Insert 1000 random AT lines | `at_dispatch::dispatch` test surface (planned for v0.3) |
 | NVS round-trip survives reboot | Set SSID, reboot, query | Flash + serial test |
-| Length caps enforced | SSID 33 chars → `+CMDER:8` | Parser unit test |
-| Safe-mode blocks CWJAP set | Set safemode=1, attempt CWJAP | Firmware trace |
+| Length caps enforced | SSID 33 bytes → `+CMDER:8` | `at_validate.rs` (`CWJAP_SSID_MAX = 32`) |
+| Safe-mode blocks CWJAP set | Set safemode=1, attempt CWJAP → `+CMDER:4` | `at_dispatch::cwjap_dispatch` (safe_mode gate) |
 | IDENTROT survives reboot | Rotate, query, reboot, query | Ed25519 round-trip |
-| **DBO1 seal round-trips** | 22 unit tests (empty / ASCII / UTF-8 / boundary / wrong-key / corrupt / version-tag / nonce-uniqueness) | `magent_core::wifi_pass_seal::tests` |
-| **DBO2 seal round-trips** | 17 unit tests (round-trip / boundary / MAC-tamper / prefix-rejection / length-rejection / DBO1 fallback) | `magent_core::wifi_pass_seal_v2::tests` |
+| **DBO1 seal round-trips** | 24 unit tests (empty / ASCII / UTF-8 / boundary / wrong-key / corrupt / version-tag / nonce-uniqueness) | `magent_core::wifi_pass_seal::tests` |
+| **DBO2 seal round-trips** | 24 unit tests (round-trip / boundary / MAC-tamper / prefix-rejection / length-rejection / DBO1 fallback) | `magent_core::wifi_pass_seal_v2::tests` (requires `--features web3`) |
 | **WIFIPASSUPGRADE parses** | `AT+WIFIPASSUPGRADE?` and `AT+WIFIPASSUPGRADE=1` round-trip via the parser | `magent-core::at::tests::parses_wifipassupgrade_*` |
 | **DBO1 → DBO2 migration** | Seal under DBO1, call `open_sealed_v2`, recover plaintext, seal under DBO2, call `open_sealed_v2`, recover plaintext, assert equal | `magent_core::wifi_pass_seal_v2::tests::dbo1_to_dbo2_migration_round_trip` |
 | **DBO1 not downgraded on error** | Corrupt prefix → `None` returned, not legacy string | `open_stored_wifi_pass` boot path (firmware) |
-| **DBO2 not downgraded on MAC mismatch** | Tamper one byte of ciphertext → `BadMac`, no plaintext returned | `magent_core::wifi_pass_seal_v2::tests::mac_tamper_returns_bad_mac` |
+| **DBO2 not downgraded on MAC mismatch** | Tamper one byte of ciphertext → `BadMac`, no plaintext returned | `magent_core::wifi_pass_seal_v2::tests::tampered_ciphertext_fails_mac` |
 | **No plaintext leaks in log** | Run `AT+CWJAP=`, grep serial for password | Manual / serial-capture test |
 
-Currently the parser has 48 unit + 37 integration tests passing
+Currently the parser has 79 unit + 44 integration tests passing
 (host-side), covering every command + every error code in the
-numerical table above. The DBO1 seal/open layer has 22 unit tests
+numerical table above. The DBO1 seal/open layer has 24 unit tests
 covering boundary conditions, encoding errors, version-tag drift,
-and the nonce-uniqueness property. The DBO2 layer adds 17 unit tests
+and the nonce-uniqueness property. The DBO2 layer adds 24 unit tests
 covering round-trip, MAC-tamper rejection, length-rejection,
 hex-validation, and the transparent DBO1 / legacy plaintext fallback
-that makes the in-place migration safe.
+that makes the in-place migration safe. (DBO2 lives behind the
+`web3` feature, so `cargo test -p magent-core --features web3` is
+what exercises it; the bare default-feature test run does not.)
 
 ---
 
@@ -470,7 +515,7 @@ that makes the in-place migration safe.
 | `AT+CIPSTAMAC` set | refused | live cycle |
 | `AT+SIGN` | ✅ implemented | — |
 | `AT+RESTORE` | ✅ implemented (NVS wipe + reboot) | — |
-| `AT+PING` | refused | needs ICMP |
+| `AT+PING` | ✅ implemented (ICMP via esp_ping, v4 + v6) | — |
 | `AT+IFCONFIG` | ✅ live IP (mask/gw pending) | lwip netif dump |
 | `AT+MACRAND` | ✅ implemented (wifi stopped) | live cycle |
 | `AT+OTA=<url>` | ✅ implemented (stream + verify + reboot) | OTA-only table + rollback |
@@ -483,4 +528,4 @@ ships today and what the tests cover.
 
 ---
 
-*Last reviewed: 2026-08-23 · owner: arksong · doc revision: AT v0.2 (DBO2 + WIFIPASSUPGRADE)*
+*Last reviewed: 2026-09-22 · owner: arksong · doc revision: AT v0.2 (DBO2 + WIFIPASSUPGRADE)*

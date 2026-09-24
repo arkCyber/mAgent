@@ -5,13 +5,14 @@ aerospace-grade Lua 5.4 host** with `hardware.*` and `agent.reason()` bound
 onto `magent-hal` / `magent-core`. This document is the second stage: wiring
 the *same* bindings into `firmware/esp32-app` (S3).
 
-> **Status (2026-08):** the S3 Lua wiring skeleton lives in
+> **Status (2026-09):** the S3 Lua wiring lives in
 > `firmware/esp32-app/src/lua_task.rs`, gated behind a separate **`lua` Cargo
-> feature** (OFF by default). The `board-s3` firmware itself builds and boots.
+> feature** (OFF by default). It is off not because of the build but because the
+> Lua VM **crashes Core0 on hardware** (see `firmware/esp32-app/build-s3.sh:17`).
 > `mlua` cannot build for Xtensa ("don't know how to build Lua for
-> xtensa-esp32s3-espidf"), so the S3 Lua VM must use a **pure-Rust engine.
-> `piccolo`** is now integrated as an optional `piccolo` Cargo feature, with a
-> **Status (2026-08):** the S3 Lua path is now **build-verified end-to-end**:
+> xtensa-esp32s3-espidf"), so the S3 Lua VM uses a **pure-Rust engine**,
+> `piccolo`, integrated as the `piccolo` Cargo feature of `magent-lua`.
+> **The S3 Lua path is build-verified end-to-end**:
 > `cargo +esp build --target xtensa-esp32s3-espidf --no-default-features
 > --features board-s3,wifi,uart,lua --release` compiles the firmware with
 > `PiccoloVm` (pure-Rust `piccolo`, **no `mlua`**) + `Esp32Hardware` +
@@ -20,15 +21,16 @@ the *same* bindings into `firmware/esp32-app` (S3).
 > `default-features = false, features = ["piccolo"]`. `PiccoloVm` covers the
 > full `HardwareBackend` surface + `agent.reason` + `call`/`has`, and the whole
 > runtime is host-verified (mlua 61 tests, mlua+piccolo 67, pure-piccolo 6).
-> Remaining: real S3 board validation (the `Esp32Hardware` drivers and the
-> on-device Lua app).
+> Remaining: **root-cause the on-device Core0 crash** (see `build-s3.sh`), then
+> real S3 board validation (the `Esp32Hardware` drivers and the on-device Lua
+> app).
 
 ## Why S3 and not C61
 
 | Chip | Internal dynamic SRAM | PSRAM | Verdict |
 |---|---|---|---|
-| ESP32‑C61 | ~134 KB | 2 MB | Too tight for WiFi + BLE + agent + a Lua VM |
-| **ESP32‑S3** | **~390 KB** | **8 MB** | Comfortably runs WiFi(DeepSeek) + BLE + agent + Lua |
+| ESP32‑C61 | ~134 KB | 2 MB | Too tight for WiFi + agent + a Lua VM |
+| **ESP32‑S3** | **~390 KB** | **8 MB** | Comfortably runs WiFi(DeepSeek) + agent + Lua |
 
 On the S3 the firmware already uses `esp-idf-svc + std`, and `std::alloc` is
 backed by the 8 MB PSRAM — exactly the heap a Lua VM needs. This is the
@@ -42,21 +44,23 @@ target board for this feature.
 │   └─ spawn "lua-thread" (FreeRTOS task, e.g. stack_size(32*1024))           │
 │        └─ LuaVm::new(hardware_backend, shared_agent)                       │
 │             ├─ hardware  → Esp32Hardware implements magent_lua::HardwareBackend
-│             │              (esp-hal GPIO / I2C / SPI flash / BLE)          │
+│             │              (ESP-IDF gpio / I2C / NVS; LEDC PWM)            │
 │             ├─ agent     → Arc<Mutex<MiniAgent>> with set_llm_backend(DeepSeek)
 │             │              (the firmware's existing DeepSeek HTTP client)   │
 │             └─ run_script(include_bytes main.lua)  (boot-time main loop)    │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Wiring skeleton (design, not yet compiled for Xtensa)
+## Wiring skeleton (build-verified for Xtensa; on-device run pending)
 
 ```rust
 // firmware/esp32-app/src/lua_task.rs  (sketch)
+// NOTE: the real firmware drives `AppRuntime<PiccoloVm>` — `LuaVm` is the
+// mlua-backed engine, which cannot build for Xtensa. Shown here for shape only.
 use magent_lua::{HardwareBackend, LuaVm};
 use magent_core::MiniAgent;
 
-struct Esp32Hardware { /* esp-hal pins, i2c bus, nvs, ble */ }
+struct Esp32Hardware { /* ESP-IDF gpio/pins, i2c bus, nvs */ }
 impl HardwareBackend for Esp32Hardware {
     fn gpio_write(&mut self, pin: u8, level: u8) -> Result<(), String> {
         // gpio: &mut OutputPin; level 0→Low, else High
@@ -98,13 +102,16 @@ fn spawn_lua_thread() {
 > - PWM via **LEDC** (timer 0, 8-bit, 1 kHz; channels 0..7 allocated lazily per GPIO; duty 0..=100 %);
 > - ADC via **oneshot** on **ADC1** (GPIO1..=10 → channels 0..=9, 12-bit, `DB_11`; ADC2 is excluded because it conflicts with the Wi-Fi the firmware uses);
 > - I2C **master** on `I2C_NUM_0` (register read/write via repeated start; SDA/SCL pins are `I2C_SDA_PIN`/`I2C_SCL_PIN` constants, default GPIO9/GPIO8);
-> - persistent **flash** backed by ESP-IDF **NVS** (`flash_<addr:08x>` keyed blobs in the `magent_lua` namespace; NVS already initialised by `main::init_default_nvs()`);
-> - **BLE TX** (`ble_send`) pushes to the connected client's SYS_RSP characteristic via the firmware `ble_config` GATT server (enabled with `--features ble`).
+> - persistent **flash** backed by ESP-IDF **NVS** (`flash_<addr:08x>` keyed blobs in the `magent_lua` namespace; NVS already initialised by `main::init_default_nvs()`).
+>
+> `hardware.ble_send` always returns `Err`: BLE was removed from the firmware on
+> 2026-09-20 (see the *BLE removed outright* entry in `docs/BACKLOG.md`), so
+> there is no GATT server to push to. It errors rather than silently dropping the
+> payload, so a Lua app that depends on the channel fails loudly.
 >
 > The default boot script (`DEFAULT_MAIN_LUA`) is a hardware **self-test** that
 > probes every wired driver inside `pcall` and prints `[lua] <driver> ok/err` to
-> the console. Every `HardwareBackend` method is now wired (BLE returns an error
-> only when no BLE client is connected / the `ble` feature is off).
+> the console. Every `HardwareBackend` method is wired except `ble_send`.
 >
 > **App source loading:** at boot `start_lua_task` prefers an operator-provided
 > `main.lua` stored in NVS (key `main.lua`, written via `set_lua_app_source`),
@@ -120,8 +127,17 @@ fn spawn_lua_thread() {
 Hardware is connected. Build the Lua-enabled firmware and flash it:
 
 ```sh
-# 1. Build (board-s3 + wifi + uart + lua; piccolo engine, no mlua)
-./build-s3.sh
+# 1. Build (board-s3 + wifi + uart + lua; piccolo engine, no mlua).
+#    NOTE: ./build-s3.sh does NOT enable `lua` (it builds board-s3,wifi,uart),
+#    because the Lua VM currently crashes Core0 on hardware — see build-s3.sh:17.
+#    Add `lua` to the feature list there while root-causing, or build directly:
+cd firmware/esp32-app
+MCU=ESP32S3 ESP_IDF_SDKCONFIG_DEFAULTS=sdkconfig.defaults \
+  BINDGEN_EXTRA_CLANG_ARGS="-target xtensa-esp32s3-none-elf" \
+  CC=$HOME/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc \
+  CXX=$HOME/.platformio/packages/toolchain-xtensa-esp-elf/bin/xtensa-esp32s3-elf-g++ \
+  RUSTC_BOOTSTRAP=1 cargo +esp build --target xtensa-esp32s3-espidf \
+  --no-default-features --features board-s3,wifi,uart,lua --release
 
 # 2. Flash and monitor (install `cargo-espflash` if needed)
 espflash flash --monitor target/xtensa-esp32s3-espidf/release/magent-esp32-app
@@ -137,14 +153,15 @@ prints one line per wired driver. Expected console output:
 [lua] i2c   ok  <1 byte from 0x38>    # only if a device (e.g. TMP102/SSD1306) is on GPIO9/GPIO8
 [lua] gpio  ok  p2=1                  # measure GPIO2 high
 [lua] flash ok  HELLO                 # NVS round-trip at address 0x100
-[lua] ble   ok  sent                  # connect a BLE client; else err "no connected BLE client"
 ```
 
 A driver prints `err` (not a crash) when its hardware isn't wired — the
 `pcall`-wrapped probe contains it. `i2c` is expected to print `err` unless a
 device is present on the configured SDA/SCL pins (`I2C_SDA_PIN`/`I2C_SCL_PIN`,
-default GPIO9/GPIO8 — change to match your wiring). `flash`/`ble` return an
-explicit `Err` (not yet wired).
+default GPIO9/GPIO8 — change to match your wiring). Every wired driver returns
+an explicit `Err` (never a crash) when its hardware is absent; `hardware.ble_send`
+is the one method that is *not* wired — it always returns `Err` because BLE was
+removed from the firmware (see above).
 
 ### Updating the app without reflashing (`AT+LUAAPP`)
 
@@ -196,8 +213,8 @@ newlines) survives AT argument parsing losslessly.
 6. **Wire the tested runtime.** Drive [`AppRuntime`](../host/lua-app/src/runtime.rs)
    (39-tested on the host): boot `main.lua` once, then call `tick()` from the
    worker thread and poll `tick_count()` / `uptime_ms()` / `is_stale(...)` as
-   the watchdog heartbeat. The `HardwareBackend` impl (esp-hal GPIO / I2C /
-   PWM / BLE / flash) is the only S3-specific code you write — the loop,
+   the watchdog heartbeat. The `HardwareBackend` impl (ESP-IDF gpio / I2C /
+   LEDC PWM / NVS flash) is the only S3-specific code you write — the loop,
    sandbox, action dispatch, and per-tick error containment are already
    proven. Map [`nvram`](../host/lua-app/src/nvram.rs) `get`/`set` onto
    ESP-IDF NVS (or a flash partition) so `hardware.nvram_*` persists across a

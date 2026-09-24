@@ -12,18 +12,26 @@
 //! (NIST-approved AEAD) instead of the historical XOR placeholder, gated on
 //! the `web3` feature (which pulls in `aes-gcm` + `hmac` + `sha2`).
 //!
-//! ## Backwards compatibility
+//! ## Failure modes
 //!
-//! - Builds without `web3` (the default `cargo check`) keep the historical
-//!   XOR placeholder so the rest of the test suite stays unchanged.
 //! - Builds with `web3` get the real AES-128-GCM encrypt/decrypt round-trip
-//!   and HMAC-SHA-256 auth tags. The wire format is **self-incompatible**
-//!   with the XOR path — it is deliberately a different module so a single
-//!   build picks exactly one.
+//!   and HMAC-SHA-256 auth tags.
+//! - Builds **without** `web3` **fail closed** on embedded targets
+//!   (`no_std`): `encrypt` / `decrypt` / `generate_auth_tag` return
+//!   [`AgentError::CryptoError`]. They never return the input unchanged — see
+//!   the note on [`SecurityManager::encrypt`].
+//! - A `std` build without `web3` uses the XOR simulator so the host test
+//!   suite can exercise the call graph. That path is **test-only and is not a
+//!   security boundary**; never ship it as an encryption story.
 //!
-//! **Security Notice**: Real hardware (nRF52840) continues to delegate
-//! encryption to the SoftDevice AES-CCM engine, which provides FIPS-140-2
-//! compliant authenticated encryption.
+//! The wire formats are mutually incompatible — a single build picks exactly
+//! one.
+//!
+//! **Security Notice**: real hardware (nRF52840) is expected to delegate
+//! encryption to the SoftDevice AES-CCM engine. Note that this module does not
+//! currently call into that engine (see the nRF52 firmware status in
+//! `docs/BACKLOG.md`), so the SoftDevice path is a design intent rather than
+//! verified behaviour.
 
 use crate::error::{AgentError, Result};
 use heapless::{String, Vec};
@@ -310,12 +318,23 @@ impl SecurityManager {
     /// domain-separated constant. The output layout is
     /// `nonce(12) || ciphertext_with_tag(plaintext.len() + 16)`.
     ///
-    /// On builds without `web3` (the historical default) the function
-    /// falls back to the XOR placeholder so the rest of the test suite
-    /// stays unchanged. **Do not** use the XOR path for production data.
+    /// On builds without `web3` the function **fails closed** on embedded
+    /// targets: it returns [`AgentError::CryptoError`] rather than handing the
+    /// plaintext back. Silently returning cleartext from a function named
+    /// `encrypt` is the worst possible failure mode — a caller that ignores
+    /// the `Result` would ship secrets in the clear, and one that *checks* it
+    /// would see `Ok`. An explicit error is always safer than fake
+    /// ciphertext.
     ///
-    /// Production hardware (nRF52840) delegates encryption to the SoftDevice
-    /// AES-CCM engine and never calls this function.
+    /// The one exception is a `std` build without `web3`, which still uses the
+    /// XOR simulator so the host test suite can exercise the call graph. That
+    /// path is **test-only and is not a security boundary**.
+    ///
+    /// Nothing on the nRF52840 calls this function: the firmware has no
+    /// code path into it. The SoftDevice AES-CCM engine is the intended
+    /// production story but is **not wired up** (see the module-level security
+    /// notice), so on that target this method is simply unused rather than
+    /// delegated to a hardware engine.
     pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8, 512>> {
         if !self.encryption_enabled {
             return self.copy_to_vec(data);
@@ -338,9 +357,14 @@ impl SecurityManager {
             }
             #[cfg(not(feature = "std"))]
             {
-                // On embedded, encryption is handled by SoftDevice.
-                // Pass through (real implementation would use crypto hardware).
-                self.copy_to_vec(data)
+                // FAIL CLOSED. There is no AEAD on this path (`web3` is off, so
+                // `aes-gcm`/`hmac` are not compiled in) and the SoftDevice
+                // AES-CCM engine is not reachable from this module. Returning
+                // `copy_to_vec(data)` here used to hand the caller plaintext
+                // while reporting success.
+                Err(AgentError::CryptoError {
+                    reason: crate::error::EncryptionError::CipherError,
+                })
             }
         }
     }
@@ -349,7 +373,12 @@ impl SecurityManager {
     ///
     /// On `web3` builds this inverts [`Self::encrypt`] using AES-128-GCM
     /// and verifies the 16-byte authentication tag (constant-time).
-    /// Without `web3` the historical XOR placeholder is used.
+    ///
+    /// Without `web3` it mirrors [`Self::encrypt`]: the XOR simulator on a
+    /// `std` build (test-only, not a security boundary), and an
+    /// [`AgentError::CryptoError`] on an embedded target, where there is no
+    /// AEAD to invert and a pass-through would make an authentication check
+    /// "succeed" on arbitrary attacker-chosen bytes.
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8, 512>> {
         if !self.encryption_enabled {
             return self.copy_to_vec(data);
@@ -368,7 +397,12 @@ impl SecurityManager {
             }
             #[cfg(not(feature = "std"))]
             {
-                self.copy_to_vec(data)
+                // FAIL CLOSED — see `encrypt` above. A pass-through here would
+                // make `decrypt` an identity function, so an authentication
+                // check would "succeed" on arbitrary attacker-chosen bytes.
+                Err(AgentError::CryptoError {
+                    reason: crate::error::EncryptionError::CipherError,
+                })
             }
         }
     }
@@ -377,7 +411,10 @@ impl SecurityManager {
     ///
     /// On `web3` builds this is a real HMAC-SHA-256 over `data`, hex-encoded
     /// (16 hex chars / 64 bits) so it fits the existing `String<32>` return
-    /// type. On historical builds the simulator hash is used (test-only).
+    /// type. Without `web3` the simulator hash is used on a `std` build
+    /// (test-only); on an embedded target the call fails closed with
+    /// [`AgentError::CryptoError`] rather than returning a "tag" that
+    /// authenticates nothing.
     pub fn generate_auth_tag(&self, data: &[u8]) -> Result<String<32>> {
         #[cfg(feature = "web3")]
         {
@@ -392,16 +429,15 @@ impl SecurityManager {
             }
             #[cfg(not(feature = "std"))]
             {
-                // In a no_std embedded build the real SoftDevice provides the
-                // tag; in this test-only stub we synthesize a short tag from
-                // the data. The exact value doesn't matter for tests - the
-                // round-trip `verify_auth_tag` call below just needs *some*
-                // deterministic output.
-                let mut tag: String<32> = String::new();
-                for &b in data.iter().take(31) {
-                    let _ = core::fmt::Write::write_fmt(&mut tag, format_args!("{:02x}", b));
-                }
-                Ok(tag)
+                // FAIL CLOSED. The old code synthesized a tag by hex-encoding
+                // the plaintext itself. That is not a MAC: anyone can recompute
+                // it, so `verify_auth_tag` would accept forged data. Without
+                // `web3` there is no HMAC here — report the capability gap
+                // instead of returning a tag that authenticates nothing.
+                let _ = data;
+                Err(AgentError::CryptoError {
+                    reason: crate::error::EncryptionError::CipherError,
+                })
             }
         }
     }

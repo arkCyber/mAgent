@@ -12,6 +12,17 @@ use magent_core::agent_runner::{
 };
 use magent_core::real_tools::SimulatorExecutor;
 
+/// Build a runner in *explicit* simulation mode: no LLM backend is wired up,
+/// so every response comes from the built-in scripted responder.
+///
+/// Simulation is no longer a fallback — a runner with a configured but
+/// unreachable backend now makes `run()` return `Err` instead of fabricating a
+/// plausible answer. These tests want the scripted responder, so they ask for
+/// it directly via `without_backend()`.
+fn simulated(executor: TestExecutor, config: RunnerConfig) -> RealAgentRunner<TestExecutor> {
+    RealAgentRunner::with_config(executor, config).without_backend()
+}
+
 /// Test executor that wraps the simulator
 struct TestExecutor {
     simulator: SimulatorExecutor,
@@ -34,7 +45,7 @@ impl ToolExecutor for TestExecutor {
 #[test]
 fn test_agent_initialization() {
     let executor = TestExecutor::new();
-    let runner = RealAgentRunner::new(executor);
+    let runner = simulated(executor, RunnerConfig::default());
 
     assert_eq!(runner.state(), AgentState::Idle);
     assert_eq!(runner.iteration(), 0);
@@ -44,7 +55,7 @@ fn test_agent_initialization() {
 #[test]
 fn test_read_temperature_sensor() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,
@@ -63,7 +74,7 @@ fn test_read_temperature_sensor() {
 #[test]
 fn test_read_humidity_sensor() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,
@@ -81,7 +92,7 @@ fn test_read_humidity_sensor() {
 #[test]
 fn test_read_pressure_sensor() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,
@@ -99,7 +110,7 @@ fn test_read_pressure_sensor() {
 #[test]
 fn test_read_accelerometer() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,
@@ -117,7 +128,7 @@ fn test_read_accelerometer() {
 #[test]
 fn test_control_led_on() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,
@@ -135,7 +146,7 @@ fn test_control_led_on() {
 #[test]
 fn test_control_led_off() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,
@@ -153,7 +164,7 @@ fn test_control_led_off() {
 #[test]
 fn test_send_ble_message() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,
@@ -171,7 +182,7 @@ fn test_send_ble_message() {
 #[test]
 fn test_flash_operations() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,
@@ -189,7 +200,7 @@ fn test_flash_operations() {
 #[test]
 fn test_iteration_limit() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             max_iterations: 2,
@@ -206,11 +217,16 @@ fn test_iteration_limit() {
 #[test]
 fn test_multiple_sensor_reads() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: false,
-            max_tool_calls: 3,
+            // The "monitor" script issues four tool calls (temperature,
+            // humidity, pressure, ble_send) and only then answers. A smaller
+            // budget starves it, so the run ends with no assistant text —
+            // which `get_result` now reports as an error instead of a
+            // fabricated "Task completed".
+            max_tool_calls: 5,
             ..Default::default()
         },
     );
@@ -220,12 +236,13 @@ fn test_multiple_sensor_reads() {
 
     let output = result.unwrap();
     println!("Multi-sensor task result: {}", output);
+    assert!(output.contains("Environmental monitoring complete"));
 }
 
 #[test]
 fn test_agent_message_history() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::new(executor);
+    let mut runner = simulated(executor, RunnerConfig::default());
 
     let result = runner.run("Read temperature");
     assert!(result.is_ok());
@@ -237,7 +254,7 @@ fn test_agent_message_history() {
 #[test]
 fn test_smart_home_scenario() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,
@@ -272,7 +289,7 @@ Think step by step. When done, respond with {"result": "..."}"#
 #[test]
 fn test_environmental_monitoring() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,
@@ -291,7 +308,7 @@ fn test_environmental_monitoring() {
 #[test]
 fn test_health_check() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,
@@ -311,7 +328,7 @@ fn test_health_check() {
 #[test]
 fn test_wearable_device_scenario() {
     let executor = TestExecutor::new();
-    let mut runner = RealAgentRunner::with_config(
+    let mut runner = simulated(
         executor,
         RunnerConfig {
             verbose: true,

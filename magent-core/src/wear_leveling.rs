@@ -60,9 +60,15 @@ pub struct WearLeveler {
 }
 
 impl WearLeveler {
-    /// Create a new wear leveler
+    /// Create a new wear leveler.
+    ///
+    /// `sector_count` is clamped to `1..=16`: the upper bound is the size of the
+    /// fixed `sector_writes` array, and the lower bound matters because the
+    /// rotation strategies compute `% self.sector_count` — a count of 0 would be
+    /// an integer division by zero (a panic, not an error) on the first write
+    /// that reached the rotation threshold.
     pub fn new(sector_count: u32, max_writes_per_sector: u32) -> Self {
-        let sector_count = sector_count.min(16); // Limit to 16 for static array
+        let sector_count = sector_count.clamp(1, 16);
         Self {
             strategy: WearLevelingStrategy::Dynamic,
             current_sector: Cell::new(0),
@@ -410,6 +416,31 @@ mod tests {
         // Should be capped at 16
         let wl = WearLeveler::new(32, 1000);
         assert_eq!(wl.sector_count(), 16);
+    }
+
+    #[test]
+    fn test_zero_sector_count_is_clamped_to_one() {
+        // A zero sector count must not reach the `% self.sector_count` in the
+        // rotation strategies (integer division by zero panics). The rotation is
+        // driven past its threshold *before* any assertion, so on the unfixed
+        // code this test aborts with the `% 0` panic rather than a plain
+        // assertion mismatch.
+        for strategy in [
+            WearLevelingStrategy::Dynamic,
+            WearLevelingStrategy::Static,
+            WearLevelingStrategy::Hybrid,
+        ] {
+            let mut wl = WearLeveler::new(0, 3);
+            wl.set_strategy(strategy);
+
+            // Push the write count past `max_writes_per_sector` so the next
+            // `get_next_sector` actually takes the rotation branch.
+            for _ in 0..4 {
+                wl.increment_write_count();
+                assert_eq!(wl.get_next_sector().unwrap(), 0);
+            }
+            assert_eq!(wl.sector_count(), 1);
+        }
     }
 
     #[test]

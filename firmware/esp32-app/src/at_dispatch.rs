@@ -78,6 +78,12 @@ const NVS_KEY_IDENTITY: &str = "dev_identity";     // shared; in `magent` ns
 const NVS_KEY_LLM_MODEL: &str = "llm_model";
 const NVS_KEY_LLM_API_KEY: &str = "llm_api_key";
 
+// PATCHED (MicroAgent): flight-price provider config for the on-device
+// `get_flight_price` tool (see `local_tools::get_flight_price`). Stored in the
+// same `mag_at` namespace as the LLM config, written by `AT+FLIGHTCFG=`.
+const NVS_KEY_FLIGHT_PROVIDER: &str = "flight_provider";
+const NVS_KEY_FLIGHT_TOKEN: &str = "flight_token";
+
 // ---------------------------------------------------------------------------
 // Buffered response types.
 // ---------------------------------------------------------------------------
@@ -171,6 +177,40 @@ fn load_device_key() -> Result<[u8; 32], &'static str> {
 }
 
 // ---------------------------------------------------------------------------
+// Credential persistence.
+//
+// The NVS keys are shared by the AT dispatcher, the agent readers and the
+// boot-time Wi-Fi provisioning, so they must stay in one place: a passphrase
+// written by `AT+CWJAP=` has to be readable by every reader of
+// `magent:wifi_pass`.
+// ---------------------------------------------------------------------------
+
+/// Seal a Wi-Fi passphrase with the device-bound DBO2 key.
+///
+/// A fresh nonce is drawn from the ESP32 hardware TRNG; the nonce lives only
+/// in this frame. Returns the encoded `DBO2:…` string, or a short reason:
+/// `"no_device_key"` (identity not yet provisioned) or `"trng_unavailable"`.
+pub(crate) fn seal_wifi_password(
+    password: &str,
+) -> Result<HeaplessString<{ wifi_pass_seal_v2::MAX_ENCODED_LEN }>, &'static str> {
+    let device_key = load_device_key().map_err(|_| "no_device_key")?;
+    let mut nonce = [0u8; wifi_pass_seal_v2::NONCE_LEN];
+    if getrandom::getrandom(&mut nonce).is_err() {
+        return Err("trng_unavailable");
+    }
+    let mut sealed: HeaplessString<{ wifi_pass_seal_v2::MAX_ENCODED_LEN }> =
+        HeaplessString::new();
+    wifi_pass_seal_v2::seal_str(password, &device_key, &nonce, &mut sealed)
+        .map_err(|_| "seal_failed")?;
+    Ok(sealed)
+}
+
+/// Persist the Wi-Fi SSID under `magent:wifi_ssid`.
+pub(crate) fn store_wifi_ssid(ssid: &str) -> Result<(), &'static str> {
+    nvs_save(NVS_KEY_WIFI_SSID, ssid, "magent")
+}
+
+// ---------------------------------------------------------------------------
 // Public dispatcher entry.
 // ---------------------------------------------------------------------------
 
@@ -241,7 +281,11 @@ fn dispatch_inner<'a>(
         AtOp::CwMode => cwmode_dispatch(cmd),
         AtOp::CwJap => cwjap_dispatch(cmd, safe_mode),
         AtOp::CwQap => {
-            log::info!("[at] CWQAP — disconnect issued (deferred to next boot)");
+            // The radio handle lives on the supervisor thread, so raise the
+            // request instead of pretending to disconnect. The supervisor
+            // disconnects within one tick (<=3s) and publishes the new state.
+            crate::WIFI_DISCONNECT_REQUESTED.store(true, core::sync::atomic::Ordering::Release);
+            log::info!("[at] CWQAP — disconnect requested (supervisor will apply)");
             AtOutcome::NoReply
         }
         AtOp::CwLap => cwlap_line(),
@@ -287,6 +331,7 @@ fn dispatch_inner<'a>(
         AtOp::HttpGet => http_get_dispatch(cmd),
         AtOp::Ota => ota_dispatch(cmd),
         AtOp::LlmCfg => llmcfg_dispatch(cmd),
+        AtOp::FlightCfg => flightcfg_dispatch(cmd),
         AtOp::Time => time_dispatch(cmd, time_sync, now_ms),
         AtOp::NtpSync => ntp_sync_dispatch(cmd, time_sync, force_ntp_sync, safe_mode),
         AtOp::Timezone => timezone_dispatch(cmd, time_sync),
@@ -389,11 +434,22 @@ fn ota_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
         return AtOutcome::error(7);
     };
     let url = url.to_string();
+    // Validate the URL *before* replying. `perform_ota` re-checks it on the
+    // worker thread, but by then `+OTA:STARTED` has already gone to the
+    // operator — so a plaintext `http://` URL (or a later refusal) looked like
+    // an accepted update that simply never started. Replying with an error here
+    // makes the refusal synchronous and observable.
+    if !crate::ota::validate_ota_url(&url) {
+        log::warn!("[at] AT+OTA refused: {url} is not an https:// URL");
+        return AtOutcome::error(7);
+    }
     log::info!("[at] AT+OTA=<{url}> — starting OTA");
     // The OTA worker streams the image over HTTP and writes the OTA slot —
     // heavy, network-facing work → I/O domain (Core 0).
     crate::core_affinity::apply_profile(crate::core_affinity::ThreadProfile::IO_NETWORK);
     std::thread::spawn(move || match crate::ota::perform_ota(&url) {
+        // Unreachable on success: `perform_ota` calls `esp_restart` and never
+        // returns. Kept so the match is exhaustive.
         Ok(()) => log::info!("[ota] OTA completed; device rebooting"),
         Err(e) => log::error!("[ota] OTA failed: {e}"),
     });
@@ -577,6 +633,19 @@ fn cwmode_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
                 Ok(v) => v,
                 Err(outcome) => return outcome,
             };
+            // This firmware only ever runs as a WiFi station. Mode 1 (STA) is
+            // the only mode the radio is configured for; 2 (AP) and 3 (APSTA)
+            // would require a SoftAP netif that does not exist here. Refuse
+            // them rather than persist a mode nothing reads and report OK —
+            // a client that trusted the OK would then wait forever for an AP
+            // that is not there.
+            if validated.mode != 1 {
+                log::warn!(
+                    "[at] CWMODE={} refused: only station mode (1) is supported",
+                    validated.mode
+                );
+                return AtOutcome::error(7);
+            }
             match nvs_save(NVS_KEY_WIFI_MODE, &validated.mode.to_string(), NS) {
                 Ok(()) => AtOutcome::NoReply,
                 Err(_) => AtOutcome::error(7),
@@ -638,36 +707,23 @@ fn cwjap_dispatch(cmd: &AtCommand<'_>, safe_mode: bool) -> AtOutcome {
             // the Ed25519 seed from `magent:dev_identity` AND the
             // hardware-bound BTDK1 key material AND replicate the
             // ESP32's TRNG output for this specific nonce.
-            let device_key = match load_device_key() {
-                Ok(k) => k,
-                Err(_) => {
-                    log::warn!("[at] CWJAP= refused: no device key in NVS yet");
+            //
+            // The sealing itself lives in [`seal_wifi_password`]. Error codes
+            // here stay distinct so the operator can tell "device not
+            // provisioned yet" (7) from "hardware RNG failed" (6).
+            let sealed = match seal_wifi_password(validated.password.as_str()) {
+                Ok(s) => s,
+                Err("trng_unavailable") => {
+                    log::warn!("[at] CWJAP= refused: TRNG unavailable");
+                    return AtOutcome::error(6);
+                }
+                Err(e) => {
+                    log::warn!("[at] CWJAP= refused: DBO2 seal failed: {e}");
                     return AtOutcome::error(7);
                 }
             };
-            // Draw a fresh nonce from the ESP32 hardware TRNG via
-            // the `getrandom` shim — same source `dev_identity`
-            // uses, so the sealing randomness is consistent
-            // across the firmware. The nonce lives only in this
-            // stack frame; nothing persists.
-            let mut nonce = [0u8; wifi_pass_seal_v2::NONCE_LEN];
-            if getrandom::getrandom(&mut nonce).is_err() {
-                log::warn!("[at] CWJAP= refused: TRNG unavailable");
-                return AtOutcome::error(6);
-            }
-            let mut sealed: HeaplessString<{ wifi_pass_seal_v2::MAX_ENCODED_LEN }> =
-                HeaplessString::new();
-            if let Err(e) = wifi_pass_seal_v2::seal_str(
-                validated.password.as_str(),
-                &device_key,
-                &nonce,
-                &mut sealed,
-            ) {
-                log::warn!("[at] CWJAP= DBO2 seal failed: {e}");
-                return AtOutcome::error(7);
-            }
 
-            if nvs_save(NVS_KEY_WIFI_SSID, validated.ssid.as_str(), "magent").is_err() {
+            if store_wifi_ssid(validated.ssid.as_str()).is_err() {
                 return AtOutcome::error(7);
             }
             if nvs_save(NVS_KEY_WIFI_PASS, sealed.as_str(), "magent").is_err() {
@@ -945,13 +1001,43 @@ fn cwlap_line() -> AtOutcome {
         .clone();
     match cached {
         Some(s) if !s.is_empty() => {
-            // Strip the trailing newline so the reply is a single line.
-            let trimmed = s.trim_end();
+            // PATCHED (MicroAgent): append the cached entries one at a time
+            // instead of formatting the whole list in a single `write!`.
+            //
+            // The reply line is bounded by `REPLY_LINE_MAX` (256 B) and a
+            // scope-less `write_fmt` on the bounded string writes *nothing*
+            // for an argument that does not fit — so the old
+            // `write!(line, "+CWLAP:{trimmed}")` emitted a bare `+CWLAP:`
+            // whenever the (up to 20-entry) cache exceeded the line: the scan
+            // list was effectively invisible, exactly when an operator needs it
+            // most (diagnosing an AP that is not in range). Now we emit as many
+            // entries as fit and mark the truncation with `...`.
+            use magent_core::at_dispatch_outcome::REPLY_LINE_MAX;
             let mut line = ReplyLine::new();
-            let _ = write!(line, "+CWLAP:{trimmed}");
+            let _ = write!(line, "+CWLAP:");
+            let mut truncated = false;
+            for entry in s.lines() {
+                // `;` separator + room for the trailing "..." marker.
+                if line.len() + entry.len() + 1 + 3 > REPLY_LINE_MAX {
+                    truncated = true;
+                    break;
+                }
+                let _ = write!(line, "{entry};");
+            }
+            if truncated {
+                let _ = write!(line, "...");
+            }
             AtOutcome::Ok { data: line }
         }
-        _ => AtOutcome::ok_line("+CWLAP:scan-started"),
+        _ => {
+            // No cached result yet: ask the supervisor to scan now and tell
+            // the client to re-read. Previously this branch returned
+            // "scan-started" without starting anything, so a client that
+            // polled forever never saw a scan happen.
+            crate::WIFI_SCAN_REQUESTED.store(true, core::sync::atomic::Ordering::Release);
+            log::info!("[at] CWLAP — scan requested (re-read AT+CWLAP in a few seconds)");
+            AtOutcome::ok_line("+CWLAP:scan-started")
+        }
     }
 }
 
@@ -1288,7 +1374,13 @@ fn http_get_worker(url: &str) -> Result<ReplyLine, u8> {
         match response.read(&mut buf[read..]) {
             Ok(0) => break,
             Ok(n) => read += n,
-            Err(_) => break,
+            // A mid-body read error is not end-of-body: breaking here made the
+            // command emit `+HTTPGET:<status> bytes=<partial>` as an OK line,
+            // so a truncated preview looked like a complete one.
+            Err(e) => {
+                log::warn!("[at] HTTPGET: body read failed after {read} B: {e}");
+                return Err(6);
+            }
         }
     }
     let lossy = String::from_utf8_lossy(&buf[..read]);
@@ -1313,29 +1405,15 @@ const CONNECT_TIMEOUT_S: u64 = 5;
 /// Extract `(host, port)` from a `http://` / `https://` URL. Handles
 /// optional userinfo (`user:pass@host`), a trailing port, and defaults
 /// (80 for http, 443 for https). Returns `None` for anything else.
+/// Split an `http(s)://` URL into `(host, port)`.
+///
+/// The parsing itself lives in `magent_core::at_validate::parse_http_authority`
+/// so it shares one implementation — and one set of host-side tests — with the
+/// host web tools' SSRF guard. Keeping a second copy here is how the two drifted
+/// far enough apart that `http://::1/` slipped past the guard (see that
+/// function's doc comment).
 pub(crate) fn url_host_port(url: &str) -> Option<(String, u16)> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let is_tls = url.starts_with("https://");
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let authority = authority.rsplit('@').next()?; // strip userinfo
-    if authority.is_empty() {
-        return None;
-    }
-    if let Some(idx) = authority.rfind(':') {
-        // Only treat as port if the part after ':' is all digits and the
-        // host doesn't look like an unbracketed IPv6 literal.
-        let host = &authority[..idx];
-        let port_str = &authority[idx + 1..];
-        if !host.is_empty() && !port_str.is_empty() {
-            if let Ok(port) = port_str.parse::<u16>() {
-                return Some((host.to_string(), port));
-            }
-        }
-        return Some((authority.to_string(), if is_tls { 443 } else { 80 }));
-    }
-    Some((authority.to_string(), if is_tls { 443 } else { 80 }))
+    magent_core::at_validate::parse_http_authority(url).map(|(h, p)| (h.to_string(), p))
 }
 
 /// `AT+LLMCFG?` / `AT+LLMCFG=<model>,<api_key>` — query / set the LLM
@@ -1377,18 +1455,78 @@ fn llmcfg_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
     }
 }
 
+/// `AT+FLIGHTCFG=<provider>,<token>` — configure the flight-price data provider
+/// used by the on-device `get_flight_price` tool; `AT+FLIGHTCFG?` reports the
+/// configured provider with the token masked.
+///
+/// PATCHED (MicroAgent): the device has no keyless flight-price source (verified
+/// from the board: Travelpayouts → 401 without a token, Ctrip → 432 whaleguard,
+/// Kiwi's legacy endpoint → unreachable), so the tool is key-driven exactly like
+/// the LLM backend: the operator provisions the provider + token here and it is
+/// persisted in NVS.
+fn flightcfg_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
+    match cmd.kind {
+        AtCommandKind::Query => {
+            let provider = nvs_load(NVS_KEY_FLIGHT_PROVIDER, NS).unwrap_or_default();
+            let token = nvs_load(NVS_KEY_FLIGHT_TOKEN, NS).unwrap_or_default();
+            let mut line = ReplyLine::new();
+            let _ = write!(line, "+FLIGHTCFG:{},{}", provider, mask_key(&token));
+            AtOutcome::Ok { data: line }
+        }
+        AtCommandKind::Set => {
+            let validated = match magent_core::at_validate::validate_flightcfg_set(cmd) {
+                Ok(v) => v,
+                Err(outcome) => return outcome,
+            };
+            match (
+                nvs_save(NVS_KEY_FLIGHT_PROVIDER, validated.provider.as_str(), NS),
+                nvs_save(NVS_KEY_FLIGHT_TOKEN, validated.token.as_str(), NS),
+            ) {
+                (Ok(()), Ok(())) => {
+                    log::info!(
+                        "[at] FLIGHTCFG: provider={} token set (masked {})",
+                        validated.provider.as_str(),
+                        mask_key(validated.token.as_str())
+                    );
+                    AtOutcome::NoReply
+                }
+                _ => AtOutcome::error(7),
+            }
+        }
+        _ => AtOutcome::error(4),
+    }
+}
+
+/// Flight provider config for the tool layer: `(provider, token)`, or `None`
+/// when `AT+FLIGHTCFG=` has not been run. Kept here (not in `local_tools`) so
+/// the NVS key names stay in one place.
+pub(crate) fn flight_cfg() -> Option<(std::string::String, std::string::String)> {
+    let provider = nvs_load(NVS_KEY_FLIGHT_PROVIDER, NS)?;
+    let token = nvs_load(NVS_KEY_FLIGHT_TOKEN, NS)?;
+    if provider.is_empty() || token.is_empty() {
+        return None;
+    }
+    Some((provider.to_string(), token.to_string()))
+}
+
 /// Mask a secret for display: keep the first 4 and last 4 chars, fill the
 /// rest with `*`. A short secret is fully masked.
+///
+/// Indexes by **character**, not byte. Slicing `&key[..4]` panicked whenever
+/// byte 4 landed inside a multi-byte code point — reachable from the
+/// `AT+LLMCFG=?` / `AT+FLIGHTCFG=?` query path with any non-ASCII API key or
+/// token, turning a config *report* into a device reboot.
 fn mask_key(key: &str) -> HeaplessString<40> {
     let mut out = HeaplessString::new();
-    let b = key.as_bytes();
-    if b.len() <= 8 {
+    if key.chars().count() <= 8 {
         let _ = out.push_str("****");
         return out;
     }
-    let _ = out.push_str(&key[..4]);
+    let head: std::string::String = key.chars().take(4).collect();
+    let tail: std::string::String = key.chars().skip(key.chars().count() - 4).collect();
+    let _ = out.push_str(&head);
     let _ = out.push_str("…");
-    let _ = out.push_str(&key[b.len() - 4..]);
+    let _ = out.push_str(&tail);
     out
 }
 
@@ -1397,19 +1535,11 @@ fn mask_key(key: &str) -> HeaplessString<40> {
 // ---------------------------------------------------------------------------
 
 fn escape_wire(s: &str) -> HeaplessString<128> {
-    let mut out = HeaplessString::new();
-    for c in s.chars() {
-        match c {
-            '"' | '\\' => {
-                if out.push('\\').is_err() { break; }
-                if out.push(c).is_err() { break; }
-            }
-            '\n' => { let _ = out.push_str("\\n"); }
-            '\r' => { let _ = out.push_str("\\r"); }
-            other => { if out.push(other).is_err() { break; } }
-        }
-    }
-    out
+    // Shared with the host so one set of tests covers the escaping rules; see
+    // `magent_core::at::escape_wire` for why CR/LF and a dangling backslash
+    // both matter. Truncation never happens for a legal input (a 32-byte SSID
+    // escapes to at most 64 bytes).
+    magent_core::at::escape_wire(s)
 }
 
 /// `AT+TIME?` — report the current wall-clock time as ISO 8601 UTC
@@ -1528,82 +1658,17 @@ fn timezone_dispatch(
     }
 }
 
-/// `AT+BLE?` / `AT+BLE=<ON|OFF|STATE>` — query / control the BLE
-/// peripheral.
+/// `AT+BLE?` / `AT+BLE=<ON|OFF|STATE>` — always `+CMDER:9`.
 ///
-/// The verb is validated by `magent_core::at_validate::validate_ble_set`
-/// so a malformed `AT+BLE=` line returns a precise `+CMDER:4` / `:7`
-/// instead of falling through. The actual `BleServer` operation is
-/// executed on the process-wide shared server
-/// (`ble_config::shared_ble_server`) that `main.rs` initialises at boot,
-/// so `AT+BLE=ON/OFF/STATE` now actually drives advertising state instead
-/// of returning `+CMDER:9`.
-#[cfg_attr(not(feature = "ble"), allow(unused_variables))] // `cmd` unused when BLE is off
-fn ble_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
-    #[cfg(not(feature = "ble"))]
-    {
-        // BLE stack isn't compiled into this build — a syntactically-valid
-        // `AT+BLE=` verb is unsupported (never silently swallowed).
-        return AtOutcome::error(9);
-    }
-    #[cfg(feature = "ble")]
-    {
-        ble_dispatch_impl(cmd)
-    }
-}
-
-/// `AT+BLE` implementation behind the `ble` feature (see [`ble_dispatch`]).
-#[cfg(feature = "ble")]
-fn ble_dispatch_impl(cmd: &AtCommand<'_>) -> AtOutcome {
-    // Query form: `AT+BLE?` → report the current advertising state.
-    if cmd.kind == AtCommandKind::Query {
-        let server = crate::ble_config::shared_ble_server();
-        let guard = server.lock().unwrap_or_else(|e| e.into_inner());
-        return AtOutcome::ok_line(format!("+BLE:{}", ble_state_str(guard.get_state())));
-    }
-
-    let validated = match magent_core::at_validate::validate_ble_set(cmd) {
-        Ok(v) => v,
-        Err(outcome) => return outcome,
-    };
-
-    let server = crate::ble_config::shared_ble_server();
-    let mut guard = server.lock().unwrap_or_else(|e| e.into_inner());
-    use magent_core::at_validate::BleAction;
-    match validated.action {
-        BleAction::Start => {
-            if let Err(e) = guard.init() {
-                log::error!("[ble] AT+BLE=ON init failed: {e:?}");
-                return AtOutcome::error(9);
-            }
-            if let Err(e) = guard.start_advertising() {
-                log::error!("[ble] AT+BLE=ON start_advertising failed: {e:?}");
-                return AtOutcome::error(9);
-            }
-            AtOutcome::ok_line("OK")
-        }
-        BleAction::Stop => {
-            if let Err(e) = guard.stop_advertising() {
-                log::error!("[ble] AT+BLE=OFF stop_advertising failed: {e:?}");
-                return AtOutcome::error(9);
-            }
-            AtOutcome::ok_line(format!("+BLE:{}", ble_state_str(guard.get_state())))
-        }
-        BleAction::State => AtOutcome::ok_line(format!("+BLE:{}", ble_state_str(guard.get_state()))),
-    }
-}
-
-/// Human-readable BLE state string for the `+BLE:` reply line.
-#[cfg(feature = "ble")]
-fn ble_state_str(s: crate::ble_config::BleState) -> &'static str {
-    use crate::ble_config::BleState;
-    match s {
-        BleState::Idle => "idle",
-        BleState::Initializing => "initializing",
-        BleState::Advertising => "advertising",
-        BleState::Connected => "connected",
-        BleState::Error => "error",
-    }
+/// BLE was removed from the firmware on 2026-09-20: the Bluedroid controller
+/// needs ~244 KB of contiguous DMA-capable internal DRAM, which neither the
+/// C61 (~134 KiB) nor the S3 (~253 KiB free) can supply alongside Wi-Fi and
+/// the agent threads (see `docs/BACKLOG.md`). The `AT+BLE` verb is still
+/// *parsed* — command-surface compatibility — but reports "unsupported"
+/// rather than silently answering `OK` for a radio that is not there.
+fn ble_dispatch(_cmd: &AtCommand<'_>) -> AtOutcome {
+    log::warn!("[at] AT+BLE refused: BLE support was removed from this firmware");
+    AtOutcome::error(9)
 }
 
 // Suppress dead-code warnings for shared NVS keys that exist but are

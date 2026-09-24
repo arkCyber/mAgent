@@ -187,21 +187,25 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          /root/.cargo/registry
-            /root/.cargo/git
           key: ${{ runner.os }}-cargo-esp32c61-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-esp32c61-
 
-      - name: cargo build (ESP32-C61, release)
+      # Run the same script a developer runs, NOT a bare `cargo build`.
+      # `sdkconfig.c61.defaults` is only honoured because `build-c61.sh` swaps it
+      # into the standard-named `sdkconfig.defaults` (PlatformIO's idf.py reads
+      # no other filename) for the duration of the build. A bare `cargo build`
+      # here therefore compiled the C61 against the *S3* config — which masked a
+      # real break: `sdkconfig.c61.defaults` had `CONFIG_LWIP_IPV6=n` while
+      # `ping.rs` referenced `esp_idf_sys::ip6_addr`, so the C61 firmware did not
+      # build locally while CI stayed green. Keep this going through the script
+      # so CI and local builds cannot diverge again.
+      - name: build (ESP32-C61, release)
         working-directory: firmware/esp32-app
-        env:
-          MCU: ESP32C61
-          RUSTC_BOOTSTRAP: "1"
-          # The vendored patches under .cargo-patches/ already pin the right
-          # crypto backend (aws-lc-rs for RISC-V), so no extra feature flags
-          # are needed here.
-        run: cargo build --release
+        # The vendored patches under .cargo-patches/ already pin the right
+        # crypto backend (aws-lc-rs for RISC-V), so no extra feature flags are
+        # needed. `build-c61.sh` sets MCU/RUSTC_BOOTSTRAP itself.
+        run: ./build-c61.sh
 
       - name: Upload ELF artifact
         uses: actions/upload-artifact@v4
