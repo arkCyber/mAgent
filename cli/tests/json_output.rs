@@ -54,6 +54,131 @@ fn run(cmd: &mut Command) -> Output {
     cmd.output().expect("spawn magent")
 }
 
+/// How many complete JSON values are on stdout.
+///
+/// `--json` promises stdout is *exactly one* document, so counting is
+/// how a test catches a second envelope being appended after the first
+/// (`jq` reads only the first, or errors). `serde_json::from_slice` on
+/// the whole stream would accept a trailing object, so it can't see this.
+fn count_json_values(bytes: &[u8]) -> usize {
+    let de = serde_json::Deserializer::from_slice(bytes);
+    de.into_iter::<serde_json::Value>().count()
+}
+
+/// Assert stdout holds exactly one JSON object and return it.
+fn one_json_object(out: &Output, what: &str) -> serde_json::Value {
+    let n = count_json_values(&out.stdout);
+    assert_eq!(
+        n,
+        1,
+        "{what}: stdout must be exactly one JSON document, found {n}:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{what}: stdout is not valid JSON ({e})"))
+}
+
+/// A failing command under `--json` used to write *nothing* to stdout, so
+/// `magent --json … | jq` got a parse error instead of the failure the
+/// pipeline was trying to detect. It now emits a structured envelope —
+/// and the human `error:` line still reaches stderr, so an operator
+/// running `--json` by hand is not staring at an empty terminal.
+#[test]
+fn json_failure_emits_a_single_error_envelope() {
+    let sb = Sandbox::new("errjson");
+    let out = run(sb.cmd().args(["--json", "set-prompt", "show", "nosuch"]));
+
+    assert!(
+        !out.status.success(),
+        "`set-prompt show nosuch` must fail, got exit 0",
+    );
+    let v = one_json_object(&out, "set-prompt show --json (missing)");
+    assert_eq!(v["ok"], serde_json::Value::Bool(false), "got {v}");
+    assert_eq!(v["code"], "set_prompt_error", "got {v}");
+    assert_eq!(v["exit"], serde_json::json!(2), "got {v}");
+    assert!(
+        v["error"].as_str().is_some_and(|e| e.contains("nosuch")),
+        "the envelope must carry the diagnostic: {v}",
+    );
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("error:") && err.contains("nosuch"),
+        "the human diagnostic must survive on stderr: {err:?}",
+    );
+}
+
+/// Human mode is unchanged: the `error:` line on stderr, nothing on
+/// stdout — the envelope is a `--json`-only affordance.
+#[test]
+fn human_failure_still_writes_nothing_to_stdout() {
+    let sb = Sandbox::new("errhuman");
+    let out = run(sb.cmd().args(["set-prompt", "show", "nosuch"]));
+
+    assert!(!out.status.success(), "expected failure");
+    assert!(
+        out.stdout.is_empty(),
+        "human mode must not write an envelope: {:?}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("error:"),
+        "stderr should carry the diagnostic",
+    );
+}
+
+/// `scheduler run-once` writes its result envelope *and* returns
+/// `TasksFailed`. The two together used to put two JSON objects on
+/// stdout, which `jq` cannot read. The envelope is now the single
+/// self-describing document: it carries the failure fields itself, and
+/// the envelope latch stops `Output::fail` from appending a second one.
+#[test]
+fn json_scheduler_failure_is_one_self_describing_envelope() {
+    let sb = Sandbox::new("schedfail");
+    let tasks = sb.path("tasks.json");
+    std::fs::write(
+        &tasks,
+        r#"{"tasks":[{"name":"bad","task":"say hi","mock":true,"prompt_name":"nosuch"}]}"#,
+    )
+    .unwrap();
+
+    let out = run(sb.cmd().args([
+        "--json",
+        "scheduler",
+        "run-once",
+        "--tasks-file",
+        tasks.to_str().unwrap(),
+    ]));
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = one_json_object(&out, "scheduler run-once --json (failing)");
+    assert_eq!(v["ok"], serde_json::Value::Bool(false), "got {v}");
+    assert_eq!(v["code"], "scheduler_tasks_failed", "got {v}");
+    assert_eq!(v["exit"], serde_json::json!(1), "got {v}");
+    assert_eq!(v["failed"], serde_json::json!(1), "got {v}");
+    assert_eq!(v["kind"], "scheduler.run_once", "got {v}");
+
+    // The recorded cause is the child's error, not the ~380-char
+    // `[Config] applied …` line every `magent run` prints first — that
+    // preamble used to eat the record's whole truncation budget.
+    let last_error = v["tasks"]["bad"]["last_error"]
+        .as_str()
+        .expect("last_error recorded");
+    assert!(
+        last_error.contains("could not load system prompt"),
+        "the cause must survive: {last_error}",
+    );
+    assert!(
+        !last_error.contains("[Config] applied"),
+        "the config preamble is noise, not the cause: {last_error}",
+    );
+}
+
 fn assert_json_stdout(out: &Output, what: &str) -> serde_json::Value {
     assert!(
         out.status.success(),
@@ -106,6 +231,66 @@ fn summary_export_load_delete_emit_json_in_json_mode() {
     let del = run(sb.cmd().args(["--json", "summary", "delete", "t1"]));
     let v = assert_json_stdout(&del, "summary delete --json");
     assert_eq!(v["deleted"], serde_json::Value::Bool(true), "got {v}");
+}
+
+/// `summary rollback` had only a Human-mode branch, so under `--json` it
+/// exited 0 with zero bytes on stdout.
+#[test]
+fn summary_rollback_emits_json_in_json_mode() {
+    let sb = Sandbox::new("rollback");
+    seed_summary(&sb, "t1");
+
+    // Re-saving an exported record with --overwrite merges with the previous
+    // snapshot and therefore creates one history entry to roll back to.
+    let export = run(sb.cmd().args(["summary", "export", "t1"]));
+    assert!(export.status.success());
+    let rec = sb.path("rec.json");
+    std::fs::write(&rec, &export.stdout).unwrap();
+    let save = run(sb.cmd().args([
+        "summary",
+        "save",
+        "t1",
+        "--from",
+        rec.to_str().unwrap(),
+        "--overwrite",
+    ]));
+    assert!(
+        save.status.success(),
+        "seed with history failed: {}",
+        String::from_utf8_lossy(&save.stderr)
+    );
+
+    let out = run(sb.cmd().args(["--json", "summary", "rollback", "t1", "0"]));
+    let v = assert_json_stdout(&out, "summary rollback --json");
+    assert_eq!(v["topic"], "t1", "got {v}");
+    assert_eq!(v["rolled_back_to_index"], 0, "got {v}");
+}
+
+/// `run --save-summary-overwrite` used to delete the previous record before
+/// saving, so run-produced summaries never accumulated history and
+/// `summary rollback` could never target them.
+#[test]
+fn run_overwrite_keeps_history_for_rollback() {
+    let sb = Sandbox::new("runhist");
+    seed_summary(&sb, "t1");
+    let second = run(sb.cmd().args([
+        "run",
+        "--mock",
+        "--save-summary",
+        "t1",
+        "--save-summary-overwrite",
+        "again",
+    ]));
+    assert!(
+        second.status.success(),
+        "second run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let rollback = run(sb.cmd().args(["--json", "summary", "rollback", "t1", "0"]));
+    let v = assert_json_stdout(&rollback, "rollback after run --save-summary-overwrite");
+    assert_eq!(v["topic"], "t1", "got {v}");
+    assert_eq!(v["rolled_back_to_index"], 0, "got {v}");
 }
 
 #[test]

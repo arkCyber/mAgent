@@ -300,7 +300,7 @@ impl<'a> DoctorCmd<'a> {
         }
         let client = OllamaClient::new(self.ollama_url, self.model);
         let models = client.get_models();
-        if models.iter().any(|m| m == self.model) {
+        if models.iter().any(|m| same_model(m, self.model)) {
             out.trace_labeled("model", &format!("'{}' is installed", self.model))?;
             Ok(CheckResult::Pass)
         } else {
@@ -333,9 +333,35 @@ impl<'a> DoctorCmd<'a> {
     }
 }
 
+/// Compare an installed Ollama model tag with the configured name.
+///
+/// `ollama pull llama3.2` normally reports `llama3.2:latest`, while the
+/// runner sends the untagged name; an exact comparison therefore produced a
+/// false `model=FAIL` on a perfectly working default install.
+fn same_model(installed: &str, wanted: &str) -> bool {
+    installed == wanted
+        || installed
+            .strip_suffix(":latest")
+            .is_some_and(|base| base == wanted)
+        || wanted
+            .strip_suffix(":latest")
+            .is_some_and(|base| base == installed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ollama pull llama3.2` reports `llama3.2:latest`; the default
+    /// `OLLAMA_MODEL=llama3.2` must not be reported missing.
+    #[test]
+    fn model_tag_latest_is_equivalent_to_the_untagged_name() {
+        assert!(same_model("llama3.2:latest", "llama3.2"));
+        assert!(same_model("llama3.2", "llama3.2:latest"));
+        assert!(same_model("llama3.2", "llama3.2"));
+        assert!(!same_model("llama3.2:7b", "llama3.2"));
+        assert!(!same_model("qwen2.5:latest", "llama3.2"));
+    }
 
     /// If Ollama is not reachable, the overall doctor run must report
     /// `false` regardless of what the tool backend does.

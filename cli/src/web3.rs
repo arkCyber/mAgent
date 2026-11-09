@@ -314,7 +314,10 @@ pub struct VaultEntry {
 /// Sub-actions of `magent web3`. The CLI parser picks one of these
 /// from the second positional argument (the first being the
 /// `web3` subcommand itself).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Equality is not derived: the blockchain variant carries claim values
+/// (`serde_json::Value`), which are not `Eq` (a JSON number may be a float).
+/// Parsing tests match on the variant with `matches!` rather than `==`.
+#[derive(Debug, Clone)]
 pub enum Web3Action {
     /// `magent web3 new <NAME> [--passphrase-env VAR | --no-passphrase]`
     New(Web3NewOptions),
@@ -334,6 +337,9 @@ pub enum Web3Action {
     Export(String),
     /// `magent web3 delete <NAME>`
     Delete(String),
+    /// `magent web3 chain|bind|balance|tx|vc …` — the blockchain surface.
+    #[cfg(feature = "blockchain")]
+    Blockchain(crate::web3_blockchain::BlockchainAction),
 }
 
 /// Options for `magent web3 new <NAME>`.
@@ -518,6 +524,10 @@ impl<'a> Web3Cmd<'a> {
             Web3Action::List => self.run_list(out),
             Web3Action::Export(name) => self.run_export(name, out),
             Web3Action::Delete(name) => self.run_delete(name, out),
+            #[cfg(feature = "blockchain")]
+            Web3Action::Blockchain(action) => {
+                crate::web3_blockchain::execute(action, &mut self.passphrase, out)
+            }
         }
     }
 
@@ -534,6 +544,7 @@ impl<'a> Web3Cmd<'a> {
             .vault_override
             .clone()
             .unwrap_or_else(default_vault_path);
+        let _vault_lock = acquire_vault_lock(&vault_path)?;
         let mut vault = load_or_init_vault(&vault_path)?;
 
         if vault.identities.contains_key(&opts.name) && !opts.force {
@@ -666,6 +677,11 @@ impl<'a> Web3Cmd<'a> {
                 .as_deref()
                 .unwrap_or("MAGENT_WEB3_PASSPHRASE"),
         )?;
+        if passphrase.trim().is_empty() {
+            return Err(Web3CliError::Usage(
+                "passphrase must not be empty".to_string(),
+            ));
+        }
         let secret_bytes = decrypt_secret(
             &entry.salt_b64,
             &entry.nonce_b64,
@@ -815,6 +831,7 @@ impl<'a> Web3Cmd<'a> {
 
     fn run_delete(&self, name: &str, out: &mut Output) -> Result<(), Web3CliError> {
         let vault_path = default_vault_path();
+        let _vault_lock = acquire_vault_lock(&vault_path)?;
         let mut vault = load_vault(&vault_path)?;
         if vault.identities.remove(name).is_none() {
             return Err(Web3CliError::NotFound(name.to_string()));
@@ -971,16 +988,121 @@ pub fn save_vault(path: &Path, vault: &Vault) -> Result<(), Web3CliError> {
         path: path.to_path_buf(),
         source: Some(e),
     })?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &json).map_err(|e| Web3CliError::VaultIo {
-        path: tmp.clone(),
-        source: e,
-    })?;
-    fs::rename(&tmp, path).map_err(|e| Web3CliError::VaultIo {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    Ok(())
+    // Unique temp name: a fixed `keys.json.tmp` let two concurrent writers
+    // rename each other's file out from under the save and lose an identity.
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("keys.json");
+    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let write = (|| -> Result<(), Web3CliError> {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            // The vault holds encrypted private keys; it must not be
+            // world-readable (the old plain `fs::write` left it 0644).
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|e| Web3CliError::VaultIo {
+                    path: tmp.clone(),
+                    source: e,
+                })?;
+            f.write_all(&json).map_err(|e| Web3CliError::VaultIo {
+                path: tmp.clone(),
+                source: e,
+            })?;
+            f.sync_all().map_err(|e| Web3CliError::VaultIo {
+                path: tmp.clone(),
+                source: e,
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::write(&tmp, &json).map_err(|e| Web3CliError::VaultIo {
+                path: tmp.clone(),
+                source: e,
+            })?;
+        }
+        fs::rename(&tmp, path).map_err(|e| Web3CliError::VaultIo {
+            path: path.to_path_buf(),
+            source: e,
+        })
+    })();
+    if write.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write
+}
+
+/// Exclusive read-modify-write lock for the vault.
+///
+/// `web3 new` / `web3 delete` load the whole file, mutate it, and write it
+/// back; without this, concurrent invocations each wrote a vault containing
+/// only their own identity. A lock older than 30 s is treated as abandoned
+/// (the writer crashed) and reclaimed.
+pub struct VaultLock {
+    path: std::path::PathBuf,
+}
+
+impl Drop for VaultLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Acquire the vault's lock file.
+pub fn acquire_vault_lock(vault_path: &Path) -> Result<VaultLock, Web3CliError> {
+    let path = vault_path.with_extension("json.lock");
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| Web3CliError::VaultIo {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+    }
+    const STALE: std::time::Duration = std::time::Duration::from_secs(30);
+    for attempt in 0..2 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(VaultLock { path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                let stale = fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|m| m.elapsed().unwrap_or_default() > STALE)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                return Err(Web3CliError::VaultIo {
+                    path,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "another `magent web3` process is updating the vault",
+                    ),
+                });
+            }
+            Err(e) => {
+                return Err(Web3CliError::VaultIo { path, source: e });
+            }
+        }
+    }
+    Err(Web3CliError::VaultIo {
+        path,
+        source: std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "vault lock was reclaimed concurrently",
+        ),
+    })
 }
 
 /// Encrypt `secret_bytes` under the passphrase. Returns the
@@ -1002,6 +1124,15 @@ fn encrypt_secret(
     } else {
         passphrase(env_var.unwrap_or("MAGENT_WEB3_PASSPHRASE"))?
     };
+    // An empty `MAGENT_WEB3_PASSPHRASE=""` used to be fed straight to
+    // Argon2id: the vault was created "successfully" with no passphrase,
+    // i.e. with no protection at all.
+    if passphrase_str.trim().is_empty() {
+        return Err(Web3CliError::Usage(
+            "passphrase must not be empty — an empty vault passphrase provides no protection"
+                .to_string(),
+        ));
+    }
 
     let params = Params::new(
         ARGON2_MEM_KIB,
@@ -1367,6 +1498,51 @@ struct ExportedIdentity<'a> {
 mod tests {
     use super::*;
 
+    /// Concurrent `web3 new` must not lose identities: the vault is a
+    /// read-modify-write file and the lock is exclusive.
+    #[test]
+    fn vault_lock_is_exclusive_and_released() {
+        let dir = std::env::temp_dir().join(format!(
+            "magent-web3-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys.json");
+
+        let lock = acquire_vault_lock(&path).expect("first lock");
+        assert!(
+            acquire_vault_lock(&path).is_err(),
+            "a second writer must be refused while the lock is held"
+        );
+        drop(lock);
+        let again = acquire_vault_lock(&path).expect("lock released on drop");
+        drop(again);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The vault contains encrypted private keys and must be owner-only,
+    /// like the config and prompt stores.
+    #[cfg(unix)]
+    #[test]
+    fn save_vault_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "magent-web3-perm-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys.json");
+        save_vault(&path, &empty_vault()).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Vault → identity → sign → verify round-trip using a
     /// fixed passphrase.
     #[test]
@@ -1445,6 +1621,16 @@ mod tests {
         assert!(matches!(err, Web3CliError::VerificationFailed { .. }));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An empty passphrase must be refused before the KDF: the vault would
+    /// otherwise be encrypted under a well-known empty key.
+    #[test]
+    fn empty_passphrase_is_refused_when_creating_a_vault() {
+        let mut resolver = |_: &str| Ok(String::new());
+        let err = encrypt_secret(b"secret", &mut resolver, None)
+            .expect_err("empty passphrase must be refused");
+        assert!(matches!(err, Web3CliError::Usage(_)), "{err:?}");
     }
 
     #[test]

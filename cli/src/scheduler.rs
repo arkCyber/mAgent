@@ -129,6 +129,35 @@ pub enum SchedulerError {
     State { path: PathBuf, source: io::Error },
     /// JSON serialisation / deserialisation of the state file failed.
     StateJson { path: PathBuf, source: serde_json::Error },
+    /// A scheduled task's `magent run` subprocess exited non-zero, or
+    /// could not be spawned at all.
+    ///
+    /// Separate from [`Self::State`] on purpose: those two used to
+    /// share a variant, so a task that failed at the LLM was recorded
+    /// in `last_error` as `scheduler state file "<magent run> (exit 1)": …`
+    /// — pointing the operator at a state file that was perfectly
+    /// healthy, in the one field that exists to say why the task failed.
+    TaskRun {
+        /// The scheduled task's name, so the message identifies which
+        /// entry failed.
+        name: String,
+        /// Exit code, or `<signal>` / `<spawn>` when there is no code.
+        exit: String,
+        /// Combined stdout + stderr of the child.
+        detail: String,
+    },
+    /// One or more tasks in a `run-once` queue failed.
+    ///
+    /// Raised *after* the state file is written and the summary (or the
+    /// `--json` envelope) is emitted, so a CI caller keeps both and
+    /// still sees a non-zero exit. The daemon ignores this variant: a
+    /// flaky backend must not stop the tick loop.
+    TasksFailed {
+        /// How many tasks failed.
+        failed: usize,
+        /// How many were attempted.
+        total: usize,
+    },
     /// The user hit Ctrl-C (SIGINT) and we shut down cleanly.
     Interrupted,
 }
@@ -174,6 +203,16 @@ impl std::fmt::Display for SchedulerError {
             }
             SchedulerError::StateJson { path, source } => {
                 write!(f, "scheduler state file {:?}: invalid JSON: {}", path, source)
+            }
+            SchedulerError::TaskRun { name, exit, detail } => {
+                write!(
+                    f,
+                    "scheduled task {:?} failed (exit {}): {}",
+                    name, exit, detail
+                )
+            }
+            SchedulerError::TasksFailed { failed, total } => {
+                write!(f, "{} of {} scheduled task(s) failed", failed, total)
             }
             SchedulerError::Interrupted => write!(f, "interrupted by SIGINT"),
         }
@@ -343,8 +382,9 @@ pub struct TaskStats {
     /// Number of failed runs since the state file was created.
     #[serde(default)]
     pub failure_count: u64,
-    /// Last error message (truncated to 512 chars so the state file
-    /// can't grow without bound).
+    /// Last error message (truncated to [`LAST_ERROR_MAX`] so the state
+    /// file can't grow without bound). The **tail** is kept — see
+    /// [`TaskStats::record_failure`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -361,14 +401,19 @@ impl TaskStats {
     fn record_failure(&mut self, err: &str) {
         self.failure_count = self.failure_count.saturating_add(1);
         let truncated = if err.len() > LAST_ERROR_MAX {
-            // `floor_char_boundary` avoids panicking on a multi-byte
-            // boundary mid-string. If the truncation lands mid-codepoint
-            // we step back until we're on a boundary.
-            let mut idx = LAST_ERROR_MAX;
-            while idx > 0 && !err.is_char_boundary(idx) {
-                idx -= 1;
+            // Keep the **tail**, not the head. A subprocess failure's
+            // buffer is the child's whole stderr, which opens with
+            // `[Config] applied …` / `[Backend] …` / `[Task] <the task>` —
+            // so head-truncating filled `last_error` with run metadata and
+            // dropped the `error: agent failed: …` line it exists to
+            // report. An error message names its cause last.
+            let mut idx = err.len() - LAST_ERROR_MAX;
+            // Never split a code point: step *forward* to the next
+            // boundary (the head path stepped back from a fixed offset).
+            while idx < err.len() && !err.is_char_boundary(idx) {
+                idx += 1;
             }
-            format!("{}…", &err[..idx])
+            format!("…{}", &err[idx..])
         } else {
             err.to_string()
         };
@@ -377,7 +422,7 @@ impl TaskStats {
 }
 
 /// Top-level state file.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerState {
     /// Schema version. Bumped on breaking changes.
     #[serde(default = "default_schema_version")]
@@ -388,6 +433,24 @@ pub struct SchedulerState {
     /// Unix-epoch seconds of the last daemon start (for observability).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_started_at: Option<u64>,
+}
+
+/// Hand-written rather than derived: `#[derive(Default)]` gives
+/// `schema_version: 0` (u32's own default), while the serde attribute
+/// above gives `1` (the field's declared "absent" value) — so the file
+/// the daemon *wrote* on its first run said `0` and the same file read
+/// back with the field deleted said `1`. A version that depends on
+/// whether the key was omitted is worse than useless for a migration:
+/// the very first run produced a file that looked one version older
+/// than it is.
+impl Default for SchedulerState {
+    fn default() -> Self {
+        Self {
+            schema_version: default_schema_version(),
+            tasks: std::collections::BTreeMap::new(),
+            last_started_at: None,
+        }
+    }
 }
 
 fn default_schema_version() -> u32 {
@@ -589,7 +652,7 @@ impl SchedulerCmd {
             SchedulerAction::Status => execute_status(out),
             SchedulerAction::RunOnce { tasks_file, preset } => {
                 let tasks = resolve_tasks(tasks_file.as_deref(), preset.as_deref())?;
-                execute_run_once(&tasks, out)
+                execute_run_once(&tasks, out, true)
             }
             SchedulerAction::Daemon {
                 tasks_file,
@@ -696,16 +759,27 @@ fn load_tasks_file(path: &Path) -> Result<Vec<ScheduledTask>, SchedulerError> {
 // Executor
 // ============================================================================
 
-/// One-shot executor. Runs every task, prints a summary line per
-/// task, persists the counters, returns `Ok(())` even if individual
-/// tasks failed (per-task failures are reflected in the state file
-/// and the summary, not in the process exit code).
-fn execute_run_once(tasks: &[ScheduledTask], out: &mut Output) -> Result<(), SchedulerError> {
+/// One-shot executor. Runs every task, prints a line per task, persists
+/// the counters, and then reports the outcome: `Ok(())` only when every
+/// task succeeded, otherwise [`SchedulerError::TasksFailed`] so the
+/// process exits non-zero. A failed task is also visible in the state
+/// file (`failure_count` / `last_error`), the `FAILED:` line and the
+/// `--json` envelope's `failed` counter — the exit code is what a CI
+/// script can act on without parsing either stream.
+///
+/// The failure is raised *last*, so everything is written and printed
+/// before the process gives up on the run.
+fn execute_run_once(
+    tasks: &[ScheduledTask],
+    out: &mut Output,
+    emit_json: bool,
+) -> Result<(), SchedulerError> {
     let state_path = resolve_state_path()?;
     let mut state = load_state(&state_path)?;
     state.last_started_at = Some(now_secs());
 
     let total = tasks.len();
+    let mut failed = 0usize;
     if total == 0 {
         // Don't early-return: a CI `--json` caller still expects the
         // `{"kind":"scheduler.run_once","ran":0,…}` envelope below,
@@ -723,20 +797,47 @@ fn execute_run_once(tasks: &[ScheduledTask], out: &mut Output) -> Result<(), Sch
             .or_insert_with(TaskStats::default);
         match run_one_task(task, out) {
             Ok(()) => stats.record_success(),
-            Err(e) => stats.record_failure(&e.to_string()),
+            Err(e) => {
+                failed += 1;
+                // Say so, in the transcript. A failing task used to print
+                // its `[n/N] running "x"` line and then nothing — the only
+                // trace was the state file, so a human running `run-once`
+                // over a queue where everything failed saw a clean run.
+                let _ = out.trace_labeled(
+                    "scheduler",
+                    &format!("{:?} FAILED: {}", task.name, one_line_failure(&e)),
+                );
+                stats.record_failure(&e.to_string());
+            }
         }
     }
     save_state(&state_path, &state)?;
 
-    if out.kind() == OutputKind::Json {
+    if emit_json && out.kind() == OutputKind::Json {
         // Emit a single JSON envelope with the final state so a CI
         // pipeline can `jq` the counters without scraping stderr.
-        let envelope = serde_json::json!({
+        //
+        // The envelope is *self-describing* on failure (`ok:false` plus
+        // the same `error`/`code`/`exit` triple `Output::fail` writes),
+        // because this is the last thing stdout gets: `main.rs` sees the
+        // `TasksFailed` returned below and calls `Output::fail`, which
+        // would otherwise append a *second* JSON object and leave `jq`
+        // with an unparseable stream. `Output`'s envelope latch suppresses
+        // that second write, so the outcome has to be spelled out here.
+        let mut envelope = serde_json::json!({
             "kind": "scheduler.run_once",
+            "ok": failed == 0,
             "ran": total,
+            "failed": failed,
             "state_path": state_path.display().to_string(),
             "tasks": state.tasks,
         });
+        if failed > 0 {
+            envelope["error"] =
+                serde_json::json!(format!("{} of {} scheduled task(s) failed", failed, total));
+            envelope["code"] = serde_json::json!("scheduler_tasks_failed");
+            envelope["exit"] = serde_json::json!(1);
+        }
         // `final_answer` only *stores* its argument in JSON mode (it
         // expects a later `write_json` to flush the envelope), so using
         // it here emitted nothing and the CI pipeline got an empty
@@ -744,12 +845,76 @@ fn execute_run_once(tasks: &[ScheduledTask], out: &mut Output) -> Result<(), Sch
         // straight to stdout.
         out.write_json_str(envelope.to_string());
     } else {
+        let outcome = if failed == 0 {
+            format!("finished {} task(s)", total)
+        } else {
+            format!("finished {} task(s), {} FAILED", total, failed)
+        };
         let _ = out.trace_labeled(
             "scheduler",
-            &format!("finished {} task(s); state written to {:?}", total, state_path),
+            &format!("{}; state written to {:?}", outcome, state_path),
         );
     }
+
+    // State written and summary emitted — now report the failure through
+    // the exit code. `run-once` is the CI entry point ("Execute every
+    // task in the queue once and exit"), and a queue where every task
+    // failed used to look exactly like a clean run from the shell's
+    // point of view.
+    if failed > 0 {
+        return Err(SchedulerError::TasksFailed { failed, total });
+    }
     Ok(())
+}
+
+/// The one line of a task failure worth putting in the transcript.
+///
+/// A [`SchedulerError::TaskRun`] carries the child's entire stderr, whose
+/// last non-empty line is the `error: …` that `magent run` printed; the
+/// earlier lines are `[Config]`/`[Backend]` noise. Everything else is
+/// already a single line, so it is returned as-is.
+///
+/// The `stdout: ` / `stderr: ` label [`task_failure_detail`] prepends is
+/// stripped: it is a useful tag in the state file, where the recorded
+/// error may mix both streams, but on the transcript line it just repeats
+/// what `error:` already says.
+fn one_line_failure(err: &SchedulerError) -> String {
+    let SchedulerError::TaskRun { exit, detail, .. } = err else {
+        return err.to_string();
+    };
+    let last = detail.lines().rev().find(|l| !l.trim().is_empty());
+    match last {
+        Some(line) => {
+            let line = line.trim();
+            let line = line
+                .strip_prefix("stderr: ")
+                .or_else(|| line.strip_prefix("stdout: "))
+                .unwrap_or(line);
+            format!("exit {}: {}", exit, line)
+        }
+        None => format!("exit {} (no output)", exit),
+    }
+}
+
+/// Unix second at which the daemon's **first** tick fires.
+///
+/// `Interval` fires immediately (fast feedback); `Cron` must wait for the
+/// next matching wall-clock instant (it used to run the queue at startup);
+/// `Once` waits for its absolute deadline.
+fn first_tick_deadline(
+    schedule: &DaemonSchedule,
+    now: u64,
+    timezone: SchedulerTimezone,
+) -> Result<u64, SchedulerError> {
+    match schedule {
+        DaemonSchedule::Interval { .. } => Ok(now),
+        DaemonSchedule::Cron(expr) => {
+            let spec = CronSpec::parse(expr)
+                .map_err(|e| SchedulerError::InvalidCron(format!("{:?}: {}", expr, e)))?;
+            Ok(spec.next_after(now, timezone))
+        }
+        DaemonSchedule::Once { at_secs } => Ok(*at_secs),
+    }
 }
 
 /// Daemon loop. Behaviour depends on `schedule`:
@@ -794,29 +959,40 @@ fn execute_daemon(
         ),
     );
 
+    // Deadline for the *first* tick:
+    //   * `Interval` fires immediately (fast feedback),
+    //   * `Cron` waits for the next matching wall-clock instant — it used to
+    //     run the whole queue once at startup regardless of the schedule,
+    //     so `--cron "0 0 1 1 *"` fired today instead of next January,
+    //   * `Once` waits for its absolute deadline.
+    let mut next_tick = first_tick_deadline(&schedule, now_secs(), timezone.clone())?;
+
     loop {
         if stop.load(Ordering::SeqCst) {
             let _ = out.trace_labeled("scheduler", "stopping (signal received)");
             return Err(SchedulerError::Interrupted);
         }
 
-        // Run the queue on every iteration *before* computing the
-        // next sleep, so the first tick is immediate for
-        // `Interval` and `Cron`-with-implicit-now matches. For
-        // `Once` the run happens at the *top* of the iteration
-        // only when the deadline has been reached.
-        match &schedule {
-            DaemonSchedule::Interval { .. } | DaemonSchedule::Cron(_) => {
-                run_one_tick(tasks, out);
-            }
-            DaemonSchedule::Once { at_secs } => {
-                if now_secs() >= *at_secs {
+        if now_secs() >= next_tick {
+            match &schedule {
+                DaemonSchedule::Once { .. } => {
                     run_one_tick(tasks, out);
                     let _ = out.trace_labeled(
                         "scheduler",
                         "one-shot complete; exiting daemon",
                     );
                     return Ok(());
+                }
+                DaemonSchedule::Interval { secs } => {
+                    run_one_tick(tasks, out);
+                    next_tick = now_secs().saturating_add(*secs);
+                }
+                DaemonSchedule::Cron(expr) => {
+                    run_one_tick(tasks, out);
+                    let spec = CronSpec::parse(expr).map_err(|e| {
+                        SchedulerError::InvalidCron(format!("{:?}: {}", expr, e))
+                    })?;
+                    next_tick = spec.next_after(now_secs(), timezone.clone());
                 }
             }
         }
@@ -826,26 +1002,7 @@ fn execute_daemon(
             return Err(SchedulerError::Interrupted);
         }
 
-        // Compute how long to sleep until the next tick. For
-        // `Interval` this is the constant interval; for `Cron` it's
-        // the duration until the next matching wall-clock instant;
-        // for `Once` it's the duration until the absolute deadline
-        // (or zero if we've already crossed it — handled above).
-        let sleep_for: Duration = match &schedule {
-            DaemonSchedule::Interval { secs } => Duration::from_secs(*secs),
-            DaemonSchedule::Cron(expr) => {
-                let spec = CronSpec::parse(expr).map_err(|e| {
-                    SchedulerError::InvalidCron(format!("{:?}: {}", expr, e))
-                })?;
-                let now = now_secs();
-                let next = spec.next_after(now, timezone.clone());
-                Duration::from_secs(next.saturating_sub(now))
-            }
-            DaemonSchedule::Once { at_secs } => {
-                let now = now_secs();
-                Duration::from_secs(at_secs.saturating_sub(now))
-            }
-        };
+        let sleep_for = Duration::from_secs(next_tick.saturating_sub(now_secs()));
 
         // Sleep in 250ms chunks so SIGINT is honoured within ~quarter
         // of a second instead of "after the next interval". This is
@@ -865,8 +1022,21 @@ fn execute_daemon(
 /// Errors are logged but never propagated — a flaky LLM backend
 /// shouldn't take the whole daemon down.
 fn run_one_tick(tasks: &[ScheduledTask], out: &mut Output) {
-    if let Err(e) = execute_run_once(tasks, out) {
-        let _ = out.trace_labeled("scheduler", &format!("tick error: {}", e));
+    // A daemon tick lives inside a long-running process: writing one JSON
+    // document per tick violates the "stdout is exactly one document"
+    // contract (`jq` fails on the concatenation). The final outcome is
+    // reported by `main` when the daemon exits (normal or interrupted).
+    match execute_run_once(tasks, out, false) {
+        Ok(()) => {}
+        // `run-once` reports task failures through its exit code; the
+        // daemon has no caller to report to, and each failure is
+        // already on a `FAILED:` line plus in the state file. Logging
+        // it again as a "tick error" would suggest the tick itself
+        // broke, which is a different (and actionable) thing.
+        Err(SchedulerError::TasksFailed { .. }) => {}
+        Err(e) => {
+            let _ = out.trace_labeled("scheduler", &format!("tick error: {}", e));
+        }
     }
 }
 
@@ -958,48 +1128,72 @@ fn run_one_task(task: &ScheduledTask, out: &mut Output) -> Result<(), SchedulerE
     if task.mock {
         cmd.arg("--mock");
     }
-    cmd.arg(&task.task);
+    // `--` terminates option parsing: without it a task whose text starts
+    // with `-` (a Markdown list, or literally "--help") was parsed by the
+    // child as a flag — `--help` made the child print usage and exit 0, so
+    // the scheduler reported success without running the agent at all.
+    cmd.arg("--").arg(&task.task);
 
-    let output = cmd
-        .output()
-        .map_err(|e| SchedulerError::State {
-            path: PathBuf::from("<magent run>"),
-            source: e,
-        })?;
+    let output = cmd.output().map_err(|e| SchedulerError::TaskRun {
+        name: task.name.clone(),
+        exit: "<spawn>".to_string(),
+        detail: format!("could not start `magent run`: {e}"),
+    })?;
 
     if output.status.success() {
         let _ = out.trace_labeled("scheduler", &format!("{:?} ok", task.name));
         Ok(())
     } else {
         // Combine stdout + stderr so the recorded error is
-        // actionable. Both are bounded to ~512 chars by the
-        // `TaskStats::record_failure` truncation.
-        let mut buf = String::new();
-        if !output.stdout.is_empty() {
-            buf.push_str("stdout: ");
-            buf.push_str(&String::from_utf8_lossy(&output.stdout));
-        }
-        if !output.stderr.is_empty() {
-            if !buf.is_empty() {
-                buf.push_str(" | ");
-            }
-            buf.push_str("stderr: ");
-            buf.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
+        // actionable. Both are bounded by the `TaskStats::record_failure`
+        // truncation.
         let exit = output
             .status
             .code()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "<signal>".to_string());
-        Err(SchedulerError::State {
-            // Reuse the State variant so we don't add a new error
-            // type for "subprocess failed"; the message still tells
-            // the user which task failed via the surrounding log
-            // line.
-            path: PathBuf::from(format!("<magent run> (exit {})", exit)),
-            source: io::Error::other(buf),
+        Err(SchedulerError::TaskRun {
+            name: task.name.clone(),
+            exit,
+            detail: task_failure_detail(&output.stdout, &output.stderr),
         })
     }
+}
+
+/// The child's output, with the boilerplate every `magent run` prints
+/// before it does any work removed.
+///
+/// Every invocation emits a `[Config] applied provider=…, ollama_url=…,
+/// model=…, …` line on stderr — around 380 characters. The state file
+/// keeps only [`LAST_ERROR_MAX`] of `last_error`, so recording that
+/// preamble verbatim pushed the actual cause past the cut and left the
+/// durable record with a config dump and no diagnosis. Dropping the
+/// `[Config]`/`[Backend]` status lines keeps the reason, and makes
+/// `last_error` read like an error rather than a settings echo.
+fn task_failure_detail(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut out = String::new();
+    for (label, bytes) in [("stdout", stdout), ("stderr", stderr)] {
+        let text = String::from_utf8_lossy(bytes);
+        let kept: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty()
+                    && !t.starts_with("[Config] applied")
+                    && !t.starts_with("[Backend]")
+            })
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(label);
+        out.push_str(": ");
+        out.push_str(&kept.join("\n"));
+    }
+    out
 }
 
 // ============================================================================
@@ -1194,7 +1388,21 @@ impl CronSpec {
             // approach. Each helper advances `tm` to the next
             // candidate that hasn't been ruled out yet.
             if !self.months.contains(&tm.month) {
+                // Jump to the first moment of the next month.
+                // `advance_to_next_month` only rolls the month over, so
+                // reset the day and time-of-day here: carrying them across
+                // the boundary both skips the earlier part of the target
+                // month (`0 0 * 4 *` from mid-January would land mid-April)
+                // and can produce a day that does not exist in it
+                // (`Jan 31` → `Feb 31`), which sent the search a year
+                // forward. `dow` is maintained incrementally elsewhere, so
+                // it has to be re-derived for the new date.
                 advance_to_next_month(&mut tm);
+                tm.day = 1;
+                tm.dow = day_of_week(tm.year, tm.month, tm.day);
+                tm.hour = 0;
+                tm.minute = 0;
+                tm.second = 0;
                 continue;
             }
             let dom_match = self.doms.contains(&tm.day) || self.doms.len() == 31;
@@ -1610,7 +1818,7 @@ pub fn scheduler_help_text() -> String {
     let _ = writeln!(s, "ACTIONS:");
     let _ = writeln!(
         s,
-        "    run-once    Execute every task in the queue once and exit (CI-friendly)"
+        "    run-once    Execute every task in the queue once and exit; exits 1 if any task failed"
     );
     let _ = writeln!(
         s,
@@ -1773,7 +1981,108 @@ mod tests {
         s.record_failure(&huge);
         let err = s.last_error.as_ref().expect("error should be recorded");
         assert!(err.len() <= LAST_ERROR_MAX + 4, "got {} chars", err.len());
-        assert!(err.ends_with('…'));
+        // The ellipsis marks where the cut happened — at the *front* now.
+        assert!(err.starts_with('…'), "expected a leading ellipsis: {err:?}");
+    }
+
+    /// The tail is the part worth keeping: a task's failure message is a
+    /// whole stderr whose last line is the `error: …`, and the head is
+    /// `[Config]`/`[Backend]` noise. Head-truncating dropped the cause.
+    #[test]
+    fn task_stats_truncation_keeps_the_cause_not_the_noise() {
+        let mut s = TaskStats::default();
+        let noisy = format!(
+            "[Config] applied {}\nerror: agent failed: 401 Unauthorized\n",
+            "x".repeat(LAST_ERROR_MAX * 2)
+        );
+        s.record_failure(&noisy);
+        let err = s.last_error.as_ref().expect("error should be recorded");
+        assert!(
+            err.contains("error: agent failed: 401 Unauthorized"),
+            "the cause was truncated away: {err:?}"
+        );
+        assert!(
+            !err.contains("[Config] applied"),
+            "the head noise should have been dropped: {err:?}"
+        );
+    }
+
+    /// A task failure must not be described as a *state file* problem —
+    /// that variant is for the scheduler's own I/O, and naming it here
+    /// sent the operator to a file that was perfectly healthy.
+    #[test]
+    fn task_failure_is_reported_as_a_task_failure() {
+        let err = SchedulerError::TaskRun {
+            name: "audit-todos".to_string(),
+            exit: "1".to_string(),
+            detail: "stderr: error: agent failed: boom\n".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("scheduled task \"audit-todos\" failed"),
+            "{msg}"
+        );
+        assert!(msg.contains("exit 1"), "{msg}");
+        assert!(!msg.contains("state file"), "{msg}");
+    }
+
+    /// …and the transcript line is the child's last non-empty line, not
+    /// the whole stderr it arrives wrapped in.
+    #[test]
+    fn one_line_failure_picks_the_children_error_line() {
+        let err = SchedulerError::TaskRun {
+            name: "t".to_string(),
+            exit: "1".to_string(),
+            detail: "[Config] applied …\n[Task] do it\nerror: agent failed: 401\n".to_string(),
+        };
+        assert_eq!(one_line_failure(&err), "exit 1: error: agent failed: 401");
+        // A variant that is already one line passes through unchanged.
+        assert_eq!(
+            one_line_failure(&SchedulerError::MissingSchedule),
+            SchedulerError::MissingSchedule.to_string()
+        );
+    }
+
+    /// The config preamble is ~380 characters; `last_error` keeps only
+    /// `LAST_ERROR_MAX`, so it has to leave the record before truncation
+    /// or it is the *only* thing the record contains.
+    #[test]
+    fn task_failure_detail_drops_the_config_preamble() {
+        let stdout = b"";
+        let stderr = b"[Config] applied provider=ollama, model=llama3.2\n\
+                       error: could not load system prompt: no prompt named \"x\"\n";
+        let detail = task_failure_detail(stdout, stderr);
+        assert!(!detail.contains("[Config] applied"), "got {detail:?}");
+        assert!(
+            detail.contains("could not load system prompt"),
+            "got {detail:?}"
+        );
+        // The cause is still what the transcript quotes.
+        let err = SchedulerError::TaskRun {
+            name: "t".to_string(),
+            exit: "1".to_string(),
+            detail,
+        };
+        assert_eq!(
+            one_line_failure(&err),
+            "exit 1: error: could not load system prompt: no prompt named \"x\""
+        );
+    }
+
+    #[test]
+    fn task_failure_detail_labels_both_streams_and_skips_empty_ones() {
+        assert_eq!(
+            task_failure_detail(b"partial output", b"error: boom\n"),
+            "stdout: partial output\nstderr: error: boom"
+        );
+        assert_eq!(
+            task_failure_detail(b"", b"error: boom\n"),
+            "stderr: error: boom"
+        );
+        assert_eq!(
+            task_failure_detail(b"", b"[Config] applied x=1\n").as_str(),
+            ""
+        );
     }
 
     #[test]
@@ -1867,8 +2176,10 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("scheduler.json");
+        // Deliberately `Default::default()` — the file the daemon writes on
+        // its very first run. The version must not be left to the field's
+        // `u32` zero; setting it here by hand is what hid the mismatch.
         let mut s = SchedulerState {
-            schema_version: 1,
             last_started_at: Some(42),
             ..Default::default()
         };
@@ -1877,10 +2188,23 @@ mod tests {
         s.tasks.insert("t".to_string(), stats);
         save_state(&path, &s).unwrap();
         let back = load_state(&path).unwrap();
-        assert_eq!(back.schema_version, 1);
+        assert_eq!(back.schema_version, default_schema_version());
         assert_eq!(back.last_started_at, Some(42));
         assert_eq!(back.tasks.get("t").unwrap().success_count, 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A freshly created state — what `load_state` returns for a missing or
+    /// empty file — has to carry the same version a file *without* the key
+    /// deserialises to. `#[derive(Default)]` made it 0 while serde's
+    /// `default = "default_schema_version"` made it 1, so the written file
+    /// and the read-back file disagreed.
+    #[test]
+    fn default_state_carries_the_current_schema_version() {
+        assert_eq!(SchedulerState::default().schema_version, 1);
+        // And a key-less file must agree with it.
+        let parsed: SchedulerState = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.schema_version, SchedulerState::default().schema_version);
     }
 
     #[test]
@@ -1950,6 +2274,30 @@ mod tests {
         let next = spec.next_after(now, SchedulerTimezone::Utc);
         assert!(next > now);
         assert!(next - now <= 60, "got {}s in the future", next - now);
+    }
+
+    /// `execute_daemon` used to run a tick before the first sleep for every
+    /// schedule kind, so a cron daemon fired at startup regardless of the
+    /// expression. Pin the first deadlines instead.
+    #[test]
+    fn the_first_cron_tick_is_the_next_match_not_now() {
+        let now: u64 = 1_700_000_000;
+        let cron = DaemonSchedule::Cron("0 0 1 1 *".to_string());
+        let first = first_tick_deadline(&cron, now, SchedulerTimezone::Utc).unwrap();
+        assert!(first > now, "cron must not fire at startup ({first} <= {now})");
+
+        let interval = DaemonSchedule::Interval { secs: 60 };
+        assert_eq!(
+            first_tick_deadline(&interval, now, SchedulerTimezone::Utc).unwrap(),
+            now,
+            "interval keeps its immediate first tick"
+        );
+
+        let once = DaemonSchedule::Once { at_secs: now + 30 };
+        assert_eq!(
+            first_tick_deadline(&once, now, SchedulerTimezone::Utc).unwrap(),
+            now + 30
+        );
     }
 
     #[test]
@@ -2029,6 +2377,30 @@ mod tests {
         let spec = CronSpec::parse("* * 15 * *").unwrap();
         assert_eq!(spec.doms, vec![15]);
         assert_eq!(spec.dows.len(), 7);
+    }
+
+    #[test]
+    fn cron_month_skip_lands_on_the_first_of_the_target_month() {
+        // A restricted month field (short of `*`) makes the matcher jump
+        // forward to the next listed month. That jump used to carry the *day
+        // of month* and time-of-day over from `from`, so `0 0 * 4 *` starting
+        // 2026-01-15T06:00:00Z landed on April 15th — the first two weeks of
+        // April were skipped. Worse, when the carried day does not exist in
+        // the target month (`Jan 31` → `Feb 31`) the search marched a full
+        // year forward, returning February 1st of *2027*.
+        let april_midnights = CronSpec::parse("0 0 * 4 *").unwrap();
+        assert_eq!(
+            april_midnights.next_after(1_768_456_800, SchedulerTimezone::Utc), // 2026-01-15T06:00:00Z
+            1_775_001_600, // 2026-04-01T00:00:00Z
+            "the first midnight of April, not mid-April",
+        );
+
+        let february_midnights = CronSpec::parse("0 0 * 2 *").unwrap();
+        assert_eq!(
+            february_midnights.next_after(1_769_860_800, SchedulerTimezone::Utc), // 2026-01-31T12:00:00Z
+            1_769_904_000, // 2026-02-01T00:00:00Z
+            "February 1st of the same year, not next year",
+        );
     }
 
     // ---- DaemonSchedule error tests ----------------------------------------

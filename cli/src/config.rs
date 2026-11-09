@@ -250,6 +250,10 @@ impl From<io::Error> for ConfigError {
 /// defaults at load time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigRecord {
+    /// Every field is optional on read (a hand-written partial config is
+    /// merged with the defaults); an absent version is treated as the
+    /// oldest supported one and rewritten as current on the next save.
+    #[serde(default)]
     pub schema_version: u32,
     #[serde(default)]
     pub provider: ProviderConfig,
@@ -264,8 +268,10 @@ pub struct ConfigRecord {
     #[serde(default)]
     pub metadata: ConfigMetadata,
     /// Unix seconds. Set on first write, refreshed on every update.
+    #[serde(default)]
     pub created_at: u64,
     /// Unix seconds. Refreshed on every update.
+    #[serde(default)]
     pub updated_at: u64,
 }
 
@@ -560,37 +566,63 @@ pub fn save(record: ConfigRecord) -> Result<PathBuf, ConfigError> {
 /// 0644 would expose it to any other local user). On non-Unix platforms we
 /// fall back to `fs::write` (there is no POSIX mode bit to set).
 fn write_config_file(path: &Path, contents: &str) -> Result<(), ConfigError> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|source| ConfigError::Write {
-                path: path.to_path_buf(),
+    // Write a sibling temp file and rename it over the target. The old
+    // truncate-in-place write left an empty/half JSON file if the process
+    // died mid-write, and `load()` then silently fell back to defaults —
+    // i.e. a crash quietly discarded the whole configuration.
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("magent.json");
+    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+
+    let result = (|| -> Result<(), ConfigError> {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|source| ConfigError::Write {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            f.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|source| ConfigError::Write {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            f.write_all(contents.as_bytes())
+                .map_err(|source| ConfigError::Write {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            f.sync_all().map_err(|source| ConfigError::Write {
+                path: tmp.clone(),
                 source,
             })?;
-        f.write_all(contents.as_bytes()).map_err(|source| ConfigError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        f.flush().map_err(|source| ConfigError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, contents).map_err(|source| ConfigError::Write {
+        }
+        #[cfg(not(unix))]
+        {
+            fs::write(&tmp, contents).map_err(|source| ConfigError::Write {
+                path: tmp.clone(),
+                source,
+            })?;
+        }
+        fs::rename(&tmp, path).map_err(|source| ConfigError::Write {
             path: path.to_path_buf(),
             source,
         })
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
+    result
 }
 
 /// Delete the config file. Returns `Ok(true)` if a file was removed,
@@ -1563,51 +1595,49 @@ impl<'a> ConfigCmd<'a> {
     }
 
     fn run_set(&self, key: &str, value: &str, out: &mut Output) -> Result<(), ConfigError> {
+        // Hold an exclusive lock across load → mutate → save so concurrent
+        // `config set` calls cannot each overwrite the others' changes.
+        let _lock = acquire_config_lock(&config_path()?)?;
         let mut record = load()?;
-        // Auto-detect the JSON type: if the value parses as an integer,
-        // treat it as usize; if it parses as a float, treat it as f32;
-        // if it parses as `true`/`false`/string, use that.
-        let parsed: serde_json::Value = if let Ok(n) = value.parse::<u64>() {
-            serde_json::Value::Number(n.into())
-        } else if let Ok(f) = value.parse::<f64>() {
-            serde_json::Number::from_f64(f)
-                .map(serde_json::Value::Number)
-                .unwrap_or_else(|| serde_json::Value::String(value.to_string()))
-        } else if value == "true" {
-            serde_json::Value::Bool(true)
-        } else if value == "false" {
-            serde_json::Value::Bool(false)
-        } else if value == "null" {
-            serde_json::Value::Null
-        } else {
-            serde_json::Value::String(value.to_string())
+        // Rewrite a type error so the user sees the key they typed (the
+        // outer CLI key, e.g. `author`) rather than the dotted path `set`
+        // reported, and sanitize `got` so control characters from the input
+        // cannot be re-injected into the message.
+        let map_err = |e: ConfigError| -> ConfigError {
+            match e {
+                ConfigError::TypeMismatch { expected, .. } => ConfigError::TypeMismatch {
+                    key: key.to_string(),
+                    expected,
+                    got: sanitize_for_error(value),
+                },
+                other => other,
+            }
         };
-        record = set(record, key, parsed.clone()).map_err(|e| match e {
-            // Rewrite the error so the CLI user sees the key
-            // they typed (the *outer* CLI key, e.g. `author`)
-            // rather than the dotted key path we got from `set`
-            // (e.g. `metadata.author`). Previously we stuffed
-            // the full `e.to_string()` into `expected`, which
-            // produced strings like
-            // `config key "metadata.author": expected config
-            //  key "metadata.author": expected …`. That was
-            // both confusing and the key was duplicated.
-            //
-            // We also sanitize `got`: the user's raw input
-            // (`value`) may contain control characters that
-            // would re-introduce the very injection the
-            // `metadata_set` validator was trying to block.
-            // Strip them so the error message is safe to print.
-            ConfigError::TypeMismatch {
-                expected, ..
-            } => ConfigError::TypeMismatch {
-                key: key.to_string(),
-                expected,
-                got: sanitize_for_error(value),
-            },
-            other => other,
-        })?;
-        let path = save(record.touched(now_unix_seconds()))?;
+
+        // Prefer the target field's type, but fall back to a literal string
+        // when that guess produces a type mismatch. This is what makes
+        // `config set provider.ollama.model 1234` / `metadata.author true`
+        // work even when the key currently holds `null` (an absent optional
+        // field) and `get` can't reveal the schema.
+        let parsed = value_for_key(&record, key, value);
+        record = match set(record.clone(), key, parsed.clone()) {
+            Ok(updated) => updated,
+            Err(ConfigError::TypeMismatch { .. })
+                if !matches!(parsed, serde_json::Value::String(_)) =>
+            {
+                set(record, key, serde_json::Value::String(value.to_string()))
+                    .map_err(map_err)?
+            }
+            Err(e) => return Err(map_err(e)),
+        };
+        // `set` is deliberately a type-level operation (it does not refuse a
+        // semantically invalid value — the BACKLOG's option (a)). But writing
+        // `sampling.temperature 9` and leaving the file in a state the very
+        // next `config validate` flags is a surprise, so say so immediately
+        // without changing what was written (option (c)).
+        let record = record.touched(now_unix_seconds());
+        let issues = validate_record(&record);
+        let path = save(record)?;
         if matches!(out.kind(), OutputKind::Json) {
             out.write_json(serde_json::json!({
                 "action": "set",
@@ -1617,6 +1647,13 @@ impl<'a> ConfigCmd<'a> {
             }))?;
         } else {
             out.info(&format!("{} = {}", key, value))?;
+            if !issues.is_empty() {
+                out.info(&format!(
+                    "warning: this value leaves {} issue(s) for `config validate`; \
+                     run `magent config validate` for details",
+                    issues.len()
+                ))?;
+            }
         }
         Ok(())
     }
@@ -1744,6 +1781,121 @@ impl std::fmt::Display for ValidationIssue {
 /// The rules are intentionally cheap and deterministic — no I/O,
 /// no network calls. We only check what's already inside the
 /// in-memory record.
+/// Type-detect an arbitrary CLI value (`123` → number, `true` → bool, …).
+fn auto_json_value(value: &str) -> serde_json::Value {
+    if let Ok(n) = value.parse::<u64>() {
+        serde_json::Value::Number(n.into())
+    } else if let Ok(f) = value.parse::<f64>() {
+        serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(value.to_string()))
+    } else if value == "true" {
+        serde_json::Value::Bool(true)
+    } else if value == "false" {
+        serde_json::Value::Bool(false)
+    } else if value == "null" {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(value.to_string())
+    }
+}
+
+/// Build the JSON value for `key` from the raw CLI string, using the
+/// field's current type as the schema.
+///
+/// A string-typed field always receives the literal text, so model names,
+/// authors and other identifiers that happen to look numeric or boolean are
+/// representable. Unknown keys fall back to type detection (the subsequent
+/// `set` rejects them with a type error either way).
+fn value_for_key(record: &ConfigRecord, key: &str, raw: &str) -> serde_json::Value {
+    // Optional string fields are `null` until set, so `get` cannot reveal
+    // their type. Treat them as strings explicitly.
+    if matches!(key, "metadata.author" | "metadata.description") {
+        return serde_json::Value::String(raw.to_string());
+    }
+    match get(record, key) {
+        Ok(serde_json::Value::String(_)) => serde_json::Value::String(raw.to_string()),
+        Ok(serde_json::Value::Bool(_)) => match raw {
+            "true" => serde_json::Value::Bool(true),
+            "false" => serde_json::Value::Bool(false),
+            _ => serde_json::Value::String(raw.to_string()),
+        },
+        Ok(serde_json::Value::Number(n)) if n.is_u64() => raw
+            .parse::<u64>()
+            .map(|v| serde_json::Value::Number(v.into()))
+            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string())),
+        Ok(serde_json::Value::Number(_)) => raw
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(raw.to_string())),
+        _ => auto_json_value(raw),
+    }
+}
+
+/// Exclusive lock around the config's load→mutate→save cycle.
+///
+/// `config set` is a whole-file read-modify-write; without this, concurrent
+/// invocations each wrote a file containing only their own change. A lock
+/// older than 30 s is treated as abandoned (the writer crashed).
+pub struct ConfigLock {
+    path: PathBuf,
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Acquire the config lock file next to `config_path`.
+pub fn acquire_config_lock(config_path: &Path) -> Result<ConfigLock, ConfigError> {
+    let path = config_path.with_extension("lock");
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    const STALE: std::time::Duration = std::time::Duration::from_secs(30);
+    for attempt in 0..2 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(ConfigLock { path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                let stale = fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|m| m.elapsed().unwrap_or_default() > STALE)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                return Err(ConfigError::Write {
+                    path: path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "another `magent config` process is updating the file",
+                    ),
+                });
+            }
+            Err(e) => {
+                return Err(ConfigError::Write { path, source: e })
+            }
+        }
+    }
+    Err(ConfigError::Write {
+        path,
+        source: std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "config lock was reclaimed concurrently",
+        ),
+    })
+}
+
 pub fn validate_record(record: &ConfigRecord) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
 
@@ -2201,6 +2353,79 @@ mod tests {
         assert_eq!(record.provider.default, "deepseek");
         // Defaults still apply for the omitted sections.
         assert_eq!(record.sampling.temperature, 0.3);
+    }
+
+    /// The module docs say every field is optional so a hand-written partial
+    /// file can be loaded. `schema_version` / `created_at` / `updated_at` had
+    /// no `serde(default)`, so omitting any of them rejected the whole file.
+    #[test]
+    fn a_minimal_hand_written_config_loads() {
+        let json = r#"{ "provider": { "default": "deepseek" } }"#;
+        let record: ConfigRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.provider.default, "deepseek");
+        assert_eq!(record.schema_version, 0);
+        assert_eq!(record.created_at, 0);
+        assert_eq!(record.updated_at, 0);
+    }
+
+    /// `OpenOptions::mode(0o600)` only applies at creation. An existing
+    /// world-readable config stayed 0644 after every save despite the docs.
+    #[cfg(unix)]
+    #[test]
+    fn save_tightens_an_existing_config_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmp = TempConfig::new("mode");
+        let path = save(ConfigRecord::with_defaults()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let path = save(ConfigRecord::with_defaults()).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config must be owner-only after save");
+    }
+
+    /// A string field must accept a value that *looks* numeric/boolean.
+    #[test]
+    fn numeric_looking_strings_stay_strings_for_string_fields() {
+        let r = ConfigRecord::with_defaults();
+        assert_eq!(
+            value_for_key(&r, "provider.ollama.model", "1234"),
+            serde_json::json!("1234")
+        );
+        assert_eq!(
+            value_for_key(&r, "metadata.author", "true"),
+            serde_json::json!("true")
+        );
+        // A numeric field still parses as a number.
+        assert_eq!(
+            value_for_key(&r, "sampling.num_predict", "64"),
+            serde_json::json!(64)
+        );
+        // A boolean field accepts true/false and rejects other text via the
+        // usual set() type check (it stays a string here).
+        assert_eq!(
+            value_for_key(&r, "io.json_default", "false"),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            value_for_key(&r, "io.json_default", "nope"),
+            serde_json::json!("nope")
+        );
+    }
+
+    /// `config set` is a whole-file read-modify-write; the lock must make
+    /// concurrent invocations serialize instead of losing updates.
+    #[test]
+    fn config_lock_is_exclusive_and_released() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmp = TempConfig::new("lock");
+        let path = config_path().unwrap();
+        let guard = acquire_config_lock(&path).expect("first lock");
+        assert!(
+            acquire_config_lock(&path).is_err(),
+            "a second writer must be refused"
+        );
+        drop(guard);
+        assert!(acquire_config_lock(&path).is_ok());
     }
 
     #[test]

@@ -18,8 +18,11 @@
 //!   line-at-a-time read, so scripted input keeps working unchanged.
 //!
 //! Raw mode deliberately leaves `ISIG` alone, so Ctrl-C still sends
-//! `SIGINT` and kills the REPL the way it always has; nothing here has
-//! to invent an interrupt path.
+//! `SIGINT` and kills the REPL the way it always has. Because that signal
+//! terminates the process without unwinding, `Drop` never runs on it — so
+//! the guard also installs a `SIGINT` handler that puts the terminal back
+//! before the signal is allowed to kill the process. Without it, Ctrl-C
+//! left the shell with echo and line editing off.
 //!
 //! The prompt and the redraws go to the terminal stream — stdout when it
 //! is a terminal, stderr otherwise — so a redirected stdout stays the
@@ -238,6 +241,7 @@ mod tty {
     use super::LineBuffer;
     use std::collections::VecDeque;
     use std::io::{self, Read, Write};
+    use std::sync::atomic::{AtomicPtr, Ordering};
 
     /// Byte-level keys. Kept as named constants so the dispatch below
     /// reads as a keymap rather than a table of magic numbers.
@@ -253,11 +257,59 @@ mod tty {
     const BACKSPACE: u8 = 0x7F;
     const ESC: u8 = 0x1B;
 
+    /// The settings to put back when a signal kills us mid-edit, or null
+    /// while no guard is alive.
+    ///
+    /// `Drop` cannot cover this: `SIGINT`'s default disposition ends the
+    /// process without unwinding, so the guard is never dropped and the
+    /// terminal stays in raw mode. The handler needs the saved settings
+    /// without allocating or locking (neither is signal-safe), so they are
+    /// published here as a bare pointer. `tcsetattr` is on POSIX's list of
+    /// async-signal-safe functions, which is what makes the restore legal.
+    /// Signals are process-wide and there is one prompt at a time, so a
+    /// single slot is enough.
+    static SAVED_TERMIOS: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
+
+    /// Put the terminal back, then let the signal kill the process.
+    ///
+    /// Only async-signal-safe calls appear here — an atomic load, a
+    /// `tcsetattr`, and the `sigaction`/`raise` re-raise. No allocation,
+    /// no locks, no formatting.
+    extern "C" fn restore_on_sigint(sig: libc::c_int) {
+        let saved = SAVED_TERMIOS.load(Ordering::Acquire);
+        if !saved.is_null() {
+            // SAFETY: a non-null value points at the `termios` boxed by a
+            // live `RawMode`; `drop` clears the pointer before that box is
+            // freed, so the target is valid for the whole time the handler
+            // is installed.
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, saved);
+            }
+        }
+        // Hand SIGINT back to its default disposition and re-raise: the
+        // REPL dies from the signal exactly as it did before the guard
+        // existed, so a shell still sees "Interrupt" and the exit status
+        // is unchanged.
+        // SAFETY: `action` is a zeroed `sigaction` whose handler is
+        // `SIG_DFL`; installing it is what `signal(2)` does internally.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+            libc::raise(sig);
+        }
+    }
+
     /// Terminal state guard: whatever flags the terminal had before we
     /// touched them are restored on drop, including on the panic path.
     struct RawMode {
         fd: i32,
-        saved: libc::termios,
+        /// Boxed so its address is stable across the move out of
+        /// [`RawMode::enable`] — [`SAVED_TERMIOS`] points into it.
+        saved: Box<libc::termios>,
+        /// SIGINT's disposition before the guard took it over, restored on
+        /// drop so a program that installed its own handler keeps it.
+        previous: Option<libc::sigaction>,
     }
 
     impl RawMode {
@@ -266,11 +318,11 @@ mod tty {
             // SAFETY: `fd` is a valid descriptor (stdin) and `saved` is a
             // live, properly aligned `termios`. `tcgetattr` only writes on
             // success, which the return code checks.
-            let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-            if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+            let mut saved: Box<libc::termios> = Box::new(unsafe { std::mem::zeroed() });
+            if unsafe { libc::tcgetattr(fd, saved.as_mut()) } != 0 {
                 return None;
             }
-            let mut raw = saved;
+            let mut raw = *saved;
             // Canonical mode is what buffers a whole line and does its own
             // echo; both must go for per-keystroke editing. `ISIG` is left
             // set so Ctrl-C still raises SIGINT.
@@ -284,15 +336,47 @@ mod tty {
             if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
                 return None;
             }
-            Some(Self { fd, saved })
+            // Publish the settings before the handler can observe them, so
+            // a Ctrl-C landing between these two steps still restores the
+            // terminal. A failure to install the handler is not fatal:
+            // `Drop` still covers the normal and panic paths, so line
+            // editing is worth more than refusing the guard.
+            SAVED_TERMIOS.store(saved.as_mut() as *mut libc::termios, Ordering::Release);
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = restore_on_sigint as *const () as libc::sighandler_t;
+            action.sa_flags = 0;
+            let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: `action` is a fully initialised `sigaction` with a
+            // handler of the right signature; `previous` receives the old
+            // one.
+            let installed = unsafe { libc::sigaction(libc::SIGINT, &action, &mut previous) } == 0;
+            if !installed {
+                SAVED_TERMIOS.store(std::ptr::null_mut(), Ordering::Release);
+            }
+            Some(Self {
+                fd,
+                saved,
+                previous: installed.then_some(previous),
+            })
         }
     }
 
     impl Drop for RawMode {
         fn drop(&mut self) {
+            // Retract the handler's save area, then hand SIGINT back to
+            // whoever had it. Clearing first means a signal landing in
+            // between reads a null pointer instead of memory about to be
+            // freed.
+            SAVED_TERMIOS.store(std::ptr::null_mut(), Ordering::Release);
+            if let Some(previous) = self.previous.take() {
+                // SAFETY: `previous` was filled by `sigaction` above.
+                unsafe {
+                    libc::sigaction(libc::SIGINT, &previous, std::ptr::null_mut());
+                }
+            }
             // SAFETY: restoring the struct we read a moment ago.
             unsafe {
-                libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved);
+                libc::tcsetattr(self.fd, libc::TCSAFLUSH, self.saved.as_ref());
             }
         }
     }
@@ -378,6 +462,18 @@ mod tty {
             Some(b'[') | Some(b'O') => {}
             _ => return,
         }
+        /// Discard the remainder of a CSI sequence: parameter/intermediate
+        /// bytes (0x20..=0x3f) up to the final byte (0x40..=0x7e).
+        fn discard_csi<R: Read>(input: &mut R) {
+            loop {
+                match read_byte(input) {
+                    Some(x) if (0x40..=0x7e).contains(&x) => return,
+                    Some(_) => {}
+                    None => return,
+                }
+            }
+        }
+
         match read_byte(input) {
             Some(b'A') => recall(buf, history, hist_idx, draft, -1),
             Some(b'B') => recall(buf, history, hist_idx, draft, 1),
@@ -400,7 +496,20 @@ mod tty {
                 loop {
                     match read_byte(input) {
                         Some(b'~') => break,
-                        Some(x) if x.is_ascii_digit() => param = param * 10 + (x - b'0') as u32,
+                        Some(x) if x.is_ascii_digit() => {
+                            // A long digit run (`ESC [ 99999999999 ~`) used to
+                            // overflow `u32` and panic in dev builds.
+                            param = param
+                                .saturating_mul(10)
+                                .saturating_add((x - b'0') as u32);
+                        }
+                        // Modifier sequences (`ESC [ 1 ; 5 C` for Ctrl-Right)
+                        // continue with parameter bytes; swallow the rest of
+                        // the CSI instead of typing `5C` into the line.
+                        Some(x) if (0x20..=0x3f).contains(&x) => {
+                            discard_csi(input);
+                            return;
+                        }
                         _ => return,
                     }
                 }
@@ -417,6 +526,12 @@ mod tty {
                     _ => {}
                 }
             }
+            // An unknown final byte (e.g. `ESC [ Z` for Shift-Tab) is a
+            // complete sequence: ignore it. Parameter/intermediate bytes
+            // (`ESC [ ; 5 C`, focus events) need the rest consumed through
+            // their final byte and must never be typed as text.
+            Some(x) if (0x40..=0x7e).contains(&x) => {}
+            Some(x) if (0x20..=0x3f).contains(&x) => discard_csi(input),
             _ => return,
         }
         redraw(out, prompt, buf, char_width);
@@ -765,6 +880,24 @@ mod tty {
             // 0x80 with no lead byte, then a normal char.
             let (line, _) = feed(b"\x80ok\r", &[]);
             assert_eq!(line.as_deref(), Some("ok"));
+        }
+
+        #[test]
+        fn modifier_csi_sequences_are_swallowed_not_typed() {
+            // Ctrl-Right / Ctrl-Left: `ESC [ 1 ; 5 C/D`. The `;5C` tail used
+            // to be inserted into the line as literal text.
+            let (line, _) = feed(b"ab\x1b[1;5Cc\r", &[]);
+            assert_eq!(line.as_deref(), Some("abc"));
+            let (line, _) = feed(b"ab\x1b[1;5Dc\r", &[]);
+            assert_eq!(line.as_deref(), Some("abc"));
+        }
+
+        #[test]
+        fn a_huge_csi_parameter_does_not_overflow() {
+            // The `ESC [ n ~` parser multiplied without a bound; a long digit
+            // run overflowed u32 and panicked in debug builds.
+            let (line, _) = feed(b"ab\x1b[99999999999~c\r", &[]);
+            assert_eq!(line.as_deref(), Some("abc"));
         }
 
         #[test]

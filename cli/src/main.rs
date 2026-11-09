@@ -16,7 +16,7 @@ use magent::{
     doctor::DoctorCmd,
     output::{Output, OutputKind},
     prompt::SetPromptCmd,
-    runner::RunCmd,
+    runner::{RunCmd, RunError},
     scheduler::SchedulerCmd,
     summary::SummaryCmd,
 };
@@ -108,9 +108,94 @@ fn restore_default_sigpipe() {
 #[cfg(not(unix))]
 fn restore_default_sigpipe() {}
 
+/// Whether stdout is promised to hold exactly one JSON document.
+///
+/// Set once `--json` (or `io.json_default`) is resolved. The panic hook
+/// reads it, so it is only ever flipped `false → true`; a relaxed load is
+/// enough because the hook has no ordering requirement beyond "see the
+/// value eventually".
+static JSON_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Report a panic as a bug rather than a mystery.
+///
+/// The default hook already prints the message and the source location, so
+/// this keeps that whole report on stderr and adds the two things a user
+/// actually needs: a statement that the failure is a *bug in magent* (not
+/// their command line), and — under `--json` — an error envelope on
+/// stdout, so the "stdout is exactly one JSON document" promise survives a
+/// crash. The process still exits 101 (see `EXIT CODES` in `--help`),
+/// which is how a caller distinguishes a crash from a handled failure.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        let message = panic_message(info);
+        eprintln!(
+            "error: internal error ({message}) — this is a bug in magent, not in your \
+             command line; please report it at https://github.com/arkCyber/mAgent/issues"
+        );
+        if JSON_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            // Write to stdout directly instead of through `Output`: the
+            // panicking frame may be the one holding its lock, and the
+            // envelope is the only thing that must get out.
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": message,
+                "code": "internal_error",
+                "exit": 101,
+            });
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+    }));
+}
+
+/// The panic payload as text — `panic!("x")` and `panic!("{x}")` produce
+/// different payload types, and a `panic_any` can be neither.
+fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
+    if let Some(s) = info.payload().downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = info.payload().downcast_ref::<String>() {
+        s.clone()
+    } else {
+        match info.location() {
+            Some(l) => format!("panic at {}:{}", l.file(), l.line()),
+            None => "panic".to_string(),
+        }
+    }
+}
+
+/// Collect argv as UTF-8 strings.
+///
+/// `std::env::args()` panics on a non-UTF-8 argument, which the panic hook
+/// reports as an internal bug (exit 101). A bad argument is user input, so
+/// surface it through the usage-error path (exit 2) instead.
+fn collect_argv() -> Result<Vec<String>, std::ffi::OsString> {
+    let mut argv = Vec::new();
+    for arg in std::env::args_os() {
+        argv.push(arg.into_string()?);
+    }
+    Ok(argv)
+}
+
 fn main() -> ExitCode {
     restore_default_sigpipe();
-    let argv: Vec<String> = std::env::args().collect();
+    install_panic_hook();
+    let argv = match collect_argv() {
+        Ok(argv) => argv,
+        Err(raw) => {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "error: argument is not valid UTF-8: {:?}",
+                raw
+            );
+            let _ = writeln!(stderr);
+            let _ = writeln!(stderr, "{}", help_text(VERSION));
+            return ExitCode::from(2);
+        }
+    };
 
     let args = match Args::parse(&argv) {
         Ok(a) => a,
@@ -154,6 +239,17 @@ fn main() -> ExitCode {
         OutputKind::Human
     };
     let no_color = args.global.no_color || io_config.no_color;
+    JSON_MODE.store(
+        output_kind == OutputKind::Json,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // Test seam for `cli/tests/panics.rs`, and the only way to exercise the
+    // hook above end-to-end: an env-gated deliberate panic, placed after
+    // `JSON_MODE` so the test can prove the envelope path too. Inert unless
+    // the variable is set, which nothing but the test suite does.
+    if std::env::var_os("MAGENT_TEST_PANIC").is_some() {
+        panic!("MAGENT_TEST_PANIC: deliberate panic for the panic-hook test");
+    }
     let mut out = Output::new(output_kind, no_color);
 
     match args.command {
@@ -188,8 +284,14 @@ fn main() -> ExitCode {
         Command::Run(mut opts) => match RunCmd::new(&mut opts).execute(&mut out) {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
-                let _ = out.error(&e.to_string());
-                ExitCode::FAILURE
+                // A missing/unreadable `--prompt` file is rejected input, not
+                // a failed run: `--help` documents exit 2 for that class.
+                let code = match &e {
+                    RunError::PromptLoad(_) => 2,
+                    _ => 1,
+                };
+                out.fail("run_error", code, &e.to_string());
+                ExitCode::from(code)
             }
         },
         Command::Doctor => {
@@ -231,7 +333,7 @@ fn main() -> ExitCode {
                 // All prompt-store errors are user errors (bad name,
                 // missing file, IO failure creating the dir, …). Print
                 // the diagnostic and exit non-zero so CI can pick it up.
-                let _ = out.error(&e.to_string());
+                out.fail("set_prompt_error", 2, &e.to_string());
                 ExitCode::from(2)
             }
         },
@@ -247,7 +349,7 @@ fn main() -> ExitCode {
                 // summary-store errors are always user-facing
                 // diagnostics (bad topic, IO failure, invalid
                 // JSON in --from) so print and exit non-zero.
-                let _ = out.error(&e.to_string());
+                out.fail("summary_error", 2, &e.to_string());
                 ExitCode::from(2)
             }
         },
@@ -263,7 +365,7 @@ fn main() -> ExitCode {
                 // config errors are always user-facing diagnostics
                 // (no permission to write, bad key, etc.) so print
                 // and exit non-zero.
-                let _ = out.error(&e.to_string());
+                out.fail("config_error", 2, &e.to_string());
                 ExitCode::from(2)
             }
         },
@@ -280,11 +382,25 @@ fn main() -> ExitCode {
                 // short notice and exit 130, the conventional
                 // "killed by SIGINT" code, so a CI script can
                 // tell a clean stop from a real failure.
+                //
+                // `TasksFailed` is a *runtime* failure, not a usage
+                // error: the queue ran and some of it failed, so it
+                // exits 1 (`FAILURE`) exactly as `magent run` does for
+                // a failed task. Exit 2 stays reserved for "your
+                // command line or config was rejected".
                 let code = match &e {
                     magent::scheduler::SchedulerError::Interrupted => 130,
+                    magent::scheduler::SchedulerError::TasksFailed { .. } => 1,
                     _ => 2,
                 };
-                let _ = out.error(&e.to_string());
+                let tag = match &e {
+                    magent::scheduler::SchedulerError::Interrupted => "scheduler_interrupted",
+                    magent::scheduler::SchedulerError::TasksFailed { .. } => {
+                        "scheduler_tasks_failed"
+                    }
+                    _ => "scheduler_error",
+                };
+                out.fail(tag, code, &e.to_string());
                 ExitCode::from(code)
             }
         },
@@ -326,7 +442,7 @@ fn main() -> ExitCode {
             match cmd.execute(&mut out) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    let _ = out.error(&e.to_string());
+                    out.fail("web3_error", 2, &e.to_string());
                     ExitCode::from(2)
                 }
             }

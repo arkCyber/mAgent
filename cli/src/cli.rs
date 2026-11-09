@@ -76,6 +76,11 @@ use crate::web3::{
     PayloadSource, Web3Action, Web3DidOptions, Web3NewOptions, Web3PubkeyOptions,
     Web3SignOptions, Web3VerifyOptions,
 };
+#[cfg(feature = "blockchain")]
+use crate::web3_blockchain::{
+    BalanceOptions, BindCreateOptions, BlockchainAction, KeySource, TxBuildOptions, VcIssueOptions,
+    VcPresentOptions,
+};
 
 // ============================================================================
 // Top-level types
@@ -196,6 +201,11 @@ pub struct RunOptions {
     /// Cap on tool executions. `None` → fall through to the config
     /// file (and finally the built-in default).
     pub max_tool_calls: Option<usize>,
+    /// `--timeout <SECS>` — wall-clock budget for the whole run.
+    /// `None` → no time bound (only the iteration/tool-call caps
+    /// apply). Checked between ReAct steps, not inside an in-flight
+    /// request (each client has its own timeout).
+    pub timeout_secs: Option<u64>,
     /// Path to a custom system prompt file. `None` → use the default.
     pub prompt_file: Option<PathBuf>,
     /// Name of a prompt stored via `magent set-prompt set <NAME>`.
@@ -710,7 +720,44 @@ fn parse_run_args<'a>(
 ) -> Result<RunParseOutcome, ParseError> {
     let mut opts = RunOptions::default();
 
+    /// Consume the next argv token as an option value, rejecting a following
+    /// flag token.
+    ///
+    /// The generic value path used to call `iter.next()` unconditionally, so
+    /// `magent run --model --mock "hi"` consumed `--mock` as the model name
+    /// and ran against the real backend instead of the simulator. A lone `-`
+    /// remains a valid value (stdin convention).
+    fn take_value<'a>(
+        iter: &mut std::iter::Peekable<std::slice::Iter<'a, String>>,
+        flag: &str,
+    ) -> Result<&'a String, ParseError> {
+        match iter.peek() {
+            Some(v) if !v.starts_with('-') || v.as_str() == "-" => iter
+                .next()
+                .ok_or_else(|| ParseError::MissingValue(flag.to_string())),
+            _ => Err(ParseError::MissingValue(flag.to_string())),
+        }
+    }
+
     while let Some(arg) = iter.next() {
+        // `--` ends option parsing: everything after it is positional, so a
+        // task beginning with `-` ("-5 degrees") is representable. Previously
+        // `--` was treated as the empty long-flag key.
+        if arg == "--" {
+            let rest: Vec<&String> = iter.collect();
+            if rest.is_empty() {
+                break;
+            }
+            let leading = usize::from(!opts.task.is_empty());
+            if leading > 0 || rest.len() > 1 {
+                return Err(ParseError::TooManyPositional {
+                    expected: 1,
+                    got: leading + rest.len(),
+                });
+            }
+            opts.task = rest[0].clone();
+            break;
+        }
 
         // Long-form options first so `--mock` doesn't fall through to the
         // `-m` short-option matcher.
@@ -759,10 +806,9 @@ fn parse_run_args<'a>(
                 }
                 "help" => return Ok(RunParseOutcome::Help),
                 other => {
-                    // Anything else expects a value.
-                    let v = iter
-                        .next()
-                        .ok_or(ParseError::MissingValue(other.to_string()))?;
+                    // Anything else expects a value. Do not swallow a
+                    // following flag as that value.
+                    let v = take_value(&mut iter, other)?;
                     apply_long_flag(other, v, &mut opts)?;
                 }
             }
@@ -800,18 +846,17 @@ fn parse_run_args<'a>(
                 apply_short_flag(key, rest, &mut opts)?;
                 continue;
             }
-            // `-m <value>`
-            let v = iter
-                .next()
-                .ok_or(ParseError::MissingValue(match key {
-                    "m" => "-m".to_string(),
-                    "u" => "-u".to_string(),
-                    "i" => "-i".to_string(),
-                    "t" => "-t".to_string(),
-                    "p" => "-p".to_string(),
-                    "e" => "-e".to_string(),
-                    _ => arg.to_string(),
-                }))?;
+            // `-m <value>` — same flag-token guard as the long form.
+            let flag_name = match key {
+                "m" => "-m".to_string(),
+                "u" => "-u".to_string(),
+                "i" => "-i".to_string(),
+                "t" => "-t".to_string(),
+                "p" => "-p".to_string(),
+                "e" => "-e".to_string(),
+                _ => arg.to_string(),
+            };
+            let v = take_value(&mut iter, &flag_name)?;
             apply_short_flag(key, v, &mut opts)?;
             continue;
         }
@@ -862,6 +907,16 @@ fn parse_run_args<'a>(
         // dropped without a word. Both are terminal modes of `run`, so
         // refuse the combination rather than pick one silently.
         return Err(ParseError::ReplVerifySigned);
+    }
+    #[cfg(feature = "web3_app")]
+    if opts.verify_signed_path.is_some() && !opts.task.is_empty() {
+        // `execute()` returns from the verify branch before the task is
+        // looked at, so the task was silently discarded.
+        return Err(ParseError::Usage(
+            "`--verify-signed <PATH>` verifies an existing envelope and does not run \
+             a task — pass either the path or a task, not both"
+                .to_string(),
+        ));
     }
     #[cfg(feature = "web3_app")]
     if opts.task.is_empty()
@@ -1313,15 +1368,370 @@ fn parse_web3_args<'a, I: Iterator<Item = &'a String>>(
             }
             Web3Action::Delete(name)
         }
+        #[cfg(feature = "blockchain")]
+        "chain" => Web3Action::Blockchain(parse_blockchain_chain(&snapshot[1..])?),
+        #[cfg(feature = "blockchain")]
+        "balance" => Web3Action::Blockchain(parse_blockchain_balance(&snapshot[1..])?),
+        #[cfg(feature = "blockchain")]
+        "tx" => Web3Action::Blockchain(parse_blockchain_tx(&snapshot[1..])?),
+        #[cfg(feature = "blockchain")]
+        "bind" => Web3Action::Blockchain(parse_blockchain_bind(&snapshot[1..])?),
+        #[cfg(feature = "blockchain")]
+        "vc" => Web3Action::Blockchain(parse_blockchain_vc(&snapshot[1..])?),
         other => {
+            #[cfg(feature = "blockchain")]
+            const EXTRA: &str = ", `chain`, `bind`, `balance`, `tx`, or `vc`";
+            #[cfg(not(feature = "blockchain"))]
+            const EXTRA: &str = "";
             return Err(ParseError::Usage(format!(
-                "web3 {} (try `new`, `identity`, `did`, `pubkey`, `sign`, `verify`, `list`, `export`, or `delete`)",
-                other
+                "web3 {} (try `new`, `identity`, `did`, `pubkey`, `sign`, `verify`, `list`, `export`, or `delete`{})",
+                other, EXTRA
             )));
         }
     };
 
     Ok(Web3ParseOutcome::Action(action))
+}
+
+// ----------------------------------------------------------------------------
+// `magent web3 chain|bind|balance|tx|vc …` parsing
+// ----------------------------------------------------------------------------
+
+/// Read the value that follows a flag, advancing `i` past it.
+#[cfg(feature = "blockchain")]
+fn take_flag_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, ParseError> {
+    *i += 1;
+    args.get(*i)
+        .cloned()
+        .ok_or_else(|| ParseError::Usage(format!("{flag} requires a value")))
+}
+
+/// Reject a flag this action does not know, so a typo never silently does
+/// nothing (matching the rest of the `web3` parser).
+#[cfg(feature = "blockchain")]
+fn unexpected_flag(flag: &str, usage: &str) -> ParseError {
+    ParseError::Usage(format!("unknown flag {flag} ({usage})"))
+}
+
+#[cfg(feature = "blockchain")]
+fn parse_blockchain_chain(args: &[String]) -> Result<BlockchainAction, ParseError> {
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            if args.len() != 1 {
+                return Err(ParseError::Usage(
+                    "web3 chain list: takes no arguments".to_string(),
+                ));
+            }
+            Ok(BlockchainAction::ChainList)
+        }
+        Some("info") => {
+            let chain = args
+                .get(1)
+                .ok_or_else(|| ParseError::Usage("web3 chain info: missing <CHAIN>".to_string()))?
+                .clone();
+            if args.len() != 2 {
+                return Err(ParseError::Usage(
+                    "web3 chain info: takes no flags beyond <CHAIN>".to_string(),
+                ));
+            }
+            Ok(BlockchainAction::ChainInfo(chain))
+        }
+        _ => Err(ParseError::Usage(
+            "web3 chain: expected `list` or `info <CHAIN>`".to_string(),
+        )),
+    }
+}
+
+#[cfg(feature = "blockchain")]
+fn parse_blockchain_balance(args: &[String]) -> Result<BlockchainAction, ParseError> {
+    let address = args
+        .first()
+        .ok_or_else(|| ParseError::Usage("web3 balance: missing <ADDRESS>".to_string()))?
+        .clone();
+    let usage = "usage: web3 balance <ADDRESS> [--chain <CHAIN>]";
+    let mut chain = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--chain" => chain = Some(take_flag_value(args, &mut i, "--chain")?),
+            other => return Err(unexpected_flag(other, usage)),
+        }
+        i += 1;
+    }
+    Ok(BlockchainAction::Balance(BalanceOptions { address, chain }))
+}
+
+#[cfg(feature = "blockchain")]
+fn parse_blockchain_tx(args: &[String]) -> Result<BlockchainAction, ParseError> {
+    let usage = "usage: web3 tx build <TO> --value <ETH> [--data <HEX>] [--chain <CHAIN>]";
+    if args.first().map(String::as_str) != Some("build") {
+        return Err(ParseError::Usage(
+            "web3 tx: expected `build <TO>`".to_string(),
+        ));
+    }
+    let to = args
+        .get(1)
+        .ok_or_else(|| ParseError::Usage("web3 tx build: missing <TO>".to_string()))?
+        .clone();
+    let mut value = None;
+    let mut data = None;
+    let mut chain = None;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--value" => value = Some(take_flag_value(args, &mut i, "--value")?),
+            "--data" => data = Some(take_flag_value(args, &mut i, "--data")?),
+            "--chain" => chain = Some(take_flag_value(args, &mut i, "--chain")?),
+            other => return Err(unexpected_flag(other, usage)),
+        }
+        i += 1;
+    }
+    Ok(BlockchainAction::TxBuild(TxBuildOptions {
+        to,
+        value,
+        data,
+        chain: chain.unwrap_or_else(|| "ethereum".to_string()),
+    }))
+}
+
+#[cfg(feature = "blockchain")]
+fn parse_blockchain_bind(args: &[String]) -> Result<BlockchainAction, ParseError> {
+    match args.first().map(String::as_str) {
+        Some("create") => {
+            let usage = "usage: web3 bind create <DID> --chain <CHAIN> --from-seed <HEX> \
+                         [--expiry-days <N>] [--output <FILE>]";
+            let did = args
+                .get(1)
+                .ok_or_else(|| ParseError::Usage("web3 bind create: missing <DID>".to_string()))?
+                .clone();
+            let mut chain = None;
+            let mut from_seed = None;
+            let mut expiry_days = None;
+            let mut output = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--chain" => chain = Some(take_flag_value(args, &mut i, "--chain")?),
+                    "--from-seed" => {
+                        from_seed = Some(take_flag_value(args, &mut i, "--from-seed")?)
+                    }
+                    "--expiry-days" => {
+                        let raw = take_flag_value(args, &mut i, "--expiry-days")?;
+                        expiry_days = Some(raw.parse::<u64>().map_err(|_| {
+                            ParseError::Usage(format!("--expiry-days {raw:?} is not a number"))
+                        })?);
+                    }
+                    "--output" => output = Some(take_flag_value(args, &mut i, "--output")?.into()),
+                    other => return Err(unexpected_flag(other, usage)),
+                }
+                i += 1;
+            }
+            let chain = chain.ok_or_else(|| {
+                ParseError::Usage("web3 bind create: --chain is required".to_string())
+            })?;
+            let from_seed = from_seed.ok_or_else(|| {
+                ParseError::Usage("web3 bind create: --from-seed is required".to_string())
+            })?;
+            Ok(BlockchainAction::BindCreate(BindCreateOptions {
+                did,
+                chain,
+                from_seed,
+                expiry_days,
+                output,
+            }))
+        }
+        Some("verify") => {
+            let path = args
+                .get(1)
+                .ok_or_else(|| ParseError::Usage("web3 bind verify: missing <FILE>".to_string()))?
+                .into();
+            if args.len() != 2 {
+                return Err(ParseError::Usage(
+                    "web3 bind verify: takes no flags beyond <FILE>".to_string(),
+                ));
+            }
+            Ok(BlockchainAction::BindVerify(path))
+        }
+        _ => Err(ParseError::Usage(
+            "web3 bind: expected `create <DID>` or `verify <FILE>`".to_string(),
+        )),
+    }
+}
+
+/// `--from-seed <HEX>`, `--issuer <NAME>` / `--holder <NAME>`, plus the vault
+/// flags a named identity needs. `require` is the vault flag (`--issuer` or
+/// `--holder`) so the error message names the right one.
+/// Accumulator for the key-source flags (`--from-seed` / a vault identity,
+/// plus `--passphrase-env` / `--vault`) shared by `web3 vc issue` and
+/// `web3 vc present`.
+#[cfg(feature = "blockchain")]
+#[derive(Default)]
+struct KeySourceFlags {
+    seed: Option<String>,
+    vault_name: Option<String>,
+    passphrase_env: Option<String>,
+    vault: Option<PathBuf>,
+}
+
+#[cfg(feature = "blockchain")]
+impl KeySourceFlags {
+    /// Consume the flag at `args[*i]` if it is one of the key-source flags,
+    /// or report it as unexpected. `require` is the vault-identity flag name
+    /// this subcommand uses (`--issuer` or `--holder`).
+    fn consume(
+        &mut self,
+        args: &[String],
+        i: &mut usize,
+        require: &str,
+        usage: &str,
+    ) -> Result<(), ParseError> {
+        match args[*i].as_str() {
+            "--from-seed" => self.seed = Some(take_flag_value(args, i, "--from-seed")?),
+            f if f == require => self.vault_name = Some(take_flag_value(args, i, require)?),
+            "--passphrase-env" => {
+                self.passphrase_env = Some(take_flag_value(args, i, "--passphrase-env")?)
+            }
+            "--vault" => self.vault = Some(take_flag_value(args, i, "--vault")?.into()),
+            other => return Err(unexpected_flag(other, usage)),
+        }
+        Ok(())
+    }
+
+    /// Resolve the accumulated flags into a [`KeySource`], rejecting the
+    /// "neither" and "both" cases with a usage error naming `scope`.
+    fn finish(self, scope: &str) -> Result<KeySource, ParseError> {
+        match (self.seed, self.vault_name) {
+            (Some(hex), None) => Ok(KeySource::Seed(hex)),
+            (None, Some(name)) => Ok(KeySource::Vault {
+                name,
+                passphrase_env: self.passphrase_env,
+                vault: self.vault,
+            }),
+            (Some(_), Some(_)) => Err(ParseError::Usage(format!(
+                "{scope}: pass either --from-seed or a vault identity, not both"
+            ))),
+            (None, None) => Err(ParseError::Usage(format!(
+                "{scope}: need --from-seed <HEX> or a vault identity"
+            ))),
+        }
+    }
+}
+
+#[cfg(feature = "blockchain")]
+fn parse_blockchain_vc(args: &[String]) -> Result<BlockchainAction, ParseError> {
+    match args.first().map(String::as_str) {
+        Some("issue") => {
+            let usage = "usage: web3 vc issue <SUBJECT_DID> --type <TYPE> [--claim <KEY>=<JSON>]... \
+                         [--from-seed <HEX> | --issuer <NAME>] [--valid-until <ISO8601>] [--output <FILE>]";
+            let subject_did = args
+                .get(1)
+                .ok_or_else(|| {
+                    ParseError::Usage("web3 vc issue: missing <SUBJECT_DID>".to_string())
+                })?
+                .clone();
+            let mut credential_type = None;
+            let mut claims = Vec::new();
+            let mut valid_until = None;
+            let mut output = None;
+            let mut key = KeySourceFlags::default();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--type" => credential_type = Some(take_flag_value(args, &mut i, "--type")?),
+                    "--claim" => {
+                        let raw = take_flag_value(args, &mut i, "--claim")?;
+                        claims.push(parse_claim(&raw)?);
+                    }
+                    "--valid-until" => {
+                        valid_until = Some(take_flag_value(args, &mut i, "--valid-until")?)
+                    }
+                    "--output" => output = Some(take_flag_value(args, &mut i, "--output")?.into()),
+                    _ => key.consume(args, &mut i, "--issuer", usage)?,
+                }
+                i += 1;
+            }
+            let credential_type = credential_type.ok_or_else(|| {
+                ParseError::Usage("web3 vc issue: --type is required".to_string())
+            })?;
+            let issuer = key.finish("web3 vc issue")?;
+            Ok(BlockchainAction::VcIssue(VcIssueOptions {
+                subject_did,
+                credential_type,
+                claims,
+                issuer,
+                valid_until,
+                output,
+            }))
+        }
+        Some("verify") => {
+            let path = args
+                .get(1)
+                .ok_or_else(|| ParseError::Usage("web3 vc verify: missing <FILE>".to_string()))?
+                .into();
+            if args.len() != 2 {
+                return Err(ParseError::Usage(
+                    "web3 vc verify: takes no flags beyond <FILE>".to_string(),
+                ));
+            }
+            Ok(BlockchainAction::VcVerify(path))
+        }
+        Some("present") => {
+            let usage = "usage: web3 vc present <FILE> --challenge <STR> \
+                         [--from-seed <HEX> | --holder <NAME>] [--domain <D>] [--output <FILE>]";
+            let vc_file = args
+                .get(1)
+                .ok_or_else(|| ParseError::Usage("web3 vc present: missing <FILE>".to_string()))?
+                .into();
+            let mut challenge = None;
+            let mut domain = None;
+            let mut output = None;
+            let mut key = KeySourceFlags::default();
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--challenge" => {
+                        challenge = Some(take_flag_value(args, &mut i, "--challenge")?)
+                    }
+                    "--domain" => domain = Some(take_flag_value(args, &mut i, "--domain")?),
+                    "--output" => output = Some(take_flag_value(args, &mut i, "--output")?.into()),
+                    _ => key.consume(args, &mut i, "--holder", usage)?,
+                }
+                i += 1;
+            }
+            let challenge = challenge.ok_or_else(|| {
+                ParseError::Usage("web3 vc present: --challenge is required".to_string())
+            })?;
+            let holder = key.finish("web3 vc present")?;
+            Ok(BlockchainAction::VcPresent(VcPresentOptions {
+                vc_file,
+                holder,
+                challenge,
+                domain,
+                output,
+            }))
+        }
+        _ => Err(ParseError::Usage(
+            "web3 vc: expected `issue`, `verify`, or `present`".to_string(),
+        )),
+    }
+}
+
+/// Parse a `--claim <KEY>=<JSON>` value. The right-hand side is JSON if it
+/// parses as such, and a plain string otherwise, so `--claim role=admin` and
+/// `--claim age=42` both do the obvious thing.
+#[cfg(feature = "blockchain")]
+fn parse_claim(raw: &str) -> Result<(String, serde_json::Value), ParseError> {
+    let (key, value) = raw
+        .split_once('=')
+        .ok_or_else(|| ParseError::Usage(format!("--claim {raw:?} must be <KEY>=<JSON>")))?;
+    if key.is_empty() {
+        return Err(ParseError::Usage(format!(
+            "--claim {raw:?} has an empty key"
+        )));
+    }
+    let value = serde_json::from_str(value)
+        .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+    Ok((key.to_string(), value))
 }
 
 #[cfg(feature = "web3")]
@@ -1580,6 +1990,19 @@ fn parse_scheduler_args<'a, I: Iterator<Item = &'a String>>(
         }
         Some("run-once") => {
             let opts = parse_scheduler_source_flags(&snapshot[1..])?;
+            // Schedule-selection flags belong to `daemon`. They used to be
+            // accepted and dropped, so `run-once --cron "0 0 1 1 *"` ran the
+            // queue once and exited as if the schedule had applied.
+            // `--timezone` stays accepted (it has no effect on an immediate
+            // run, and rejecting it would break existing invocations).
+            if opts.interval_secs.is_some() || opts.cron_expr.is_some() || opts.at_rfc3339.is_some()
+            {
+                return Err(ParseError::Usage(
+                    "`magent scheduler run-once` does not take --interval, --cron, or \
+                     --at; those select the `daemon` schedule"
+                        .to_string(),
+                ));
+            }
             scheduler::SchedulerAction::RunOnce {
                 tasks_file: opts.tasks_file,
                 preset: opts.preset,
@@ -1610,8 +2033,9 @@ fn parse_scheduler_args<'a, I: Iterator<Item = &'a String>>(
     Ok(SchedulerParseOutcome::Action(action))
 }
 
-/// Options shared by `run-once` and `daemon`. `run-once` ignores
-/// the schedule fields; `daemon` requires exactly one of them.
+/// Options shared by `run-once` and `daemon`. `daemon` requires exactly one
+/// schedule field; `run-once` rejects `--interval`/`--cron`/`--at` because it
+/// runs immediately.
 #[derive(Debug, Default)]
 struct SchedulerSourceFlags {
     tasks_file: Option<PathBuf>,
@@ -2399,6 +2823,19 @@ fn apply_long_flag(key: &str, value: &str, opts: &mut RunOptions) -> Result<(), 
         "max-tool-calls" => {
             opts.max_tool_calls = Some(parse_usize_nonzero(key, value)?);
         }
+        "timeout" => {
+            // Seconds. `0` would mean "expire before the first step", which
+            // is never what a user wants, so reuse the non-zero rule.
+            opts.timeout_secs = Some(
+                u64::try_from(parse_usize_nonzero(key, value)?).map_err(|_| {
+                    ParseError::InvalidValue {
+                        flag: "--timeout".to_string(),
+                        value: value.to_string(),
+                        expected: "a positive number of seconds (>= 1)".to_string(),
+                    }
+                })?,
+            );
+        }
         "max-messages" => {
             opts.max_messages = Some(parse_usize(key, value)?);
         }
@@ -2509,11 +2946,23 @@ fn parse_usize_nonzero(flag: &str, value: &str) -> Result<usize, ParseError> {
 }
 
 fn parse_f32(flag: &str, value: &str) -> Result<f32, ParseError> {
-    value.parse::<f32>().map_err(|_| ParseError::InvalidValue {
+    let parsed = value.parse::<f32>().map_err(|_| ParseError::InvalidValue {
         flag: flag.to_string(),
         value: value.to_string(),
         expected: "a floating-point number".to_string(),
-    })
+    })?;
+    // `"nan"` / `"inf"` parse as f32 but are not representable in JSON; the
+    // core request builder's hand-written encoder would emit the literal
+    // `NaN`, which every OpenAI-compatible provider rejects. Reject at the
+    // CLI boundary.
+    if !parsed.is_finite() {
+        return Err(ParseError::InvalidValue {
+            flag: flag.to_string(),
+            value: value.to_string(),
+            expected: "a finite floating-point number".to_string(),
+        });
+    }
+    Ok(parsed)
 }
 
 /// Returns the help text the CLI prints when `--help` or no subcommand
@@ -2597,6 +3046,50 @@ pub fn help_text(version: &str) -> String {
         "    the DEEPSEEK_API_KEY environment variable)."
     );
     let _ = writeln!(s);
+    let _ = writeln!(s, "EXIT CODES:");
+    let _ = writeln!(
+        s,
+        "    0    Success (for `scheduler run-once`, every task succeeded)."
+    );
+    let _ = writeln!(
+        s,
+        "    1    The command ran and failed — a failed agent task, a"
+    );
+    let _ = writeln!(
+        s,
+        "         backend error, or a `scheduler run-once` where at"
+    );
+    let _ = writeln!(
+        s,
+        "         least one task failed. With --json, stdout still holds"
+    );
+    let _ = writeln!(
+        s,
+        "         an {{\"ok\":false,\"error\":…,\"code\":…}} envelope."
+    );
+    let _ = writeln!(
+        s,
+        "    2    Your input was rejected — a bad flag, a missing file,"
+    );
+    let _ = writeln!(s, "         or a corrupt config. Nothing ran.");
+    let _ = writeln!(
+        s,
+        "    101  Internal error (a bug in magent). Report it; the"
+    );
+    let _ = writeln!(
+        s,
+        "         message names the location and diagnoses itself as a bug."
+    );
+    let _ = writeln!(
+        s,
+        "    130  Interrupted (SIGINT) — a clean `scheduler daemon` stop."
+    );
+    let _ = writeln!(
+        s,
+        "    141  SIGPIPE — the reader went away (`magent … | head`), the"
+    );
+    let _ = writeln!(s, "         same as any other Unix filter. Not an error.");
+    let _ = writeln!(s);
     let _ = writeln!(s, "See `magent run --help` for run-specific options.");
     s
 }
@@ -2620,6 +3113,10 @@ pub fn run_help_text() -> String {
     let _ = writeln!(s, "    -k, --api-key <KEY>        DeepSeek API key (or DEEPSEEK_API_KEY env)");
     let _ = writeln!(s, "    -i, --max-iterations <N>   Cap the ReAct loop (default 10)");
     let _ = writeln!(s, "    -t, --max-tool-calls <N>   Cap tool executions (default 8)");
+    let _ = writeln!(
+        s,
+        "    --timeout <SECS>           Wall-clock budget per run/turn (default off)"
+    );
     let _ = writeln!(s, "    --max-messages <N>         Cap conversation history (default 32, 0=off)");
     let _ = writeln!(
         s,
@@ -2920,6 +3417,65 @@ pub fn web3_help_text() -> String {
         s,
         "    delete <NAME>                     Remove an identity from the vault"
     );
+    #[cfg(feature = "blockchain")]
+    {
+        let _ = writeln!(
+            s,
+            "    chain list                        List the chains this build knows"
+        );
+        let _ = writeln!(
+            s,
+            "    chain info <CHAIN>                Show one chain's id, currency, RPC, explorer"
+        );
+        let _ = writeln!(
+            s,
+            "    balance <ADDRESS> [--chain <C>]   Query a native balance (needs network)"
+        );
+        let _ = writeln!(
+            s,
+            "    tx build <TO> --value <ETH> [--data <HEX>] [--chain <C>]"
+        );
+        let _ = writeln!(
+            s,
+            "                                      Build an unsigned transaction request"
+        );
+        let _ = writeln!(
+            s,
+            "    bind create <DID> --chain <C> --from-seed <HEX> [--expiry-days <N>]"
+        );
+        let _ = writeln!(
+            s,
+            "                                      Sign a DID-to-address binding proof"
+        );
+        let _ = writeln!(
+            s,
+            "    bind verify <FILE>                Verify a binding proof signature"
+        );
+        let _ = writeln!(
+            s,
+            "    vc issue <SUBJECT_DID> --type <TYPE> [--claim <KEY>=<JSON>]..."
+        );
+        let _ = writeln!(
+            s,
+            "        [--from-seed <HEX> | --issuer <NAME>] [--valid-until <ISO8601>]"
+        );
+        let _ = writeln!(
+            s,
+            "                                      Issue and sign a verifiable credential"
+        );
+        let _ = writeln!(
+            s,
+            "    vc verify <FILE>                  Check a credential's structure and expiry"
+        );
+        let _ = writeln!(
+            s,
+            "    vc present <FILE> --challenge <STR> [--from-seed <HEX> | --holder <NAME>]"
+        );
+        let _ = writeln!(
+            s,
+            "                                      Build a signed verifiable presentation"
+        );
+    }
     let _ = writeln!(s);
     let _ = writeln!(s, "STORAGE:");
     let _ = writeln!(s, "    The encrypted vault defaults to:");
@@ -3129,6 +3685,59 @@ mod tests {
     fn rfc3339_multibyte_in_time_fields_is_rejected_not_panicked() {
         assert!(parse_rfc3339("2026-08-11T09:00:日").is_err());
         assert!(parse_rfc3339("2026-08-11T09:00:00日").is_err());
+    }
+
+    /// `--model --mock` used to consume `--mock` as the model name, silently
+    /// disabling the simulator and contacting the real backend.
+    #[test]
+    fn a_following_flag_is_not_swallowed_as_a_value() {
+        match Args::parse(&argv(["magent", "run", "--model", "--mock", "hi"])) {
+            Err(ParseError::MissingValue(flag)) => assert_eq!(flag, "model"),
+            other => panic!("expected MissingValue(model), got {other:?}"),
+        }
+        match Args::parse(&argv(["magent", "run", "-m", "--mock", "hi"])) {
+            Err(ParseError::MissingValue(flag)) => assert_eq!(flag, "-m"),
+            other => panic!("expected MissingValue(-m), got {other:?}"),
+        }
+        // The attached forms remain valid: the value is explicit.
+        assert!(Args::parse(&argv(["magent", "run", "--model=--mock", "hi"])).is_ok());
+    }
+
+    /// `--` must end option parsing so a dash-leading task is representable.
+    #[test]
+    fn double_dash_ends_option_parsing() {
+        let a = Args::parse(&argv(["magent", "run", "--", "-5 degrees"])).unwrap();
+        match a.command {
+            Command::Run(opts) => {
+                assert_eq!(opts.task, "-5 degrees");
+                assert!(!opts.mock);
+            }
+            other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    /// Schedule flags belong to `daemon`; `run-once` used to accept and drop
+    /// them, so `run-once --cron …` looked like the schedule had applied.
+    #[test]
+    fn run_once_rejects_daemon_schedule_flags() {
+        for flag in ["--interval", "--cron", "--at"] {
+            let value = match flag {
+                "--interval" => "5",
+                "--cron" => "0 0 1 1 *",
+                _ => "2026-08-11T09:00:00Z",
+            };
+            let r = Args::parse(&argv([
+                "magent",
+                "scheduler",
+                "run-once",
+                flag,
+                value,
+            ]));
+            assert!(
+                matches!(r, Err(ParseError::Usage(_))),
+                "{flag} must be rejected on run-once, got {r:?}"
+            );
+        }
     }
 
     #[test]
@@ -3779,6 +4388,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_timeout_seconds() {
+        let a = Args::parse(&argv(["magent", "run", "--timeout", "90", "task"])).unwrap();
+        match a.command {
+            Command::Run(o) => assert_eq!(o.timeout_secs, Some(90)),
+            _ => panic!("expected Run"),
+        }
+        let a = Args::parse(&argv(["magent", "run", "--timeout=1", "task"])).unwrap();
+        match a.command {
+            Command::Run(o) => assert_eq!(o.timeout_secs, Some(1)),
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn rejects_a_timeout_that_cannot_bound_a_run() {
+        // `0` would expire before the first step, and a non-number is not a
+        // duration at all; both are usage errors rather than a silent
+        // fallback to "no timeout".
+        for value in ["0", "soon"] {
+            let err = Args::parse(&argv(["magent", "run", "--timeout", value, "task"])).unwrap_err();
+            assert!(
+                matches!(err, ParseError::InvalidValue { .. }),
+                "--timeout {value} should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn compression_defaults_match_library() {
         // The CLI defaults must mirror `CompressionPolicy::default()`
         // so users get a sensible out-of-the-box experience without
@@ -3805,6 +4442,34 @@ mod tests {
                 "the `--repl` help line does not mention {needle:?}: {line}"
             );
         }
+    }
+
+    /// The exit codes are the only interface a CI script can rely on
+    /// without parsing either stream, and they were documented nowhere.
+    /// Pinned so a future change to `main`'s dispatch has to update the
+    /// contract it prints.
+    #[test]
+    fn help_text_documents_every_exit_code() {
+        let h = help_text("0.0.0-test");
+        assert!(h.contains("EXIT CODES:"), "no EXIT CODES section:\n{h}");
+        let section: String = h
+            .lines()
+            .skip_while(|l| !l.starts_with("EXIT CODES:"))
+            .take_while(|l| !l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for code in ["0", "1", "2", "101", "130", "141"] {
+            assert!(
+                section.contains(&format!("\n    {code}")),
+                "exit code {code} is not documented:\n{section}"
+            );
+        }
+        // Code 1 is where the `--json` contract matters most, so the
+        // section must say that stdout still carries an envelope.
+        assert!(
+            section.contains("ok\":false"),
+            "the JSON-failure promise is missing:\n{section}"
+        );
     }
 
     #[test]
@@ -3851,7 +4516,6 @@ mod tests {
             "--not-before", "100",
             "--not-after", "200",
             "--verify-signed", "/tmp/in.json",
-            "task",
         ]);
         let a = Args::parse(&argv).unwrap();
         let Command::Run(opts) = a.command else {
@@ -3868,6 +4532,17 @@ mod tests {
             opts.verify_signed_path.as_deref().map(|p| p.to_str().unwrap()),
             Some("/tmp/in.json")
         );
+    }
+
+    /// `--verify-signed` never runs the agent, so a task argument used to be
+    /// silently discarded. Reject the combination instead.
+    #[cfg(feature = "web3_app")]
+    #[test]
+    fn verify_signed_with_a_task_is_rejected() {
+        let argv = argv([
+            "magent", "run", "--verify-signed", "/tmp/in.json", "do something",
+        ]);
+        assert!(matches!(Args::parse(&argv), Err(ParseError::Usage(_))));
     }
 
     /// `--features web3_app`: bare `--sign` (no value) lands as
@@ -4792,6 +5467,183 @@ mod tests {
             "error must mention the bogus flag: {}",
             msg
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `magent web3 chain|balance|tx|bind|vc` parser tests.
+    //
+    // These subcommands were listed in `web3 --help` while the parser still
+    // answered `unknown subcommand`, so every documented invocation was
+    // unreachable. Each test below drives the real `Args::parse` entry point
+    // and asserts the action comes back typed, which is exactly the assertion
+    // that failed before the parser arms existed.
+    // -----------------------------------------------------------------------
+
+    #[cfg(all(feature = "web3", feature = "blockchain"))]
+    #[test]
+    fn web3_blockchain_subcommands_route() {
+        // Every name advertised by `web3 --help` must parse to a blockchain
+        // action. Before the parser arms existed each of these returned
+        // "web3 <name>" as an unknown subcommand.
+        let a = Args::parse(&argv(["magent", "web3", "chain", "list"])).unwrap();
+        assert!(matches!(
+            a.command,
+            Command::Web3(Web3Action::Blockchain(BlockchainAction::ChainList))
+        ));
+
+        let a = Args::parse(&argv(["magent", "web3", "chain", "info", "polygon"])).unwrap();
+        match a.command {
+            Command::Web3(Web3Action::Blockchain(BlockchainAction::ChainInfo(name))) => {
+                assert_eq!(name, "polygon")
+            }
+            other => panic!("expected ChainInfo, got {:?}", other),
+        }
+
+        let a = Args::parse(&argv([
+            "magent",
+            "web3",
+            "balance",
+            "0x0000000000000000000000000000000000000001",
+            "--chain",
+            "sepolia",
+        ]))
+        .unwrap();
+        match a.command {
+            Command::Web3(Web3Action::Blockchain(BlockchainAction::Balance(opts))) => {
+                assert_eq!(opts.address, "0x0000000000000000000000000000000000000001");
+                assert_eq!(opts.chain.as_deref(), Some("sepolia"));
+            }
+            other => panic!("expected Balance, got {:?}", other),
+        }
+
+        let a = Args::parse(&argv([
+            "magent",
+            "web3",
+            "tx",
+            "build",
+            "0x0000000000000000000000000000000000000002",
+            "--value",
+            "1.5",
+            "--data",
+            "0xdeadbeef",
+            "--chain",
+            "sepolia",
+        ]))
+        .unwrap();
+        match a.command {
+            Command::Web3(Web3Action::Blockchain(BlockchainAction::TxBuild(opts))) => {
+                assert_eq!(opts.to, "0x0000000000000000000000000000000000000002");
+                assert_eq!(opts.value.as_deref(), Some("1.5"));
+                assert_eq!(opts.data.as_deref(), Some("0xdeadbeef"));
+                assert_eq!(opts.chain, "sepolia");
+            }
+            other => panic!("expected TxBuild, got {:?}", other),
+        }
+
+        let a = Args::parse(&argv([
+            "magent",
+            "web3",
+            "bind",
+            "create",
+            "did:key:z6Mk",
+            "--chain",
+            "sepolia",
+            "--from-seed",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        ]))
+        .unwrap();
+        match a.command {
+            Command::Web3(Web3Action::Blockchain(BlockchainAction::BindCreate(opts))) => {
+                assert_eq!(opts.did, "did:key:z6Mk");
+                assert_eq!(opts.chain, "sepolia");
+                assert_eq!(opts.from_seed.len(), 64);
+            }
+            other => panic!("expected BindCreate, got {:?}", other),
+        }
+
+        let a = Args::parse(&argv(["magent", "web3", "bind", "verify", "proof.json"])).unwrap();
+        match a.command {
+            Command::Web3(Web3Action::Blockchain(BlockchainAction::BindVerify(path))) => {
+                assert_eq!(path, PathBuf::from("proof.json"))
+            }
+            other => panic!("expected BindVerify, got {:?}", other),
+        }
+
+        let a = Args::parse(&argv([
+            "magent",
+            "web3",
+            "vc",
+            "issue",
+            "did:key:z6MkSubject",
+            "--type",
+            "Role",
+            "--claim",
+            "role=admin",
+            "--from-seed",
+            "0000000000000000000000000000000000000000000000000000000000000002",
+        ]))
+        .unwrap();
+        match a.command {
+            Command::Web3(Web3Action::Blockchain(BlockchainAction::VcIssue(opts))) => {
+                assert_eq!(opts.subject_did, "did:key:z6MkSubject");
+                assert_eq!(opts.credential_type, "Role");
+                assert_eq!(opts.claims.len(), 1);
+                assert_eq!(opts.claims[0].0, "role");
+                assert_eq!(opts.claims[0].1, serde_json::json!("admin"));
+            }
+            other => panic!("expected VcIssue, got {:?}", other),
+        }
+
+        let a = Args::parse(&argv(["magent", "web3", "vc", "verify", "vc.json"])).unwrap();
+        assert!(matches!(
+            a.command,
+            Command::Web3(Web3Action::Blockchain(BlockchainAction::VcVerify(_)))
+        ));
+
+        let a = Args::parse(&argv([
+            "magent",
+            "web3",
+            "vc",
+            "present",
+            "vc.json",
+            "--challenge",
+            "nonce-1",
+            "--domain",
+            "example.com",
+            "--from-seed",
+            "0000000000000000000000000000000000000000000000000000000000000003",
+        ]))
+        .unwrap();
+        match a.command {
+            Command::Web3(Web3Action::Blockchain(BlockchainAction::VcPresent(opts))) => {
+                assert_eq!(opts.vc_file, PathBuf::from("vc.json"));
+                assert_eq!(opts.challenge, "nonce-1");
+                assert_eq!(opts.domain.as_deref(), Some("example.com"));
+            }
+            other => panic!("expected VcPresent, got {:?}", other),
+        }
+    }
+
+    #[cfg(all(feature = "web3", feature = "blockchain"))]
+    #[test]
+    fn web3_blockchain_requires_arguments() {
+        // The advertised commands must reject missing required arguments with
+        // a usage error rather than falling through to the unknown-subcommand
+        // path (which is what "not implemented" looked like).
+        let cases: [Vec<String>; 5] = [
+            argv(["magent", "web3", "balance"]),
+            argv(["magent", "web3", "tx", "build"]),
+            argv(["magent", "web3", "bind", "create", "did:key:z6Mk"]),
+            argv(["magent", "web3", "vc", "issue", "did:key:z6Mk"]),
+            argv(["magent", "web3", "vc", "present", "vc.json"]),
+        ];
+        for args in cases {
+            let msg = format!("{:?}", Args::parse(&args).unwrap_err());
+            assert!(
+                msg.contains("Usage") && !msg.contains("unknown subcommand"),
+                "missing args must be a usage error, got: {msg}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

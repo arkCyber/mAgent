@@ -367,6 +367,15 @@ mod tests {
         }
     }
 
+    /// `has_email_tools` is the source of truth the runner now uses for its
+    /// backend label and tool catalogue. It must follow the cargo feature,
+    /// not the presence of the `--email-tools` flag.
+    #[test]
+    fn has_email_tools_follows_the_feature_not_the_flag() {
+        let executor = CompositeExecutor::new(Some("true"));
+        assert_eq!(executor.has_email_tools(), cfg!(feature = "email-tools"));
+    }
+
     #[test]
     fn email_tool_descriptions_matches_executor_when_enabled() {
         // `email_tool_descriptions` is a static catalogue that

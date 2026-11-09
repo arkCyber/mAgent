@@ -1049,6 +1049,7 @@ impl<'a> RunCmd<'a> {
         let config = RunnerConfig {
             max_iterations,
             max_tool_calls,
+            max_run_duration: self.opts.timeout_secs.map(std::time::Duration::from_secs),
             system_prompt,
             verbose: !self.opts.quiet,
             sampling: SamplingParams {
@@ -1323,6 +1324,23 @@ fn finalize_report<E: ToolExecutor>(
         approx_tokens: runner.approx_total_tokens(),
         approx_bytes: runner.approx_total_bytes(),
     };
+    // ── web3_app: signed envelope emission ────────────────────────
+    // Do this *before* any stdout document is written. It used to run after
+    // the success envelope had been flushed, so a signing failure returned
+    // exit 1 while stdout still held a success-shaped `{"answer":…}` object
+    // and `Output::fail` suppressed its own `{"ok":false,…}` (the latch saw
+    // a document already written). Signing first lets the failure envelope
+    // describe the actual outcome.
+    #[cfg(feature = "web3_app")]
+    if opts.sign_with_vault_identity.is_some() {
+        if let Err(e) = sign_after_run(&report, opts, out) {
+            return Err(RunError::SignedEnvelope(format!(
+                "--sign failed: {}",
+                e
+            )));
+        }
+    }
+
     out.final_answer(result)?;
     out.write_json(report.to_json())?;
     out.flush()?;
@@ -1344,31 +1362,6 @@ fn finalize_report<E: ToolExecutor>(
                     topic, e
                 ))?;
             }
-        }
-    }
-
-    // ── web3_app: signed envelope emission ────────────────────────
-    // When `--sign` (or `--signer <NAME>`) is set, sign the
-    // report with the named vault identity and persist the
-    // envelope to disk. We do this AFTER the JSON envelope has
-    // been flushed so a vault failure never poisons the
-    // primary result the user actually asked for. Errors are
-    // surfaced as warnings (Human mode) / `info:` lines
-    // (JSON mode); a signing failure is also a `RunError` so
-    // CI scripts that want strict semantics can check the
-    // exit code.
-    #[cfg(feature = "web3_app")]
-    if opts.sign_with_vault_identity.is_some() {
-        if let Err(e) = sign_after_run(&report, opts, out) {
-            // Promote the warning into a hard error so CI
-            // scripts that explicitly opted into --sign get a
-            // non-zero exit if the signature didn't land on
-            // disk. The error message includes the path the
-            // user asked for, so debugging is easy.
-            return Err(RunError::SignedEnvelope(format!(
-                "--sign failed: {}",
-                e
-            )));
         }
     }
 
@@ -1660,15 +1653,13 @@ fn save_summary_after_run<E: ToolExecutor>(
         .build()?;
 
     let store = FileSummaryStore::open_default();
-    // Honour `--save-summary-overwrite` by clearing the file
-    // first when set. We do this rather than passing a flag
-    // into `store.save` because the trait signature is shared
-    // with the embedded KV backend (which doesn't have
-    // files to delete).
-    if opts.save_summary_overwrite {
-        // `delete` is idempotent; ignore errors here.
-        let _ = store.delete(topic);
-    } else if store.load(topic).is_ok() {
+    // `--save-summary-overwrite` permits the write; it must NOT delete the
+    // previous record first. `store.save` replaces the active content and
+    // merges the previous snapshot into `history`, which is what makes
+    // `summary rollback` usable on run-produced summaries (`summary save
+    // --overwrite` already behaves this way). The old delete erased the
+    // history, so rollback could never reach it.
+    if !opts.save_summary_overwrite && store.load(topic).is_ok() {
         // Documented default (README / SUMMARY_STORE.md / RunOptions docs)
         // is to refuse clobbering an existing summary unless
         // `--save-summary-overwrite` is passed — mirror the probe the
@@ -1842,7 +1833,16 @@ pub fn build_runner(
     // means use default path, a path string means use that path).
     let email_tools_path: Option<&str> = opts.email_tools.as_deref();
     let executor = CompositeExecutor::new(email_tools_path);
-    let email_tools_enabled = opts.email_tools.is_some();
+    // Ask the executor, not the flag: a build without the `email-tools`
+    // feature constructs `SimulatorOnly`, so the flag used to make the trace
+    // claim an email executor that did not exist (and the model was never
+    // given email tools).
+    let email_tools_enabled = executor.has_email_tools();
+    if opts.email_tools.is_some() && !email_tools_enabled {
+        let _ = out.warn(
+            "--email-tools ignored: this binary was built without the `email-tools` feature",
+        );
+    }
 
     // Compose a backend label that reflects every enabled executor.
     let mut backend_label = if email_tools_enabled {
@@ -1867,6 +1867,7 @@ pub fn build_runner(
     let config = RunnerConfig {
         max_iterations,
         max_tool_calls,
+        max_run_duration: opts.timeout_secs.map(std::time::Duration::from_secs),
         system_prompt,
         verbose: !opts.quiet,
         sampling: SamplingParams {
@@ -1883,11 +1884,17 @@ pub fn build_runner(
         trace_sink: None,
     };
 
+    // Name the wall clock only when the user set one: the historical label
+    // stays byte-identical for every run that keeps the default.
+    let wall_clock = match opts.timeout_secs {
+        Some(secs) => format!(" / {secs}s"),
+        None => String::new(),
+    };
     out.trace_labeled(
         "Backend",
         &format!(
-            "{}; budget = {} iter / {} tools / {} msg / {} chars",
-            backend_label, max_iterations, max_tool_calls, max_messages, tool_max_chars
+            "{}; budget = {} iter / {} tools / {} msg / {} chars{}",
+            backend_label, max_iterations, max_tool_calls, max_messages, tool_max_chars, wall_clock
         ),
     )?;
 
@@ -1990,6 +1997,29 @@ mod tests {
         .expect("build_runner");
         assert_eq!(runner.config().compression.max_messages, 12);
         assert_eq!(runner.config().compression.tool_content_max_chars, 200);
+    }
+
+    #[test]
+    fn build_runner_propagates_the_wall_clock_budget() {
+        // `--timeout` has to reach the ReAct loop, or the flag is decorative.
+        let opts = RunOptions {
+            task: "noop".to_string(),
+            timeout_secs: Some(90),
+            mock: true,
+            ..Default::default()
+        };
+        let mut out = Output::new(OutputKind::Json, true);
+        let runner = build_runner(
+            &opts,
+            RunnerConfig::default().system_prompt,
+            &mut out,
+            OutputKind::Json,
+        )
+        .expect("build_runner");
+        assert_eq!(
+            runner.config().max_run_duration,
+            Some(std::time::Duration::from_secs(90))
+        );
     }
 
     #[test]
@@ -3304,22 +3334,23 @@ fn print_repl_history(session: &ReplSession) {
 
 /// Print available tools in REPL.
 ///
-/// Generated from [`magent_core::ollama::TOOL_DEFINITIONS`] — the same
-/// catalog the LLM is handed — instead of hand-written prose, so the REPL
-/// can't advertise a tool that doesn't exist. (It used to list a
-/// `ble_scan()` implemented nowhere, and sensor names the host executor
-/// doesn't back.)
+/// Generated from the *live* system prompt
+/// ([`magent_core::agent_runner::advertised_tools`]) — the same tool list the
+/// model is handed — instead of hand-written prose, so the REPL can't
+/// advertise a tool that doesn't exist. (It used to list a `ble_scan()`
+/// implemented nowhere, and sensor names the host executor doesn't back.)
+///
+/// This used to read `ollama::TOOL_DEFINITIONS`, the nRF52-era five-tool
+/// catalog, on the stated belief that it was "the same catalog the LLM is
+/// handed". It is not: the runner sends the system prompt, which advertises
+/// four times as many tools. `/tools` was therefore telling the user that
+/// `start_exercise`, `get_sleep_quality` and the rest did not exist while the
+/// model was happily calling them.
 fn print_repl_tools() {
     box_open("Available Tools");
-    for (name, description, params) in magent_core::ollama::TOOL_DEFINITIONS {
-        let signature = if params.is_empty() {
-            format!("{}()", name)
-        } else {
-            let names: Vec<&str> = params.iter().map(|(p, _, _)| *p).collect();
-            format!("{}({})", name, names.join(", "))
-        };
-        box_line(&format!("  {}", signature));
-        box_line(&format!("      {}", description));
+    for tool in magent_core::agent_runner::advertised_tools() {
+        box_line(&format!("  {}", tool.signature));
+        box_line(&format!("      {}", tool.description));
     }
     // The optional backends supply their own catalogs, so reuse them
     // rather than hand-writing names (the previous static list named

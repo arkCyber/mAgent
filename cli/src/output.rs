@@ -7,7 +7,10 @@
 //!   `magent run "..."` interactively.
 //!
 //! * **JSON** (`--json`): a single JSON envelope on stdout that scripts
-//!   and CI pipelines can parse. stderr is silent in this mode.
+//!   and CI pipelines can parse — a success payload, or on failure
+//!   `{"ok":false,"error":…,"code":…,"exit":…}`. stderr still carries the
+//!   human `error:` diagnostic so an operator running `--json` by hand
+//!   isn't left staring at an empty terminal.
 //!
 //! The two writers are unified behind the [`Output`] type so `runner.rs`
 //! doesn't have to branch on every print site.
@@ -34,6 +37,15 @@ pub struct Output {
     /// [`Output::final_answer`] is called so [`Output::write_json`] can
     /// include it in the envelope.
     pending_answer: Option<String>,
+    /// Whether a complete JSON document has already reached stdout.
+    ///
+    /// `--json` promises that stdout holds *exactly one* object, so a
+    /// later [`Output::fail`] must not append a second one on top of an
+    /// envelope some subcommand already wrote. `scheduler run-once` is
+    /// the concrete case: it writes its result envelope and *then*
+    /// returns `TasksFailed`, so without this latch stdout carried two
+    /// JSON objects and `jq` choked on the second.
+    envelope_written: bool,
 }
 
 impl Output {
@@ -56,6 +68,7 @@ impl Output {
             stderr: stderr.lock(),
             color,
             pending_answer: None,
+            envelope_written: false,
         }
     }
 
@@ -92,11 +105,50 @@ impl Output {
         writeln!(self.stderr, "{}warning: {}{}", prefix, msg, reset)
     }
 
-    /// Print an error. Always shown, always on stderr.
-    pub fn error(&mut self, msg: &str) -> io::Result<()> {
+    /// Report a command failure.
+    ///
+    /// Human mode: the familiar red `error: …` line on stderr.
+    ///
+    /// JSON mode: the same human line on stderr **and** a structured
+    /// envelope on stdout:
+    ///
+    /// ```json
+    /// { "ok": false, "error": "…", "code": "run_error", "exit": 1 }
+    /// ```
+    ///
+    /// So `--json` makes one promise about stdout — it is always exactly
+    /// one parseable JSON object — and that promise now holds for the
+    /// failure path too. Before this, a failing `--json` command wrote
+    /// *nothing* to stdout, so a CI pipeline doing `magent --json … | jq`
+    /// got a parse error instead of the failure it was trying to detect.
+    ///
+    /// `code` is a stable machine-readable tag (see the dispatch arms in
+    /// `main.rs`); `exit` is the process status the caller is about to
+    /// return, so a consumer that captured only stdout still learns the
+    /// outcome. `ok: false` is the discriminator — a success envelope
+    /// never carries it.
+    ///
+    /// If a subcommand already wrote its own document to stdout (see
+    /// [`Self::envelope_written`]), the envelope is skipped and only the
+    /// stderr line is added — the subcommand's document is the one
+    /// allowed to describe the outcome, and adding a second object would
+    /// make stdout unparseable.
+    pub fn fail(&mut self, code: &str, exit: u8, msg: &str) {
         let prefix = if self.color { "\x1b[31m" } else { "" }; // red
         let reset = if self.color { "\x1b[0m" } else { "" };
-        writeln!(self.stderr, "{}error: {}{}", prefix, msg, reset)
+        let _ = writeln!(self.stderr, "{}error: {}{}", prefix, msg, reset);
+
+        if self.kind == OutputKind::Json && !self.envelope_written {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "error": msg,
+                "code": code,
+                "exit": exit,
+            });
+            let json = serde_json::to_string_pretty(&envelope)
+                .unwrap_or_else(|_| "{\"ok\":false}".to_string());
+            let _ = writeln!(self.stdout, "{}", json);
+        }
     }
 
     /// Print an informational line. In Human mode it's just a
@@ -158,6 +210,7 @@ impl Output {
     pub fn write_stdout_line(&mut self, payload: &str) {
         let _ = self.stdout.write_all(payload.as_bytes());
         let _ = self.stdout.write_all(b"\n");
+        self.envelope_written = true;
     }
 
     /// Write a JSON envelope payload (string form) to stdout. In
@@ -172,6 +225,7 @@ impl Output {
         if self.kind == OutputKind::Json {
             let _ = self.stdout.write_all(payload.as_bytes());
             let _ = self.stdout.write_all(b"\n");
+            self.envelope_written = true;
         }
     }
 
@@ -257,7 +311,9 @@ impl Output {
         }
         let json = serde_json::to_string_pretty(&serde_json::Value::Object(envelope))
             .unwrap_or_else(|_| "{}".to_string());
-        writeln!(self.stdout, "{}", json)
+        writeln!(self.stdout, "{}", json)?;
+        self.envelope_written = true;
+        Ok(())
     }
 
     /// Flush both streams.

@@ -127,6 +127,12 @@ fn repl_builtin_commands_all_respond() {
         "System prompt",        // prompt
         "Environment:",         // env
         "Goodbye",              // quit
+        // `/tools` lists the prompt's tools. It used to read the nRF52-era
+        // five-tool catalog, so it named `read_sensor` but not a single health
+        // tool — while the model was being told about all of them.
+        "start_exercise(type)",
+        "get_sleep_quality()",
+        "notify_emergency_contact(name, message)",
         // `env` lists every variable the CLI consults; the store dirs were
         // missing, though `MAGENT_PROMPTS_DIR` relocates the prompt store
         // `--prompt-name` reads (which the REPL honours).

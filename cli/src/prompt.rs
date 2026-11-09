@@ -503,10 +503,32 @@ pub fn save(record: PromptRecord) -> Result<PathBuf, PromptError> {
         path: path.clone(),
         source,
     })?;
-    fs::write(&path, json).map_err(|source| PromptError::Write {
-        path: path.clone(),
-        source,
-    })?;
+    // Atomic replace: a crash mid-`fs::write` left an empty/truncated JSON
+    // file, which the prompt store then reports as corrupt.
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("prompt.json");
+    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let write_result = (|| -> Result<(), PromptError> {
+        fs::write(&tmp, json).map_err(|source| PromptError::Write {
+            path: tmp.clone(),
+            source,
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
+        fs::rename(&tmp, &path).map_err(|source| PromptError::Write {
+            path: path.clone(),
+            source,
+        })
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result?;
     Ok(path)
 }
 
@@ -547,15 +569,16 @@ pub fn list() -> Result<Vec<PromptRecord>, PromptError> {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let raw = fs::read_to_string(&path).map_err(|source| PromptError::PromptFileLoad {
-            path: path.clone(),
-            source,
-        })?;
-        let record: PromptRecord =
-            serde_json::from_str(&raw).map_err(|source| PromptError::Parse {
-                path: path.clone(),
-                source,
-            })?;
+        // A single stray/broken `.json` in the prompts directory must not
+        // make the whole listing fail. (`set-prompt sign` writes
+        // `<name>.signed.json` into this same directory.) Skip anything
+        // that is not a readable, supported `PromptRecord`.
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<PromptRecord>(&raw) else {
+            continue;
+        };
         if record.schema_version <= CURRENT_SCHEMA_VERSION {
             out.push(record);
         }
@@ -942,6 +965,16 @@ impl<'a> SetPromptCmd<'a> {
                 path: opts.path.clone(),
                 source,
             })?;
+        // A newer schema means fields this binary does not know about;
+        // writing it back would silently drop them (the loader already
+        // refuses such files).
+        if record.schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(PromptError::UnsupportedSchema {
+                path: opts.path.clone(),
+                found: record.schema_version,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
         // Resolve the final name (override → JSON → file stem).
         let final_name = opts
             .name
@@ -1730,6 +1763,21 @@ mod tests {
         assert_eq!(names, vec!["a", "m", "z"]);
     }
 
+    /// `set-prompt sign` writes `<name>.signed.json` into the prompts
+    /// directory; a stray or malformed `.json` must not take the whole
+    /// listing down.
+    #[test]
+    fn list_skips_files_that_are_not_prompt_records() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempPromptsDir::new("list_stray");
+        save(PromptRecord::new("real", "p", "", "", PromptMetadata::default(), 1)).unwrap();
+        fs::write(tmp.0.join("real.signed.json"), r#"{"not":"a prompt"}"#).unwrap();
+        fs::write(tmp.0.join("junk.json"), "not json at all").unwrap();
+
+        let names: Vec<String> = list().unwrap().into_iter().map(|r| r.name).collect();
+        assert_eq!(names, vec!["real"]);
+    }
+
     #[test]
     fn delete_removes_existing_file() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1855,6 +1903,36 @@ mod tests {
     }
 
     /// `--name` overrides the JSON's `name` field.
+    /// A future schema must be refused rather than rewritten as v1 with the
+    /// unknown fields dropped.
+    #[test]
+    fn import_rejects_a_newer_schema() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmp = TempPromptsDir::new("import_future");
+        let dir = std::env::temp_dir().join("magent_import_future");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("future.json");
+        let raw = serde_json::json!({
+            "schema_version": 9999,
+            "name": "future",
+            "prompt": "x",
+            "brand_new_field": "must not be dropped",
+            "created_at": 1,
+            "updated_at": 1
+        });
+        std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+        let err = SetPromptCmd::new(&SetPromptAction::Import(SetPromptImportOptions {
+            path,
+            name: None,
+            force: false,
+        }))
+        .execute(&mut Output::new(OutputKind::Human, true))
+        .unwrap_err();
+        assert!(matches!(err, PromptError::UnsupportedSchema { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn import_renames_via_flag() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

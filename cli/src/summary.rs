@@ -442,26 +442,64 @@ impl<'a> SummaryCmd<'a> {
             updated_at: current.updated_at,
             kept: current.stats.kept,
             source_session_id: current.source.session_id.clone(),
+            head_tail_window: current.head_tail_window.clone(),
+            llm_summary: current.llm_summary.clone(),
+            stats: current.stats,
         });
+        // Restore the snapshot's content, not just its `kept` counter.
+        // Entries written before the snapshot fields existed fall back to
+        // the old counter-only semantics.
+        let legacy = entry.head_tail_window.is_empty() && entry.llm_summary.is_none();
+        let (head_tail_window, llm_summary, stats) = if legacy {
+            (
+                current.head_tail_window.clone(),
+                current.llm_summary.clone(),
+                CompressionStats {
+                    kept: entry.kept,
+                    ..current.stats
+                },
+            )
+        } else {
+            (
+                entry.head_tail_window.clone(),
+                entry.llm_summary.clone(),
+                entry.stats,
+            )
+        };
         let rolled = SummaryRecord {
             updated_at: now,
-            stats: CompressionStats {
-                kept: entry.kept,
-                ..current.stats
-            },
+            head_tail_window,
+            llm_summary,
+            stats,
             history: new_history,
             ..current
         };
-        let report = store.save(rolled)?;
-        if out.kind() == OutputKind::Human {
-            out.write_human(&format!(
+        // The rollback record already contains the complete post-state (the
+        // entry removed, the superseded snapshot appended). `save` merges the
+        // on-disk history back in, which re-added the entry the caller just
+        // rolled back — use the no-merge path.
+        let report = store.save_overwrite(rolled)?;
+        match out.kind() {
+            OutputKind::Human => out.write_human(&format!(
                 "rolled back {:?} to history[{}] (was kept={}); saved {} bytes to {}\n",
                 opts.topic,
                 opts.index,
                 entry.kept,
                 report.bytes,
                 report.path.display()
-            ));
+            )),
+            // A successful `--json` command must write exactly one document.
+            // This arm was missing, so rollback exited 0 with empty stdout.
+            OutputKind::Json => out.write_json_str(
+                serde_json::json!({
+                    "topic": opts.topic,
+                    "rolled_back_to_index": opts.index,
+                    "kept": entry.kept,
+                    "saved_bytes": report.bytes,
+                    "path": report.path.display().to_string(),
+                })
+                .to_string(),
+            ),
         }
         Ok(())
     }
@@ -644,11 +682,19 @@ fn format_unix_long(ts: u64) -> String {
     }
 }
 
+/// Truncate `s` to at most `max` characters, appending `…` when shortened.
+///
+/// Counts characters, not bytes: the topic column and the `llm_summary` line
+/// both carry operator- and model-supplied text, and slicing a `str` at a byte
+/// offset that lands inside a multi-byte code point panics. This mirrors the
+/// `truncate` helpers in `config.rs` and `prompt.rs`.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -1049,6 +1095,42 @@ mod tests {
         });
     }
 
+    /// Rollback builds the complete post-state itself; the store's normal
+    /// merge re-added the entry the caller had just removed, so history grew
+    /// instead of shrinking.
+    #[test]
+    fn rollback_removes_the_rolled_back_entry_from_history() {
+        with_temp_summaries_dir(|_dir| {
+            let store = build_store(None).unwrap();
+            let mut first = sample_record("rb-merge");
+            first.stats.kept = 1;
+            store.save(first).unwrap();
+            let mut second = sample_record("rb-merge");
+            second.stats.kept = 2;
+            store.save(second).unwrap();
+            assert_eq!(store.load("rb-merge").unwrap().history.len(), 1);
+
+            let mut out = Output::new(OutputKind::Human, true);
+            SummaryCmd::new(&SummaryAction::Rollback(SummaryRollbackOptions {
+                topic: "rb-merge".into(),
+                index: 0,
+                dir: None,
+            }))
+            .execute(&mut out)
+            .unwrap();
+
+            let after = store.load("rb-merge").unwrap();
+            assert_eq!(after.stats.kept, 1, "the snapshot must become active");
+            assert_eq!(
+                after.history.len(),
+                1,
+                "the rolled-back entry must be removed and the superseded \
+                 snapshot appended, not merged back"
+            );
+            assert_eq!(after.history[0].kept, 2);
+        });
+    }
+
     #[test]
     fn rollback_out_of_range_errors() {
         with_temp_summaries_dir(|_dir| {
@@ -1124,5 +1206,30 @@ mod tests {
         assert_eq!(format_unix_short(0), "-");
         // 2025-08-03 00:00:00 UTC
         assert_eq!(format_unix_short(1_754_179_200), "2025-08-03 00:00:00");
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        // The `list` call site truncates the topic column to 24, and
+        // `validate_topic` bounds a topic by *bytes* (128), so a topic of 23
+        // ASCII bytes plus one 3-byte code point is a legal 26-byte topic.
+        // The old byte slice `&s[..24]` split the code point and panicked.
+        let cjk = format!("{}日", "a".repeat(23));
+        assert_eq!(cjk.len(), 26);
+        assert_eq!(truncate(&cjk, 24), cjk);
+
+        // Genuine multi-byte truncation stays on a character boundary.
+        assert_eq!(truncate("日本語日本語日本語", 4), "日本語…");
+
+        // A 24-character ASCII string fits and is returned whole.
+        assert_eq!(
+            truncate("abcdefghijklmnopqrstuvwx", 24),
+            "abcdefghijklmnopqrstuvwx"
+        );
+        // 25 characters: the ellipsis is included in the `max` budget.
+        assert_eq!(
+            truncate("abcdefghijklmnopqrstuvwxy", 24),
+            "abcdefghijklmnopqrstuvw…"
+        );
     }
 }
