@@ -41,20 +41,21 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-/// Maximum length of a tool result string before we truncate it.
+/// Maximum length of a tool result string, **in characters**, before we
+/// truncate it. (The name and docs always said characters; the comparison
+/// used `str::len`, so a CJK response was cut at 4096 bytes — roughly 1365
+/// characters.)
 const MAX_RESULT_CHARS: usize = 4096;
 
-/// Largest byte index `<= max` that is a UTF-8 character boundary.
+/// Byte index just past the first `max_chars` characters of `s`.
 ///
-/// `content[..MAX_RESULT_CHARS]` panics with "byte index is not a char
-/// boundary" whenever the cut lands inside a multi-byte code point — reachable
-/// with any non-ASCII MCP response (an email body, a non-English subject).
-fn char_boundary_at(s: &str, max: usize) -> usize {
-    let mut i = max.min(s.len());
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
+/// Returns `s.len()` when the string is shorter. Slicing at the result is
+/// always a valid UTF-8 boundary.
+fn byte_index_after_chars(s: &str, max_chars: usize) -> usize {
+    s.char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 /// Per-request timeout for the JSON-RPC round-trip.
@@ -316,13 +317,22 @@ impl McpExecutor {
                 *guard = None;
                 format!("MCP subprocess crashed: {e}")
             }
+            // A timeout means the request was written but no matching reply
+            // arrived. A serial MCP server (email-mcp) may be stuck in a
+            // blocking IMAP call and will never read stdin again, so keeping
+            // the child would make every later call time out too. Drop it;
+            // `kill_on_drop` reaps it and the next call spawns a fresh one.
+            McpError::Timeout(_) => {
+                *guard = None;
+                format!("MCP subprocess timed out and was restarted: {e}")
+            }
             other => other.to_string(),
         })?;
 
         // ── 4. Truncate if needed. ─────────────────────────────────────
-        if content.len() > MAX_RESULT_CHARS {
-            let mut truncated =
-                content[..char_boundary_at(&content, MAX_RESULT_CHARS)].to_string();
+        if content.chars().count() > MAX_RESULT_CHARS {
+            let cut = byte_index_after_chars(&content, MAX_RESULT_CHARS);
+            let mut truncated = content[..cut].to_string();
             truncated.push_str("… [truncated]");
             Ok(truncated)
         } else {
@@ -511,24 +521,26 @@ impl McpChild {
             .map_err(|e| McpError::ParseError(e.to_string()))?;
 
         // ── WRITE ─────────────────────────────────────────────────────
-        // Take stdin from the Option, write, then put it back. This is
-        // required because `write_all` takes ownership of the writer.
-        //
-        // The lock is held only for the duration of the write — no
-        // await while holding it.
+        // Borrow the writer through the mutex instead of `take()`-ing it.
+        // The old take/put-back sequence left `stdin` permanently `None` if
+        // the future was cancelled between the two, and the next call then
+        // panicked on `expect("stdin already taken")`. `rpc` is invoked
+        // serially on `&mut self`, so holding the guard for the write is the
+        // same serialization the child already has.
         let write_result: std::io::Result<()> = {
             let mut stdin_guard = self.stdin.lock().await;
-            let mut stdin = stdin_guard.take().expect("stdin already taken");
-            let r = async {
+            let Some(stdin) = stdin_guard.as_mut() else {
+                return Err(McpError::ParseError(
+                    "MCP subprocess stdin is unavailable".to_string(),
+                ));
+            };
+            async {
                 stdin.write_all(line.as_bytes()).await?;
                 stdin.write_all(b"\n").await?;
                 stdin.flush().await?;
                 Ok::<(), std::io::Error>(())
             }
-            .await;
-            // Hand the writer back before dropping the lock.
-            *stdin_guard = Some(stdin);
-            r
+            .await
         };
         if let Err(e) = write_result {
             return Err(self.classify_pipe_error(e));
@@ -676,15 +688,23 @@ impl McpToolExecutor {
         ToolDescriptor::email_tool_descriptions()
     }
 
-    /// Kill the underlying subprocess, if any.
+    /// Kill the underlying subprocess, if any (synchronous).
     ///
     /// Best-effort: failures are dropped, because the child is spawned with
-    /// `kill_on_drop` and dies with the process regardless. Must be called
-    /// from *outside* an async context — it blocks on the shared runtime.
+    /// `kill_on_drop` and dies with the process regardless. Safe to call from
+    /// an async context (the future is driven on the dedicated runtime, via a
+    /// helper thread when the caller is already inside one), but it blocks the
+    /// caller; async callers should prefer [`Self::shutdown_async`].
     pub fn shutdown(&self) {
-        let handle = tokio_runtime();
-        #[allow(clippy::let_unit_value)]
-        let _ = handle.block_on(self.inner.shutdown());
+        let _ = block_on_mcp(async {
+            self.inner.shutdown().await;
+            Ok::<(), String>(())
+        });
+    }
+
+    /// Async shutdown for callers that already hold a runtime.
+    pub async fn shutdown_async(&self) {
+        self.inner.shutdown().await;
     }
 
     /// Synchronous one-shot: forward `tool` to the MCP subprocess.
@@ -694,8 +714,7 @@ impl McpToolExecutor {
         tool: &str,
         args: &str,
     ) -> std::result::Result<String, String> {
-        let handle = tokio_runtime();
-        handle.block_on(self.inner.execute(tool, args))
+        block_on_mcp(self.inner.execute(tool, args))
     }
 }
 
@@ -765,21 +784,16 @@ impl magent_core::agent_runner::ToolExecutor for McpToolExecutor {
 // be expensive (network/IMAP sessions), so we create one lazily and
 // reuse it for the lifetime of the process.
 //
-// We try `Handle::try_current()` first so that callers running inside a
-// tokio runtime (e.g. `#[tokio::test]`) use the test's runtime and we
-// don't deadlock. If no current runtime exists we build a dedicated
-// multi-thread runtime and run the call on it via `block_on`.
+// The executor always runs on its own process-wide runtime. The previous
+// implementation returned the *current* runtime's handle when one existed and
+// then called `Handle::block_on` — which panics with "Cannot start a runtime
+// from within a runtime" in exactly that situation (every async caller). When
+// the caller is already inside a runtime, the future is driven on a scoped
+// helper thread running the dedicated runtime; otherwise it is driven inline.
 
 use std::sync::OnceLock;
 
-#[allow(dead_code)]
-fn tokio_runtime() -> tokio::runtime::Handle {
-    // Path A: called from inside a tokio runtime (e.g. tests).
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return handle;
-    }
-
-    // Path B: build a process-wide runtime once.
+fn dedicated_runtime_handle() -> tokio::runtime::Handle {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     let runtime = RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -787,9 +801,33 @@ fn tokio_runtime() -> tokio::runtime::Handle {
             .worker_threads(2)
             .thread_name("magent-mcp")
             .build()
-            .expect("failed to build tokio runtime for mcp-tool-executor")
+            .unwrap_or_else(|e| {
+                // Building the only runtime is a startup invariant; failing
+                // here would leave every MCP call without a driver. There is
+                // no error channel from a `OnceLock` initializer, so report
+                // through the panic hook rather than silently retrying.
+                panic!("failed to build tokio runtime for mcp-tool-executor: {e}")
+            })
     });
     runtime.handle().clone()
+}
+
+/// Drive an MCP future to completion from synchronous code.
+///
+/// Returns `Err` (rather than propagating a worker-thread panic) when the
+/// helper thread unwinds.
+fn block_on_mcp<F, T>(fut: F) -> std::result::Result<T, String>
+where
+    F: std::future::Future<Output = std::result::Result<T, String>> + Send,
+    T: Send,
+{
+    let handle = dedicated_runtime_handle();
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| scope.spawn(move || handle.block_on(fut)).join())
+            .map_err(|_| "MCP executor worker thread panicked".to_string())?
+    } else {
+        handle.block_on(fut)
+    }
 }
 
 // ============================================================================
@@ -923,6 +961,26 @@ mod tests {
         exec.shutdown();
     }
 
+    /// The sync `ToolExecutor::execute` used to call `Handle::block_on`
+    /// while already inside a runtime, which panics ("Cannot start a runtime
+    /// from within a runtime"). It must work from async callers too.
+    #[cfg(feature = "std")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_execute_inside_a_runtime_does_not_panic() {
+        use magent_core::agent_runner::ToolExecutor as _;
+        let mut exec = McpToolExecutor::new("true");
+        // `true` exits before the handshake; the call still has to travel
+        // through the dedicated runtime and return an error rather than
+        // unwinding.
+        let err = exec
+            .execute("mcp__email__list_inbox", "{}")
+            .expect_err("a bare `true` cannot complete the MCP handshake");
+        assert!(!err.is_empty());
+        // Both forms must be callable from async code.
+        exec.shutdown();
+        exec.shutdown_async().await;
+    }
+
     // ── Async tests (no subprocess) ────────────────────────────────────
     #[tokio::test]
     async fn execute_unknown_tool_returns_error() {
@@ -1050,13 +1108,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn long_non_ascii_result_is_truncated_without_panicking() {
-        // Regression: the cap used `content[..MAX_RESULT_CHARS]`, a raw byte
-        // index, which panics with "byte index 4096 is not a char boundary"
-        // on any non-ASCII response longer than the budget. "天" is 3 bytes,
-        // so 4096 lands mid-character.
-        let payload = "天".repeat(2000); // 6000 bytes > 4096
-        assert!(payload.len() > MAX_RESULT_CHARS);
-        assert!(!payload.is_char_boundary(MAX_RESULT_CHARS));
+        // The budget is in *characters*: 5000 CJK characters (15 KB) must
+        // keep 4096 characters, not 4096 bytes (~1365 characters).
+        let payload = "天".repeat(5000);
+        assert_eq!(payload.chars().count(), 5000);
 
         let script = format!(
             r#"
@@ -1077,22 +1132,22 @@ mod tests {
             .expect("long non-ASCII result should not panic");
 
         assert!(out.ends_with("… [truncated]"), "not truncated: {out:.40}");
-        // Truncated on a character boundary, and within the budget + marker.
-        assert!(out.is_char_boundary(out.len()));
-        assert!(out.len() <= MAX_RESULT_CHARS + "… [truncated]".len());
+        // Exactly MAX_RESULT_CHARS characters kept, plus the marker.
+        let marker_chars = "… [truncated]".chars().count();
+        assert_eq!(out.chars().count(), MAX_RESULT_CHARS + marker_chars);
 
         exec.shutdown().await;
     }
 
     #[test]
-    fn char_boundary_at_never_lands_inside_a_codepoint() {
-        let s = "天".repeat(10); // boundaries at multiples of 3
-        assert_eq!(char_boundary_at(&s, 4), 3);
-        assert_eq!(char_boundary_at(&s, 6), 6);
+    fn byte_index_after_chars_lands_on_a_boundary() {
+        let s = "天".repeat(10); // 3 bytes per character
+        assert_eq!(byte_index_after_chars(&s, 1), 3);
+        assert_eq!(byte_index_after_chars(&s, 4), 12);
         // Past the end clamps to the length rather than panicking.
-        assert_eq!(char_boundary_at(&s, 9999), s.len());
-        assert_eq!(char_boundary_at("", 5), 0);
-        assert_eq!(char_boundary_at("ascii", 3), 3);
+        assert_eq!(byte_index_after_chars(&s, 9999), s.len());
+        assert_eq!(byte_index_after_chars("", 5), 0);
+        assert_eq!(byte_index_after_chars("ascii", 3), 3);
     }
 
     // ── Helpers ────────────────────────────────────────────────────────

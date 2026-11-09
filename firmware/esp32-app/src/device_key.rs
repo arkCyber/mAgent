@@ -36,13 +36,14 @@
 //! host-side test path (the cryptographic mixing is exercised
 //! via `magent_core::boot_key` instead).
 
-use magent_core::wifi_pass_seal;
+use magent_core::wifi_pass_seal_v2;
 use heapless::String as HeaplessString;
 
 /// Wire-format prefix used by the sealed form of `dev_identity`.
-/// Mirrors the convention `wifi_pass_seal` uses (`DBO1:` for its
-/// sealed form) so a generic "sealed vs legacy" detector can
-/// recognise both without algorithm-specific logic.
+///
+/// The payload after the prefix is a DBO2 blob (`DBO2:` + nonce + cipher +
+/// MAC, from `magent_core::wifi_pass_seal_v2`). Older builds wrapped a DBO1
+/// payload here; the opener still accepts and migrates that form.
 pub const BTDK1_PREFIX: &str = "BTDK1:";
 
 /// Strength of the BTDK material actually collected.
@@ -184,13 +185,18 @@ pub fn derive_btdk() -> Result<[u8; 32], &'static str> {
 // always go through the sealed path.
 
 /// Maximum NVS storage length for `dev_identity` in BTDK1 form.
-/// = `BTDK1_PREFIX.len()` + `wifi_pass_seal::MAX_ENCODED_LEN`.
+/// = `BTDK1_PREFIX.len()` + `wifi_pass_seal_v2::MAX_ENCODED_LEN`.
 ///
 /// NOTE: the prefix is `"BTDK1:"` which is **6** chars, not 5. The previous
 /// `5 + MAX_ENCODED_LEN` was one byte short, so sealing a 32-byte seed
-/// (`6 + 157 = 163 > 162`) overflowed and `seal_dev_identity` always failed
-/// with `persist_full` — leaving `dev_identity` stuck as legacy plaintext.
-pub const DEV_IDENTITY_STORED_MAX: usize = BTDK1_PREFIX.len() + wifi_pass_seal::MAX_ENCODED_LEN;
+/// overflowed and `seal_dev_identity` always failed with `persist_full` —
+/// leaving `dev_identity` stuck as legacy plaintext.
+///
+/// The payload is DBO2 (the only writer); readings still accept DBO1 and
+/// migrate it forward. DBO2 adds a 16-byte MAC, so the bound grew from 163
+/// to `6 + 189 = 195` bytes.
+pub const DEV_IDENTITY_STORED_MAX: usize =
+    BTDK1_PREFIX.len() + wifi_pass_seal_v2::MAX_ENCODED_LEN;
 
 /// Detect the wire-format prefix of a `dev_identity` NVS value.
 /// Returns true if the value starts with the BTDK1 prefix.
@@ -202,6 +208,29 @@ pub const DEV_IDENTITY_STORED_MAX: usize = BTDK1_PREFIX.len() + wifi_pass_seal::
 #[inline]
 pub fn is_sealed(stored: &str) -> bool {
     stored.starts_with(BTDK1_PREFIX)
+}
+
+/// Decode the sealed plaintext into the 32-byte seed.
+///
+/// Accepts both encodings a sealed entry can hold:
+/// * 32 bytes — the raw seed (current),
+/// * 64 hex chars — the seed's hex encoding (an older writer).
+fn decode_seed(out: &[u8]) -> Result<[u8; 32], &'static str> {
+    if out.len() == 32 {
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(out);
+        Ok(seed)
+    } else if out.len() == 64 {
+        let mut seed = [0u8; 32];
+        for i in 0..32 {
+            let hi = hex_nibble(out[i * 2]).ok_or("dev_identity non-hex")?;
+            let lo = hex_nibble(out[i * 2 + 1]).ok_or("dev_identity non-hex")?;
+            seed[i] = (hi << 4) | lo;
+        }
+        Ok(seed)
+    } else {
+        Err("btdk:open_wrong_length")
+    }
 }
 
 /// Open a `dev_identity` NVS value, returning the 32 raw seed
@@ -218,44 +247,42 @@ pub fn is_sealed(stored: &str) -> bool {
 /// affect the bytes returned to the caller.
 pub fn open_dev_identity(stored: &str) -> Result<[u8; 32], &'static str> {
     if let Some(sealed_payload) = stored.strip_prefix(BTDK1_PREFIX) {
-        // Sealed form. Open with the BTDK1 key.
+        // Sealed form. Open with the BTDK1 key. DBO2 is the only writer now;
+        // DBO1 is still accepted so a device provisioned by an older build
+        // keeps its identity, and is migrated forward in place.
         let key = derive_btdk()?;
-        let mut out: heapless::Vec<u8, { wifi_pass_seal::MAX_PLAINTEXT }> = heapless::Vec::new();
-        match wifi_pass_seal::open_sealed_bytes(sealed_payload, &key, &mut out) {
-            Ok(wifi_pass_seal::OpenOutcome::DecodedBytes) => {
-                // The sealed plaintext is the seed in one of two encodings:
-                //   * 32 bytes  = the raw seed (current),
-                //   * 64 hex    = the seed's hex encoding (legacy
-                //                 `seal_dev_identity`).
-                // Accept both so a sealed entry never gets stuck in a
-                // regenerate loop.
-                if out.len() == 32 {
-                    let mut seed = [0u8; 32];
-                    seed.copy_from_slice(&out);
-                    Ok(seed)
-                } else if out.len() == 64 {
-                    let bytes = &out[..64];
-                    let mut seed = [0u8; 32];
-                    for i in 0..32 {
-                        let hi = hex_nibble(bytes[i * 2]).ok_or("dev_identity non-hex")?;
-                        let lo = hex_nibble(bytes[i * 2 + 1]).ok_or("dev_identity non-hex")?;
-                        seed[i] = (hi << 4) | lo;
-                    }
-                    Ok(seed)
-                } else {
-                    Err("btdk:open_wrong_length")
-                }
+        let mut out: heapless::Vec<u8, { wifi_pass_seal_v2::MAX_PLAINTEXT }> =
+            heapless::Vec::new();
+        let mut migrate_dbo1 = false;
+        let seed = match wifi_pass_seal_v2::open_sealed_v2(sealed_payload, &key, &mut out) {
+            Ok(wifi_pass_seal_v2::OpenOutcome::Dbo2Decoded) => decode_seed(&out),
+            Ok(wifi_pass_seal_v2::OpenOutcome::Dbo1Decoded) => {
+                migrate_dbo1 = true;
+                decode_seed(&out)
             }
-            Ok(wifi_pass_seal::OpenOutcome::LegacyPlaintext(_)) => {
-                // strip_prefix succeeded but open_sealed_bytes reports
-                // legacy — corruption.
+            Ok(wifi_pass_seal_v2::OpenOutcome::LegacyPlaintext(_)) => {
+                // strip_prefix succeeded but the opener reports legacy —
+                // corruption (the BTDK1 wrapper was applied over plaintext).
                 Err("btdk:open_unexpected_legacy")
             }
             Err(e) => {
                 log::error!("[magent] BTDK1 open of dev_identity failed: {e:?}");
                 Err("btdk:open_failed")
             }
+        };
+        if migrate_dbo1 {
+            if let Ok(ref seed) = seed {
+                match seal_and_store_dev_identity(seed) {
+                    Ok(()) => log::info!(
+                        "[magent] dev_identity migrated from DBO1 to DBO2 (integrity checked)"
+                    ),
+                    Err(e) => log::warn!(
+                        "[magent] DBO1->DBO2 dev_identity re-seal failed: {e}"
+                    ),
+                }
+            }
         }
+        seed
     } else if stored.len() == 64 {
         // Legacy plaintext (64 hex chars = 32 bytes seed).
         let mut seed = [0u8; 32];
@@ -285,12 +312,14 @@ pub fn open_dev_identity(stored: &str) -> Result<[u8; 32], &'static str> {
 pub fn seal_dev_identity(seed: &[u8; 32]) -> Result<HeaplessString<DEV_IDENTITY_STORED_MAX>, &'static str> {
 
     let key = derive_btdk()?;
-    let mut nonce = [0u8; wifi_pass_seal::NONCE_LEN];
+    let mut nonce = [0u8; wifi_pass_seal_v2::NONCE_LEN];
     getrandom::getrandom(&mut nonce).map_err(|_| "trng_unavailable")?;
 
-    // Reuse wifi_pass_seal::seal_str on the hex representation of
-    // the seed. This keeps the seal algorithm identical across
-    // secrets; only the key source differs.
+    // DBO2 (HKDF-stretched key + HMAC) rather than DBO1. The identity seed is
+    // the root secret for the device DID/wallet: DBO1 has no integrity check,
+    // so a single flipped bit in NVS silently produced a *different* seed
+    // (and therefore a different identity) with no error. DBO2 rejects the
+    // same tampering with BadMac.
     let mut plain_hex = [0u8; 64];
     let hex_chars = b"0123456789abcdef";
     for (i, &b) in seed.iter().enumerate() {
@@ -299,8 +328,9 @@ pub fn seal_dev_identity(seed: &[u8; 32]) -> Result<HeaplessString<DEV_IDENTITY_
     }
     let plain_str = core::str::from_utf8(&plain_hex).map_err(|_| "hex_utf8")?;
 
-    let mut sealed: HeaplessString<{ wifi_pass_seal::MAX_ENCODED_LEN }> = HeaplessString::new();
-    wifi_pass_seal::seal_str(plain_str, &key, &nonce, &mut sealed)
+    let mut sealed: HeaplessString<{ wifi_pass_seal_v2::MAX_ENCODED_LEN }> =
+        HeaplessString::new();
+    wifi_pass_seal_v2::seal_str(plain_str, &key, &nonce, &mut sealed)
         .map_err(|_| "seal_failed")?;
 
     let mut persisted: HeaplessString<DEV_IDENTITY_STORED_MAX> = HeaplessString::new();

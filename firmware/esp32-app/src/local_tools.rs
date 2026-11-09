@@ -64,16 +64,115 @@ fn kv<'a>(pairs: &[(&'a str, &'a str)], key: &str, default: &'a str) -> &'a str 
     default
 }
 
+/// Like [`kv`], but with no default: `None` means the argument was omitted or
+/// empty. Used where a fallback would be a *side effect* (driving a pin,
+/// writing a flash address) rather than a harmless display choice — the core
+/// simulator treats the same inputs as `MissingField` errors.
+fn required_kv<'a>(pairs: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(k, v)| *k == key && !v.is_empty())
+        .map(|(_, v)| *v)
+}
+
+/// Why `pin` must not be driven as a user GPIO on this board, or `None`.
+///
+/// The tool/Lua APIs take a **pin number chosen by the model or the script**.
+/// ESP-IDF's `gpio_*` calls reject only *out-of-range* numbers; a valid number
+/// that already belongs to the flash, the PSRAM, or a peripheral this firmware
+/// owns passes straight through and gets reconfigured. Driving the SPI-flash
+/// pins is the worst case: `gpio_reset_pin(26..=32)` detaches the SPI0/1
+/// function, and the next instruction/data fetch from flash on *any* core
+/// faults — a `StoreProhibited` reported on whichever core fetches first,
+/// often Core 0 running the Wi-Fi/lwIP tasks, with the actual cause on the
+/// thread that touched the pin. Both callers (`write_gpio` here and the Lua
+/// `hardware.gpio_*` / `pwm_set` / `adc_read` bindings) refuse these pins so
+/// the failure is a reported error instead of a crash.
+///
+/// `GPIO33..=37` are reserved only when the **octal-PSRAM** profile
+/// (`s3-8mb-psram`) is compiled in; on the quad-PSRAM dev board they are
+/// ordinary GPIOs. The map follows the memory profile, not `board-s3` alone.
+///
+/// Out-of-range and nonexistent numbers (the S3 has no GPIO22..=25) are left to
+/// ESP-IDF, which already returns `ESP_ERR_INVALID_ARG` for them.
+#[cfg(feature = "board-s3")]
+pub(crate) fn reserved_pin_reason(pin: i32) -> Option<&'static str> {
+    match pin {
+        // SPI0/1 to the in-package flash.
+        26..=32 => Some("SPI flash pin (GPIO26-32) — driving it detaches the flash"),
+        // Octal-PSRAM (N8R8) modules route the PSRAM over GPIO33..=37. They
+        // are plain GPIOs on the quad-PSRAM dev board, so the refusal is
+        // gated on the memory profile rather than `board-s3` alone. Driving
+        // one on an octal build breaks the PSRAM bus just like a flash pin.
+        #[cfg(feature = "s3-8mb-psram")]
+        33..=37 => Some("octal-PSRAM pin (GPIO33-37) — driving it breaks the PSRAM bus"),
+        // Native USB-Serial/JTAG console, claimed by the ingress adapter.
+        19 | 20 => Some("USB-Serial/JTAG D-/D+ — owned by the USB console ingress"),
+        // UART0, claimed by the UART ingress adapter.
+        10 | 11 => Some("UART0 RX/TX — owned by the UART ingress"),
+        // I2C0, this firmware's Lua i2c bus.
+        4 | 5 => Some("I2C0 SCL/SDA — owned by hardware.i2c_*"),
+        _ => None,
+    }
+}
+
+/// The ESP32-C61's reserved-pin map is not encoded yet, so nothing is refused
+/// there. The C61 is single-core with its own flash/PSRAM pin assignment;
+/// guessing it would be worse than not having it. Recorded in
+/// `docs/BACKLOG.md` as follow-up.
+#[cfg(not(feature = "board-s3"))]
+pub(crate) fn reserved_pin_reason(_pin: i32) -> Option<&'static str> {
+    None
+}
+
 /// `write_gpio pin=N,state=high|low` — drive a real GPIO on the C61.
 fn write_gpio(args: &str) -> ToolResult {
     let pairs = parse_kv(args);
-    let pin: i32 = kv(&pairs, "pin", "13").parse().unwrap_or(13);
-    let state = kv(&pairs, "state", "high");
-    let level: u32 = if state.eq_ignore_ascii_case("high") || state.eq_ignore_ascii_case("on") {
-        1
-    } else {
-        0
+    // An omitted or unparseable `pin` used to fall back to GPIO13, so a
+    // malformed model call silently drove a real pin. The core simulator
+    // distinguishes "missing" from "invalid" and refuses both; this path does
+    // the same instead of substituting a value.
+    let pin = match required_kv(&pairs, "pin") {
+        Some(raw) => match raw.parse::<i32>() {
+            Ok(pin) => pin,
+            Err(_) => {
+                return tool_result(
+                    "write_gpio",
+                    std::format!("invalid pin: {raw} (expected an integer)"),
+                    false,
+                )
+            }
+        },
+        None => {
+            return tool_result(
+                "write_gpio",
+                "missing required argument: pin".to_string(),
+                false,
+            )
+        }
     };
+    let state = kv(&pairs, "state", "high").to_ascii_lowercase();
+    // Only the documented tokens are accepted. The old code treated anything
+    // that was not high/on as low, so `state=wobble` drove the pin low.
+    let level: u32 = match state.as_str() {
+        "high" | "on" | "1" => 1,
+        "low" | "off" | "0" => 0,
+        other => {
+            return tool_result(
+                "write_gpio",
+                std::format!("expected state=high|low|1|0, got {other}"),
+                false,
+            )
+        }
+    };
+
+    if let Some(reason) = reserved_pin_reason(pin) {
+        return tool_result(
+            "write_gpio",
+            std::format!("refusing GPIO{pin}: {reason}"),
+            false,
+        );
+    }
 
     let mut last;
     unsafe {
@@ -137,14 +236,22 @@ fn read_sensor(args: &str) -> ToolResult {
                 e = sys::temperature_sensor_enable(handle);
             }
             if e == 0 {
-                sys::temperature_sensor_get_celsius(handle, &mut celsius);
+                // Capture `get_celsius`'s `esp_err_t` too. Discarding it meant a
+                // failed read still reported `success:true` with `celsius` at
+                // its 0.0 initialiser — a reading the sensor never produced.
+                e = sys::temperature_sensor_get_celsius(handle, &mut celsius);
             }
             let _ = sys::temperature_sensor_disable(handle);
             let _ = sys::temperature_sensor_uninstall(handle);
             e
         };
         let ok = last == 0;
-        let data = std::format!("temperature={celsius:.1} C (err={last})");
+        let data = if ok {
+            std::format!("temperature={celsius:.1} C (err={last})")
+        } else {
+            // Never hand back a value we did not obtain.
+            std::format!("temperature read failed (err={last})")
+        };
         tool_result("read_sensor", data, ok)
     } else if sensor.contains("mem") || sensor.contains("heap") || sensor.contains("sram") {
         // Free heap — a real, changing memory status.
@@ -179,7 +286,18 @@ fn parse_addr(s: &str) -> Option<u32> {
 /// writing an address twice replaces the blob.
 fn flash_write(args: &str) -> ToolResult {
     let pairs = parse_kv(args);
-    let addr_str = kv(&pairs, "address", "0");
+    // Address 0 is a real, writable key in the NVS-backed store, so an
+    // omitted/malformed `address` must not silently write there.
+    let addr_str = match required_kv(&pairs, "address") {
+        Some(raw) => raw,
+        None => {
+            return tool_result(
+                "flash_write",
+                "missing required argument: address".to_string(),
+                false,
+            )
+        }
+    };
     let Some(addr) = parse_addr(addr_str) else {
         return tool_result(
             "flash_write",
@@ -204,7 +322,17 @@ fn flash_write(args: &str) -> ToolResult {
 /// read as success.
 fn flash_read(args: &str) -> ToolResult {
     let pairs = parse_kv(args);
-    let addr_str = kv(&pairs, "address", "0");
+    // See `flash_write`: a missing address used to read key 0.
+    let addr_str = match required_kv(&pairs, "address") {
+        Some(raw) => raw,
+        None => {
+            return tool_result(
+                "flash_read",
+                "missing required argument: address".to_string(),
+                false,
+            )
+        }
+    };
     let Some(addr) = parse_addr(addr_str) else {
         return tool_result("flash_read", std::format!("bad address: {addr_str}"), false);
     };
@@ -242,8 +370,9 @@ const HTTP_PREVIEW_MAX: usize = 1024;
 /// Mirrors `AT+HTTPGET`'s robustness so a black-holed host can never stall the
 /// real-time agent thread: DNS + TCP preflight with a 5 s connect timeout
 /// (fails fast instead of burning the TLS timeout), CA-bundle verification,
-/// 6 s request timeout and a bounded read. Returns `(status, body)` or a
-/// human-readable failure reason.
+/// 6 s request timeout and a bounded read. Redirects are followed manually with
+/// the SSRF guard re-run on every hop (see [`http_get_following_redirects`]).
+/// Returns `(status, body)` or a human-readable failure reason.
 ///
 /// PATCHED (MicroAgent): **one bounded retry**. A phone-hotspot uplink drops
 /// the occasional TLS handshake (`E esp-tls-mbedtls: mbedtls_ssl_handshake
@@ -274,7 +403,7 @@ fn http_get_bounded_headers(
     let mut last_err = std::string::String::from("no attempt made");
     for attempt in 1..=ATTEMPTS {
         crate::rt_watchdog::feed();
-        match http_get_once(url, max, accept, extra_headers) {
+        match http_get_following_redirects(url, max, accept, extra_headers) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 log::warn!("[tool] http GET {url} failed (attempt {attempt}/{ATTEMPTS}): {e}");
@@ -288,13 +417,66 @@ fn http_get_bounded_headers(
     Err(last_err)
 }
 
-/// Single-shot half of [`http_get_bounded`] (see it for the contract).
-fn http_get_once(
+/// Redirect hops followed per fetch, on top of the initial request.
+///
+/// The host tools allow five (`magent_core::web`); the on-device budget is
+/// tighter because every hop is a fresh DNS + TCP + TLS handshake on the
+/// real-time thread, and the whole chain runs inside the two-attempt retry.
+const MAX_REDIRECT_HOPS: usize = 3;
+
+/// [`http_get_once`] with manual, guard-checked redirect following.
+///
+/// The esp-idf HTTP client would follow GET redirects by itself
+/// (`FollowRedirectsPolicy::FollowGetHead`, the default) — but it does so inside
+/// C and the wrapper exposes **no** post-redirect URL, so the SSRF guard in
+/// [`http_get_once`] would only ever see the *first* host. A model-supplied
+/// public URL could then 302 the agent straight onto the device's own
+/// web-admin port, a LAN service or the metadata endpoint, echoing the body
+/// back out — the exact hole the guard exists to close. So `http_get_once`
+/// turns the built-in following **off** (`FollowNone`) and we walk the chain
+/// here: each hop is a fresh `http_get_once` (re-running the guard, DNS and TCP
+/// preflight on the new host), and the next URL comes from
+/// [`magent_core::at_validate::resolve_http_redirect`], which refuses any
+/// `Location` it cannot re-vet. Mirrors the host-side post-redirect
+/// re-validation in `magent_core::web`.
+fn http_get_following_redirects(
     url: &str,
     max: usize,
     accept: &str,
     extra_headers: &[(&str, &str)],
 ) -> Result<(u16, std::string::String), std::string::String> {
+    let mut current = std::string::String::from(url);
+    for _ in 0..=MAX_REDIRECT_HOPS {
+        let (status, location, body) = http_get_once(&current, max, accept, extra_headers)?;
+        // Only the five statuses that carry a `Location` are redirects; 300 and
+        // 304 land here too and must be returned as-is.
+        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+            return Ok((status, body));
+        }
+        match location
+            .as_deref()
+            .and_then(|loc| magent_core::at_validate::resolve_http_redirect(&current, loc))
+        {
+            Some(next) => current = next,
+            // No usable `Location` (or one we decline to re-vet): hand the 3xx
+            // back rather than follow blind.
+            None => return Ok((status, body)),
+        }
+    }
+    Err(format!(
+        "too many redirects (> {MAX_REDIRECT_HOPS}) for {url}"
+    ))
+}
+
+/// Single-shot half of [`http_get_bounded`] (see it for the contract). Returns
+/// `(status, location, body)` — the `Location` header is surfaced for
+/// [`http_get_following_redirects`] because the client's own following is off.
+fn http_get_once(
+    url: &str,
+    max: usize,
+    accept: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<(u16, Option<std::string::String>, std::string::String), std::string::String> {
     use embedded_svc::http::client::Client as HttpClient;
     use embedded_svc::http::Method;
     use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
@@ -313,28 +495,57 @@ fn http_get_once(
     // model-generated and the fetched text can inject further instructions, so
     // the agent must not be able to read the device's own HTTP server, a LAN
     // service, or the cloud-metadata endpoint. `AT+HTTPGET` deliberately keeps
-    // unrestricted reach — its URL is typed by the operator.
+    // unrestricted reach — its URL is typed by the operator. Run on **every**
+    // hop: `http_get_following_redirects` calls this function once per
+    // redirect, so a public host cannot 302 the agent onto an internal one.
     if let Some(reason) = magent_core::at_validate::public_fetch_target_refusal(&host, false) {
         return Err(format!("{reason}: {host}"));
     }
     let authority = format!("{host}:{port}");
+    // The lexical guard above cannot see a *hostname* that resolves inward:
+    // `http://127.0.0.1.nip.io/` is not an IP literal, so it passed, resolved
+    // to loopback, and the preflight happily connected to the device's own
+    // services. Vet every resolved address too. (DNS rebinding between this
+    // check and the client's own resolution is still theoretically possible;
+    // esp-idf's HTTP client exposes no pinned-address hook.)
     match authority.to_socket_addrs() {
-        Ok(mut addrs) => match addrs.next() {
-            Some(addr) => {
-                if std::net::TcpStream::connect_timeout(&addr, core::time::Duration::from_secs(5))
-                    .is_err()
+        Ok(addrs) => {
+            let mut first: Option<std::net::SocketAddr> = None;
+            for addr in addrs {
+                let ip = addr.ip().to_string();
+                if let Some(reason) =
+                    magent_core::at_validate::public_fetch_target_refusal(&ip, false)
                 {
-                    return Err(format!("connect timeout to {authority}"));
+                    return Err(format!("{reason}: {host} resolved to {ip}"));
+                }
+                if first.is_none() {
+                    first = Some(addr);
                 }
             }
-            None => return Err(format!("no address for {authority}")),
-        },
+            match first {
+                Some(addr) => {
+                    if std::net::TcpStream::connect_timeout(
+                        &addr,
+                        core::time::Duration::from_secs(5),
+                    )
+                    .is_err()
+                    {
+                        return Err(format!("connect timeout to {authority}"));
+                    }
+                }
+                None => return Err(format!("no address for {authority}")),
+            }
+        }
         Err(e) => return Err(format!("dns failed: {e}")),
     }
 
     let cfg = HttpConfig {
         timeout: Some(core::time::Duration::from_secs(6)),
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        // Follow redirects in Rust, not in C: the built-in following hides the
+        // post-redirect URL, so the SSRF guard above could not re-vet it. See
+        // `http_get_following_redirects`.
+        follow_redirects_policy: esp_idf_svc::http::client::FollowRedirectsPolicy::FollowNone,
         ..Default::default()
     };
     let conn = EspHttpConnection::new(&cfg).map_err(|e| format!("connect: {e}"))?;
@@ -356,6 +567,9 @@ fn http_get_once(
     crate::rt_watchdog::feed();
     let mut response = request.submit().map_err(|e| format!("submit: {e}"))?;
     let status = response.status();
+    // Capture `Location` before the body read (and before `response` drops) for
+    // `http_get_following_redirects`; harmless on a non-3xx.
+    let location = response.header("location").map(std::string::String::from);
 
     let mut buf = vec![0u8; max];
     let mut read = 0usize;
@@ -384,7 +598,7 @@ fn http_get_once(
         return Err(format!("{e} after {read} B"));
     }
     let body = std::string::String::from_utf8_lossy(&buf[..read]).into_owned();
-    Ok((status, body))
+    Ok((status, location, body))
 }
 
 /// Percent-encode a **whole URL** for `esp_http_client`.
@@ -764,6 +978,27 @@ fn extract_news_titles(body: &str, limit: usize) -> Vec<std::string::String> {
 }
 
 
+/// Tools `Esp32ToolHandler` can actually run: the hardware/sensor set plus the
+/// four network tools.
+///
+/// This governs what the LLM is told it can do
+/// ([`magent_core::tools::ToolRegistry::describe_served`]). The registry still
+/// holds the whole built-in hardware pack — the health sensors, `voice_output`,
+/// `send_notification`, `ble_send` — none of which this board has hardware for;
+/// without this list the prompt advertised them and every call came back "not
+/// implemented on this target". Keep in step with the `handle` arms below (the
+/// fallback logs if a name here has no arm).
+const SERVED: &[&str] = &[
+    "write_gpio",
+    "read_sensor",
+    "flash_write",
+    "flash_read",
+    "fetch_web",
+    "get_weather",
+    "get_news",
+    "get_flight_price",
+];
+
 impl ToolHandler for Esp32ToolHandler {
     fn handle(&self, call: &ToolCall) -> Option<ToolResult> {
         match call.name.as_str() {
@@ -775,6 +1010,44 @@ impl ToolHandler for Esp32ToolHandler {
             "get_weather" => Some(get_weather(call.arguments.as_str())),
             "get_news" => Some(get_news(call.arguments.as_str())),
             "get_flight_price" => Some(get_flight_price(call.arguments.as_str())),
+            _ => {
+                // A name advertised as served but with no arm here would be a
+                // tool the prompt promises and this handler refuses — the exact
+                // gap `SERVED` exists to close. Say so rather than fall through
+                // silently.
+                if SERVED.contains(&call.name.as_str()) {
+                    log::error!(
+                        "[tools] '{}' is listed in SERVED but has no handler arm — \
+                         the prompt advertises a tool this target cannot run",
+                        call.name
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    fn serves(&self, name: &str) -> bool {
+        SERVED.contains(&name)
+    }
+
+    /// Advertise the sensors this board really reads.
+    ///
+    /// The registry's shared `read_sensor` description lists twelve sensors,
+    /// but this handler runs only two of them: the chip's internal temperature
+    /// sensor and the free heap. Shipping the shared text taught the model it
+    /// could read a battery, accelerometer, humidity, pressure, light, heart
+    /// rate, HRV, glucose, ECG or stress level on a board that answers every
+    /// one of those with "unsupported sensor" (`read_sensor`'s `else` arm) —
+    /// and left `memory`, which the board *can* read, unmentioned. Keep this in
+    /// step with the `read_sensor` arms above; a change there without a change
+    /// here re-opens the gap.
+    fn describe_tool(&self, name: &str) -> Option<&'static str> {
+        match name {
+            "read_sensor" => Some(
+                "Read a real device value. args: sensor=temperature (chip die temperature) \
+                 | sensor=memory (free heap)",
+            ),
             _ => None,
         }
     }

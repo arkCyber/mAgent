@@ -20,6 +20,10 @@ ignore = [
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill is superseded by stable atomics; no CVE" },
     { id = "RUSTSEC-2026-0110", reason = "bare-metal crate is deprecated; superseded by core::error" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile superseded by rustls-native-certs; no CVE" },
+    # `pin-utils` is a macro-only helper crate pulled in by futures-util. The
+    # advisory is maintenance-status only, and cargo-deny reports no safe
+    # upgrade path (futures-util still depends on it).
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained; no replacement path, no CVE" },
 ]
 
 [licenses]

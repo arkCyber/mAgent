@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    task (tokio) and the gateway ingest loop (main) can
     //    both reach it without races.
     let adapter = Arc::new(Mutex::new(MqttAdapter::new("magent/cmd")));
-    let (sub_client, _eventloop_task, payload_tx) =
+    let (sub_client, sub_task, payload_tx) =
         spawn_subscriber(addr, Arc::clone(&adapter)).await?;
 
     // 4. Spin up a publisher that pushes one raw payload onto
@@ -95,6 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[subscriber] received {} raw bytes from broker",
         raw_payload.len()
     );
+    // Join the subscriber before `Arc::try_unwrap` below: the task holds its
+    // own `Arc` clone, and dropping the oneshot sender does not guarantee the
+    // task (and its clone) is gone by the time the main thread unwraps —
+    // an intermittent "another owner still holds the adapter".
+    let _ = sub_task.await;
 
     // The rumqttc subscriber already pushed the bytes into the
     // adapter; now we drain through a Signed-mode gateway. The
@@ -139,13 +144,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("[verify] ✅ envelope verifies against device DID");
 
-    // 7. Clean disconnect. The subscriber task exited naturally
-    //    after the first publish (we needed to release the
-    //    `Arc<Mutex<MqttAdapter>>` so we could unwrap it), so
-    //    there's nothing to abort here.
+    // 7. Clean disconnect. The subscriber task was already joined after the
+    //    first publish (which released its `Arc<Mutex<MqttAdapter>>` clone
+    //    before the gateway took ownership).
     sub_client.disconnect().await.ok();
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let _ = _eventloop_task.await;
 
     println!("\n=== end-to-end MQTT ingest verified ===");
     Ok(())

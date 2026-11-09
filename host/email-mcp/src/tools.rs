@@ -138,7 +138,8 @@ impl ToolRegistry {
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Substring to match (case-insensitive).",
+                            "description": "Non-empty substring to match (case-insensitive). Use `list_inbox` to list without a filter.",
+                            "minLength": 1,
                         },
                         "limit": {
                             "type": "integer",
@@ -200,6 +201,15 @@ impl ToolRegistry {
         self.catalogue.iter().map(ToolDescriptor::to_json).collect()
     }
 
+    /// Whether `name` is one of the tools this server advertises.
+    ///
+    /// The JSON-RPC layer uses this to keep "no such tool" a protocol
+    /// error while reporting a *handler* failure as an MCP tool error
+    /// (`isError: true`), per the MCP specification.
+    pub fn contains(&self, name: &str) -> bool {
+        self.catalogue.iter().any(|d| d.name == name)
+    }
+
     /// Dispatch a tool call by name. Returns the tool's output as
     /// a JSON string ready to embed in the JSON-RPC `content`
     /// array.
@@ -247,6 +257,20 @@ impl ToolRegistry {
             .get("query")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("missing `query`"))?;
+        // IMAP's `SUBJECT ""` / `FROM ""` match every message, so a
+        // query that reduces to nothing after escaping (empty,
+        // whitespace-only, or only quote/backslash/CR/LF characters)
+        // turns this into "list the whole INBOX" — a surprising result
+        // for a search, and one the caller can get explicitly via
+        // `list_inbox`. Reject it rather than issue a match-all
+        // search. Check the escaped form because that is what reaches
+        // the server.
+        if crate::imap_client::escape_imap_string(query)
+            .trim()
+            .is_empty()
+        {
+            anyhow::bail!("`query` must not be empty");
+        }
         let limit = limit_arg(&args)?;
         self.state.ensure_imap().await?;
         let mut guard = self.state.imap.lock().await;
@@ -287,7 +311,9 @@ impl ToolRegistry {
         let session = guard
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
-        session.mark_read(uid).await?;
+        if !session.mark_read(uid).await? {
+            anyhow::bail!("no message with uid {uid} in INBOX");
+        }
         Ok(json!({ "status": "marked_read", "uid": uid }).to_string())
     }
 }

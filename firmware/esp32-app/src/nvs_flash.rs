@@ -17,6 +17,12 @@ use esp_idf_sys as sys;
 /// NVS namespace holding every emulated flash blob.
 const NAMESPACE: &[u8] = b"magent_lua\0";
 
+/// Upper bound on a whole-blob read. `nvs_get_blob` requires the buffer to be
+/// at least the stored size, so a short read still allocates the full blob;
+/// cap it so a blob planted by another NVS user cannot force a huge
+/// allocation on the agent thread.
+const MAX_NVS_BLOB_READ: usize = 4096;
+
 /// Open [`NAMESPACE`] read-write.
 pub fn open_rw() -> Result<sys::nvs_handle_t, String> {
     let mut handle: sys::nvs_handle_t = 0;
@@ -97,8 +103,20 @@ pub fn read(addr: u32, len: usize) -> Result<Vec<u8>, String> {
         unsafe { sys::nvs_close(handle) };
         return Ok(Vec::new());
     }
-    let mut buf = vec![0u8; len.min(required)];
-    let mut out_len = buf.len();
+    // ESP-IDF returns ESP_ERR_NVS_INVALID_LENGTH when the supplied buffer is
+    // *smaller than the stored blob*, so passing `len.min(required)` made a
+    // short read (`length=5` over a 100-byte blob) fail outright instead of
+    // returning the documented prefix. Read the whole blob, then truncate.
+    if required > MAX_NVS_BLOB_READ {
+        // SAFETY: raw ESP-IDF NVS handle close.
+        unsafe { sys::nvs_close(handle) };
+        return Err(format!(
+            "flash_read(addr=0x{addr:08x}): stored blob is {required} B, \
+             exceeding the {MAX_NVS_BLOB_READ} B read cap"
+        ));
+    }
+    let mut buf = vec![0u8; required];
+    let mut out_len = required;
     // SAFETY: raw ESP-IDF NVS blob read; returns an `esp_err_t`.
     let r = unsafe {
         sys::nvs_get_blob(
@@ -113,7 +131,7 @@ pub fn read(addr: u32, len: usize) -> Result<Vec<u8>, String> {
     if r != 0 {
         return Err(format!("flash_read(addr=0x{addr:08x}) err={r}"));
     }
-    buf.truncate(out_len);
+    buf.truncate(out_len.min(len));
     Ok(buf)
 }
 

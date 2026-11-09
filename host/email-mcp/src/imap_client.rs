@@ -227,7 +227,26 @@ impl ImapSession {
     }
 
     /// Mark a message as seen (set `\Seen` flag) by UID.
-    pub async fn mark_read(&mut self, uid: u32) -> Result<(), anyhow::Error> {
+    ///
+    /// Returns `false` when no message with `uid` exists. IMAP's
+    /// `UID STORE +FLAGS` on an absent UID is **not** an error — the
+    /// server answers `OK` and simply never emits an untagged `FETCH`
+    /// — so draining the STORE stream alone cannot tell success from a
+    /// no-op. Probe with `UID FETCH <uid> (UID)` first: a present UID
+    /// always produces one untagged `FETCH`, an absent one produces
+    /// none.
+    pub async fn mark_read(&mut self, uid: u32) -> Result<bool, anyhow::Error> {
+        let mut probe = self.client.uid_fetch(uid.to_string(), "UID").await?;
+        let mut exists = false;
+        while let Some(item) = probe.next().await {
+            item?;
+            exists = true;
+        }
+        if !exists {
+            return Ok(false);
+        }
+        drop(probe);
+
         let mut stream = self
             .client
             .uid_store(uid.to_string(), "+FLAGS (\\Seen)")
@@ -236,8 +255,10 @@ impl ImapSession {
         // processes the STORE. Without this, the warning
         // "unused implementer of Stream" fires and the
         // server-side state never gets updated.
-        while let Some(_resp) = stream.next().await {}
-        Ok(())
+        while let Some(resp) = stream.next().await {
+            resp?;
+        }
+        Ok(true)
     }
 
     /// Render a list of [`MessageSummary`] as a JSON array.
@@ -302,7 +323,7 @@ fn from_address(env: &Envelope<'_>) -> Option<String> {
 /// Escape an arbitrary string for inclusion in an IMAP SEARCH
 /// quoted-string. We strip characters that would otherwise let
 /// the user inject extra criteria.
-fn escape_imap_string(s: &str) -> String {
+pub(crate) fn escape_imap_string(s: &str) -> String {
     s.chars()
         .filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n'))
         .collect()

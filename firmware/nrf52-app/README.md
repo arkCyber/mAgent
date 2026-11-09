@@ -105,6 +105,7 @@ src/
 | `read_heart_rate` | Read heart rate (alias) |
 | `read_glucose` | Read glucose level |
 | `read_ecg` | Read ECG trace |
+| `check_stress_level` | Read stress level (alias for `read_sensor sensor=stress`) |
 | `voice_output` | Queue text-to-speech |
 | `send_notification` | Send notification |
 

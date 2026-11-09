@@ -104,14 +104,28 @@ fn compress_messages(messages: &mut VecDeque<Message>, policy: &Policy) -> Stats
     // Step 1: truncate over-long tool messages.
     if policy.tool_max_chars > 0 {
         for m in messages.iter_mut() {
-            if m.role == Role::Tool && m.body.len() > policy.tool_max_chars {
+            // The cap is in characters, matching the production
+            // `tool_content_max_chars` contract; slicing bytes panicked on
+            // any multi-byte body.
+            if m.role == Role::Tool && m.body.chars().count() > policy.tool_max_chars {
                 let original = m.body.len();
-                let keep = policy.tool_max_chars;
-                let mut new_body = m.body[..keep].to_string();
+                let cut = m
+                    .body
+                    .char_indices()
+                    .nth(policy.tool_max_chars)
+                    .map(|(i, _)| i)
+                    .unwrap_or(original);
+                let mut new_body = String::with_capacity(cut + TRUNCATION_MARKER.len());
+                new_body.push_str(&m.body[..cut]);
                 new_body.push_str(TRUNCATION_MARKER);
-                m.body = new_body;
-                stats.tool_results_truncated += 1;
-                stats.bytes_saved += original - m.body.len();
+                // Never accept a "truncation" that is longer than the
+                // original (the marker can exceed small caps), and never
+                // subtract a larger length from a smaller one.
+                if new_body.len() < original {
+                    m.body = new_body;
+                    stats.tool_results_truncated += 1;
+                    stats.bytes_saved += original.saturating_sub(m.body.len());
+                }
             }
         }
     }

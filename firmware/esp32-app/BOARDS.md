@@ -5,10 +5,11 @@
 | 板卡 | Cargo feature | 目标 target | CPU | 内部 SRAM | PSRAM |
 |---|---|---|---|---|---|
 | **ESP32-C61** (默认) | `board-c61` | `riscv32imac-esp-espidf` | RISC-V 160MHz | ~134KB 动态 | 2MB |
-| **ESP32-S3** | `board-s3` | `xtensa-esp32s3-espidf` | Xtensa 240MHz | ~390KB 动态 | 8MB |
+| **ESP32-S3**（quad 开发板，当前刷写目标） | `board-s3` | `xtensa-esp32s3-espidf` | Xtensa 240MHz | ~390KB 动态 | 2MB quad |
+| **ESP32-S3-WROOM-1-N8R8**（octal 模块） | `board-s3,s3-8mb-psram` | `xtensa-esp32s3-espidf` | Xtensa 240MHz | ~390KB 动态 | 8MB octal |
 
 ## 为什么需要 S3
-C61 内部 SRAM 动态区仅 ~134KB，WiFi + agent 已接近上限。**S3 有 ~390KB 内部动态堆 + 8MB PSRAM，可以同时跑 WiFi(DeepSeek) + agent + Lua App**，端到端解决智能体的云端对话问题。
+C61 内部 SRAM 动态区仅 ~134KB，WiFi + agent 已接近上限。**S3 有 ~390KB 内部动态堆 + 2MB（quad 开发板）/ 8MB（N8R8，需 `s3-8mb-psram`）PSRAM，可以同时跑 WiFi(DeepSeek) + agent + Lua App**，端到端解决智能体的云端对话问题。
 
 > BLE 已于 2026-09-20 从固件中整体移除（Bluedroid 控制器需要 ~244KB
 > **连续、可 DMA 的内部 DRAM**，两块板卡在 WiFi + agent 并存时都无法提供；
@@ -28,20 +29,46 @@ C61 内部 SRAM 动态区仅 ~134KB，WiFi + agent 已接近上限。**S3 有 ~3
 cd firmware/esp32-app && RUSTC_BOOTSTRAP=1 cargo build --release
 ```
 
-### ESP32-S3（需先装 Xtensa 工具链）
+### ESP32-S3 quad 开发板（当前刷写目标，2MB PSRAM）
 ```bash
 cargo install espup && espup install        # 一次
-cd firmware/esp32-app && ./build-s3.sh       # 或手动：
-#   MCU=ESP32S3 \
-#   ESP_IDF_SDKCONFIG_DEFAULTS=.../sdkconfig.s3.defaults \
-#   RUSTC_BOOTSTRAP=1 cargo build --target xtensa-esp32s3-espidf --features board-s3 --release
+cd firmware/esp32-app && ./check-s3.sh       # 快速编译检查（不烧录）
+cd firmware/esp32-app && ./build-s3.sh       # 使用 sdkconfig.defaults + board-s3
+./build-s3.sh --lua                          # 含 Lua 宿主（用于抓 Core0 崩溃日志）
 ```
+`./check-s3.sh --lua` 额外编译 Lua 宿主；`--octal8mb` 切换到 N8R8 8MB octal 配置。
+
+### 无硬件调试（QEMU）
+```bash
+# 一次性安装: python $IDF_PATH/tools/idf_tools.py install qemu-xtensa
+cd firmware/esp32-app
+./qemu-s3.sh              # release 构建 + 4MB flash image + esp32s3 机型启动
+./qemu-s3.sh --timeout 60 # 健康启动不会自行退出；默认 25s 后回收
+./qemu-s3.sh --gdb        # -s -S 暂停在复位点，GDB server :1234
+```
+默认关闭 `CONFIG_SPIRAM`（QEMU 的 esp32s3 机型不模拟 PSRAM，否则在
+`cpu_start` 直接 abort），使用 `--psram` 可保留原配置。`-no-reboot` 让崩溃/
+复位循环立即退出并保留串口日志，适合定位 Lua 启动崩溃。
+
+> 若 `espup install` 因网络/代理在 RISC-V target 步骤失败，也可手动安装 esp-rs
+> release 的 `rust-1.97.0.0-<host>.tar.xz` + `rust-src-1.97.0.0.tar.xz`
+> 到 `~/xtensa-rust`，然后 `rustup toolchain link esp-rust ~/xtensa-rust`。
+> 三个脚本会依次探测 `+esp`、`+esp-rust`，无需改配置。
+
+### ESP32-S3-WROOM-1-N8R8（8MB octal PSRAM）
+```bash
+cd firmware/esp32-app
+./check-s3.sh --octal8mb     # 快速编译检查
+./build-s3.sh --octal8mb     # 构建（自动换入 sdkconfig.s3.defaults 并加 s3-8mb-psram）
+```
+`board-s3` 只选择芯片；`s3-8mb-psram` 才启用 4 MiB / 2 MiB 的内存上限档位。
 
 ## 板卡专用 sdkconfig
-- `sdkconfig.defaults` → C61（flash/PSRAM/WiFi 削减/分区表等）
-- `sdkconfig.s3.defaults` → S3（8MB octal PSRAM、S3 分区、mbedTLS、lwIP）
+- `sdkconfig.defaults` → S3 **quad 开发板**（2MB PSRAM、4MB flash、S3 分区、mbedTLS、lwIP）
+- `sdkconfig.s3.defaults` → S3 **N8R8 模块**（8MB octal PSRAM；需同时启用 `s3-8mb-psram`）
+- `sdkconfig.c61.defaults` → ESP32-C61
 
-> **注意**：S3 配置文件与 `build-s3.sh` 是基于 ESP32-S3 标准配置的起点；**需在真实 S3 板卡上烧录验证**（WiFi + BLE 共存、DeepSeek 端到端、PSRAM 8MB 识别）。C61 配置已在本仓库验证可用。
+> **注意**：S3 配置文件与构建脚本是 ESP32-S3 的起点；**需在真实 S3 板卡上烧录验证**（WiFi + DeepSeek 端到端、PSRAM 识别：quad 板 2MB / N8R8 8MB）。BLE 已于 2026-09-20 移除，不在验证项内。C61 配置已在本仓库验证可用。
 
 
 ## ESP32-S3 构建已打通（2026-08-27 验证）
@@ -61,7 +88,7 @@ espflash save-image --chip esp32s3 \\
   target/xtensa-esp32s3-espidf/release/magent-esp32-app.bin
 ```
 
-烧录（真实板子）：`espflash flash --chip esp32s3 -b 460800 <bin>`（WiFi+BLE+agent 已在 S3 上构建成功，需真实硬件验证联机/PSRAM 8MB）。
+烧录（真实板子）：`espflash flash --chip esp32s3 -b 460800 <bin>`（WiFi + agent 已在 S3 上构建成功，需真实硬件验证联机与 PSRAM 容量识别）。
 
 ## 2026-09-15：S3 导入 & 验收定稿
 

@@ -279,6 +279,22 @@ pub struct ToolCall {
     pub args: Vec<(String, String)>,
 }
 
+/// Whether a model response marks the task complete.
+///
+/// `generate_response` emits `{"done": true, "result": …}` — lowercase —
+/// while the loop used to test for the uppercase substrings `"DONE"` /
+/// `"RESULT"`, so a completed task never left `Observing` and ran to
+/// `max_iterations` (in Ollama mode, ~20 extra LLM calls per task). Parse
+/// the JSON field first, then keep the substring check for textual replies.
+fn is_done_response(response: &str) -> bool {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(response) {
+        if let Some(done) = json.get("done").and_then(serde_json::Value::as_bool) {
+            return done;
+        }
+    }
+    response.contains("DONE") || response.contains("RESULT")
+}
+
 /// Tool result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -352,15 +368,37 @@ impl SimulatedFlash {
         }
     }
     pub fn write(&mut self, addr: usize, data: &[u8]) -> Result<(), String> {
-        if addr + data.len() > self.data.len() { return Err("Bad address".into()); }
+        // `checked_add` rather than `addr + data.len()`: the address is
+        // caller-supplied, and the sum wraps for an address near `usize::MAX`,
+        // so the bound check would pass on a small wrapped value and the slice
+        // below would panic.
+        if addr
+            .checked_add(data.len())
+            .is_none_or(|end| end > self.data.len())
+        {
+            return Err("Bad address".into());
+        }
+        // NOR flash can only clear bits; a write that would set one means the
+        // target was not erased. Silently AND-ing returned success while
+        // leaving corrupted data ("HELLO" then "WORLD" read back "@E@LD").
+        for (i, &b) in data.iter().enumerate() {
+            if self.data[addr + i] & b != b {
+                return Err("flash target is not erased".into());
+            }
+        }
         let sector = addr / self.sector_size;
         if sector < self.writes.len() { self.writes[sector] += 1; }
         for (i, &b) in data.iter().enumerate() { self.data[addr + i] &= b; }
         Ok(())
     }
     pub fn read(&self, addr: usize, buf: &mut [u8]) -> Result<(), String> {
-        if addr + buf.len() > self.data.len() { return Err("Bad address".into()); }
-        buf.copy_from_slice(&self.data[addr..addr + buf.len()]);
+        let Some(end) = addr
+            .checked_add(buf.len())
+            .filter(|&end| end <= self.data.len())
+        else {
+            return Err("Bad address".into());
+        };
+        buf.copy_from_slice(&self.data[addr..end]);
         Ok(())
     }
 }
@@ -472,35 +510,100 @@ impl SpO2Sensor {
 
 impl Default for SpO2Sensor { fn default() -> Self { Self::new() } }
 
+/// Vertical acceleration (m/s²) a footfall must exceed to register as a
+/// step. The accelerometer rests near 1 g (~9.8) and a stride spikes above it.
+const STEP_THRESHOLD_G: f32 = 10.5;
+
 /// Step counter
 #[derive(Clone)]
-pub struct StepCounter { steps: u32 }
-
-impl StepCounter {
-    pub fn new() -> Self { Self { steps: 0 } }
-    pub fn tick(&mut self, z: f32) {
-        if z > 10.5 && self.steps.is_multiple_of(2) { self.steps += 1; }
-    }
-    pub fn read(&self) -> StepData { StepData { steps: self.steps, stride_length: 75, cadence: 100 } }
-    pub fn add_steps(&mut self, n: u32) { self.steps += n; }
+pub struct StepCounter {
+    steps: u32,
+    above_threshold: bool,
 }
 
-impl Default for StepCounter { fn default() -> Self { Self::new() } }
+impl StepCounter {
+    pub fn new() -> Self {
+        Self {
+            steps: 0,
+            above_threshold: false,
+        }
+    }
+    pub fn tick(&mut self, z: f32) {
+        // Count a step on the *rising* edge over the threshold, so a
+        // sustained above-threshold reading is one step rather than one per
+        // tick. The previous body guarded on `steps.is_multiple_of(2)`, which
+        // latched off after the first increment — the counter could never
+        // exceed 1 step no matter how many footfalls it was fed.
+        let above = z > STEP_THRESHOLD_G;
+        if above && !self.above_threshold {
+            self.steps = self.steps.saturating_add(1);
+        }
+        self.above_threshold = above;
+    }
+    pub fn read(&self) -> StepData {
+        StepData {
+            steps: self.steps,
+            stride_length: 75,
+            cadence: 100,
+        }
+    }
+    pub fn add_steps(&mut self, n: u32) {
+        self.steps = self.steps.saturating_add(n);
+    }
+}
+
+impl Default for StepCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Ticks between footfalls. The RTC advances one simulated second every
+/// 1000 ticks, so the simulated wearer takes a step roughly once a second.
+const STRIDE_TICKS: u64 = 1000;
+/// Length of the footfall impulse in ticks. A real stride keeps the vertical
+/// axis elevated for ~100-200 ms.
+const FOOTFALL_TICKS: u64 = 150;
+/// Extra vertical acceleration (m/s²) a footfall adds, enough to clear
+/// [`STEP_THRESHOLD_G`] above the resting ~9.8 value.
+const FOOTFALL_IMPULSE_G: f32 = 1.6;
 
 /// Accelerometer
 #[derive(Clone)]
-pub struct Accelerometer { x: f32, y: f32, z: f32, iter: u64 }
+pub struct Accelerometer {
+    x: f32,
+    y: f32,
+    z: f32,
+    iter: u64,
+}
 
 impl Accelerometer {
-    pub fn new() -> Self { Self { x: 0.0, y: 0.0, z: 9.8, iter: 0 } }
+    pub fn new() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            z: 9.8,
+            iter: 0,
+        }
+    }
     pub fn tick(&mut self) {
         self.iter += 1;
         let mut rng = rand::thread_rng();
         self.x = rng.gen_range(-0.1..0.1);
         self.y = rng.gen_range(-0.1..0.1);
-        self.z = 9.8 + rng.gen_range(-0.2..0.2);
+        // The wearer is walking: a footfall spikes the vertical axis above the
+        // resting 1 g once per stride. Without the spike the resting noise
+        // (±0.2) never clears the step counter's threshold, so `tick`-driven
+        // step counting would stay at zero forever.
+        self.z = if self.iter % STRIDE_TICKS < FOOTFALL_TICKS {
+            9.8 + FOOTFALL_IMPULSE_G
+        } else {
+            9.8 + rng.gen_range(-0.2..0.2)
+        };
     }
-    pub fn read(&self) -> (f32, f32, f32) { (self.x, self.y, self.z) }
+    pub fn read(&self) -> (f32, f32, f32) {
+        (self.x, self.y, self.z)
+    }
     pub fn simulate_activity(&mut self, intensity: f32) {
         let mut rng = rand::thread_rng();
         self.x = rng.gen_range(-intensity..intensity);
@@ -509,7 +612,11 @@ impl Accelerometer {
     }
 }
 
-impl Default for Accelerometer { fn default() -> Self { Self::new() } }
+impl Default for Accelerometer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ============================================================================
 // Voice Processing (STT/TTS)
@@ -1155,7 +1262,7 @@ impl SmartwatchAgent {
             self.messages.push(Message::system(&format!("Executing: {:?}", tc)));
             self.execute_tool(&tc)?;
             self.state = AgentState::Acting;
-        } else if response.contains("DONE") || response.contains("RESULT") {
+        } else if is_done_response(&response) {
             self.state = AgentState::Finished;
         } else {
             self.state = AgentState::Observing;
@@ -1313,31 +1420,44 @@ impl SmartwatchAgent {
     }
 
     fn parse_tool_call(&self, response: &str) -> Option<ToolCall> {
+        // JSON-RPC-style scalar → IMAP-agnostic string for the tool layer.
+        fn scalar(v: &serde_json::Value) -> Option<String> {
+            match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                serde_json::Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            }
+        }
+
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(response) {
             if let Some(action) = json.get("action").or(json.get("tool")).and_then(|v| v.as_str()) {
-                let mut args = Vec::new();
-                if let Some(sensor) = json.get("sensor").and_then(|v| v.as_str()) { args.push(("sensor".into(), sensor.into())); }
-                if let Some(pin_val) = json.get("pin") {
-                    let pin_str = if let Some(s) = pin_val.as_str() {
-                        s.to_string()
-                    } else if let Some(n) = pin_val.as_i64() {
-                        n.to_string()
-                    } else {
-                        String::new()
-                    };
-                    args.push(("pin".into(), pin_str));
+                let mut args: Vec<(String, String)> = Vec::new();
+
+                // The simulator's own responses put every argument in a
+                // nested `"args"` object (`{"action":"write_gpio","args":
+                // {"pin":"13","state":"low"}}`). Reading only top-level keys
+                // dropped them all, so each call silently used the tool's
+                // default — a "turn the LED off" task switched it *on*, and
+                // "unlock the door" locked it. Nested args win over the
+                // top-level compatibility keys below (the tool layer takes
+                // the first match).
+                if let Some(obj) = json.get("args").and_then(|v| v.as_object()) {
+                    for (k, v) in obj {
+                        if let Some(s) = scalar(v) {
+                            args.push((k.clone(), s));
+                        }
+                    }
                 }
-                if let Some(state) = json.get("state").and_then(|v| v.as_str()) { args.push(("state".into(), state.into())); }
-                if let Some(data) = json.get("data").and_then(|v| v.as_str()) { args.push(("data".into(), data.into())); }
-                if let Some(addr_val) = json.get("address") {
-                    let addr_str = if let Some(s) = addr_val.as_str() {
-                        s.to_string()
-                    } else if let Some(n) = addr_val.as_i64() {
-                        n.to_string()
-                    } else {
-                        String::new()
-                    };
-                    args.push(("address".into(), addr_str));
+
+                // Top-level keys remain supported for hand-written calls.
+                for key in ["sensor", "pin", "state", "data", "address"] {
+                    if args.iter().any(|(k, _)| k == key) {
+                        continue;
+                    }
+                    if let Some(s) = json.get(key).and_then(scalar) {
+                        args.push((key.into(), s));
+                    }
                 }
                 return Some(ToolCall { name: action.into(), args });
             }
@@ -1464,6 +1584,49 @@ mod tests {
     }
 
     #[test]
+    fn step_counter_counts_each_footfall() {
+        // A step counter that can never count more than one step is not a
+        // step counter. The old body guarded on `steps.is_multiple_of(2)`,
+        // which latched off after the first increment, so three footfalls
+        // counted as one. Every rising edge over the threshold is a step.
+        let mut counter = StepCounter::new();
+        for _ in 0..3 {
+            counter.tick(11.0); // footfall spike
+            counter.tick(9.8); // between steps
+        }
+        assert_eq!(counter.read().steps, 3);
+    }
+
+    #[test]
+    fn step_counter_does_not_double_count_a_sustained_reading() {
+        let mut counter = StepCounter::new();
+        for _ in 0..5 {
+            counter.tick(11.0);
+        }
+        assert_eq!(counter.read().steps, 1, "a sustained spike is one step");
+        // A later footfall still counts.
+        counter.tick(9.8);
+        counter.tick(11.0);
+        assert_eq!(counter.read().steps, 2);
+    }
+
+    #[test]
+    fn simulator_tick_advances_the_step_counter() {
+        // The simulator advances every sensor on `tick`; the step counter has
+        // to actually move, otherwise "Track my steps" always reports 0.
+        let mut sim = SmartwatchSimulator::new();
+        for _ in 0..3000 {
+            sim.tick();
+        }
+        assert!(
+            sim.steps.read().steps >= 2,
+            "expected steps to accumulate over 3 s, got {}",
+            sim.steps.read().steps
+        );
+        assert!(sim.rtc_seconds >= 2, "the RTC should have advanced too");
+    }
+
+    #[test]
     fn test_gpio_operations() {
         let mut sim = SmartwatchSimulator::new();
         sim.gpio.set_state(13, PinState::High).unwrap();
@@ -1484,6 +1647,33 @@ mod tests {
         let mut buf = [0u8; 4];
         sim.flash.read(0, &mut buf).unwrap();
         assert_eq!(&buf, b"Test");
+    }
+
+    #[test]
+    fn flash_tool_rejects_an_overlarge_address_without_panicking() {
+        // `flash_read`/`flash_write` parse `address` straight out of the tool
+        // argument, and `SimulatedFlash` bounds-checked with `addr + len`. For
+        // an address near `usize::MAX` that sum wraps: the check compared a
+        // small number, passed, and the slice that followed panicked — even
+        // though both methods return `Result` and the tool layer expects to
+        // turn a bad argument into an error string. Same bug class the round-30
+        // fix removed from `host/simulator`'s copy of this type.
+        let mut sim = SmartwatchSimulator::new();
+        let huge = format!("{}", usize::MAX);
+
+        let r = sim.execute_tool("flash_read", &[("address", huge.as_str())]);
+        assert!(r.is_err(), "flash_read should error, got {r:?}");
+
+        let r = sim.execute_tool("flash_write", &[("address", huge.as_str()), ("data", "hi")]);
+        assert!(r.is_err(), "flash_write should error, got {r:?}");
+
+        // The last fully-readable block still reads, so the fix cannot degrade
+        // into "reject everything".
+        let near_end = format!("{}", FLASH_SIZE - 64);
+        assert!(
+            sim.execute_tool("flash_read", &[("address", near_end.as_str())])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1521,6 +1711,51 @@ mod tests {
         agent.config.verbose = false;
         let result = agent.run("Turn on the LED");
         assert!(result.is_ok());
+    }
+
+    /// The simulator's generated calls nest their arguments under `"args"`;
+    /// the parser used to read only top-level keys, so every argument was
+    /// dropped and the tool ran with its default. "Turn off the LED" then
+    /// drove GPIO13 **high**.
+    #[test]
+    fn test_nested_args_reach_the_tool() {
+        let agent = SmartwatchAgent::with_defaults();
+        let tc = agent
+            .parse_tool_call(r#"{"action":"write_gpio","args":{"pin":"13","state":"low"}}"#)
+            .expect("action should parse");
+        assert_eq!(tc.name, "write_gpio");
+        assert_eq!(
+            tc.args
+                .iter()
+                .find(|(k, _)| k == "state")
+                .map(|(_, v)| v.as_str()),
+            Some("low")
+        );
+
+        let mut agent = SmartwatchAgent::with_defaults();
+        agent.config.verbose = false;
+        agent.run("Turn off the LED").unwrap();
+        assert_eq!(
+            agent.sim.gpio.get_state(13).unwrap(),
+            crate::PinState::Low,
+            "the requested state must reach the GPIO"
+        );
+    }
+
+    /// `generate_response` emits `{"done": true, …}` (lowercase) while the
+    /// completion check looked for `"DONE"`/`"RESULT"`, so no task ever
+    /// reached `Finished` and every run burned all `max_iterations`.
+    #[test]
+    fn test_a_completed_task_stops_immediately() {
+        let mut agent = SmartwatchAgent::with_defaults();
+        agent.config.verbose = false;
+        agent.run("Read temperature").unwrap();
+        assert_eq!(agent.state(), AgentState::Finished);
+        assert!(
+            agent.iteration() < agent.config.max_iterations,
+            "a completed task must not run to the iteration cap (ran {})",
+            agent.iteration()
+        );
     }
 
     #[test]

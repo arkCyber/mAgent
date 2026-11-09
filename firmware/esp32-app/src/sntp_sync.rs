@@ -144,11 +144,15 @@ pub fn start_sntp() -> Result<EspSntp<'static>, EspError> {
 /// releases (i64 → i32 on 32-bit RISC-V/Xtensa in IDF v6) and whose
 /// return value is the time itself — not an error code.
 pub fn read_rtc_unix() -> Result<Option<i64>, EspError> {
+    // The RTC counts from 0 before the first SNTP sync, so `SystemTime::now()`
+    // returns "1970 + uptime". Any positive value is therefore not proof of a
+    // sync; require a plausible wall-clock date (2020-09-13) as the floor.
+    const PLAUSIBLE_MIN_UNIX: i64 = 1_600_000_000;
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => {
             let secs = d.as_secs() as i64;
-            if secs <= 0 {
-                // Boot-time clock (1970-01-01) — SNTP hasn't synced.
+            if secs < PLAUSIBLE_MIN_UNIX {
+                // Boot-time clock — SNTP hasn't synced.
                 Ok(None)
             } else {
                 Ok(Some(secs))
@@ -182,13 +186,22 @@ pub fn restore_from_nvs(
     nvs_record: Option<&str>,
 ) -> Result<(), magent_core::time_sync::TimeSyncError> {
     let mut guard = handle.lock().unwrap_or_else(|e| e.into_inner());
+    // The persisted record carries no timezone (its 6-field format predates
+    // `AT+TIMEZONE`), and `parse_record` hardcodes 0. The handle was built
+    // with the NVS-stored operator offset, so overwrite would silently reset
+    // every reboot. Carry the live value across the restore.
+    let live_tz = guard.tz_offset_minutes();
     match nvs_record {
         Some(s) => match TimeSync::load(s, monotonic_ms()) {
-            Ok(loaded) => {
+            Ok(mut loaded) => {
+                if let Err(e) = loaded.set_tz_offset_minutes(live_tz) {
+                    log::warn!("[sntp] could not restore tz offset {live_tz}: {e}");
+                }
                 log::info!(
-                    "[sntp] restored time-sync from NVS (source={:?}, drift={}ppm)",
+                    "[sntp] restored time-sync from NVS (source={:?}, drift={}ppm, tz={}min)",
                     loaded.source(),
-                    loaded.drift_ppm()
+                    loaded.drift_ppm(),
+                    loaded.tz_offset_minutes()
                 );
                 *guard = loaded;
                 Ok(())
@@ -353,31 +366,39 @@ pub fn run_sntp_supervisor<F>(
             if let Ok(mut g) = force_flag.lock() {
                 *g = false;
             }
-            // Ask the IDF SNTP daemon to forget its last result; it
-            // will re-poll within ~30s.
+            // Only record a sample when the IDF daemon actually reports a
+            // completed exchange. (`read_rtc_unix` also rejects the boot
+            // epoch, but the status is the authoritative signal.) The status
+            // read must come *before* the reset below, since
+            // `sntp_get_sync_status` consumes COMPLETED.
+            let forced_status = sntp.get_sync_status();
+            if forced_status == SyncStatus::Completed {
+                if let Ok(Some(wall)) = read_rtc_unix() {
+                    if record_sample(&handle, wall, 0, now).is_ok() {
+                        log::info!(
+                            "[sntp] force-sync: recorded completed sync wall_unix={} \
+                             monotonic_ms={}",
+                            wall, now
+                        );
+                    }
+                }
+            }
+            // Ask the IDF SNTP daemon to forget its last result; it will
+            // re-poll within ~30s.
             unsafe {
                 esp_idf_svc::sys::sntp_set_sync_status(
                     esp_idf_svc::sys::sntp_sync_status_t_SNTP_SYNC_STATUS_RESET,
                 );
             }
-            if let Ok(Some(wall)) = read_rtc_unix() {
-                if record_sample(&handle, wall, 0, now).is_ok() {
-                    // Do NOT claim a sync, and do NOT advance `last_sync_ms`.
-                    // No NTP exchange happened here — we only reset the IDF
-                    // daemon's status so it re-polls (within ~30 s) and
-                    // re-recorded the *current* RTC reading, which may still be
-                    // the pre-sync value. Advancing `last_sync_ms` would defer
-                    // the real periodic re-sync (the `elapsed_since_sync`
-                    // check below) by up to `RESYNC_INTERVAL_S` — precisely
-                    // after an operator asked for a *fresher* clock.
-                    log::info!(
-                        "[sntp] force-sync: re-poll requested; recorded current RTC \
-                         wall_unix={} monotonic_ms={} (no NTP exchange yet)",
-                        wall, now
-                    );
-                }
-            } else {
-                log::warn!("[sntp] force-sync: RTC not yet synced");
+            if forced_status != SyncStatus::Completed {
+                // No NTP exchange happened here — we only reset the IDF
+                // daemon's status so it re-polls (within ~30 s). Do NOT claim a
+                // sync, and do NOT advance `last_sync_ms`: that would defer
+                // the real periodic re-sync by up to `RESYNC_INTERVAL_S`,
+                // precisely after an operator asked for a fresher clock.
+                log::info!(
+                    "[sntp] force-sync: re-poll requested (no completed NTP exchange yet)"
+                );
             }
             persist_to_nvs(&handle, &mut save_fn);
         }
@@ -396,13 +417,13 @@ pub fn run_sntp_supervisor<F>(
         // `status == Completed` (which never happens if we never synced). So
         // the moment a link appears, nudge the daemon and do the first sync.
         if !did_first_sync && network_up.load(Ordering::Acquire) {
-            // Ask the IDF daemon to (re)start polling now that we have a link.
-            unsafe {
-                esp_idf_svc::sys::sntp_set_sync_status(
-                    esp_idf_svc::sys::sntp_sync_status_t_SNTP_SYNC_STATUS_RESET,
-                );
-            }
-            if wait_for_first_sync(&sntp, FIRST_SYNC_TIMEOUT_MS) {
+            // `sntp_get_sync_status()` (behind `status` above) is destructive:
+            // reading COMPLETED resets the IDF status to RESET. A sync that
+            // finished between the 5 s ticks is therefore visible here only
+            // once. Record it before doing anything that clears it — the old
+            // code unconditionally RESET and then waited, discarding that
+            // sample, and the next poll could be an hour away.
+            if status == SyncStatus::Completed {
                 if let Ok(Some(wall)) = read_rtc_unix() {
                     let n = monotonic_ms();
                     if record_sample(&handle, wall, 0, n).is_ok() {
@@ -413,6 +434,28 @@ pub fn run_sntp_supervisor<F>(
                         persist_to_nvs(&handle, &mut save_fn);
                         last_sync_ms = n;
                         did_first_sync = true;
+                    }
+                }
+            }
+            if !did_first_sync {
+                // Ask the IDF daemon to (re)start polling now that we have a link.
+                unsafe {
+                    esp_idf_svc::sys::sntp_set_sync_status(
+                        esp_idf_svc::sys::sntp_sync_status_t_SNTP_SYNC_STATUS_RESET,
+                    );
+                }
+                if wait_for_first_sync(&sntp, FIRST_SYNC_TIMEOUT_MS) {
+                    if let Ok(Some(wall)) = read_rtc_unix() {
+                        let n = monotonic_ms();
+                        if record_sample(&handle, wall, 0, n).is_ok() {
+                            log::info!(
+                                "[sntp] first sync recorded on link-up: wall_unix={} monotonic_ms={}",
+                                wall, n
+                            );
+                            persist_to_nvs(&handle, &mut save_fn);
+                            last_sync_ms = n;
+                            did_first_sync = true;
+                        }
                     }
                 }
             }

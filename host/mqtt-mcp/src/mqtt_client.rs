@@ -121,26 +121,38 @@ impl MqttClient {
         let connected = Arc::new(Mutex::new(false));
         let connected_clone = connected.clone();
         tokio::spawn(async move {
-            while let Ok(event) = eventloop.poll().await {
-                match event {
-                    Event::Incoming(Incoming::ConnAck(_)) => {
+            // The event loop must be polled *forever*: rumqttc performs the
+            // reconnect inside `poll()`, so returning on the first `Err` (the
+            // old `while let Ok`) ended the task, dropped the event loop and
+            // its request receiver, and made every later publish/subscribe
+            // fail for the life of the process after a single network blip.
+            loop {
+                match eventloop.poll().await {
+                    Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                         let mut g = connected_clone.lock().await;
                         *g = true;
                         log::info!("mqtt: connack received");
                     }
-                    Event::Incoming(Incoming::Disconnect) => {
+                    Ok(Event::Incoming(Incoming::Disconnect)) => {
                         let mut g = connected_clone.lock().await;
                         *g = false;
                         log::warn!("mqtt: broker disconnected");
                     }
-                    Event::Outgoing(Outgoing::PingReq) => {
+                    Ok(Event::Outgoing(Outgoing::PingReq)) => {
                         log::trace!("mqtt: pingreq");
                     }
-                    _ => {}
+                    Ok(_) => {}
+                    Err(e) => {
+                        let mut g = connected_clone.lock().await;
+                        *g = false;
+                        drop(g);
+                        // Rate-limit the retry loop; the next poll attempts a
+                        // fresh connection.
+                        log::warn!("mqtt: event loop error ({e}); retrying in 1s");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                 }
             }
-            let mut g = connected_clone.lock().await;
-            *g = false;
         });
 
         Ok(Self {

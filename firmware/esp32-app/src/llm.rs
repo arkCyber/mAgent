@@ -209,6 +209,32 @@ pub struct ChannelLlmBackend {
     tx: mpsc::Sender<LlmRequest>,
 }
 
+/// Process-wide sender to the single Core-0 LLM worker.
+///
+/// The main agent publishes it once during boot (`setup_agent`); the Lua host
+/// then installs a second `ChannelLlmBackend` over the **same** worker instead
+/// of spawning another one. One TLS client per device keeps Core-0 internal
+/// DRAM/stack pressure bounded (the Lua build previously ran two mbedTLS
+/// stacks concurrently — a candidate in the on-device Core0 crash) and the
+/// worker already serialises requests, so both agents share it safely.
+static SHARED_SENDER: std::sync::OnceLock<mpsc::Sender<LlmRequest>> = std::sync::OnceLock::new();
+
+/// Publish the process-wide LLM worker sender (idempotent; first wins).
+pub fn publish_shared_sender(tx: mpsc::Sender<LlmRequest>) {
+    if SHARED_SENDER.set(tx).is_err() {
+        log::warn!("[llm] shared sender already published — keeping the first worker");
+    }
+}
+
+/// The shared worker sender, if the main agent has published one.
+///
+/// `None` means no model/API key was configured (no worker exists), so a
+/// second consumer must fall back to its local heuristic rather than spawn a
+/// duplicate TLS client.
+pub fn shared_sender() -> Option<mpsc::Sender<LlmRequest>> {
+    SHARED_SENDER.get().cloned()
+}
+
 impl ChannelLlmBackend {
     /// Wrap a sender to the LLM worker.
     pub fn new(tx: mpsc::Sender<LlmRequest>) -> Self {
@@ -231,9 +257,12 @@ impl LlmBackend for ChannelLlmBackend {
         // the agent's wait does not spin Core 1. We poll in 1s slices and
         // re-feed the RT watchdog between polls, so a long multi-iteration
         // ReAct task (several back-to-back LLM calls) never looks like an
-        // agent hang to the P3 watchdog. Bounded to 10s total; the backend
-        // itself already has an 8s TLS timeout.
-        let deadline = crate::latency_metrics::now_us() + 10_000_000;
+        // agent hang to the P3 watchdog. The budget must cover the backend's
+        // full retry chain (8s + 300ms + 8s ≈ 16.3s); a 10s cap cut the
+        // second attempt off, so the retry that exists to survive a transient
+        // TLS failure never got to report its result. 20s stays under the
+        // 30s agent-heartbeat staleness threshold.
+        let deadline = crate::latency_metrics::now_us() + 20_000_000;
         let out = loop {
             match reply_rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(res) => break res,
@@ -242,14 +271,14 @@ impl LlmBackend for ChannelLlmBackend {
                     if crate::latency_metrics::now_us() >= deadline {
                         break Err(AgentError::NetworkTimeout {
                             operation: "deepseek",
-                            duration_ms: 10_000,
+                            duration_ms: 20_000,
                         });
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     break Err(AgentError::NetworkTimeout {
                         operation: "deepseek",
-                        duration_ms: 10_000,
+                        duration_ms: 20_000,
                     });
                 }
             }

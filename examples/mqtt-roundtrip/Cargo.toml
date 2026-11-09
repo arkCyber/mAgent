@@ -14,6 +14,6 @@ path = "src/main.rs"
 [dependencies]
 # Same rumqttc version as the production `magent-mqtt-mcp` server,
 # so this example doubles as a wire-protocol regression test.
-rumqttc = { version = "0.24", default-features = false, features = ["default"] }
+rumqttc = { version = "0.25", default-features = false, features = ["default"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
 bytes = "1"

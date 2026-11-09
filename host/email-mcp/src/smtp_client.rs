@@ -6,7 +6,7 @@
 //! — each call to `send` reuses the existing transport if it's
 //! still alive.
 
-use lettre::message::{header, Mailbox, MultiPart, SinglePart};
+use lettre::message::{header, Mailbox, Mailboxes, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
@@ -51,17 +51,7 @@ impl SmtpSession {
     /// Compose and send a plain-text email. Multiple recipients
     /// can be supplied as a comma-separated string.
     pub async fn send(&self, to: &str, subject: &str, body: &str) -> Result<String, anyhow::Error> {
-        let addresses: Vec<Mailbox> = to
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::parse::<Mailbox>)
-            .collect::<Result<_, _>>()
-            .map_err(|e| anyhow::anyhow!("invalid `to` address: {e}"))?;
-
-        if addresses.is_empty() {
-            anyhow::bail!("`to` must contain at least one address");
-        }
+        let addresses = parse_recipients(to)?;
 
         // multipart/alternative: text/plain + text/html version.
         let html_body = SinglePart::builder()
@@ -78,14 +68,11 @@ impl SmtpSession {
         // recipients into a single `To(Mailboxes)` header up
         // front. `Mailboxes::with()` returns the updated
         // collection so we can chain.
-        let mut mailboxes = lettre::message::Mailboxes::new();
-        for mbox in addresses {
-            mailboxes = mailboxes.with(mbox);
-        }
-
         let builder = Message::builder()
             .from(self.from.clone())
-            .mailbox(lettre::message::header::To::from(mailboxes))
+            .mailbox(lettre::message::header::To::from(Mailboxes::from(
+                addresses,
+            )))
             .subject(subject.to_string())
             .multipart(multipart)?;
 
@@ -109,6 +96,22 @@ impl SmtpSession {
     }
 }
 
+/// Parse a comma-separated recipient list using lettre's RFC-aware parser.
+///
+/// Hand-splitting on `,` broke legal display names that contain a comma
+/// (`"Doe, John" <john@example.com>`), rejecting addresses the LLM can
+/// legitimately produce.
+fn parse_recipients(to: &str) -> Result<Vec<Mailbox>, anyhow::Error> {
+    let addresses: Mailboxes = to
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid `to` address: {e}"))?;
+    let addresses: Vec<Mailbox> = addresses.into();
+    if addresses.is_empty() {
+        anyhow::bail!("`to` must contain at least one address");
+    }
+    Ok(addresses)
+}
+
 /// Minimal HTML escaping for the auto-generated text/html part.
 /// Covers &, <, > which are the only characters that can break
 /// HTML structure.
@@ -116,4 +119,22 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recipients_accept_a_comma_inside_a_display_name() {
+        let to = r#""Doe, John" <john@example.com>, jane@example.com"#;
+        let list = parse_recipients(to).expect("both addresses are valid");
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn recipients_reject_an_empty_list() {
+        assert!(parse_recipients("  ").is_err());
+        assert!(parse_recipients("").is_err());
+    }
 }

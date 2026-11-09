@@ -22,8 +22,11 @@ use std::time::Duration;
 static PING_DONE: AtomicBool = AtomicBool::new(false);
 /// Number of ICMP echo replies received.
 static PING_REPLY: AtomicU32 = AtomicU32::new(0);
-/// Round-trip time of the last reply, in microseconds.
-static PING_TIME_US: AtomicU32 = AtomicU32::new(0);
+/// Round-trip time of the last reply, in **milliseconds**.
+///
+/// ESP-IDF's `ESP_PING_PROF_TIMEGAP` writes `elapsed_time_ms`
+/// (`ping_sock.c`), so the old `us` label reported 25 ms as "25us".
+static PING_TIME_MS: AtomicU32 = AtomicU32::new(0);
 
 /// Milliseconds since boot (for the bounded wait loop).
 fn now_ms() -> u64 {
@@ -44,7 +47,7 @@ unsafe extern "C" fn on_ping_success(hdl: esp_idf_sys::esp_ping_handle_t, _args:
         )
     };
     if rc == esp_idf_sys::ESP_OK {
-        PING_TIME_US.store(gap, Ordering::SeqCst);
+        PING_TIME_MS.store(gap, Ordering::SeqCst);
     }
 }
 
@@ -215,7 +218,7 @@ pub fn ping_ipv4(host: &str, now_ms_now: u64) -> Result<String, u8> {
 
     PING_DONE.store(false, Ordering::SeqCst);
     PING_REPLY.store(0, Ordering::SeqCst);
-    PING_TIME_US.store(0, Ordering::SeqCst);
+    PING_TIME_MS.store(0, Ordering::SeqCst);
 
     let mut handle: esp_idf_sys::esp_ping_handle_t = core::ptr::null_mut();
     // SAFETY: cfg/callbacks are valid; handle is written by the callee.
@@ -244,9 +247,9 @@ pub fn ping_ipv4(host: &str, now_ms_now: u64) -> Result<String, u8> {
     }
 
     let reply = PING_REPLY.load(Ordering::SeqCst);
-    let gap_us = PING_TIME_US.load(Ordering::SeqCst);
+    let gap_ms = PING_TIME_MS.load(Ordering::SeqCst);
     log::info!(
-        "[ping] {host}: reply={reply} rtt={gap_us}us done={}",
+        "[ping] {host}: reply={reply} rtt={gap_ms}ms done={}",
         PING_DONE.load(Ordering::SeqCst)
     );
 
@@ -257,5 +260,5 @@ pub fn ping_ipv4(host: &str, now_ms_now: u64) -> Result<String, u8> {
     if reply == 0 {
         return Err(6); // no reply (unreachable / timeout)
     }
-    Ok(format!("+PING: reply={reply} rtt={gap_us}us"))
+    Ok(format!("+PING: reply={reply} rtt={gap_ms}ms"))
 }

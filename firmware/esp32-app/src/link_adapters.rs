@@ -162,6 +162,9 @@ where
     // embedded-svc 0.29) dual-version problem. We bridge to the
     // 0.7 `IngressSource::Rs232.port` field in `source_kind`.
     port: std::string::String,
+    /// Line reassembly buffer. `poll` returns exactly one complete
+    /// `\r`/`\n`-terminated line at a time.
+    line: std::vec::Vec<u8>,
 }
 
 impl<T> UartAdapter<T>
@@ -176,6 +179,7 @@ where
         Self {
             inner,
             port: std::string::String::from(port),
+            line: std::vec::Vec::new(),
         }
     }
 
@@ -209,13 +213,49 @@ where
         // `delay::BLOCK` until at least one byte arrives — with no input that
         // blocks forever, stalling the ingress loop (and its watchdog
         // heartbeat). Check the RX buffer first: if empty, report "no data".
-        if self.inner.rx_available() == 0 {
-            return Ok(0);
-        }
-        match self.inner.read(buf) {
-            Ok(0) => Ok(0),
-            Ok(n) => Ok(n),
-            Err(_) => Err(AdapterError::Io),
+        //
+        // Once bytes are available, drain them into the line buffer and
+        // return **one complete line**. The gateway treats each `poll` result
+        // as one frame, so returning a raw chunk split a long command into a
+        // truncated prefix plus a remainder that was then routed to the LLM
+        // as natural language, and merged two back-to-back commands into one
+        // unparseable frame.
+        loop {
+            // A terminated line already buffered: hand it out.
+            if let Some(pos) = self.line.iter().position(|b| *b == b'\n' || *b == b'\r') {
+                let mut rest = self.line.split_off(pos + 1);
+                let mut line: std::vec::Vec<u8> = std::mem::take(&mut self.line);
+                // Drop the terminator (and a following `\n` of a CRLF pair,
+                // which `split_off` left at the head of `rest`).
+                line.truncate(pos);
+                if rest.first() == Some(&b'\n') || rest.first() == Some(&b'\r') {
+                    rest.remove(0);
+                }
+                self.line = rest;
+                let n = line.len().min(buf.len());
+                buf[..n].copy_from_slice(&line[..n]);
+                return Ok(n);
+            }
+
+            if self.inner.rx_available() == 0 {
+                return Ok(0);
+            }
+            let mut chunk = [0u8; 64];
+            match self.inner.read(&mut chunk) {
+                Ok(0) => return Ok(0),
+                Ok(n) => {
+                    self.line.extend_from_slice(&chunk[..n]);
+                    // Bound the reassembly buffer: an unterminated flood must
+                    // not grow without limit (~1 KiB is well above the 256-byte
+                    // AT line cap).
+                    const MAX_LINE: usize = 1024;
+                    if self.line.len() > MAX_LINE {
+                        self.line.clear();
+                        return Ok(0);
+                    }
+                }
+                Err(_) => return Err(AdapterError::Io),
+            }
         }
     }
 
@@ -557,7 +597,20 @@ impl LinkAdapter for UsbSerialAdapter {
         }
         // `NON_BLOCK` (0 ticks) = "hand back whatever is buffered right now".
         match self.inner.read(buf, esp_idf_svc::hal::delay::NON_BLOCK) {
-            Ok(n) => Ok(n),
+            // The vendored `UsbSerialDriver::read` returns `Ok(len as _)` from
+            // the C `int` without mapping errors, so a driver error surfaces as
+            // a huge `usize` instead of `Err`. Trust `buf`, not the count: a
+            // count past `buf.len()` means nothing was written (or the buffer
+            // was already full), and passing it on would make the gateway slice
+            // `&scratch[..n]` out of range on the Core-1 ingress thread.
+            Ok(n) if n <= buf.len() => Ok(n),
+            Ok(n) => {
+                log::warn!(
+                    "[ingress] USB-JTAG read reported {n}B into a {}B buffer — treating as I/O error",
+                    buf.len()
+                );
+                Err(AdapterError::Io)
+            }
             Err(_) => Err(AdapterError::Io),
         }
     }
@@ -591,6 +644,17 @@ impl LinkAdapter for UsbSerialAdapter {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
+                // Same `-1 as usize` narrowing as `poll`: a count larger than
+                // what we handed the driver means the driver errored. Advancing
+                // `offset` by it would end the loop and report `Ok(())` — a
+                // silent "reply sent" for a reply that was never transmitted.
+                Ok(n) if n > buf.len() - offset => {
+                    log::warn!(
+                        "[ingress] USB-JTAG write reported {n}B for {}B remaining — treating as I/O error",
+                        buf.len() - offset
+                    );
+                    return Err(AdapterError::Io);
+                }
                 Ok(n) => {
                     offset += n;
                     stalls = 0;
@@ -610,9 +674,13 @@ impl LinkAdapter for UsbSerialAdapter {
     }
 
     fn is_connected(&self) -> bool {
-        // The USB peripheral is always attached on these dev boards; a real
-        // product could gate this on `UsbSerialDriver::is_connected()`.
-        true
+        // Report the peripheral's real host-attachment state. The ingress
+        // gateway skips disconnected adapters, so a constant `true` made it
+        // poll a port whose host was gone (the driver returns `Ok(0)` either
+        // way, but the gateway's diagnostics then claimed a live link). The
+        // vendored HAL's `UsbSerialDriver::is_connected` asks
+        // `usb_serial_jtag_is_connected()`, which is exactly this bit.
+        self.inner.is_connected()
     }
 }
 

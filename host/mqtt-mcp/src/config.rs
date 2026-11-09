@@ -62,25 +62,43 @@ pub enum ConfigError {
 pub struct Config {
     /// Broker hostname or IP. Empty string is allowed but rejected
     /// at connect-time by `rumqttc`.
+    #[serde(default)]
     pub broker_host: String,
     /// Broker port. Defaults to the unencrypted MQTT port (1883).
+    #[serde(default)]
     pub broker_port: u16,
     /// MQTT client identifier. `rumqttc` allows an empty string
     /// (the broker assigns one) but we default to a stable one so
     /// operators can identify mAgent sessions in `mosquitto`'s
     /// `$SYS` introspection.
+    #[serde(default)]
     pub client_id: String,
     /// PINGREQ interval in seconds.
+    #[serde(default)]
     pub keep_alive_secs: u16,
     /// Default topic used by `publish_event` when the LLM doesn't
     /// specify one.
+    #[serde(default)]
     pub default_topic: String,
     /// Optional username for broker auth.
+    #[serde(default)]
     pub username: String,
-    /// Optional password for broker auth.
+    /// Optional password for broker auth. Never serialised: `--show-config`
+    /// prints this struct, and the password must not reach stdout/logs.
+    #[serde(default, skip_serializing)]
     pub password: String,
     /// Default QoS level for publishes (0 / 1 / 2).
+    ///
+    /// `serde(default)` uses the same value as [`Config::defaults`] so a
+    /// partial TOML file keeps the default; an explicit `0` in the file is
+    /// still distinguishable from an absent key because zero is a valid QoS.
+    #[serde(default = "default_qos")]
     pub qos_default: u8,
+}
+
+/// `qos_default` when the field is absent from a config file.
+fn default_qos() -> u8 {
+    1
 }
 
 impl Config {
@@ -120,6 +138,13 @@ impl Config {
                 path: path.clone(),
                 source,
             })?;
+            // A file value of 3 was silently ignored by `merge`; reject it
+            // the same way `MQTT_QOS=3` is rejected.
+            if file.qos_default > 2 {
+                return Err(ConfigError::InvalidQos {
+                    value: file.qos_default.to_string(),
+                });
+            }
             merge(&mut base, &file);
             base
         } else {
@@ -232,6 +257,34 @@ mod tests {
         assert_eq!(c.broker_port, 1883);
         assert_eq!(c.qos_default, 1);
         assert!(!c.client_id.is_empty());
+    }
+
+    /// A partial config file must parse (every field is `serde(default)`).
+    #[test]
+    fn a_partial_toml_file_parses_with_defaults() {
+        let file: Config = toml::from_str(r#"broker_host = "broker.example.com""#).unwrap();
+        assert_eq!(file.broker_host, "broker.example.com");
+        assert_eq!(file.qos_default, 1);
+        assert_eq!(file.broker_port, 0); // absent → merge leaves the default
+    }
+
+    /// `--show-config` serialises `Config`; the password must not appear.
+    #[test]
+    fn password_is_never_serialised() {
+        let mut cfg = Config::defaults();
+        cfg.password = "super-secret".to_string();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("super-secret"), "password leaked: {json}");
+        assert!(!json.contains("password"), "password field present: {json}");
+    }
+
+    /// QoS 0 is explicit and valid; it must survive the file→merge path.
+    #[test]
+    fn file_qos_zero_is_honoured() {
+        let file: Config = toml::from_str("qos_default = 0").unwrap();
+        let mut base = Config::defaults();
+        merge(&mut base, &file);
+        assert_eq!(base.qos_default, 0);
     }
 
     #[test]

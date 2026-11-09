@@ -159,17 +159,29 @@ uart = []
 # Exactly ONE of these must be enabled. They gate the chip-specific code
 # (device name, PSRAM profile, `esp-println` chip feature, ...) so the
 # same source builds for either chip. Default is the ESP32-C61 (RISC-V, 2MB
-# PSRAM). To build for the ESP32-S3 (Xtensa, 8MB PSRAM), enable `board-s3` and
-# build with `--target xtensa-esp32s3-espidf --features board-s3`.
+# PSRAM). To build for the ESP32-S3 (Xtensa), enable `board-s3` and build with
+# `--target xtensa-esp32s3-espidf --features board-s3`; add `s3-8mb-psram`
+# only for the N8R8 8 MB octal module.
 board-c61 = ["esp-println/esp32c6"]   # ESP32-C61 (RISC-V, 160MHz, 2MB PSRAM)
-# ESP32-S3 (Xtensa, 240MHz, 8MB PSRAM). Also enables the S3 large-heap profile
-# in magent-core (`s3-8mb-psram`) so the configurable agent memory-budget
-# ceiling rises from 1 MiB (C61) to 4 MiB — still bounded to prevent a runaway
-# LLM reply / context cache from exhausting the 8 MB pool (heap-blast guard).
-board-s3  = ["esp-println/esp32s3", "magent-core/s3-8mb-psram"]
+# ESP32-S3 (Xtensa, 240MHz). Selects the chip, not a PSRAM size: the shipped
+# `build-s3.sh` board is the **quad-PSRAM 2 MB** dev board, which keeps the
+# default 1 MiB configurable / 512 KiB dynamic-context ceilings (the same
+# numbers as the C61 profile; both boards have 2 MB of PSRAM).
+board-s3  = ["esp-println/esp32s3"]
+# 8 MB **octal**-PSRAM module (ESP32-S3-WROOM-1-N8R8) only. Raises the agent
+# memory ceilings in magent-core to 4 MiB configurable / 2 MiB dynamic context
+# (still bounded — heap-blast guard). Build with
+# `--features board-s3,s3-8mb-psram` and `sdkconfig.s3.defaults`; enabling it
+# on the quad board would advertise a ceiling above the physical PSRAM pool.
+s3-8mb-psram = [
+    "magent-core/s3-8mb-psram",
+    # Weak dep-feature: raise the Lua VM arena cap only when the Lua host is
+    # actually built (do not pull `magent-lua` in just for this profile).
+    "magent-lua?/s3-8mb-psram",
+]
 # Lua application host on the S3. OFF by default because the Lua VM is not yet
 # stable on hardware — it crashes Core0 even after the I2C pin fix
-# (firmware/esp32-app/build-s3.sh:17). It is NOT a build limitation: the
+# (firmware/esp32-app/build-s3.sh). It is NOT a build limitation: the
 # `magent-lua` dep above pins `default-features = false, features = ["piccolo"]`,
 # a pure-Rust engine with no vendored C, so `--features board-s3,wifi,uart,lua`
 # compiles cleanly for `xtensa-esp32s3-espidf` (unlike `mlua`, which cannot).

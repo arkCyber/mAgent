@@ -33,7 +33,7 @@ bytes = "1"
 # TLS is intentionally NOT enabled; the embedded nRF52 gateway
 # doesn't have the ROM budget for it, and an opt-in `tls`
 # feature can be added later behind a separate Cargo feature.
-rumqttc = { version = "0.24", default-features = false, features = ["default"] }
+rumqttc = { version = "0.25", default-features = false, features = ["default"] }
 
 [lints]
 workspace = true

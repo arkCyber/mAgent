@@ -30,7 +30,9 @@
 //! [`ThreadSpawnConfiguration::set`]. Parameters passed explicitly to
 //! `std::thread::Builder` (name, stack size) take precedence over that global
 //! config, but `pin_to_core` and `priority` are only read from it — so we set
-//! the whole profile *immediately before* each spawn.
+//! the whole profile *immediately before* each spawn, holding [`SPAWN_LOCK`]
+//! across the pair so two concurrent spawners cannot read each other's profile
+//! (see that lock's doc).
 //!
 //! On the single-core C61 (and host builds) `apply_profile` is a compile-time
 //! no-op: `Core::Core1` does not exist, and the shipped C61 keeps its existing
@@ -88,16 +90,35 @@ impl ThreadProfile {
 }
 
 /// Applies the profile (core + priority) for the *next* `std::thread` spawn.
-/// Must be called immediately before `std::thread::Builder::spawn`. Always
-/// resets the global config (either to a pinned core or back to `None` for
-/// `Any`), so a prior call can never leak its affinity onto a later thread.
+/// Private on purpose: the caller must hold [`SPAWN_LOCK`] across this call
+/// *and* the spawn that reads it, so go through [`spawn_thread`] /
+/// [`spawn_with_profile`]. Always resets the global config (either to a pinned
+/// core or back to `None` for `Any`), so a prior call can never leak its
+/// affinity onto a later thread.
 #[cfg(feature = "board-s3")]
-pub fn apply_profile(profile: ThreadProfile) {
+fn apply_profile(profile: ThreadProfile) {
     use esp_idf_svc::hal::cpu::Core;
     use esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration;
 
+    // `ThreadSpawnConfiguration::set` **panics** when the priority is outside
+    // FreeRTOS's `[1, configMAX_PRIORITIES - 1]`, and the `unwrap_or_else`
+    // below cannot catch a panic — so a priority constant above the ceiling
+    // would abort the spawn instead of the fail-open this function documents.
+    // Clamp into range first (the `.max(1)` also keeps `clamp` itself from
+    // panicking if the ceiling ever computes to 0).
+    let max_priority = (esp_idf_sys::configMAX_PRIORITIES as u8)
+        .saturating_sub(1)
+        .max(1);
+    let priority = profile.priority.clamp(1, max_priority);
+    if priority != profile.priority {
+        log::warn!(
+            "[core] priority {} outside FreeRTOS range [1, {max_priority}] — clamped to {priority}",
+            profile.priority
+        );
+    }
+
     let mut cfg = ThreadSpawnConfiguration::default();
-    cfg.priority = profile.priority;
+    cfg.priority = priority;
     cfg.pin_to_core = match profile.core {
         CorePlacement::Io => Some(Core::Core0),
         CorePlacement::Realtime => Some(Core::Core1),
@@ -111,9 +132,24 @@ pub fn apply_profile(profile: ThreadProfile) {
 /// existing scheduling unchanged. Kept so the call sites compile unchanged
 /// for the ESP32-C61 and host builds.
 #[cfg(not(feature = "board-s3"))]
-pub fn apply_profile(_profile: ThreadProfile) {
+fn apply_profile(_profile: ThreadProfile) {
     // No-op: the C61 has a single RISC-V core; Core1 does not exist.
 }
+
+/// Serialises the `apply_profile` → spawn pair.
+///
+/// The profile lives in a **process-global** `esp_pthread_cfg_t` that
+/// `pthread_create` reads at creation time, so `apply_profile` followed by a
+/// spawn is only atomic while no other thread is doing the same thing. Two
+/// concurrent spawners can interleave — A sets profile X, B sets profile Y,
+/// A's `pthread_create` then reads Y — which silently places A's thread on
+/// the wrong core at the wrong priority. That is reachable on the S3 today:
+/// the Lua host thread spawns its `llm-worker` (Core 0) at an arbitrary moment
+/// while the boot path (or an `at_dispatch` `AT+OTA` / `AT+RST`) spawns on
+/// Core 1. Every spawn that installs a profile holds this lock across both
+/// steps, so call [`spawn_thread`] / [`spawn_with_profile`] rather than
+/// calling [`apply_profile`] directly.
+static SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Spawn a std thread pinned to the requested core + priority.
 ///
@@ -122,6 +158,9 @@ pub fn apply_profile(_profile: ThreadProfile) {
 /// same return type (`std::io::Result<JoinHandle<()>>`) — except that the
 /// thread's core affinity + priority are set first on the ESP32-S3. On the
 /// C61 this is exactly the old spawn with no scheduling changes.
+///
+/// The profile is applied under `SPAWN_LOCK`, so a concurrent
+/// [`spawn_with_profile`] cannot clobber it between the set and the create.
 ///
 /// # Panics
 ///
@@ -136,10 +175,35 @@ pub fn spawn_thread<F>(
 where
     F: FnOnce() + Send + 'static,
 {
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     apply_profile(profile);
     std::thread::Builder::new()
         .name(name.into())
         .stack_size(stack_size)
         .spawn(f)
+}
+
+/// Spawn on the **default** stack with `profile`, not a named/bounded one.
+///
+/// Same contract as [`spawn_thread`] (profile applied under `SPAWN_LOCK`)
+/// for call sites that only need the affinity/priority — the `AT+RST` /
+/// `AT+RESTORE` delay+reboot threads and the `AT+OTA` worker. Keeping the
+/// set-and-spawn atomic is the point: a direct
+/// `apply_profile(...); std::thread::spawn(...)` elsewhere is exactly the
+/// race this helper exists to remove.
+///
+/// Returns the OS error instead of panicking when the thread cannot be
+/// created: on the memory-constrained S3 an ENOMEM spawn failure inside the
+/// ingress thread would abort the whole board (`std::thread::spawn` panics).
+pub fn spawn_with_profile<F>(
+    profile: ThreadProfile,
+    f: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    apply_profile(profile);
+    std::thread::Builder::new().spawn(f)
 }
 

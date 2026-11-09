@@ -8,7 +8,8 @@ switch matrix.
 | Board | Feature | Target | Flash | PSRAM | Status |
 |-------|---------|--------|-------|-------|--------|
 | **ESP32-C61** (default) | `board-c61` | `riscv32imac-esp-espidf` | 8 MB | 2 MB | ✅ verified on HW |
-| **ESP32-S3** | `board-s3` | `xtensa-esp32s3-espidf` | 4 MB (variant) | 4 MB quad | ✅ verified on HW (flagship) |
+| **ESP32-S3** (quad dev board, shipped) | `board-s3` | `xtensa-esp32s3-espidf` | 4 MB | 2 MB quad | ✅ verified on HW (flagship) |
+| **ESP32-S3-WROOM-1-N8R8** (octal) | `board-s3,s3-8mb-psram` | `xtensa-esp32s3-espidf` | 8 MB | 8 MB octal | build + `sdkconfig.s3.defaults`; ceiling profile 4 MiB/2 MiB |
 
 ## Building
 
@@ -42,7 +43,11 @@ cd firmware/esp32-app
 **ESP32-S3 (Xtensa)** — requires the `esp` toolchain (Xtensa LLVM backend):
 ```bash
 cd firmware/esp32-app
-./build-s3.sh
+./check-s3.sh            # compile-only check (no flash)
+./check-s3.sh --lua      # also compile the (still unstable) Lua host
+./check-s3.sh --octal8mb # N8R8 8 MB octal profile
+./build-s3.sh            # release build for the quad-PSRAM dev board
+./build-s3.sh --octal8mb # N8R8 8 MB octal module (sdkconfig swapped automatically)
 # Output: target/xtensa-esp32s3-espidf/release/magent-esp32-app
 ```
 
@@ -63,9 +68,10 @@ cd firmware/esp32-app
 - **Connectivity**: Wi-Fi 6 (802.11ax), BLE 5 (LE)
 
 ### ESP32-S3
-- **Board**: ESP32-S3-WROOM-1 (4 MB flash variant used here; quad PSRAM)
+- **Board**: ESP32-S3-WROOM-1 (4 MB flash variant used here; 2 MB quad PSRAM, per `sdkconfig.defaults`)
 - **MCU**: ESP32-S3 (dual-core Xtensa LX7 @ 240 MHz)
-- **RAM**: 512 KB SRAM + 4 MB quad PSRAM (~2.18 MB free heap after boot)
+- **RAM**: 512 KB SRAM + 2 MB quad PSRAM (~2.18 MB free heap after boot)
+- **8 MB N8R8 variant**: octal PSRAM; build with `--features board-s3,s3-8mb-psram` and `sdkconfig.s3.defaults`
 - **Connectivity**: Wi-Fi 2.4 GHz, BLE 5 (LE); DeepSeek cloud LLM + HTTP dashboard
 - **Notes**: BLE and Lua are disabled in the default S3 build (see BOARDS.md)
 
@@ -150,12 +156,14 @@ riscv32-esp-elf-size -A target/riscv32imac-esp-espidf/release/build/esp-idf-sys-
 
 ### Key Files
 - `Cargo.toml` - Dependencies and features (incl. `board-c61` / `board-s3`)
-- `rust-toolchain.toml` - Rust toolchain (esp channel)
+- `rust-toolchain.toml` - Pinned stable host toolchain (the S3 build overrides it with `cargo +esp`)
 - `.cargo/config.toml` - Build target and linker settings
 - `sdkconfig.defaults` - ESP-IDF configuration (S3 quad-PSRAM dev board)
 - `sdkconfig.c61.defaults` - ESP-IDF configuration for the ESP32-C61
 - `sdkconfig.s3.defaults` - ESP-IDF overlay for the S3 N8R8 (8 MB octal) module
 - `build.rs` - Custom build script (linker script patching, Xtensa DROM fix)
+- `check-s3.sh` - Cross-target S3 compile check (`--lua`, `--octal8mb`)
+- `qemu-s3.sh` - Build + run the S3 firmware under QEMU (`esp32s3`), PSRAM off by default; `--gdb` pauses at reset with a GDB server
 - `build-c61.sh` / `build-s3.sh` - Board build wrappers
 - `flash-c61.sh` / `flash-s3.sh` / `flash-secure.sh` - Flashing wrappers
 - `partitions*.csv` - Partition tables (default / OTA / S3)
@@ -164,13 +172,14 @@ riscv32-esp-elf-size -A target/riscv32imac-esp-espidf/release/build/esp-idf-sys-
 ```toml
 [features]
 default = ["board-c61", "wifi", "uart"]
-board-c61 = []     # ESP32-C61 (RISC-V) board selection
-board-s3  = []     # ESP32-S3 (Xtensa) board selection
+board-c61 = ["esp-println/esp32c6"]        # ESP32-C61 (RISC-V) board selection
+board-s3  = ["esp-println/esp32s3"]        # ESP32-S3 (Xtensa) chip selection
+s3-8mb-psram = ["magent-core/s3-8mb-psram"] # N8R8 8 MB octal module only
 wifi = []          # Wi-Fi support
-ble  = []          # BLE support (C61 only in the default builds)
 ota  = []          # Over-the-air updates (C61, dual-slot)
 uart = []          # UART adapter
-lua  = []          # Lua app host (S3 only; pure-Rust piccolo, no mlua)
+lua  = ["dep:magent-lua"]  # Lua app host (S3 only; pure-Rust piccolo, no mlua)
+# There is deliberately no `ble` feature — BLE was removed 2026-09-20.
 ```
 
 ## 🐛 Troubleshooting
@@ -231,6 +240,8 @@ firmware/esp32-app/
 ├── sdkconfig.c61.defaults        # ESP-IDF config for ESP32-C61
 ├── sdkconfig.s3.defaults         # S3 N8R8 octal-PSRAM overlay
 ├── partitions*.csv               # Partition tables (default / OTA / S3)
+├── check-s3.sh                   # S3 cross-target compile check
+├── qemu-s3.sh                    # S3 QEMU build/run (no hardware)
 ├── build-c61.sh · build-s3.sh    # Board build wrappers
 ├── flash-c61.sh · flash-s3.sh · flash-secure.sh
 ├── BOARDS.md                     # Board / feature switch matrix

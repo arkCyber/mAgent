@@ -245,6 +245,41 @@ pub fn dispatch<'a>(
     outcome
 }
 
+/// Whether `op` has a meaningful read-only `?` form.
+///
+/// Mirrors the forms documented on `magent_core::at::AtOp` (and the AT
+/// command reference). Everything else is execute/set-only; a `?` there is a
+/// usage error, never an invitation to run the action.
+fn op_supports_query(op: AtOp) -> bool {
+    matches!(
+        op,
+        AtOp::SysRam
+            | AtOp::SysLog
+            | AtOp::SysStore
+            | AtOp::CwMode
+            | AtOp::CwJap
+            | AtOp::CwHostname
+            | AtOp::CwAutoconn
+            | AtOp::CwReconnCfg
+            | AtOp::CwState
+            | AtOp::CipStaMac
+            | AtOp::MacRand
+            | AtOp::Heap
+            | AtOp::Uptime
+            | AtOp::Safemode
+            | AtOp::Ident
+            | AtOp::Ifconfig
+            | AtOp::WifiPassUpgrade
+            | AtOp::LlmCfg
+            | AtOp::AgentCfg
+            | AtOp::FlightCfg
+            | AtOp::Time
+            | AtOp::Timezone
+            | AtOp::Ble
+            | AtOp::LuaApp
+    )
+}
+
 fn dispatch_inner<'a>(
     cmd: &AtCommand<'a>,
     now_ms: u64,
@@ -253,6 +288,23 @@ fn dispatch_inner<'a>(
     time_sync: Option<&crate::sntp_sync::TimeSyncHandle>,
     force_ntp_sync: &mut bool,
 ) -> AtOutcome {
+    // ESP-AT's `=?` parameter-discovery form is recognised by the parser
+    // (`AtCommandKind::Test`) but no command implements it. Answer a uniform
+    // usage error instead of letting the request fall through per-op matches
+    // (some of which would treat a zero-argument Set differently from a test
+    // query).
+    if matches!(cmd.kind, AtCommandKind::Test) {
+        return AtOutcome::error(4);
+    }
+    // `AT+X?` is a *query*. Several no-argument action arms ignored the kind
+    // and ran their action for any form, so `AT+RESTORE?` erased NVS,
+    // `AT+IDENTROT?` rotated the device identity, `AT+RST?` rebooted, and
+    // `AT+CWQAP?` disconnected Wi-Fi. Reject a query on an op that has no
+    // query semantics instead of executing it.
+    if matches!(cmd.kind, AtCommandKind::Query) && !op_supports_query(cmd.op) {
+        return AtOutcome::error(4);
+    }
+
     match cmd.op {
         AtOp::Ping => AtOutcome::NoReply,
         AtOp::SetEcho { on: _ } => AtOutcome::NoReply,
@@ -264,15 +316,26 @@ fn dispatch_inner<'a>(
             log::info!("[at] AT+RST — rebooting in 200ms");
             // The delay+reboot thread is short-lived and not network-bound:
             // release it to the scheduler (Any) rather than inheriting the
-            // ingress thread's Core1 affinity.
-            crate::core_affinity::apply_profile(crate::core_affinity::ThreadProfile::UNPINNED);
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                // SAFETY: `esp_restart()` never returns; nothing to clean up.
-                unsafe {
-                    esp_idf_sys::esp_restart();
-                }
-            });
+            // ingress thread's Core1 affinity. `spawn_with_profile` sets that
+            // profile under the same lock as every other spawn, so a concurrent
+            // spawn (e.g. the Lua host's LLM worker) can't swap it out between
+            // the set and the create.
+            if let Err(e) = crate::core_affinity::spawn_with_profile(
+                crate::core_affinity::ThreadProfile::UNPINNED,
+                || {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    // SAFETY: `esp_restart()` never returns; nothing to clean up.
+                    unsafe {
+                        esp_idf_sys::esp_restart();
+                    }
+                },
+            ) {
+                // Spawn failed (ENOMEM): still honour the command. Reboot
+                // immediately rather than reporting OK and doing nothing.
+                log::error!("[at] reboot: spawn failed ({e}); rebooting now");
+                // SAFETY: `esp_restart()` never returns.
+                unsafe { esp_idf_sys::esp_restart() };
+            }
             AtOutcome::NoReply
         }
         AtOp::SysRam => sysram_line(),
@@ -294,7 +357,7 @@ fn dispatch_inner<'a>(
         AtOp::CwReconnCfg => cwreconncfg_dispatch(cmd),
         AtOp::CwState => cwstate_line(wifi_status),
         AtOp::CipStaMac => cipstamac_dispatch(cmd),
-        AtOp::MacRand => macrand_dispatch(),
+        AtOp::MacRand => macrand_dispatch(cmd),
         AtOp::Heap => heap_line(),
         AtOp::Uptime => uptime_line(now_ms),
         AtOp::Safemode => safemode_dispatch(cmd),
@@ -316,12 +379,22 @@ fn dispatch_inner<'a>(
                 return AtOutcome::error(6);
             }
             log::info!("[at] AT+RESTORE — NVS erased; rebooting in 200ms");
-            crate::core_affinity::apply_profile(crate::core_affinity::ThreadProfile::UNPINNED);
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                // SAFETY: `esp_restart()` never returns; nothing to clean up.
-                unsafe { esp_idf_sys::esp_restart(); }
-            });
+            if let Err(e) = crate::core_affinity::spawn_with_profile(
+                crate::core_affinity::ThreadProfile::UNPINNED,
+                || {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    // SAFETY: `esp_restart()` never returns; nothing to clean up.
+                    unsafe {
+                        esp_idf_sys::esp_restart();
+                    }
+                },
+            ) {
+                // Spawn failed (ENOMEM): still honour the command. Reboot
+                // immediately rather than reporting OK and doing nothing.
+                log::error!("[at] reboot: spawn failed ({e}); rebooting now");
+                // SAFETY: `esp_restart()` never returns.
+                unsafe { esp_idf_sys::esp_restart() };
+            }
             AtOutcome::NoReply
         }
         AtOp::Ifconfig => ifconfig_line(wifi_status),
@@ -331,6 +404,7 @@ fn dispatch_inner<'a>(
         AtOp::HttpGet => http_get_dispatch(cmd),
         AtOp::Ota => ota_dispatch(cmd),
         AtOp::LlmCfg => llmcfg_dispatch(cmd),
+        AtOp::AgentCfg => agentcfg_dispatch(cmd),
         AtOp::FlightCfg => flightcfg_dispatch(cmd),
         AtOp::Time => time_dispatch(cmd, time_sync, now_ms),
         AtOp::NtpSync => ntp_sync_dispatch(cmd, time_sync, force_ntp_sync, safe_mode),
@@ -340,10 +414,14 @@ fn dispatch_inner<'a>(
     }
 }
 
-/// Handle `AT+LUAAPP=<base64>` (set the operator Lua app) / `AT+LUAAPP?`
-/// (query its size). URL-safe base64 (no `+`/`/`) survives the comma-splitting
-/// AT parser as a single token, so arbitrary Lua survives losslessly. Only
-/// available when the firmware is built with the `lua` feature.
+/// Handle `AT+LUAAPP=<base64>` (replace the operator Lua app),
+/// `AT+LUAAPP=+<base64>` (append one chunk), and `AT+LUAAPP?` (query its
+/// size). URL-safe base64 (no `+`/`/`) survives the comma-splitting AT parser
+/// as a single token, so arbitrary Lua survives losslessly; a leading `+` is
+/// outside that alphabet and marks the append form (the 256-byte AT line
+/// cannot carry a real app in one command). The stored source is capped at
+/// [`crate::lua_task::MAX_LUA_APP_BYTES`]. Only available when the firmware is
+/// built with the `lua` feature.
 #[cfg(feature = "lua")]
 fn luaapp_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
     use base64::Engine as _;
@@ -356,7 +434,17 @@ fn luaapp_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
                 AtArg::Token(t) => *t,
                 _ => return AtOutcome::error(4),
             };
-            let bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token) {
+            // `+` is not in the URL-safe base64 alphabet, so a leading `+`
+            // unambiguously means "append this chunk" — the only way to
+            // upload a script larger than one 256-byte AT line.
+            let (append, payload) = match token.first() {
+                Some(b'+') => (true, &token[1..]),
+                _ => (false, token),
+            };
+            if payload.is_empty() {
+                return AtOutcome::error(4);
+            }
+            let bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) {
                 Ok(b) => b,
                 Err(_) => return AtOutcome::error(7),
             };
@@ -364,7 +452,12 @@ fn luaapp_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
                 Ok(s) => s,
                 Err(_) => return AtOutcome::error(7),
             };
-            match crate::lua_task::set_lua_app_source(src) {
+            let result = if append {
+                crate::lua_task::append_lua_app_source(src)
+            } else {
+                crate::lua_task::set_lua_app_source(src)
+            };
+            match result {
                 Ok(()) => AtOutcome::NoReply,
                 Err(_) => AtOutcome::error(7),
             }
@@ -390,7 +483,28 @@ fn luaapp_dispatch(_cmd: &AtCommand<'_>) -> AtOutcome {
 /// to change the MAC while the interface is running; otherwise it returns
 /// `+CMDER:6`. The first octet is forced to the locally-administered/unicast
 /// range so we never collide with a vendor OUI.
-fn macrand_dispatch() -> AtOutcome {
+fn macrand_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
+    // `AT+MACRAND?` is documented as a query. It used to randomize the MAC
+    // too: probing a device changed its address. Report the current one.
+    if matches!(cmd.kind, AtCommandKind::Query) {
+        let mut current = [0u8; 6];
+        // SAFETY: `current` is a valid 6-byte buffer; `esp_wifi_get_mac`
+        // copies into it and takes no retained pointer.
+        let rc = unsafe {
+            esp_idf_sys::esp_wifi_get_mac(
+                esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+                current.as_mut_ptr(),
+            )
+        };
+        if rc != esp_idf_sys::ESP_OK {
+            return AtOutcome::error(6);
+        }
+        return AtOutcome::ok_line(format!(
+            "+MACRAND:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            current[0], current[1], current[2], current[3], current[4], current[5]
+        ));
+    }
+
     let mut mac = [0u8; 6];
     for b in mac.iter_mut() {
         // SAFETY: `esp_random()` (hardware TRNG) takes no arguments and is
@@ -445,14 +559,29 @@ fn ota_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
     }
     log::info!("[at] AT+OTA=<{url}> — starting OTA");
     // The OTA worker streams the image over HTTP and writes the OTA slot —
-    // heavy, network-facing work → I/O domain (Core 0).
-    crate::core_affinity::apply_profile(crate::core_affinity::ThreadProfile::IO_NETWORK);
-    std::thread::spawn(move || match crate::ota::perform_ota(&url) {
-        // Unreachable on success: `perform_ota` calls `esp_restart` and never
-        // returns. Kept so the match is exhaustive.
-        Ok(()) => log::info!("[ota] OTA completed; device rebooting"),
-        Err(e) => log::error!("[ota] OTA failed: {e}"),
-    });
+    // heavy, network-facing work → I/O domain (Core 0). The profile is applied
+    // under the shared spawn lock so a concurrent spawn cannot land this
+    // long-running download on Core 1.
+    //
+    // The worker needs a real stack: `perform_ota` holds a 2 KiB chunk buffer
+    // and then runs a TLS download. The default pthread stack (~3 KiB here)
+    // overflows during the handshake and resets the board — the same defect
+    // that made AT+HTTPGET use 24 KiB (see its comment).
+    let spawned = crate::core_affinity::spawn_thread(
+        "ota-worker",
+        24 * 1024,
+        crate::core_affinity::ThreadProfile::IO_NETWORK,
+        move || match crate::ota::perform_ota(&url) {
+            // Unreachable on success: `perform_ota` calls `esp_restart` and never
+            // returns. Kept so the match is exhaustive.
+            Ok(()) => log::info!("[ota] OTA completed; device rebooting"),
+            Err(e) => log::error!("[ota] OTA failed: {e}"),
+        },
+    );
+    if let Err(e) = spawned {
+        log::error!("[at] OTA: could not start worker: {e}");
+        return AtOutcome::error(6);
+    }
     AtOutcome::ok_line("+OTA:STARTED")
 }
 
@@ -723,10 +852,31 @@ fn cwjap_dispatch(cmd: &AtCommand<'_>, safe_mode: bool) -> AtOutcome {
                 }
             };
 
-            if store_wifi_ssid(validated.ssid.as_str()).is_err() {
+            // Write the password FIRST. The old order wrote the SSID and then
+            // the password with no rollback: if the second NVS write failed
+            // (NVS full / transient), the new SSID persisted beside the OLD
+            // passphrase and every later association looped on AUTH_FAIL.
+            // Password-first means a failure leaves both keys untouched.
+            let previous_pass = nvs_load(NVS_KEY_WIFI_PASS, "magent");
+            if nvs_save(NVS_KEY_WIFI_PASS, sealed.as_str(), "magent").is_err() {
                 return AtOutcome::error(7);
             }
-            if nvs_save(NVS_KEY_WIFI_PASS, sealed.as_str(), "magent").is_err() {
+            if store_wifi_ssid(validated.ssid.as_str()).is_err() {
+                // Best-effort rollback so the pair stays consistent.
+                match previous_pass {
+                    Some(prev) => {
+                        if nvs_save(NVS_KEY_WIFI_PASS, prev.as_str(), "magent").is_err() {
+                            log::error!(
+                                "[at] CWJAP: SSID write failed and the previous password \
+                                 could not be restored — stored pair may be inconsistent"
+                            );
+                        }
+                    }
+                    None => log::error!(
+                        "[at] CWJAP: SSID write failed; the new sealed password remains \
+                         stored with no matching SSID"
+                    ),
+                }
                 return AtOutcome::error(7);
             }
             // AUDIT: log only the SSID and a 4-byte fingerprint of the
@@ -839,21 +989,29 @@ fn wifipass_upgrade_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
                     return AtOutcome::error(7);
                 }
             };
-            // Reject if the recovered plaintext is empty (no
-            // point in writing a sealed empty blob).
-            if plain_buf.is_empty() {
+            // A legacy *plaintext* entry is returned as `LegacyPlaintext(s)`
+            // and `plain_buf` is left empty — this is exactly the case the
+            // command exists for (hand-provisioned `AT+CWJAP`), yet the old
+            // empty-buffer check rejected it with +CMDER:4, so the WPA2
+            // passphrase could never be sealed. Use the borrowed string.
+            let plain_str: &str = match &outcome {
+                wifi_pass_seal_v2::OpenOutcome::LegacyPlaintext(s) => *s,
+                _ => match core::str::from_utf8(&plain_buf) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        log::warn!(
+                            "[at] WIFIPASSUPGRADE: plaintext is non-UTF-8; refusing"
+                        );
+                        return AtOutcome::error(4);
+                    }
+                },
+            };
+            // Reject if the recovered plaintext is empty (no point in writing
+            // a sealed empty blob).
+            if plain_str.is_empty() {
                 log::warn!("[at] WIFIPASSUPGRADE: recovered plaintext is empty; refusing");
                 return AtOutcome::error(4);
             }
-            // The plaintext may contain non-UTF-8 bytes; we
-            // need a &str to call seal_str. Try strict-validate.
-            let plain_str: &str = match core::str::from_utf8(&plain_buf) {
-                Ok(s) => s,
-                Err(_) => {
-                    log::warn!("[at] WIFIPASSUPGRADE: plaintext is non-UTF-8; refusing");
-                    return AtOutcome::error(4);
-                }
-            };
             let mut nonce = [0u8; wifi_pass_seal_v2::NONCE_LEN];
             if getrandom::getrandom(&mut nonce).is_err() {
                 return AtOutcome::error(6);
@@ -1172,8 +1330,6 @@ fn sign_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
         _ => return AtOutcome::error(4),
     };
     if payload.is_empty() || payload.len() > 64 {
-        // Keep payload_hex short enough that the JSON reply fits in the
-        // 256-byte reply line (64 raw bytes -> 128 hex chars + DID + sig).
         log::warn!("[at] SIGN: payload must be 1..=64 bytes");
         return AtOutcome::error(7);
     }
@@ -1196,6 +1352,26 @@ fn sign_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
         Ok(m) => m,
         Err(_) => return AtOutcome::error(7),
     };
+    // The signed JSON is `signer DID + payload_hex + signature_hex`; the DID
+    // is ~56 chars and the signature 128, so the 256-byte reply line fits only
+    // a small payload — the old fixed `1..=64` bound promised requests that
+    // *always* failed with +CMDER:7 for anything beyond ~13 bytes. Derive the
+    // real bound from this identity's serialised form rather than guessing.
+    let mut scratch: HeaplessString<512> = HeaplessString::new();
+    if signed.to_json_into(&mut scratch).is_err() {
+        return AtOutcome::error(7);
+    }
+    let reply_capacity = magent_core::at_dispatch_outcome::REPLY_LINE_MAX;
+    let fixed = scratch.len().saturating_sub(signed.payload_hex.len());
+    let max_payload = reply_capacity.saturating_sub(fixed) / 2;
+    if payload.len() > max_payload {
+        log::warn!(
+            "[at] SIGN: payload {} B does not fit the {reply_capacity}-byte reply \
+             (max {max_payload} B for this identity)",
+            payload.len()
+        );
+        return AtOutcome::error(7);
+    }
     let mut line = ReplyLine::new();
     if signed.to_json_into(&mut line).is_err() {
         log::warn!("[at] SIGN: signed message exceeds reply buffer");
@@ -1248,7 +1424,13 @@ fn http_get_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
         log::warn!("[at] HTTPGET: concurrency limit ({HTTP_MAX_WORKERS}) reached — rejected");
         return AtOutcome::error(6);
     }
-    let _guard = HTTPWorkerGuard;
+    // The slot must be owned by the *worker*, not this dispatcher: the
+    // timeout path below returns while the leaked worker is still running, so
+    // a dispatcher-scoped guard released the slot early and each timed-out
+    // `AT+HTTPGET` could start another worker — the cap never bounded live
+    // threads. Move the guard into the closure; it is released when the
+    // thread really exits (or immediately if the spawn fails).
+    let guard = HTTPWorkerGuard;
 
     let url = validated.url.as_str().to_string(); // owned for the worker thread
 
@@ -1263,6 +1445,7 @@ fn http_get_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
         24 * 1024,
         crate::core_affinity::ThreadProfile::IO_NETWORK,
         move || {
+            let _guard = guard;
             let _ = tx.send(http_get_worker(&url));
         },
     )
@@ -1453,6 +1636,85 @@ fn llmcfg_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
         }
         _ => AtOutcome::error(4),
     }
+}
+
+/// `AT+AGENTCFG?` / `AT+AGENTCFG=<name>,<max_iter>,<max_mem>,<watchdog_secs>,
+/// <ble_secs>,<skills>,<max_skills>,<debug>` / `AT+AGENTCFG=RESET` — query,
+/// persist, or reset the core `AgentConfig` the agent boots with.
+///
+/// The agent thread reads this once at startup, so a successful set reports
+/// `OK` and applies on the next reboot (same contract as `AT+LLMCFG`). The
+/// value is validated by `magent_core::at_validate::validate_agentcfg_set`
+/// (ranges, UTF-8, control bytes) and then by `AgentConfig::validate` before
+/// anything reaches NVS. `AT+AGENTCFG=RESET` deletes the entry, returning the
+/// device to its board defaults on the next boot.
+fn agentcfg_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
+    match cmd.kind {
+        AtCommandKind::Query => match crate::config_nvs::load() {
+            Ok(Some(config)) => agentcfg_line(&config),
+            // Nothing persisted yet: report the effective board defaults
+            // rather than an empty line an operator would have to guess about.
+            Ok(None) => agentcfg_line(&crate::config_nvs::default_agent_config()),
+            Err(e) => {
+                // Do not present defaults as if they were the stored config.
+                log::error!("[at] AGENTCFG query failed: {e}");
+                AtOutcome::error(7)
+            }
+        },
+        AtCommandKind::Set => {
+            if magent_core::at_validate::agentcfg_is_reset(cmd) {
+                return match crate::config_nvs::reset() {
+                    Ok(()) => {
+                        log::info!("[at] AGENTCFG reset; board defaults apply next boot");
+                        AtOutcome::NoReply
+                    }
+                    Err(e) => {
+                        log::error!("[at] AGENTCFG reset failed: {e}");
+                        AtOutcome::error(7)
+                    }
+                };
+            }
+
+            let config = match magent_core::at_validate::validate_agentcfg_set(cmd) {
+                Ok(config) => config,
+                Err(outcome) => return outcome,
+            };
+            match crate::config_nvs::save(&config) {
+                Ok(()) => {
+                    log::info!(
+                        "[at] AGENTCFG saved: name={} iterations={} max_memory={} (applies next boot)",
+                        config.name.as_str(),
+                        config.max_iterations,
+                        config.max_memory
+                    );
+                    AtOutcome::NoReply
+                }
+                Err(e) => {
+                    log::error!("[at] AGENTCFG save failed: {e}");
+                    AtOutcome::error(7)
+                }
+            }
+        }
+        _ => AtOutcome::error(4),
+    }
+}
+
+/// Render the wire form of an `AgentConfig` for `AT+AGENTCFG?`.
+fn agentcfg_line(config: &magent_core::config::AgentConfig) -> AtOutcome {
+    let mut line = ReplyLine::new();
+    let _ = write!(
+        line,
+        "+AGENTCFG:{},{},{},{},{},{},{},{}",
+        config.name.as_str(),
+        config.max_iterations,
+        config.max_memory,
+        config.watchdog_timeout_secs,
+        config.ble_timeout_secs,
+        u8::from(config.skills_enabled),
+        config.max_skills,
+        u8::from(config.debug_enabled)
+    );
+    AtOutcome::Ok { data: line }
 }
 
 /// `AT+FLIGHTCFG=<provider>,<token>` — configure the flight-price data provider

@@ -31,4 +31,5 @@ echo "=== mAgent ESP32-C61 build ==="
 RUSTC_BOOTSTRAP=1 cargo build --release
 
 echo ""
-echo "Build complete! ELF: target/riscv32imac-esp-espidf/release/magent-esp32-app"
+WORKSPACE_ROOT="$(cd "$DIR/../.." && pwd)"
+echo "Build complete! ELF: $WORKSPACE_ROOT/target/riscv32imac-esp-espidf/release/magent-esp32-app"

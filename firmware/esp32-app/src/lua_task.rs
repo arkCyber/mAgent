@@ -45,7 +45,15 @@ use magent_lua::{HardwareBackend, SharedHardware};
 /// in NVS (see [`set_lua_app_source`] / [`load_app_source`]) takes precedence at
 /// boot, so the app can be updated without reflashing.
 const DEFAULT_MAIN_LUA: &str = r#"
--- default enterprise app (embedded bootstrap + hardware self-test)
+-- default enterprise app: passive boot + explicit hardware self-test.
+--
+-- The boot chunk deliberately does NOT touch peripherals. The Lua host is
+-- brought up while Wi-Fi/TLS is still starting; a flash write or an
+-- ADC/I2C/GPIO reconfiguration in that window is the riskiest thing this
+-- process can do (cache-disabled flash operations / owned-pin reconfiguration
+-- can fault the other core). The embedded app therefore only announces
+-- itself. Call `selftest()` from an uploaded app, once the link is up, to
+-- probe every wired driver with `pcall` containment.
 local function probe(label, fn)
     local ok, res = pcall(fn)
     if ok then
@@ -55,19 +63,17 @@ local function probe(label, fn)
     end
 end
 
--- Wired drivers (see firmware/esp32-app/src/lua_task.rs):
-probe("temp",   function() return hardware.sensor_read("temp") end)
-probe("adc",    function() return hardware.adc_read(1) end)          -- GPIO1
-probe("pwm",    function() hardware.pwm_set(1, 50) return "duty=50%" end)
-probe("i2c",    function() return hardware.i2c_read(0x38, 0x0F, 1) end)
-probe("gpio",   function() hardware.gpio_write(2, 1) return "p2=1" end)
-probe("flash",  function() hardware.flash_write(0x100, "HELLO") return hardware.flash_read(0x100, 5) end)
-
--- Enterprise control loop example: overheat -> drive the fan.
-local temp = hardware.sensor_read("temp")
-if temp > 85.0 then
-    hardware.gpio_write(1, 1) -- fan on
+function selftest()
+    probe("temp",  function() return hardware.sensor_read("temp") end)
+    probe("adc",   function() return hardware.adc_read(1) end)
+    probe("pwm",   function() hardware.pwm_set(1, 50) return "duty=50%" end)
+    probe("i2c",   function() return hardware.i2c_read(0x38, 0x0F, 1) end)
+    probe("gpio",  function() hardware.gpio_write(2, 1) return "p2=1" end)
+    probe("flash", function() hardware.flash_write(0x100, "HELLO") return hardware.flash_read(0x100, 5) end)
+    return "selftest complete"
 end
+
+print("[lua] app booted (passive); call selftest() to probe hardware")
 "#;
 
 /// A [`HardwareBackend`] for the ESP32-S3.
@@ -431,13 +437,57 @@ fn load_app_source() -> String {
     }
 }
 
+/// Maximum size of an operator-supplied `main.lua` (16 KiB).
+///
+/// The AT line limit is 256 bytes, so a real app arrives in chunks; 16 KiB is
+/// far larger than the embedded bootstrap script and comfortably below what a
+/// single NVS blob can hold on the S3 partition. A runaway upload is refused
+/// instead of consuming the NVS partition or the Lua heap.
+pub const MAX_LUA_APP_BYTES: usize = 16 * 1024;
+
 /// Persist `main.lua` into NVS so a future boot runs it (operator update path).
 ///
-/// This is the device-side API surface; it is wired from an ingress/AT/BLE
-/// command or a host tool. Returns an error if the source is too large for a
-/// single NVS value or the write fails.
-#[allow(dead_code)] // operator-update entry point; wired from an ingress/AT command
+/// This replaces any previously stored app. `AT+LUAAPP=` drives it (and
+/// `AT+LUAAPP=+<b64>` appends a chunk through [`append_lua_app_source`]).
+/// Returns an error if the source exceeds [`MAX_LUA_APP_BYTES`] or the NVS
+/// write fails.
 pub fn set_lua_app_source(source: &str) -> Result<(), String> {
+    if source.len() > MAX_LUA_APP_BYTES {
+        return Err(format!(
+            "lua app is {} bytes (max {MAX_LUA_APP_BYTES})",
+            source.len()
+        ));
+    }
+    nvs_write_app_source(source)
+}
+
+/// Append a decoded chunk to the stored `main.lua`.
+///
+/// The AT command line is capped at 256 bytes, so the operator uploads a
+/// script in chunks (`AT+LUAAPP=+<url-safe-base64>`); each call reads the
+/// stored blob, appends the chunk and writes it back. That is a read-modify-
+/// write per chunk (and therefore an NVS commit per chunk), which is fine for
+/// occasional operator updates but not a hot path.
+pub fn append_lua_app_source(chunk: &str) -> Result<(), String> {
+    if chunk.is_empty() {
+        return Err("empty chunk".to_string());
+    }
+    let mut source = nvs_read_app_source()?.unwrap_or_default();
+    let new_len = source
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| "lua app size overflow".to_string())?;
+    if new_len > MAX_LUA_APP_BYTES {
+        return Err(format!(
+            "lua app would become {new_len} bytes (max {MAX_LUA_APP_BYTES})"
+        ));
+    }
+    source.push_str(chunk);
+    nvs_write_app_source(&source)
+}
+
+/// Shared NVS write for [`set_lua_app_source`] / [`append_lua_app_source`].
+fn nvs_write_app_source(source: &str) -> Result<(), String> {
     let handle = crate::nvs_flash::open_rw()?;
     // SAFETY: raw ESP-IDF NVS blob set; returns an `esp_err_t`.
     let r = unsafe {
@@ -473,6 +523,12 @@ fn flash_erase_sector_device(addr: u32) -> Result<(), String> {
 
 impl HardwareBackend for Esp32Hardware {
     fn gpio_write(&mut self, pin: u8, level: u8) -> std::result::Result<(), String> {
+        // Refuse pins the board already uses (flash / PSRAM / the ingress
+        // links / I2C0): a Lua script picks the pin number, and reconfiguring
+        // a flash pin faults the chip. See `reserved_pin_reason`.
+        if let Some(reason) = crate::local_tools::reserved_pin_reason(i32::from(pin)) {
+            return Err(format!("gpio_write(pin={pin}): {reason}"));
+        }
         let lvl: u32 = u32::from(level != 0);
         // SAFETY: raw ESP-IDF GPIO calls on a plain pin number; each returns
         // an `esp_err_t` (0 == OK) which we check and propagate.
@@ -493,6 +549,9 @@ impl HardwareBackend for Esp32Hardware {
     }
 
     fn gpio_read(&mut self, pin: u8) -> std::result::Result<u8, String> {
+        if let Some(reason) = crate::local_tools::reserved_pin_reason(i32::from(pin)) {
+            return Err(format!("gpio_read(pin={pin}): {reason}"));
+        }
         // SAFETY: raw ESP-IDF GPIO; configure as input then read the level.
         unsafe {
             let mut r = sys::gpio_reset_pin(pin as i32);
@@ -527,7 +586,10 @@ impl HardwareBackend for Esp32Hardware {
                     e = sys::temperature_sensor_enable(handle);
                 }
                 if e == 0 {
-                    sys::temperature_sensor_get_celsius(handle, &mut celsius);
+                    // Check `get_celsius`'s return as well: dropping it made a
+                    // failed read return `Ok(0.0)` — a value the sensor never
+                    // measured (this is the Lua `household temp` path).
+                    e = sys::temperature_sensor_get_celsius(handle, &mut celsius);
                 }
                 let _ = sys::temperature_sensor_disable(handle);
                 let _ = sys::temperature_sensor_uninstall(handle);
@@ -573,12 +635,20 @@ impl HardwareBackend for Esp32Hardware {
     }
 
     fn adc_read(&mut self, pin: u8) -> std::result::Result<f64, String> {
-        // ADC1 oneshot (GPIO1..=10), 12-bit, DB_11; see `adc_read_pin`.
+        // ADC1 oneshot (GPIO1..=10), 12-bit, DB_11; see `adc_read_pin`. The
+        // ADC range overlaps UART0 (GPIO10) and I2C0 (GPIO4/5), so the
+        // reserved-pin guard applies here too.
+        if let Some(reason) = crate::local_tools::reserved_pin_reason(i32::from(pin)) {
+            return Err(format!("adc_read(pin={pin}): {reason}"));
+        }
         adc_read_pin(pin)
     }
 
     fn pwm_set(&mut self, pin: u8, duty: u8) -> std::result::Result<(), String> {
         // LEDC PWM, 8-bit resolution, duty 0..=100 %. See `pwm_set_duty`.
+        if let Some(reason) = crate::local_tools::reserved_pin_reason(i32::from(pin)) {
+            return Err(format!("pwm_set(pin={pin}): {reason}"));
+        }
         pwm_set_duty(pin, duty)
     }
 
@@ -595,6 +665,25 @@ impl HardwareBackend for Esp32Hardware {
     }
 }
 
+/// Log the headroom that matters for the Lua host.
+///
+/// The on-device Core0 crash is not yet root-caused, so each boot phase logs
+/// the free internal DRAM (the scarce pool shared with Wi-Fi/TLS), free PSRAM
+/// (where the VM heap lives via `std::alloc`) and this task's minimum-ever
+/// free stack. A boot log then shows *how far* the runtime got and whether it
+/// ran out of headroom before the reset, instead of only the fault address.
+fn log_headroom(stage: &str) {
+    // SAFETY: read-only ESP-IDF heap queries plus a FreeRTOS stack
+    // high-water query; `NULL` is documented as "the calling task".
+    let internal = unsafe { sys::esp_get_free_heap_size() };
+    let psram = unsafe { sys::heap_caps_get_free_size(sys::MALLOC_CAP_SPIRAM) };
+    let stack_free = unsafe { sys::uxTaskGetStackHighWaterMark(core::ptr::null_mut()) };
+    log::info!(
+        "[lua] {stage}: internal_free={internal}B psram_free={psram}B \
+         stack_min_free={stack_free}B"
+    );
+}
+
 /// Build and run the Lua application runtime on a dedicated thread.
 ///
 /// The non-`Send` `AppRuntime` (it owns the sandboxed Lua interpreter —
@@ -604,11 +693,37 @@ impl HardwareBackend for Esp32Hardware {
 /// `Send` values and `std::thread` accepts it. Everything is created on the
 /// new thread and never moved across it.
 pub fn start_lua_task() {
+    // Piccolo's parser/VM frames plus a nested `agent.reason()` ReAct loop
+    // need more headroom than the agent thread's 32 KiB. Try 64 KiB first;
+    // if the internal-DRAM budget refuses it (shared with Wi-Fi/TLS on the
+    // S3), fall back to the historical 32 KiB so the host still starts.
     let r = crate::core_affinity::spawn_thread(
         "lua-thread",
-        32 * 1024,
+        64 * 1024,
         crate::core_affinity::ThreadProfile::REALTIME_AGENT,
-        move || {
+        run_lua_host,
+    )
+    .or_else(|e| {
+        log::warn!("[lua] 64 KiB stack refused ({e}); retrying with 32 KiB");
+        crate::core_affinity::spawn_thread(
+            "lua-thread",
+            32 * 1024,
+            crate::core_affinity::ThreadProfile::REALTIME_AGENT,
+            run_lua_host,
+        )
+    });
+    match r {
+        Ok(_) => log::info!("[lua] thread started"),
+        Err(e) => log::error!("[lua] thread spawn failed: {e}"),
+    }
+}
+
+/// Thread body for the Lua host.
+///
+/// Kept as a plain `fn` (not a closure) so the 64 KiB -> 32 KiB spawn fallback
+/// can hand the same `FnOnce` to a second `Builder::spawn` — a closure is
+/// consumed/dropped on the failed attempt and cannot be retried.
+fn run_lua_host() {
             // NOTE (audit-2026-08): the Lua app host is intentionally NOT
             // subscribed to the RT watchdog. Its event loop (`AppRuntime::
             // run_until_stop`) is a long-lived black box that never calls
@@ -617,6 +732,7 @@ pub fn start_lua_task() {
             // reboot the board. The watchdog protects the critical real-time
             // paths (agent + ingress); the Lua host is best-effort and its
             // stalls don't affect those. Its LLM/fetch_web feeds are no-ops.
+            log_headroom("thread start");
             let hardware: SharedHardware = Arc::new(Mutex::new(Esp32Hardware));
             let mut agent = match MiniAgent::with_defaults() {
                 Ok(a) => a,
@@ -635,37 +751,42 @@ pub fn start_lua_task() {
             // `&'static mut` backend pattern.
             #[cfg(feature = "board-s3")]
             {
-                if let (Some(model), Some(key)) = (
-                    crate::nvs_load_string(crate::NVS_KEY_LLM_MODEL),
-                    crate::nvs_load_string(crate::NVS_KEY_LLM_API_KEY),
-                ) {
-                    if !model.is_empty() && !key.is_empty() {
-                        log::info!(
-                            "[lua] installing DeepSeek LLM backend via Core-0 worker (model={model})"
-                        );
-                        // P1 (REQ-SCHED-001): route the blocking DeepSeek call to
-                        // a Core-0 worker so the Lua app host (Core 1) never blocks
-                        // on TLS/HTTP. See llm.rs `ChannelLlmBackend`.
-                        let (llm_tx, llm_rx) = std::sync::mpsc::channel::<crate::llm::LlmRequest>();
-                        let worker = crate::core_affinity::spawn_thread(
-                            "llm-worker",
-                            24 * 1024,
-                            crate::core_affinity::ThreadProfile::IO_NETWORK,
-                            move || {
-                                crate::llm::run_llm_worker(
-                                    llm_rx,
-                                    crate::llm::Esp32DeepSeekBackend::new(&model, &key),
-                                );
-                            },
-                        );
-                        if worker.is_err() {
-                            log::warn!("[lua] LLM worker spawn failed — Lua uses local heuristic");
-                        } else {
+                // Share the **single** Core-0 LLM worker published by the main
+                // agent's `setup_agent`. Spawning a second `llm-worker` here
+                // meant the Lua build ran two concurrent mbedTLS clients on
+                // Core 0 (2 x 24 KiB stack + TLS buffers) — a plausible
+                // contributor to the on-device Core0 fault, and pure memory
+                // waste. The worker serves requests serially, so two agents
+                // can share it.
+                let configured = matches!(
+                    (
+                        crate::nvs_load_string(crate::NVS_KEY_LLM_MODEL),
+                        crate::nvs_load_string(crate::NVS_KEY_LLM_API_KEY),
+                    ),
+                    (Some(model), Some(key)) if !model.is_empty() && !key.is_empty()
+                );
+                if configured {
+                    let mut tx = crate::llm::shared_sender();
+                    if tx.is_none() {
+                        // The agent thread may not have reached `setup_agent`
+                        // yet; wait briefly rather than degrade to the local
+                        // heuristic for the whole session.
+                        for _ in 0..40 {
+                            std::thread::sleep(Duration::from_millis(50));
+                            crate::rt_watchdog::feed();
+                            tx = crate::llm::shared_sender();
+                            if tx.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                    match tx {
+                        Some(tx) => {
                             let backend: &'static mut crate::llm::ChannelLlmBackend =
-                                Box::leak(Box::new(crate::llm::ChannelLlmBackend::new(llm_tx)));
+                                Box::leak(Box::new(crate::llm::ChannelLlmBackend::new(tx)));
                             // HARDENING (audit-2026-08 H9): register the leaked
-                            // pointer for duplicate-leak detection, mirroring the
-                            // main agent boot path.
+                            // pointer for duplicate-leak detection, mirroring
+                            // the main agent boot path.
                             if !crate::leaked_boxes().insert(backend as *mut _ as usize) {
                                 log::error!(
                                     "[lua] leaking a duplicate LLM backend (same pointer \
@@ -673,30 +794,43 @@ pub fn start_lua_task() {
                                 );
                             }
                             agent.set_llm_backend(backend);
+                            log::info!("[lua] sharing the main agent's Core-0 LLM worker");
                         }
+                        None => log::warn!(
+                            "[lua] LLM configured but no shared worker became available — \
+                             Lua uses the local heuristic"
+                        ),
                     }
                 }
             }
             let agent = Arc::new(Mutex::new(agent));
+            log_headroom("before PiccoloVm");
             let vm = PiccoloVm::new(hardware.clone(), agent);
             let mut app = AppRuntime::new(vm, hardware);
+            log_headroom("after PiccoloVm+AppRuntime");
             // Prefer the operator's NVS copy of `main.lua`; fall back to the
             // embedded bootstrap script.
             let app_src = load_app_source();
             if let Err(e) = app.boot(&app_src) {
                 log::error!("[lua] boot main.lua: {e}");
-                return;
+                // A bad/partial NVS upload must not kill the Lua host: retry
+                // with the embedded bootstrap. Without this the thread simply
+                // exited and Lua stayed disabled until a re-upload + reboot.
+                if app_src != DEFAULT_MAIN_LUA {
+                    log::warn!("[lua] falling back to the embedded DEFAULT_MAIN_LUA");
+                    if let Err(e2) = app.boot(DEFAULT_MAIN_LUA) {
+                        log::error!("[lua] embedded fallback also failed: {e2}");
+                        return;
+                    }
+                } else {
+                    return;
+                }
             }
+            log_headroom("after main.lua boot");
             log::info!("[lua] AppRuntime booted; entering event loop");
 
             // Drive the loop until a supervisor sets the stop flag (e.g. on
             // OTA/reboot). Per-tick errors are contained by the runtime.
             app.run_until_stop(Duration::from_millis(50), None);
             log::info!("[lua] loop stopped");
-        },
-    );
-    match r {
-        Ok(_) => log::info!("[lua] thread started"),
-        Err(e) => log::error!("[lua] thread spawn failed: {e}"),
-    }
 }

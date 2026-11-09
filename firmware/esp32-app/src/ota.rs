@@ -173,6 +173,13 @@ pub fn perform_ota(url: &str) -> Result<(), String> {
     let cfg = HttpConfig {
         timeout: Some(Duration::from_secs(OTA_TIMEOUT_S)),
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        // Follow NOTHING. The client's default policy re-issues the request
+        // (including an `http://` scheme change) internally, so an
+        // `https://` URL that answers `302 Location: http://…` silently
+        // downgraded the download to plaintext, defeating the HTTPS-only
+        // check above. A 3xx now fails the `status != 200` check below.
+        follow_redirects_policy:
+            esp_idf_svc::http::client::FollowRedirectsPolicy::FollowNone,
         ..Default::default()
     };
     let conn = match EspHttpConnection::new(&cfg) {

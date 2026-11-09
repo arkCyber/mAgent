@@ -196,7 +196,7 @@ fn decode_subscribe(body: &[u8]) -> Result<Packet, CodecError> {
         return Err(CodecError::Truncated);
     }
     let mut cur = &body[2..];
-    if cur.is_empty() {
+    if cur.len() < 2 {
         return Err(CodecError::Truncated);
     }
     let topic_len = u16::from_be_bytes([cur[0], cur[1]]) as usize;
@@ -211,7 +211,7 @@ fn decode_subscribe(body: &[u8]) -> Result<Packet, CodecError> {
 }
 
 fn decode_publish(first_byte: u8, body: &[u8]) -> Result<Packet, CodecError> {
-    if body.is_empty() {
+    if body.len() < 2 {
         return Err(CodecError::Truncated);
     }
     let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
@@ -289,5 +289,21 @@ fn encode_remaining_length(out: &mut BytesMut, len: usize) {
         if x == 0 {
             break;
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A network peer can send a PUBLISH/SUBSCRIBE body shorter than the
+    /// two-byte topic-length field; the decoder used to index `body[1]`
+    /// unconditionally and panic on the broker connection task.
+    #[test]
+    fn truncated_publish_and_subscribe_are_errors_not_panics() {
+        assert!(decode_publish(0x30, &[]).is_err());
+        assert!(decode_publish(0x30, &[0x00]).is_err());
+        assert!(decode_subscribe(&[]).is_err());
+        assert!(decode_subscribe(&[0x00, 0x01]).is_err());
+        assert!(decode_subscribe(&[0x00, 0x01, 0x00]).is_err());
     }
 }

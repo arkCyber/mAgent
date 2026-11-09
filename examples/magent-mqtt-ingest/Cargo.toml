@@ -25,7 +25,7 @@ magent-core = { path = "../../magent-core", features = ["ingress", "mqtt", "web3
 #
 # We deliberately match the rumqttc version pinned by `mqtt-roundtrip`
 # so the two examples exercise the same wire-level behaviour.
-rumqttc = { version = "0.24", default-features = false }
+rumqttc = { version = "0.25", default-features = false }
 
 # Broker helpers re-used from `mqtt-roundtrip`. Using `path =` keeps
 # the example self-contained (no publishing step needed) and avoids

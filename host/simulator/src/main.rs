@@ -88,6 +88,21 @@ pub enum SensorType {
     Light,
 }
 
+/// Map a sensor name to the reading it selects, folding case and the alias
+/// spellings the firmware's `normalize_sensor` accepts. `None` means the name
+/// is not one this simulator can read — the caller must fail rather than
+/// answer with a different sensor's value.
+pub fn parse_sensor(name: &str) -> Option<SensorType> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "temperature" | "temp" | "die_temp" => SensorType::Temperature,
+        "humidity" | "humid" => SensorType::Humidity,
+        "pressure" | "press" | "baro" => SensorType::Pressure,
+        "accelerometer" | "accel" | "imu" => SensorType::Accelerometer,
+        "light" | "lux" | "als" => SensorType::Light,
+        _ => return None,
+    })
+}
+
 pub struct SimulatedSensors {
     iteration: usize,
     base_temp: f64,
@@ -209,19 +224,48 @@ impl FlashStorage {
     }
 
     pub fn read(&self, address: usize, len: usize) -> Result<Vec<u8>> {
-        if address + len > self.data.len() {
-            return Err(anyhow!("Address out of bounds"));
-        }
-        Ok(self.data[address..address + len].to_vec())
+        // The address comes straight from the model, and `as_u64()` hands back
+        // up to `u64::MAX`. A plain `address + len` overflowed: the check
+        // wrapped to a small number, passed, and the slice below panicked. A
+        // sector that does not fit is a clean error, not a crash.
+        let Some(end) = address
+            .checked_add(len)
+            .filter(|&end| end <= self.data.len())
+        else {
+            return Err(anyhow!(
+                "Read of {} bytes at {} is out of bounds (flash is {} bytes)",
+                len,
+                address,
+                self.data.len()
+            ));
+        };
+        Ok(self.data[address..end].to_vec())
     }
 
     pub fn write(&mut self, address: usize, data: &[u8]) -> Result<()> {
-        if address + data.len() > self.data.len() {
-            return Err(anyhow!("Write would exceed flash size"));
+        let Some(end) = address
+            .checked_add(data.len())
+            .filter(|&end| end <= self.data.len())
+        else {
+            return Err(anyhow!(
+                "Write of {} bytes at {} would exceed flash size ({} bytes)",
+                data.len(),
+                address,
+                self.data.len()
+            ));
+        };
+        // NOR flash can only clear bits. A write that would need to set one
+        // (target not erased) must fail rather than silently corrupt data.
+        for (slot, &byte) in self.data[address..end].iter().zip(data) {
+            if *slot & byte != byte {
+                return Err(anyhow!(
+                    "flash target at {} is not erased (write would set a bit)",
+                    address
+                ));
+            }
         }
-        for (i, &byte) in data.iter().enumerate() {
-            // Flash can only clear bits, not set them
-            self.data[address + i] &= byte;
+        for (slot, &byte) in self.data[address..end].iter_mut().zip(data) {
+            *slot &= byte;
         }
         self.writes += 1;
         Ok(())
@@ -232,11 +276,17 @@ impl FlashStorage {
     }
 
     pub fn erase_sector(&mut self, sector: usize, sector_size: usize) -> Result<()> {
-        let start = sector * sector_size;
+        // `sector * sector_size` overflowed for a large sector, and the
+        // `start + sector_size` below wrapped too — either one turns a
+        // rejected sector into a panic. Both are checked now, so a sector
+        // that does not lie wholly inside the region is refused.
+        let Some(start) = sector.checked_mul(sector_size) else {
+            return Err(anyhow!("Invalid sector: {}", sector));
+        };
         if start >= self.data.len() {
-            return Err(anyhow!("Invalid sector"));
+            return Err(anyhow!("Invalid sector: {}", sector));
         }
-        let end = (start + sector_size).min(self.data.len());
+        let end = start.saturating_add(sector_size).min(self.data.len());
         for i in start..end {
             self.data[i] = 0xFF;
         }
@@ -321,29 +371,49 @@ impl ToolExecutor {
     pub fn execute(&self, tool_name: &str, args: &HashMap<String, serde_json::Value>) -> ToolResult {
         match tool_name {
             "read_sensor" => {
-                let sensor_str = args
-                    .get("sensor")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("temperature");
-                let sensor = match sensor_str {
-                    "temperature" => SensorType::Temperature,
-                    "humidity" => SensorType::Humidity,
-                    "pressure" => SensorType::Pressure,
-                    "accelerometer" => SensorType::Accelerometer,
-                    "light" => SensorType::Light,
-                    _ => SensorType::Temperature,
+                // Route on the sensor the caller named. This used to default
+                // to `temperature` both when the key was absent and when the
+                // name was unrecognised, so `read_sensor(sensor="glucose")`
+                // returned a temperature with `success: true` and nothing in
+                // the reply said the reading came from another sensor.
+                // `magent-core`'s simulator and the firmware both refuse an
+                // unknown sensor.
+                let Some(sensor_str) = args.get("sensor").and_then(|v| v.as_str()) else {
+                    return ToolResult::error("read_sensor", "Missing required argument: sensor");
+                };
+                let Some(sensor) = parse_sensor(sensor_str) else {
+                    return ToolResult::error(
+                        "read_sensor",
+                        &format!(
+                            "Unsupported sensor: {sensor_str} (this simulator has \
+                             temperature, humidity, pressure, accelerometer, light)"
+                        ),
+                    );
                 };
                 let mut sensors = self.sensors.lock().unwrap();
                 let value = sensors.read(&sensor);
                 ToolResult::success("read_sensor", &value)
             }
             "write_gpio" => {
-                let pin = args.get("pin").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let state_str = args.get("state").and_then(|v| v.as_str()).unwrap_or("low");
-                let state = if state_str == "high" {
-                    GpioPinState::High
-                } else {
-                    GpioPinState::Low
+                let Some(pin) = args.get("pin").and_then(|v| v.as_u64()) else {
+                    return ToolResult::error("write_gpio", "Missing required argument: pin");
+                };
+                let pin = pin as usize;
+                // Match the firmware's `state` contract: `high|1` high,
+                // `low|0` low, absent defaults to high, anything else is
+                // rejected. The old `state_str == "high"` test drove the pin
+                // *low* for `state:"1"` and for an omitted state — the
+                // opposite of the firmware — and accepted `"mid"` as low.
+                let state = match args.get("state").and_then(|v| v.as_str()).map(str::trim) {
+                    Some("high") | Some("1") => GpioPinState::High,
+                    Some("low") | Some("0") => GpioPinState::Low,
+                    None => GpioPinState::High,
+                    Some(other) => {
+                        return ToolResult::error(
+                            "write_gpio",
+                            &format!("Invalid state: {other} (expected high, low, 1 or 0)"),
+                        )
+                    }
                 };
                 let mut gpio = self.gpio.lock().unwrap();
                 match gpio.set(pin, state) {
@@ -359,7 +429,10 @@ impl ToolExecutor {
                 }
             }
             "flash_read" => {
-                let address = args.get("address").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let Some(address) = args.get("address").and_then(|v| v.as_u64()) else {
+                    return ToolResult::error("flash_read", "Missing required argument: address");
+                };
+                let address = address as usize;
                 let flash = self.flash.lock().unwrap();
                 match flash.read(address, 64) {
                     Ok(data) => {
@@ -370,7 +443,10 @@ impl ToolExecutor {
                 }
             }
             "flash_write" => {
-                let address = args.get("address").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let Some(address) = args.get("address").and_then(|v| v.as_u64()) else {
+                    return ToolResult::error("flash_write", "Missing required argument: address");
+                };
+                let address = address as usize;
                 let data = args.get("data").and_then(|v| v.as_str()).unwrap_or("");
                 let mut flash = self.flash.lock().unwrap();
                 match flash.write(address, data.as_bytes()) {
@@ -785,9 +861,12 @@ Rules:
             return r#"{"result": "Data logged to flash memory"}"#.to_string();
         }
 
-        // Default task - temperature
+        // Default: nothing matched. This used to answer with a `read_sensor
+        // temperature` call and then report success, so an unmatched task
+        // executed a tool it never asked for. Say so instead.
         if tool_count == 0 {
-            return r#"{"tool": "read_sensor", "args": {"sensor": "temperature"}}"#.to_string();
+            return r#"{"result": "No tool call needed for this task (simulated planner)"}"#
+                .to_string();
         }
         r#"{"result": "Task completed"}"#.to_string()
     }
@@ -994,4 +1073,235 @@ fn main() -> Result<()> {
     println!("\nDemo completed successfully!");
 
     Ok(())
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an executor plus handles onto the same state, so a test can
+    /// inspect what a tool call actually did to the simulated hardware.
+    fn fixture() -> (
+        ToolExecutor,
+        Arc<Mutex<GpioController>>,
+        Arc<Mutex<FlashStorage>>,
+    ) {
+        let gpio = Arc::new(Mutex::new(GpioController::new(32)));
+        let flash = Arc::new(Mutex::new(FlashStorage::new(4096)));
+        let ex = ToolExecutor::new(
+            Arc::new(Mutex::new(SimulatedSensors::new())),
+            Arc::clone(&gpio),
+            Arc::clone(&flash),
+            Arc::new(Mutex::new(BleInterface::new())),
+        );
+        (ex, gpio, flash)
+    }
+
+    fn args(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    /// This executor answers five sensors. Any other name fell through
+    /// `_ => SensorType::Temperature`, so a model asking for `glucose`,
+    /// `heart_rate`, `ecg` or `stress` got `23.5°C` — `success: true`, with
+    /// nothing in the reply saying the reading came from a different sensor
+    /// than the one it asked for. `magent-core`'s simulator and the firmware
+    /// both refuse an unknown sensor; this copy has to as well, or the same
+    /// prompt behaves differently on the same hardware.
+    #[test]
+    fn read_sensor_rejects_a_sensor_this_simulator_does_not_have() {
+        let (ex, _, _) = fixture();
+        for name in ["glucose", "heart_rate", "ecg", "stress", "battery"] {
+            let r = ex.execute("read_sensor", &args(&[("sensor", serde_json::json!(name))]));
+            assert!(
+                !r.success,
+                "{name} must not report success, got {:?}",
+                r.content
+            );
+            assert!(
+                !r.content.contains("°C"),
+                "{name} answered with a temperature reading: {:?}",
+                r.content
+            );
+        }
+    }
+
+    /// Omitting the sensor entirely is a missing argument, not a request for
+    /// a temperature. The old `unwrap_or("temperature")` made `read_sensor()`
+    /// look like it worked.
+    #[test]
+    fn read_sensor_rejects_a_missing_sensor_instead_of_reading_temperature() {
+        let (ex, _, _) = fixture();
+        let r = ex.execute("read_sensor", &args(&[]));
+        assert!(
+            !r.success,
+            "a missing sensor must fail, got {:?}",
+            r.content
+        );
+    }
+
+    #[test]
+    fn read_sensor_still_reads_every_sensor_it_has() {
+        let (ex, _, _) = fixture();
+        for (name, needle) in [
+            ("temperature", "°C"),
+            ("humidity", "%"),
+            ("pressure", "hPa"),
+            ("accelerometer", "X="),
+            ("light", "lux"),
+            // The alias spellings `magent-core` accepts must work here too.
+            ("temp", "°C"),
+            ("humid", "%"),
+            ("press", "hPa"),
+            ("accel", "X="),
+            ("lux", "lux"),
+        ] {
+            let r = ex.execute("read_sensor", &args(&[("sensor", serde_json::json!(name))]));
+            assert!(r.success, "{name} should read, got {:?}", r.content);
+            assert!(
+                r.content.contains(needle),
+                "{name} produced {:?}",
+                r.content
+            );
+        }
+    }
+
+    /// `state` defaulted to `"low"` and anything that was not exactly `"high"`
+    /// became Low. So `state:"1"` drove the pin **low** where the firmware
+    /// drives it high, an omitted state drove it low where the firmware
+    /// defaults to high, and `state:"mid"` was accepted silently as low.
+    #[test]
+    fn write_gpio_accepts_the_spellings_the_firmware_accepts() {
+        let (ex, gpio, _) = fixture();
+        // "1" and "high" both mean high.
+        for spelling in ["high", "1"] {
+            ex.execute(
+                "write_gpio",
+                &args(&[
+                    ("pin", serde_json::json!(13)),
+                    ("state", serde_json::json!(spelling)),
+                ]),
+            );
+            assert_eq!(
+                gpio.lock().unwrap().get(13).unwrap(),
+                GpioPinState::High,
+                "state={spelling:?} must drive the pin high"
+            );
+        }
+        for spelling in ["low", "0"] {
+            ex.execute(
+                "write_gpio",
+                &args(&[
+                    ("pin", serde_json::json!(13)),
+                    ("state", serde_json::json!(spelling)),
+                ]),
+            );
+            assert_eq!(
+                gpio.lock().unwrap().get(13).unwrap(),
+                GpioPinState::Low,
+                "state={spelling:?} must drive the pin low"
+            );
+        }
+        // An omitted state defaults to high, as the firmware does.
+        ex.execute("write_gpio", &args(&[("pin", serde_json::json!(14))]));
+        assert_eq!(
+            gpio.lock().unwrap().get(14).unwrap(),
+            GpioPinState::High,
+            "an omitted state must default to high"
+        );
+    }
+
+    #[test]
+    fn write_gpio_rejects_a_state_it_does_not_understand() {
+        let (ex, gpio, _) = fixture();
+        let r = ex.execute(
+            "write_gpio",
+            &args(&[
+                ("pin", serde_json::json!(15)),
+                ("state", serde_json::json!("mid")),
+            ]),
+        );
+        assert!(!r.success, "a bogus state must fail, got {:?}", r.content);
+        assert_eq!(
+            gpio.lock().unwrap().get(15).unwrap(),
+            GpioPinState::Low,
+            "the pin must not be driven by a rejected call"
+        );
+    }
+
+    /// A missing `pin` used to become pin **0** — a call that named no pin
+    /// silently drove the first one. Same class for a missing flash address.
+    #[test]
+    fn a_missing_pin_or_address_is_an_error_not_a_zero() {
+        let (ex, gpio, _) = fixture();
+        let before = gpio.lock().unwrap().status();
+        let r = ex.execute("write_gpio", &args(&[("state", serde_json::json!("high"))]));
+        assert!(!r.success, "a missing pin must fail, got {:?}", r.content);
+        assert_eq!(
+            gpio.lock().unwrap().status(),
+            before,
+            "a call with no pin must not touch any pin"
+        );
+
+        for tool in ["flash_read", "flash_write"] {
+            let mut a = args(&[("data", serde_json::json!("x"))]);
+            a.remove("address");
+            let r = ex.execute(tool, &a);
+            assert!(
+                !r.success,
+                "{tool} without an address must fail, got {:?}",
+                r.content
+            );
+        }
+    }
+
+    /// The address is whatever the model put in the argument, read back with
+    /// `as_u64()` — so `u64::MAX` is a legal value to receive. The bounds
+    /// check was `address + len > self.data.len()`, and that addition
+    /// overflowed `usize`: it wrapped to a small number, the check passed,
+    /// and the slice that followed panicked — on the addition in debug, on
+    /// the range in release. The `Result` return promises a clean failure
+    /// instead. `magent-core`'s flash already guards this with `checked_add`
+    /// (see its `erase_sector`); this copy has to as well.
+    #[test]
+    fn an_address_that_overflows_the_bounds_check_is_an_error_not_a_panic() {
+        let (ex, _, _) = fixture();
+        let huge = serde_json::json!(u64::MAX);
+        for tool in ["flash_read", "flash_write"] {
+            let r = ex.execute(
+                tool,
+                &args(&[("address", huge.clone()), ("data", serde_json::json!("x"))]),
+            );
+            assert!(!r.success, "{tool} must fail, got {:?}", r.content);
+        }
+    }
+
+    /// The far edge of "too big" that does *not* overflow: an address one past
+    /// the end must still be refused, so the overflow fix cannot be a blanket
+    /// "always fail". One address that legitimately fits is checked too.
+    #[test]
+    fn addresses_at_and_past_the_end_are_handled_without_a_panic() {
+        let (ex, _, _) = fixture();
+        // 4096 is the fixture's flash size; a 64-byte read at 4096 runs off it.
+        let r = ex.execute("flash_read", &args(&[("address", serde_json::json!(4096))]));
+        assert!(
+            !r.success,
+            "a read past the end must fail, got {:?}",
+            r.content
+        );
+        // The last address a 64-byte read covers.
+        let r = ex.execute("flash_read", &args(&[("address", serde_json::json!(4032))]));
+        assert!(
+            r.success,
+            "the last readable block must read: {:?}",
+            r.content
+        );
+    }
 }

@@ -58,15 +58,26 @@ mod rt_watchdog;
 mod text_util;
 mod web_admin;
 mod at_dispatch;
+mod config_nvs;
 mod device_key;
 mod blockchain_transport;
 mod ota;
 mod ping;
 #[cfg(feature = "board-s3")]
 mod llm;
+#[cfg(all(feature = "lua", not(feature = "board-s3")))]
+compile_error!(
+    "the `lua` feature is ESP32-S3-only: build with `--features board-s3,lua` \
+     (the C61 has neither the internal DRAM nor the dual-core scheduling the Lua \
+     host assumes). Remove `lua` or add `board-s3`."
+);
 #[cfg(feature = "lua")]
 mod lua_task;
-#[cfg(feature = "wifi")]
+// Always compiled: `at_dispatch`/`main` reference `sntp_sync::TimeSyncHandle`
+// unconditionally, and the module itself only needs lwIP's SNTP client (not
+// the `wifi` feature). Gating it here made a local-only build
+// (`--no-default-features --features board-s3,uart,lua`) fail with 10
+// unresolved-module errors.
 mod sntp_sync;
 // Not gated on `wifi`: the supervisor's `#[cfg(not(feature = "wifi"))]` fallback
 // arms name `ConnectionQuality`, so gating the module here made those arms
@@ -84,7 +95,7 @@ use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition};
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use heapless::String as HeaplessString;
 
-use magent_core::{AgentConfig, MiniAgent, VERSION};
+use magent_core::{MiniAgent, VERSION};
 use magent_core::{
     ingress::{IngressGateway, IngressMode},
     web3::Identity,
@@ -600,7 +611,34 @@ fn clear_at_safemode_flag() {
 
 /// Advance the boot counter. Returns `true` if we've hit the crash-loop
 /// threshold and should boot into safe mode.
-fn check_and_advance_crash_counter() -> bool {
+///
+/// Only a *crash* reset (panic / watchdog) counts. The counter used to
+/// advance on every boot regardless of `esp_reset_reason`, so the documented
+/// provisioning sequence of three `AT+RST`s (or an OTA reboot) inside the
+/// 60-second stable window tripped the threshold and the next boot silently
+/// skipped Wi-Fi. A cold start or an intentional software reset now resets
+/// the counter instead.
+fn check_and_advance_crash_counter(
+    reset_reason: esp_idf_sys::esp_reset_reason_t,
+) -> bool {
+    let crashed = matches!(
+        reset_reason,
+        esp_idf_sys::esp_reset_reason_t_ESP_RST_PANIC
+            | esp_idf_sys::esp_reset_reason_t_ESP_RST_INT_WDT
+            | esp_idf_sys::esp_reset_reason_t_ESP_RST_TASK_WDT
+            | esp_idf_sys::esp_reset_reason_t_ESP_RST_WDT
+    );
+    if !crashed {
+        if nvs_load_string(NVS_KEY_BOOT_COUNT).is_some() {
+            let _ = nvs_save_string(NVS_KEY_BOOT_COUNT, "0");
+        }
+        log::info!(
+            "[safety] non-crash boot (reset reason 0x{:02X}) — counter cleared",
+            reset_reason
+        );
+        return false;
+    }
+
     let prev = nvs_load_string(NVS_KEY_BOOT_COUNT)
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
@@ -628,6 +666,14 @@ fn mark_stable_boot() {
     } else {
         log::info!("[safety] boot considered stable — crash counter reset");
     }
+    // OTA anti-rollback confirmation (REQ-FW-005). This must happen only
+    // after the firmware has actually proven itself (60 s of uptime), not the
+    // moment the agent thread is spawned: confirming early marked a crashing
+    // image valid before Wi-Fi/LLM/Lua initialisation had run, so the
+    // bootloader could never roll it back. No-op when anti-rollback is
+    // disabled (dev builds).
+    // SAFETY: `esp_ota_mark_app_valid_cancel_rollback` takes no pointers.
+    unsafe { esp_idf_sys::esp_ota_mark_app_valid_cancel_rollback() };
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,7 +1464,21 @@ fn run_wifi_supervisor(
                 connect_wifi(&mut *wifi, &ssid, &pass, &status);
             }
             log::warn!("[wifi-sup] backoff {backoff}s before next attempt");
-            std::thread::sleep(Duration::from_secs(backoff));
+            // Sleep in short slices so an `AT+CWJAP=` / `AT+CWQAP` /
+            // `AT+CWLAP` issued during a long credential backoff (up to
+            // 600 s) is honoured promptly instead of after the full delay.
+            let mut remaining = Duration::from_secs(backoff);
+            while !remaining.is_zero() {
+                let slice = remaining.min(Duration::from_millis(250));
+                std::thread::sleep(slice);
+                remaining = remaining.saturating_sub(slice);
+                if WIFI_RECONNECT_REQUESTED.load(Ordering::Acquire)
+                    || WIFI_DISCONNECT_REQUESTED.load(Ordering::Acquire)
+                    || WIFI_SCAN_REQUESTED.load(Ordering::Acquire)
+                {
+                    break;
+                }
+            }
         } else if !connected && attempts_exhausted && !reconnect_suppressed && !gave_up_logged {
             gave_up_logged = true;
             log::error!(
@@ -1592,16 +1652,16 @@ fn load_device_key_via_btdk() -> Result<[u8; 32], &'static str> {
 /// `magent:wifi_pass`. Used by the env-var provisioning path and
 /// (indirectly) by `cwjap_dispatch` via the same seal primitive.
 fn seal_and_store_wifi_pass(plain: &str) -> Result<(), &'static str> {
-    use magent_core::wifi_pass_seal;
+    use magent_core::wifi_pass_seal_v2;
     let key = load_device_key_for_seal()?;
-    let mut sealed: heapless::String<{ wifi_pass_seal::MAX_ENCODED_LEN }> =
+    let mut sealed: heapless::String<{ wifi_pass_seal_v2::MAX_ENCODED_LEN }> =
         heapless::String::new();
     // Pull the nonce from the ESP32 hardware TRNG via the
     // `getrandom` shim — same source `dev_identity` uses, so the
     // sealing randomness is consistent across the firmware.
-    let mut nonce = [0u8; wifi_pass_seal::NONCE_LEN];
+    let mut nonce = [0u8; wifi_pass_seal_v2::NONCE_LEN];
     getrandom::getrandom(&mut nonce).map_err(|_| "trng_unavailable")?;
-    wifi_pass_seal::seal_str(plain, &key, &nonce, &mut sealed)
+    wifi_pass_seal_v2::seal_str(plain, &key, &nonce, &mut sealed)
         .map_err(|_| "seal_failed")?;
     nvs_save_string(NVS_KEY_WIFI_PASS, sealed.as_str())
         .map_err(|_| "nvs_save_failed")?;
@@ -2009,43 +2069,12 @@ fn run_agent_loop(
     // P3: subscribe this real-time thread to the RT watchdog (S3 only).
     rt_watchdog::subscribe_current();
 
-    // HARDENING (audit-2026-08): replace `.expect()` with chained
-    // `and_then` + `ok()` so future contributors who change these compile-time
-    // constants get graceful degradation instead of a board panic.
-    // Agent display name (compile-time board switch).
-    #[cfg(feature = "board-c61")]
-    let agent_name = "mAgent-ESP32-C61";
-    #[cfg(feature = "board-s3")]
-    let agent_name = "mAgent-ESP32-S3";
-    let config = AgentConfig::new()
-        .with_name(agent_name)
-        .and_then(|c| c.with_max_iterations(20))
-        // REQ-SCHED-001 / mem-1: the memory budget scales with the board. The
-        // C61 (2 MB PSRAM) stays at 512 KiB; the S3 (8 MB octal, via the
-        // `s3-8mb-psram` feature) uses the larger 2 MiB budget. These reach the
-        // agent's `BudgetEnforcer` limits (iteration + memory) as of the
-        // 2026-09-23 wiring; before that `MiniAgent::new` ignored both fields and
-        // always used the crate defaults (50 iterations / 50 KiB), so the
-        // `with_max_iterations(20)` above silently did nothing.
-        //
-        // Caveat: the memory *limit* only binds if something calls
-        // `BudgetEnforcer::consume_memory`, which no production path does today —
-        // the real device context bound is the heapless conversation
-        // (`MAX_CONVERSATION_MESSAGES` × `MAX_BUFFER_SIZE` ≈ 40 KiB; see the
-        // `MiniAgent::new` note below). So this value is a configured ceiling,
-        // not an enforced one.
-        .and_then(|c| c.with_max_memory(magent_core::MAX_DYNAMIC_CONTEXT_BYTES as u32))
-        .ok();
-    let Some(config) = config else {
-        // Config is compile-time constants — unreachable in practice.
-        // But a future refactor that reads these from NVS or AT commands
-        // would trigger this path and should NOT panic the thread.
-        log::error!(
-            "[agent] config build failed (name/iterations/memory out of range); \
-             using safe defaults"
-        );
-        return;
-    };
+    // The config is read once per boot from NVS (`AT+AGENTCFG=` writes it,
+    // `AT+AGENTCFG=RESET` deletes it). Board defaults apply when nothing has
+    // been stored; a corrupt entry is logged and also falls back, so a bad
+    // blob cannot brick the agent thread. The board-specific budget rationale
+    // now lives on `config_nvs::default_agent_config`, the single definition.
+    let config = config_nvs::load_or_default();
     dtrace("agent:config-built");
 
     // MiniAgent is heap-allocated (`Box`) so its conversation buffers live on
@@ -2055,12 +2084,15 @@ fn run_agent_loop(
     // 8 KiB this comment used to claim), so at most ~20 × 2 KiB ≈ 40 KiB — not
     // 160 KiB. It is never byte-GC'd on device: `gc_to_budget` /
     // `MAX_DYNAMIC_CONTEXT_BYTES` run in the host `RealAgentRunner`, not in
-    // `MiniAgent` (see the `with_max_memory` note above).
+    // `MiniAgent` (see `config_nvs::default_agent_config` for the budget
+    // rationale).
     let mut agent = match MiniAgent::new(config).map(Box::new) {
         Ok(a) => a,
         Err(e) => {
-            // Config is compile-time constants so this is unreachable in
-            // practice, but don't panic the thread if it ever happens.
+            // Both the board defaults and a stored config pass
+            // `AgentConfig::validate` before reaching here, so this is
+            // unexpected; report it and back off rather than panicking the
+            // agent thread.
             log::error!("[agent] MiniAgent::new failed: {e}");
             std::thread::sleep(Duration::from_secs(30));
             return;
@@ -2195,6 +2227,11 @@ fn run_agent_loop(
                         "[agent] LLM worker spawn failed — running local heuristic only"
                     );
                 } else {
+                    // Publish only after the worker actually exists: the Lua
+                    // host (when built) installs a second ChannelLlmBackend
+                    // over this same worker instead of spawning a duplicate
+                    // Core-0 TLS client. See `llm::publish_shared_sender`.
+                    llm::publish_shared_sender(llm_tx.clone());
                     // HARDENING (audit-2026-08 H9): the agent boot path
                     // intentionally leaks the (channel) LLM backend so the agent
                     // can hold a `&'static mut` reference. This is
@@ -2334,8 +2371,24 @@ fn run_agent_loop(
                     }
                 }
             }
-            Ok(Err(e)) => log::error!("[agent] error({task}): {e}"),
-            Err(_) => log::error!("[agent] task panicked ({task}) — continuing"),
+            Ok(Err(e)) => {
+                log::error!("[agent] error({task}): {e}");
+                // A command from a link must always get a reply; otherwise
+                // the host waits for a timeout with no idea what happened.
+                if from_uart {
+                    if let Ok(mut guard) = reply_outbox.lock() {
+                        *guard = Some(std::format!("RESULT[{task}]: ERROR {e}"));
+                    }
+                }
+            }
+            Err(_) => {
+                log::error!("[agent] task panicked ({task}) — continuing");
+                if from_uart {
+                    if let Ok(mut guard) = reply_outbox.lock() {
+                        *guard = Some(std::format!("RESULT[{task}]: ERROR agent panicked"));
+                    }
+                }
+            }
         }
 
         // Periodic health metrics + low-memory warning.
@@ -2618,8 +2671,10 @@ fn setup_platform(
 /// enough for the agent (32 KiB) + ingress (24 KiB) + supervisor stacks. We
 /// therefore keep the default `MALLOC_CAP_INTERNAL` stacks (no `esp_pthread`
 /// override), which avoids the PSRAM-stack-vs-Wi-Fi lockup entirely.
-fn configure_psram_thread_stacks() {
-    // Intentionally a no-op: leave stacks in internal DRAM (see doc comment).
+fn log_stack_allocation_policy() {
+    // Deliberately does not configure anything: the policy is the *absence*
+    // of an `esp_pthread` override (see the doc comment). Named for what it
+    // does; the previous name promised work it never performed.
     log::info!("[mem] worker-thread stacks stay in internal DRAM (avoids PSRAM-vs-WiFi CPU_LOCKUP)");
 }
 
@@ -2634,12 +2689,12 @@ fn main() {
     // in internal DRAM (SRAM). We previously tried routing them to PSRAM
     // (`stack_alloc_caps = MALLOC_CAP_SPIRAM`) to free internal RAM, but a
     // PSRAM task stack running while Wi-Fi is active triggers a `CPU_LOCKUP`
-    // on the C61 regardless of free memory. `configure_psram_thread_stacks()`
-    // is therefore a documented no-op. The large per-thread *heap* buffers
+    // on the C61 regardless of free memory. `log_stack_allocation_policy()`
+    // therefore only records the (unconfigured) policy. The large per-thread *heap* buffers
     // (MiniAgent conversation, LLM context, and — once wired — the Lua VM's
     // heap) already land on PSRAM via the `std::alloc`/`heap_caps` backing;
     // only small stacks stay in SRAM. Keep it this way.
-    configure_psram_thread_stacks();
+    log_stack_allocation_policy();
 
     // HARDENING (audit-2026-08 M-WDT01): log the reset reason at the very
     // start of boot so crash dumps and serial logs always include the cause.
@@ -2683,7 +2738,7 @@ fn main() {
     // panic; if we're stuck rebooting, this returns true and we boot into
     // safe mode (skip Wi-Fi) so the board stays up long enough to diagnose
     // over UART.
-    let crash_loop_safe = check_and_advance_crash_counter();
+    let crash_loop_safe = check_and_advance_crash_counter(reason);
 
     // PATCHED (MicroAgent): `AT+SAFEMODE=1` flag — operator-forced safe
     // mode. We OR it with the crash-loop detector so the operator can
@@ -2915,26 +2970,31 @@ fn main() {
         log::error!("[ingress] thread spawn failed — continuing without ingress");
     }
 
-    // OTA anti-rollback confirmation (REQ-FW-005): once the agent thread is
-    // running, the freshly-OTA'd firmware is considered healthy, so confirm it
-    // here to stop the bootloader rolling it back on the next boot. No-op when
-    // anti-rollback is disabled (dev builds).
-    if agent_handle.is_some() {
-        // SAFETY: `esp_ota_mark_app_valid_cancel_rollback` takes no pointers.
-        unsafe { esp_idf_sys::esp_ota_mark_app_valid_cancel_rollback() };
-    }
+    // OTA anti-rollback confirmation is deliberately NOT done here. It runs
+    // from `mark_stable_boot()` after 60 s of healthy uptime: confirming at
+    // agent-thread spawn marked an image valid before Wi-Fi/LLM/Lua
+    // initialisation, so a crashing firmware was never rolled back.
 
     // Lua application runtime on the ESP32-S3. Gated behind the `lua` feature.
     // Spawned AFTER the agent + ingress: the internal-DRAM budget on this S3
-    // can't host the Lua thread (32 KiB stack) alongside the agent (96 KiB) +
+    // can't host the Lua thread (32 KiB stack) alongside the agent (32 KiB) +
     // ingress (32 KiB) + Wi-Fi, so `lua-thread` fails to spawn with ENOMEM and
     // the board stays stable (agent + ingress + Wi-Fi run). Running the full
-    // Lua app would also overflow its 32 KiB stack because `agent.reason`
-    // drives a MiniAgent ReAct loop that needs ~68 KiB. Enable only on a board
-    // with enough internal DRAM (or reduce the Lua app to avoid `agent.reason`).
+    // Lua app is also the tightest stack in the firmware: `agent.reason` drives
+    // the *same* `agent.run` ReAct loop the agent thread runs, but nested under
+    // the Piccolo VM's frames on the same 32 KiB stack, so its headroom is
+    // thinner than the agent thread's. Enable only on a board with enough
+    // internal DRAM (or reduce the Lua app to avoid `agent.reason`).
     #[cfg(feature = "lua")]
     {
-        crate::lua_task::start_lua_task();
+        // Safe mode exists to break a crash loop; starting the Lua host there
+        // would re-enter the same fault and leave no working AT/OTA path. This
+        // is what makes a Lua-induced boot crash recoverable.
+        if safe_mode {
+            log::warn!("[lua] safe mode — Lua host not started (crash-loop recovery)");
+        } else {
+            crate::lua_task::start_lua_task();
+        }
     }
 
     // PATCHED (MicroAgent): SNTP supervisor thread. SNTP needs lwIP, which is

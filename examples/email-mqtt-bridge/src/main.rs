@@ -166,10 +166,11 @@ impl Bridge {
         let decoded = decode(&raw);
         let topic = route_topic(&decoded, &self.rules);
         let payload = format!(
-            r#"{{"from":"{}","to":"{}","subject":"{}","body_kind":"{}","body":{}}}"#,
-            decoded.from,
-            decoded.to.join(","),
-            decoded.subject,
+            r#"{{"from":{},"to":{},"subject":{},"body_kind":"{}","body":{}}}"#,
+            // Every string field needs JSON escaping, not just the body.
+            serde_json_escape(&decoded.from),
+            serde_json_escape(&decoded.to.join(",")),
+            serde_json_escape(&decoded.subject),
             decoded.body_kind.as_str(),
             // Wrap the body in a JSON string. `mailparse` returns
             // the raw body, so we just escape the quotes for the
@@ -353,6 +354,36 @@ fn test_payload_shape_is_stable() {
     assert!(payload.contains("\\\"quotes\\\""));
     // Body kind is the wire form.
     assert!(payload.contains("\"body_kind\":\"text/plain\""));
+    // The whole payload must still be valid JSON — the from/to/subject
+    // fields used to be interpolated unescaped.
+    let quoted: String = payload.replace("\\\\", "\\");
+    assert!(
+        is_well_formed_json(&quoted),
+        "payload is not valid JSON: {payload}"
+    );
 
     println!("  ✅ payload has 5 stable fields + escaped quotes");
+}
+
+/// Minimal sanity check for the bridge's payload: every quoted string is
+/// closed and quoted-string interiors contain no raw control characters.
+fn is_well_formed_json(s: &str) -> bool {
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            } else if (c as u32) < 0x20 {
+                return false;
+            }
+        } else if c == '"' {
+            in_string = true;
+        }
+    }
+    !in_string && !escaped
 }

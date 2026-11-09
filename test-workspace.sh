@@ -68,6 +68,20 @@ else
 fi
 echo ""
 
+# `s3-8mb-psram`（ESP32-S3 的 8 MB PSRAM 档）此前只在下面的特性矩阵里被**编译**
+# 过，它的测试从来没跑过：该档下 `MAX_DYNAMIC_CONTEXT_BYTES` 是 2 MiB（C61 档
+# 是 512 KiB），一个按 C61 预算写死的用例在 S3 档下前提不成立，于是整档测试
+# 一直是红的却无人发现。内存预算 / 字节 GC 的 S3 路径只有这个组合能覆盖，所以
+# 这里单独把 S3 档的 lib 测试跑一遍。（默认 `std` 档的测试在上面第 3 步。）
+echo "5b) 测试（magent-core，--features std,s3-8mb-psram，S3 内存档）"
+if cargo test -p magent-core --features std,s3-8mb-psram --lib; then
+    echo "   ✓ S3 内存档测试通过"
+else
+    echo "   ✗ S3 内存档测试失败"
+    fail=1
+fi
+echo ""
+
 # 每个 feature 单独编译一遍，**必须带 --all-targets**：`#[cfg(test)]` 模块只有
 # 在测试目标里才会被编译，而历史上正是那里藏过一个编译错误
 # （agent_tools.rs 用了 `std::vec::Vec`，但 web3 不隐含 std，固件正是
