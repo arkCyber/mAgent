@@ -8,7 +8,7 @@ the *same* bindings into `firmware/esp32-app` (S3).
 > **Status (2026-09):** the S3 Lua wiring lives in
 > `firmware/esp32-app/src/lua_task.rs`, gated behind a separate **`lua` Cargo
 > feature** (OFF by default). It is off not because of the build but because the
-> Lua VM **crashes Core0 on hardware** (see `firmware/esp32-app/build-s3.sh:17`).
+> Lua VM **crashes Core0 on hardware** (see `firmware/esp32-app/build-s3.sh`).
 > `mlua` cannot build for Xtensa ("don't know how to build Lua for
 > xtensa-esp32s3-espidf"), so the S3 Lua VM uses a **pure-Rust engine**,
 > `piccolo`, integrated as the `piccolo` Cargo feature of `magent-lua`.
@@ -23,18 +23,28 @@ the *same* bindings into `firmware/esp32-app` (S3).
 > runtime is host-verified (mlua 61 tests, mlua+piccolo 67, pure-piccolo 6).
 > Remaining: **root-cause the on-device Core0 crash** (see `build-s3.sh`), then
 > real S3 board validation (the `Esp32Hardware` drivers and the on-device Lua
-> app).
+> app). Enabling `lua` without `board-s3` is now a compile error in `main.rs`,
+> so a C61 image cannot silently start the Lua host.
+>
+> The Lua thread now logs `internal_free` / `psram_free` / `stack_min_free` at
+> thread start, before and after `PiccoloVm` construction, and after
+> `main.lua` boot — a hardware boot log therefore shows the last phase reached
+> and the headroom left before a crash. The boot path is also smaller: the Lua
+> host shares the main agent's single Core-0 LLM worker (no second mbedTLS
+> client), and the default app is passive (no flash/ADC/I2C/GPIO touch until
+> an explicit `selftest()`).
 
 ## Why S3 and not C61
 
 | Chip | Internal dynamic SRAM | PSRAM | Verdict |
 |---|---|---|---|
 | ESP32‑C61 | ~134 KB | 2 MB | Too tight for WiFi + agent + a Lua VM |
-| **ESP32‑S3** | **~390 KB** | **8 MB** | Comfortably runs WiFi(DeepSeek) + agent + Lua |
+| **ESP32‑S3** | **~390 KB** | **2 MB quad (shipped dev board) / 8 MB octal (N8R8, `s3-8mb-psram`)** | Comfortably runs WiFi(DeepSeek) + agent + Lua |
 
 On the S3 the firmware already uses `esp-idf-svc + std`, and `std::alloc` is
-backed by the 8 MB PSRAM — exactly the heap a Lua VM needs. This is the
-target board for this feature.
+backed by the external PSRAM — 2 MB on the shipped quad dev board, 8 MB on the
+N8R8 module when built with `s3-8mb-psram` — which is exactly the heap a Lua
+VM needs. The quad board is the target `build-s3.sh` flashes today.
 
 ## How the pieces fit
 
@@ -101,7 +111,7 @@ fn spawn_lua_thread() {
 > - GPIO I/O, internal die temperature (mirrors `local_tools::read_sensor`), free heap;
 > - PWM via **LEDC** (timer 0, 8-bit, 1 kHz; channels 0..7 allocated lazily per GPIO; duty 0..=100 %);
 > - ADC via **oneshot** on **ADC1** (GPIO1..=10 → channels 0..=9, 12-bit, `DB_11`; ADC2 is excluded because it conflicts with the Wi-Fi the firmware uses);
-> - I2C **master** on `I2C_NUM_0` (register read/write via repeated start; SDA/SCL pins are `I2C_SDA_PIN`/`I2C_SCL_PIN` constants, default GPIO9/GPIO8);
+> - I2C **master** on `I2C_NUM_0` (register read/write via repeated start; SDA/SCL pins are `I2C_SDA_PIN`/`I2C_SCL_PIN` constants, default GPIO5 (SDA) / GPIO4 (SCL));
 > - persistent **flash** backed by ESP-IDF **NVS** (`flash_<addr:08x>` keyed blobs in the `magent_lua` namespace; NVS already initialised by `main::init_default_nvs()`).
 >
 > `hardware.ble_send` always returns `Err`: BLE was removed from the firmware on
@@ -129,7 +139,7 @@ Hardware is connected. Build the Lua-enabled firmware and flash it:
 ```sh
 # 1. Build (board-s3 + wifi + uart + lua; piccolo engine, no mlua).
 #    NOTE: ./build-s3.sh does NOT enable `lua` (it builds board-s3,wifi,uart),
-#    because the Lua VM currently crashes Core0 on hardware — see build-s3.sh:17.
+#    because the Lua VM currently crashes Core0 on hardware — see build-s3.sh.
 #    Add `lua` to the feature list there while root-causing, or build directly:
 cd firmware/esp32-app
 MCU=ESP32S3 ESP_IDF_SDKCONFIG_DEFAULTS=sdkconfig.defaults \
@@ -143,14 +153,30 @@ MCU=ESP32S3 ESP_IDF_SDKCONFIG_DEFAULTS=sdkconfig.defaults \
 espflash flash --monitor target/xtensa-esp32s3-espidf/release/magent-esp32-app
 ```
 
-On boot the `lua-thread` runs `DEFAULT_MAIN_LUA` — a hardware self-test that
-prints one line per wired driver. Expected console output:
+On boot the `lua-thread` runs `DEFAULT_MAIN_LUA`, which is deliberately
+**passive**:
+
+```
+[lua] app booted (passive); call selftest() to probe hardware
+```
+
+Bringing the Lua host up while Wi-Fi/TLS is still starting is the risky
+window; a flash write or an ADC/I2C/GPIO reconfiguration there is exactly the
+kind of operation that can fault the other core. The default app therefore
+touches no peripheral at boot and defines `selftest()` instead. Upload a small
+app that calls it (or call it from your own `on_tick`) once the link is up:
+
+```lua
+selftest()
+```
+
+Expected output from `selftest()`:
 
 ```
 [lua] temp  ok  <die temp °C>
 [lua] adc   ok  <volts on GPIO1>      # wire a divider / pot to GPIO1
 [lua] pwm   ok  duty=50%              # scope GPIO1 or wire an LED/fan
-[lua] i2c   ok  <1 byte from 0x38>    # only if a device (e.g. TMP102/SSD1306) is on GPIO9/GPIO8
+[lua] i2c   ok  <1 byte from 0x38>    # only if a device (e.g. TMP102/SSD1306) is on GPIO5/GPIO4
 [lua] gpio  ok  p2=1                  # measure GPIO2 high
 [lua] flash ok  HELLO                 # NVS round-trip at address 0x100
 ```
@@ -158,7 +184,7 @@ prints one line per wired driver. Expected console output:
 A driver prints `err` (not a crash) when its hardware isn't wired — the
 `pcall`-wrapped probe contains it. `i2c` is expected to print `err` unless a
 device is present on the configured SDA/SCL pins (`I2C_SDA_PIN`/`I2C_SCL_PIN`,
-default GPIO9/GPIO8 — change to match your wiring). Every wired driver returns
+default GPIO5 (SDA) / GPIO4 (SCL) — change to match your wiring). Every wired driver returns
 an explicit `Err` (never a crash) when its hardware is absent; `hardware.ble_send`
 is the one method that is *not* wired — it always returns `Err` because BLE was
 removed from the firmware (see above).
@@ -169,12 +195,15 @@ The boot app loads from NVS (`main.lua`) with the embedded script as fallback.
 Operators can push a new app over the UART ingress with `AT+LUAAPP`:
 
 ```sh
-# 1. Turn your Lua file into an AT command (URL-safe base64):
-scripts/luaapp-encode.sh path/to/main.lua
-#    → AT+LUAAPP=<url-safe-base64-of-the-file>
+# 1. Turn your Lua file into a sequence of AT commands (URL-safe base64,
+#    chunked on UTF-8 character boundaries because one AT line is <= 256 B):
+scripts/luaapp-encode.sh path/to/main.lua > upload.txt
+#    → AT+LUAAPP=<b64 of chunk 0>      (replaces the stored app)
+#      AT+LUAAPP=+<b64 of chunk 1>     (appends)
+#      ...
 
-# 2. Paste that line into the device console (115200). The firmware decodes it
-#    and persists it as the boot `main.lua`.
+# 2. Send the lines in order (e.g. `cat upload.txt > /dev/cu.usbmodem*`).
+#    The firmware decodes each chunk and persists it as the boot `main.lua`.
 #    AT+LUAAPP?            → +LUAAPP:<bytes>  (0 if only the embedded app)
 
 # 3. Reset / reboot the device — it boots the new app. (`AppRuntime::reload`
@@ -182,7 +211,11 @@ scripts/luaapp-encode.sh path/to/main.lua
 ```
 
 The payload is URL-safe base64 (no `+`/`/`) so arbitrary Lua (commas, quotes,
-newlines) survives AT argument parsing losslessly.
+newlines) survives AT argument parsing losslessly. A leading `+` on the value
+is outside that alphabet and means "append this chunk"; the first (replace)
+chunk must arrive before any append, and the stored source is capped at 16 KiB.
+Each chunk is a read-modify-write plus NVS commit — an occasional
+operator-update path, not a hot loop.
 
 ## Firmware-specific pitfalls (captured from the host build)
 
@@ -193,19 +226,23 @@ newlines) survives AT argument parsing losslessly.
 2. **Thread model.** The VM + its `Arc<Mutex<MiniAgent>>` run on one dedicated
    FreeRTOS task (single-threaded, like the host). Do **not** share the VM
    across tasks, and keep `agent.reason`'s `block_on` off the RTOS tick.
-3. **LLM decisions.** `start_lua_task` now installs the firmware's DeepSeek
-   backend (`MiniAgent::set_llm_backend`, via `Box::leak`) when a model + API
-   key are configured in NVS (`AT+LLMCFG`), so `agent.reason()` returns real
-   decisions on the S3 instead of the canned heuristic answer. It also installs
-   the real `Esp32ToolHandler` so agent tool calls drive actual GPIO / sensors.
+3. **LLM decisions.** `start_lua_task` installs a `ChannelLlmBackend` over the
+   **same single Core-0 worker the main agent created** (`llm::shared_sender`),
+   so `agent.reason()` returns real decisions without a second mbedTLS client
+   on Core 0. If the main agent has no model/API key (`AT+LLMCFG`), the Lua
+   host uses the local heuristic. It also installs the real
+   `Esp32ToolHandler` so agent tool calls drive actual GPIO / sensors.
 4. **Sandbox stays on.** `LuaVm::new` enforces the memory cap and instruction
    budget on the S3 exactly as on the host; a hostile `main.lua` cannot hang
    the device. For the piccolo engine this is enforced in
    `PiccoloVm::execute_bounded` around every `run_script`/`call`:
    - a bounded `Fuel` budget (instruction budget) — `while true do end` returns a
      Lua error instead of wedging the `lua-thread`;
-   - an 8 MB `Lua::total_memory()` cap — a script that grows the heap unboundedly
-     is contained instead of exhausting PSRAM.
+   - a board-sized `Lua::total_memory()` cap — 512 KiB on the quad-PSRAM dev
+     board (2 MB total, shared with Wi-Fi/TLS/the agent) and 2 MiB under the
+     N8R8 `s3-8mb-psram` profile — so a script that grows the heap unboundedly
+     is contained instead of exhausting PSRAM. (It used to be a flat 8 MiB,
+     which was above the quad board's entire pool.)
    (The mlua sandbox's `set_memory_limit`/instruction hook is mlua-only; the
    piccolo path gets the same guarantees from `Fuel` + `total_memory`.)
 5. **Stack.** The Lua interpreter's own C stack needs room; give the task a
@@ -222,7 +259,7 @@ newlines) survives AT argument parsing losslessly.
 
 ## Acceptance checklist for real S3 hardware
 
-- [ ] Firmware boots, `AT+SYSRAM?` shows large free heap (8 MB PSRAM visible).
+- [ ] Firmware boots, `AT+SYSRAM?` shows the expected free heap (2 MB PSRAM on the quad dev board; 8 MB on N8R8 with `s3-8mb-psram`).
 - [ ] `lua-thread` starts and `main.lua` runs without error.
 - [ ] `hardware.gpio_write/read` toggles a real LED; `sensor_read` reads a real
       sensor; `flash_write/read` round-trips through NVS.

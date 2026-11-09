@@ -8,7 +8,15 @@
 > Wi-Fi commands so existing factory scripts and tooling can be reused
 > without modification. Lines are terminated with `\r\n` (we also accept
 > `\n` and bare lines); queries end `?`, sets end `=...`, tests end
-> `=?`. Replies are either:
+> `=?` (the test form is recognised but **not implemented** — it is answered
+> `+CMDER:4` rather than executed as a zero-argument set). Likewise, a `?`
+> on a command that has no documented query form (e.g. `AT+RST?`,
+> `AT+RESTORE?`, `AT+IDENTROT?`) is `+CMDER:4` and **never** runs the action;
+> since 2026-11-09 the dispatcher checks the command kind before the per-op
+> arms. Command keywords
+> are case-insensitive (`at+cwmode=1` is the same
+> command as `AT+CWMODE=1`); argument values keep their case. Replies are
+> either:
 > - `+CMD:<...>` data lines followed by `\r\nOK\r\n` (success); or
 > - `+CMDER:<n>\r\nERROR\r\n` (failure).
 >
@@ -119,7 +127,7 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 |---|---|---|---|
 | `AT+CIPSTAMAC?` | `+CIPSTAMAC:aa:bb:cc:dd:ee:ff` `OK` | Read the **real** station MAC via `esp_wifi_get_mac`. | Implemented 2026-08-27 (previously a hard-coded placeholder). Note: no quotes around the value. |
 | `AT+CIPSTAMAC="aa:bb:cc:dd:ee:ff"` | `+CMDER:4` `ERROR` | Set station MAC. | Requires stopping the radio first; runtime MAC change not supported. |
-| `AT+MACRAND` | `+MACRAND:aa:bb:cc:dd:ee:ff` `OK` | Generate a random, locally-administered STA MAC (TRNG) and apply it via `esp_wifi_set_mac`. | Implemented 2026-08-28 (was `+CMDER:9`). Requires the Wi-Fi interface to be stopped (e.g. safe mode); otherwise `+CMDER:6`. No quotes around the value. |
+| `AT+MACRAND` / `AT+MACRAND?` | `+MACRAND:aa:bb:cc:dd:ee:ff` `OK` | Execute generates a random, locally-administered STA MAC (TRNG) and applies it via `esp_wifi_set_mac`; the `?` query is read-only and reports the current STA MAC. | Implemented 2026-08-28 (was `+CMDER:9`). Randomisation requires the Wi-Fi interface to be stopped (e.g. safe mode); otherwise `+CMDER:6`. No quotes around the value. Since 2026-11-09 the query form no longer randomises the MAC. |
 | `AT+IDENT?` | `+IDENT:<hex-pubkey>` `OK` | Ed25519 public key (did:key material) in hex. Returns `+IDENT:NO_IDENTITY` if absent. | Read-only; the firmware regenerates identity from hardware TRNG on first boot. |
 | `AT+IDENTROT` | `+IDENTROT:<hex-pubkey>` `OK` | Generate new Ed25519 seed from TRNG and overwrite NVS. | **Refused in `safe mode`**. Atomically persists hex-encoded 32-byte seed to `magent:dev_identity`. |
 
@@ -136,14 +144,14 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
 | `AT+IFCONFIG?` | `+IFCONFIG:"<ip>"` `OK` | Report the current STA IP (from the supervisor snapshot). Empty when the STA has no link. | Implemented 2026-08-27 (previously `+IFCONFIG: deferred`). Netmask/gateway still deferred. |
-| `AT+PING="host"` | `+PING: reply=N rtt=Xus` `OK` | ICMP echo via esp_ping; IPv4/IPv6 literal or hostname (DNS). | Implemented 2026-08-28; IPv6 (e.g. `::1`) added 2026-08-28. |
+| `AT+PING="host"` | `+PING: reply=N rtt=Xms` `OK` | ICMP echo via esp_ping; IPv4/IPv6 literal or hostname (DNS). | Implemented 2026-08-28; IPv6 (e.g. `::1`) added 2026-08-28. The unit is **milliseconds** (`ESP_PING_PROF_TIMEGAP` reports `elapsed_time_ms`); it was previously labelled `us`. |
 
 ### 3.6 Restore / agent passthrough
 
 | Command | Reply | Effect | Aerograde note |
 |---|---|---|---|
 | `AT+RESTORE` | `OK` (reboots in 200 ms) | Factory reset: erase the **entire** NVS region (`nvs_flash_erase`) then reboot. Destructive and irreversible. | Implemented 2026-08-28 (was refused). The device regenerates a fresh device identity on next boot. |
-| `AT+SIGN="text"` | `<signed-message JSON>` `OK` | Sign the payload with the device Ed25519 identity; returns canonical signed-message JSON (signer DID + payload_hex + signature_hex). | Implemented 2026-08-27 (previously `+CMDER:4`). Payload 1..=64 bytes so the reply fits the 256-byte line. |
+| `AT+SIGN="text"` | `<signed-message JSON>` `OK` | Sign the payload with the device Ed25519 identity; returns canonical signed-message JSON (signer DID + payload_hex + signature_hex). | Implemented 2026-08-27 (previously `+CMDER:4`). The accepted length is bounded by the 256-byte reply line: the DID (~56 chars) + JSON keys + 128-hex signature leave ~11 payload bytes for a typical `did:key` identity, and `+CMDER:7` names the actual maximum. (The earlier `1..=64` claim promised payloads that could never fit.) |
 | `AT+AGENT="<text>"` | `OK` | Escape hatch: hand the rest of the line to the agent's ReAct loop. | Useful when you want to script via AT but ask the LLM. |
 
 ### 3.7 OTA firmware update
@@ -158,9 +166,10 @@ touches (NVS, Wi-Fi driver, identity, …), and any aerograde caveat.
 |---|---|---|---|
 | `AT+BLE?` / `AT+BLE=<ON\|OFF\|STATE>` | `+CMDER:9` | BLE was **removed from the firmware on 2026-09-20**. The verb is still parsed for command-surface compatibility, but always reports unsupported — it never answers `OK` for a radio that is not there. | See the *BLE removed outright* entry in `docs/BACKLOG.md`. Provision over UART0 (`AT+CWJAP=`, `AT+LLMCFG=`) or the web admin panel instead. |
 | `AT+HTTPGET=<url>` | `OK` / body | Issue an HTTP GET to verify outbound reachability. | TLS via mbedTLS + CA certificate bundle (worker thread). |
+| `AT+AGENTCFG?` / `AT+AGENTCFG=<name>,<max_iter>,<max_mem>,<watchdog_secs>,<ble_secs>,<skills>,<max_skills>,<debug>` / `AT+AGENTCFG=RESET` | `+AGENTCFG:…` / `OK` | Query, persist, or reset the core `AgentConfig` the agent boots with. Booleans are `0`/`1`; `name` must not contain a comma (the query reply is comma-separated and unquoted); `RESET` deletes the entry. | Stored through `magent_core::config_store` (versioned, validated) in the `magent_cfg` NVS namespace. Takes effect on the **next boot** (the agent thread reads it once at startup, like `AT+LLMCFG`). Numeric range failures → `+CMDER:7`, missing/malformed fields → `+CMDER:4`, name too long → `+CMDER:8`, NVS failure → `+CMDER:7`. **Currently enforced at runtime:** `name`, `max_iterations`, `max_memory`, `max_skills`; `watchdog_secs` / `ble_secs` / `skills` / `debug` are stored and validated but have no consumer yet (see `AgentConfig`'s field docs). |
 | `AT+LLMCFG=<model>,<api_key>` | `OK` | Set / query the LLM backend parameters (DeepSeek). | NVS-backed (`mag_at:llm_model` / `mag_at:llm_api_key`). |
 | `AT+FLIGHTCFG=<provider>,<token>` | `OK` / `+FLIGHTCFG:<provider>,<masked>` | Set / query the flight-price provider used by the agent's `get_flight_price` tool. Providers: `travelpayouts` (token as query param) or `kiwi` (Tequila key, sent as an `apikey` header). | NVS-backed (`mag_at:flight_provider` / `mag_at:flight_token`); unknown provider → `+CMDER:7`, missing/short args → `+CMDER:4` / `:8`. The reply only ever shows the masked token. |
-| `AT+LUAAPP=<b64>` | `OK` | Upload the Lua app source (base64) for the S3 Lua host; `AT+LUAAPP?` reports length. | `lua` feature (S3 only). |
+| `AT+LUAAPP=<b64>` / `AT+LUAAPP=+<b64>` | `OK` | Set / append the Lua app source (URL-safe base64) for the S3 Lua host; `AT+LUAAPP?` reports length. | `lua` feature (S3 only). The AT line is capped at 256 bytes, so a real app is uploaded in `+` chunks; the stored source is capped at 16 KiB. Every chunk is a read-modify-write + NVS commit — an operator-update path, not a hot loop. |
 | `AT+NTPSYNC` | `OK` | Force an SNTP time sync. | Requires network up (skipped in safe mode). |
 | `AT+TIME?` | `+TIME:<iso8601>,<wall_secs>,<source>` | Report current wall-clock time. First field is ISO 8601; second is Unix seconds; third is the sync source tag. | Via `sntp_sync`. Reports `+TIME:UNSYNCED` before the first sync, `+TIME:ERROR` if the RTC read fails. |
 | `AT+TIMEZONE=<zone>` | `OK` | Set the timezone. | NVS-backed. |
@@ -186,7 +195,9 @@ need a special branch.
 
 ## 5. NVS namespace layout
 
-Two namespaces are used:
+Three namespaces are used (the third, `magent_cfg`, holds the versioned
+`config_store` entry; it is deliberately separate from every `magent` /
+`mag_at` key):
 
 | Namespace | Key | Purpose | Written by | **Read by (boots that honour it)** |
 |---|---|---|---|---|
@@ -200,10 +211,17 @@ Two namespaces are used:
 | `mag_at` | `reconn_int` / `reconn_rep` | Reconnect policy | Dispatcher writes; Wi-Fi supervisor reads (since 2026-09-23) | interval caps backoff, repeat caps attempts |
 | `mag_at` | `safemode` | Operator-forced safe mode | `AT+SAFEMODE=` | `read_at_safemode_flag()` (consumed then cleared) |
 | `mag_at` | `sysstore` | `AT+SYSSTORE` toggle | `AT+SYSSTORE=` | `provision_and_load_wifi_credentials` (gates env-var provisioning) |
+| `mag_at` | `timezone_min` | Display UTC offset (minutes) | `AT+TIMEZONE=` | time display |
+| `mag_at` | `llm_model` / `llm_api_key` | LLM backend parameters | `AT+LLMCFG=` | LLM backend construction at boot |
+| `mag_at` | `flight_provider` / `flight_token` | Flight-price provider | `AT+FLIGHTCFG=` | `get_flight_price` (at tool-call time) |
+| `magent_cfg` | `agent_config` | Versioned `config_store` `AgentConfig` entry | `AT+AGENTCFG=` | agent thread at boot (`config_nvs::load_or_default`) |
 
 The `mag_at` namespace is treated as the *overlay*; the `magent`
 namespace keeps its existing schema so factory provisioning is
-backwards compatible.
+backwards compatible. `magent_cfg` deliberately bypasses the
+`nvs_load_string` / `nvs_save_string` helpers: its entry is a binary,
+versioned `config_store` envelope, so `config_nvs.rs` uses the raw NVS blob
+API (`nvs_get_blob` / `nvs_set_blob`).
 
 ### 5.1 Namespace routing
 
@@ -236,6 +254,7 @@ have their read path explicitly wired into the boot sequence:
 | `AT+SAFEMODE=1` | Next boot only | Skips Wi-Fi init; flag cleared after use |
 | `AT+SYSSTORE=0` | Next boot | Skips env-var provisioning; existing NVS values still read |
 | `AT+IDENTROT` | Next boot | Fresh identity used; previous one rotated out |
+| `AT+AGENTCFG=` | Next boot | Agent thread loads the new name / iteration / memory / skills bounds; `RESET` restores board defaults |
 
 If you find an AT command whose setting persists to NVS but does
 **not** appear in this table, that is an audit gap — please file it.
@@ -331,6 +350,13 @@ Devices provisioned before DBO2 was added continue to work without
 intervention: every read goes through `open_sealed_v2` and falls back
 to DBO1 / plaintext automatically. The migration is a one-shot,
 idempotent, opt-in upgrade — there is no deadline pressure.
+
+The **device identity seed** (`magent:dev_identity`, wrapped as
+`BTDK1:<seal>`) follows the same rule since 2026-11-09: the writer emits
+DBO2, the opener accepts DBO2 and DBO1 (re-sealing a DBO1 payload forward
+on read), and `DEV_IDENTITY_STORED_MAX` is 195 bytes. This is deliberately
+not exposed as an AT command — rotating the seed is `AT+IDENTROT`, which
+always writes the current format.
 
 #### Properties
 

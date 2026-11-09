@@ -505,6 +505,50 @@ Serialize to bytes.
 
 Deserialize from bytes.
 
+### ConfigStore
+
+Versioned, validated persistence for [`AgentConfig`] over a pluggable
+`StorageBackend` (in-memory on the host, ESP-IDF NVS on the firmware). Entries
+are `postcard`-encoded with a schema version; a newer-schema entry is refused
+rather than misread.
+
+```rust
+use magent_core::config_store::{ConfigStore, MemoryBackend};
+
+let mut store = ConfigStore::new(MemoryBackend::new());
+store.set_agent_config(&AgentConfig::default())?;
+let loaded = store.get_agent_config()?;
+```
+
+#### Methods
+
+##### `new(backend: B) -> Self`
+
+Create a store over `backend`.
+
+##### `get_agent_config(&mut self) -> Result<Option<AgentConfig>>`
+
+Read and decode the stored config. `Ok(None)` means nothing has been stored;
+corruption and newer schema versions are errors.
+
+##### `set_agent_config(&mut self, config: &AgentConfig) -> Result<()>`
+
+Validate, encode, and persist. A rejected config leaves the store unchanged.
+
+##### `delete_agent_config(&mut self) -> Result<()>`
+
+Remove the stored config.
+
+##### `import_json(&mut self, json: &str) -> Result<AgentConfig>` / `export_json(&mut self) -> Result<String<2048>>`
+
+Import/export the JSON form (validated on import; a too-large export is an
+error, never a truncated document).
+
+##### `update_count(&self) -> u32`
+
+Mutations performed through this instance. Not persisted, so not a flash-wear
+bound.
+
 ---
 
 ## Error API

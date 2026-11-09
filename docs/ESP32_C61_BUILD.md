@@ -321,9 +321,10 @@ default    = ["wifi", "uart", "board-c61"]
 wifi       = []
 ota        = []
 uart       = []
-board-c61  = ["esp-println/esp32c6"]   # default board
-board-s3   = ["esp-println/esp32s3", "magent-core/s3-8mb-psram"]
-lua        = ["dep:magent-lua"]        # S3 only
+board-c61    = ["esp-println/esp32c6"]   # default board
+board-s3     = ["esp-println/esp32s3"]   # chip selection only
+s3-8mb-psram = ["magent-core/s3-8mb-psram"]  # N8R8 8 MB octal module only
+lua          = ["dep:magent-lua"]       # S3 only
 # There is deliberately NO `ble` feature — BLE was removed 2026-09-20.
 ```
 

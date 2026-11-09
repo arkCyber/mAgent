@@ -28,6 +28,7 @@ to a gap or feature in the **Source** column.
 | REQ-NET-002 | Network | RPC 失败必须返回 `Err`,禁止"假装成功" | 单测 + clippy lint | GAP-003 (已修) |
 | REQ-NET-003 | Network | 请求 URL 基址必须支持 `<scheme>://<host>[:<port>][/<path>]` | 单测 `test_config_from_url_*` | 已修 |
 | REQ-NET-004 | Network | 任何 HTTP 路径必须经过 `EspHttpClient::post` trait 抽象 | 代码评审 | 新增 |
+| REQ-SCHED-001 | Scheduling | P3 实时任务与核心隔离:实时线程固定 Core 1 并由 `rt_watchdog` 覆盖长操作,非实时线程不得干扰实时环路;对话/工具上下文按字节预算 GC | `firmware/esp32-app/src/rt_watchdog.rs` + `docs/DUAL_CORE_SCHEDULING.md` + `conversation::gc_to_budget` 单测 | S3 实时调度设计 |
 | REQ-SAFE-001 | Safety | 所有 `unsafe` 块必须 4 行 `SAFETY: ...` 注释 | `cargo miri test` + PR review | ECSS-E-ST-40 6.7 |
 | REQ-SAFE-002 | Safety | `Box::new` / `Vec` / `String` 不得在 ISR 中分配 | clippy `large_types_passed_by_value` + 评审 | NASA NPR 7150.2 |
 | REQ-SAFE-003 | Safety | 全局可变量必须 `Atomic` 或 `Mutex` | clippy `mutable_key_type` + miri | MISRA-C 9.1 |

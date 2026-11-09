@@ -121,10 +121,13 @@ never feeds — subscribing it would false-trip on any long-running script).
 
 For the ESP32-S3-WROOM-1-N8R8 (8 MB Octal PSRAM) target:
 
-- **Budget ceilings** (`magent-core` `s3-8mb-psram` feature, enabled by the
-  firmware's `board-s3`): `MAX_CONFIGURABLE_MEMORY` 1 MiB → 4 MiB and
-  `MAX_DYNAMIC_CONTEXT_BYTES` 512 KiB → 2 MiB — raised but still bounded vs the
-  8 MB pool so a runaway LLM reply / long context cannot exhaust PSRAM.
+- **Budget ceilings** (`magent-core` `s3-8mb-psram`, enabled by the firmware
+  feature of the same name — **not** by `board-s3`): `MAX_CONFIGURABLE_MEMORY`
+  1 MiB → 4 MiB and `MAX_DYNAMIC_CONTEXT_BYTES` 512 KiB → 2 MiB — raised but
+  still bounded vs the 8 MB pool so a runaway LLM reply / long context cannot
+  exhaust PSRAM. The shipped quad-PSRAM (2 MB) dev board keeps the default
+  1 MiB / 512 KiB ceilings; enabling this profile there would advertise a
+  ceiling above the physical pool.
 - **Byte-budget GC** (`conversation::gc_to_budget`): the host `RealAgentRunner`
   bounds the live `Vec<Message>` context cache to `MAX_DYNAMIC_CONTEXT_BYTES`,
   **unconditionally** (independent of `CompressionPolicy`) — heap-blast
