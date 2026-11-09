@@ -129,11 +129,15 @@ impl MonitoringManager {
     pub fn operation_success(&mut self, execution_time_us: u32) {
         self.metrics.successful_operations += 1;
 
-        // Update average execution time
-        let total_time =
-            self.metrics.average_execution_time_us * (self.metrics.successful_operations - 1);
-        self.metrics.average_execution_time_us =
-            (total_time + execution_time_us) / self.metrics.successful_operations;
+        // Update average execution time. Compute the running sum in `u64`:
+        // `avg * (n - 1)` overflows `u32` well before the counters do, which
+        // wrapped the average to a nonsense value in release builds.
+        let previous_count = self.metrics.successful_operations.saturating_sub(1);
+        let total = u64::from(self.metrics.average_execution_time_us)
+            .saturating_mul(u64::from(previous_count))
+            .saturating_add(u64::from(execution_time_us));
+        let count = u64::from(self.metrics.successful_operations).max(1);
+        self.metrics.average_execution_time_us = u32::try_from(total / count).unwrap_or(u32::MAX);
     }
 
     /// Record operation failure
@@ -269,6 +273,16 @@ mod tests {
         assert_eq!(m.get_logs().len(), 0);
     }
 
+    /// `avg * (n - 1)` overflowed `u32` once the two factors were large.
+    #[test]
+    fn rolling_average_does_not_overflow() {
+        let mut m = MonitoringManager::new();
+        for _ in 0..5 {
+            m.operation_success(u32::MAX);
+        }
+        assert_eq!(m.get_metrics().average_execution_time_us, u32::MAX);
+    }
+
     #[test]
     fn performance_metrics_track_operations_and_average() {
         let mut m = MonitoringManager::new();
@@ -346,5 +360,93 @@ mod tests {
             .component
             .as_str()
             .contains("comp19"));
+    }
+
+    #[test]
+    fn operation_start_without_success_still_counts() {
+        let mut m = MonitoringManager::new();
+        m.operation_start();
+        assert_eq!(m.get_metrics().total_operations, 1);
+        assert_eq!(m.get_metrics().successful_operations, 0);
+        assert_eq!(m.get_metrics().failed_operations, 0);
+    }
+
+    #[test]
+    fn operation_before_any_call_has_zero_metrics() {
+        let m = MonitoringManager::new();
+        assert_eq!(m.get_metrics().total_operations, 0);
+        assert_eq!(m.get_metrics().successful_operations, 0);
+        assert_eq!(m.get_metrics().failed_operations, 0);
+        assert_eq!(m.get_metrics().average_execution_time_us, 0);
+        assert_eq!(m.get_metrics().peak_memory_usage, 0);
+    }
+
+    #[test]
+    fn get_health_checks_empty_on_new() {
+        let m = MonitoringManager::new();
+        assert!(m.get_health_checks().is_empty());
+    }
+
+    #[test]
+    fn add_health_check_rejects_long_message() {
+        let mut m = MonitoringManager::new();
+        let long = "x".repeat(200);
+        let r = m.add_health_check("sensor", HealthStatus::Healthy, &long);
+        assert!(matches!(r, Err(AgentError::MemoryAllocationFailed { .. })));
+        assert_eq!(m.get_health_checks().len(), 0);
+    }
+
+    #[test]
+    fn log_accepts_empty_message() {
+        let mut m = MonitoringManager::new();
+        assert!(m.log(LogLevel::Info, "").is_ok());
+        assert_eq!(m.get_logs().len(), 1);
+        assert_eq!(m.get_logs()[0].message.as_str(), "");
+        assert_eq!(m.get_logs()[0].level, LogLevel::Info);
+    }
+
+    #[test]
+    fn default_impl_equals_new() {
+        let a = MonitoringManager::new();
+        let b = MonitoringManager::default();
+        assert_eq!(a.get_metrics().total_operations, b.get_metrics().total_operations);
+        assert_eq!(a.get_logs().len(), b.get_logs().len());
+        assert_eq!(a.get_health_checks().len(), b.get_health_checks().len());
+    }
+
+    #[test]
+    fn many_failures_dont_wrap_count() {
+        let mut m = MonitoringManager::new();
+        for _ in 0..1000 {
+            m.operation_failure();
+        }
+        assert_eq!(m.get_metrics().failed_operations, 1000);
+        assert_eq!(m.get_metrics().total_operations, 0);
+        assert_eq!(m.get_metrics().successful_operations, 0);
+    }
+
+    #[test]
+    fn log_all_levels() {
+        let mut m = MonitoringManager::new();
+        for level in &[LogLevel::Debug, LogLevel::Info, LogLevel::Warning, LogLevel::Error] {
+            m.log(*level, "test").unwrap();
+        }
+        assert_eq!(m.get_logs().len(), 4);
+        assert_eq!(m.get_logs()[0].level, LogLevel::Debug);
+        assert_eq!(m.get_logs()[3].level, LogLevel::Error);
+    }
+
+    #[test]
+    fn health_status_degrades_then_recovers() {
+        let mut m = MonitoringManager::new();
+        m.add_health_check("sensor", HealthStatus::Degraded, "noisy").unwrap();
+        assert_eq!(m.get_health_status(), HealthStatus::Degraded);
+        // Overwrite by adding a healthy check for the same component
+        m.add_health_check("sensor", HealthStatus::Healthy, "").unwrap();
+        // Now we have Healthy + Degraded → overall Degraded
+        assert_eq!(m.get_health_status(), HealthStatus::Degraded);
+
+        m.add_health_check("ble", HealthStatus::Healthy, "").unwrap();
+        assert_eq!(m.get_health_status(), HealthStatus::Degraded);
     }
 }

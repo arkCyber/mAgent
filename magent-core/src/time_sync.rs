@@ -757,6 +757,7 @@ pub fn empty_persisted_record() -> Vec<u8, MAX_RECORD_LEN> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
 
     fn ts_at(state: &TimeSync, ms: u64) -> Option<i64> {
         state.now_unix(ms)
@@ -1109,5 +1110,70 @@ mod tests {
         // poisoned NVS record must not smuggle it past the loader.
         let r = TimeSync::load("TIM1:100:2000000000:0:0:SNTP", 0);
         assert!(matches!(r, Err(TimeSyncError::BadField)));
+    }
+
+    /// Every error variant renders its stable `+CMDER`-mapping token. The
+    /// firmware and the AT tests both match on these strings, so a renamed
+    /// arm (or a new variant with no arm) must not slip through.
+    #[test]
+    fn time_sync_error_display_covers_every_variant() {
+        assert_eq!(TimeSyncError::BadFormat.to_string(), "bad_format");
+        assert_eq!(TimeSyncError::BadField.to_string(), "bad_field");
+        assert_eq!(TimeSyncError::UnknownSource.to_string(), "unknown_source");
+        assert_eq!(
+            TimeSyncError::DriftOutOfRange.to_string(),
+            "drift_out_of_range"
+        );
+        assert_eq!(TimeSyncError::Overflow.to_string(), "overflow");
+        assert_eq!(TimeSyncError::OutputOverflow.to_string(), "output_overflow");
+        assert_eq!(TimeSyncError::TzOutOfRange.to_string(), "tz_out_of_range");
+    }
+
+    /// The free `source_tag` fn is the audit-logging entry point and must
+    /// agree with the method it wraps for all four sources.
+    #[test]
+    fn source_tag_free_fn_covers_every_source() {
+        assert_eq!(source_tag(Source::Sntp), "SNTP");
+        assert_eq!(source_tag(Source::BleCts), "BLE_CTS");
+        assert_eq!(source_tag(Source::Operator), "OPERATOR");
+        assert_eq!(source_tag(Source::None), "NONE");
+    }
+
+    /// `PersistedRecord::as_str` hands back the exact rendered bytes, and a
+    /// record with an explicit drift reports it via `drift_ppm`.
+    #[test]
+    fn persisted_record_exposes_its_bytes_and_drift() {
+        let mut t = TimeSync::default();
+        t.set_drift_ppm(42).unwrap();
+        t.record(1_700_000_000, 0, 0, Source::Sntp).unwrap();
+        let mut buf: heapless::String<MAX_RECORD_LEN> = heapless::String::new();
+        t.serialize_for_nvs(&mut buf).unwrap();
+        let rec = PersistedRecord {
+            bytes: buf.clone(),
+        };
+        assert_eq!(rec.as_str(), buf.as_str());
+        assert_eq!(t.drift_ppm(), 42);
+    }
+
+    /// `format_iso8601_for_test` is the harness entry point; a monotonic value
+    /// past `i64::MAX` must report `Overflow` rather than wrap.
+    #[test]
+    fn format_iso8601_for_test_reports_overflow() {
+        let mut out: heapless::String<{ MAX_ISO_LEN }> = heapless::String::new();
+        let r = format_iso8601_for_test(1_700_000_000, 0, 0, u64::MAX, &mut out);
+        assert!(matches!(r, Err(TimeSyncError::Overflow)));
+    }
+
+    /// The happy path through the harness formatter produces the same string
+    /// the owning `TimeSync` would.
+    #[test]
+    fn format_iso8601_for_test_matches_the_owned_formatter() {
+        let mut out: heapless::String<{ MAX_ISO_LEN }> = heapless::String::new();
+        format_iso8601_for_test(1_756_022_400, 0, 0, 0, &mut out).unwrap();
+        let mut owned = String::new();
+        let mut t = TimeSync::default();
+        t.record(1_756_022_400, 0, 0, Source::Sntp).unwrap();
+        t.format_iso8601(0, &mut owned).unwrap();
+        assert_eq!(out.as_str(), owned.as_str());
     }
 }

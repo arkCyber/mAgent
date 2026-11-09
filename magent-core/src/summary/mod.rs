@@ -225,23 +225,81 @@ impl FileSummaryStore {
     /// descriptive source. The guard releases on drop.
     fn acquire_topic_lock(&self, topic: &str) -> Result<TopicLockGuard, SummaryError> {
         let path = self.lock_path(topic)?;
-        // `create_new(true)` is atomic on POSIX and Windows; the
-        // OS returns `AlreadyExists` when somebody else got there
-        // first.
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| SummaryError::Write {
-                path: path.display().to_string(),
-                source: format!("could not acquire lock for topic {:?}: {}", topic, e),
-            })?;
-        Ok(TopicLockGuard { path, _file: file })
+        // `create_new(true)` is atomic on POSIX and Windows. A process that
+        // is SIGKILLed (or loses power) never runs `TopicLockGuard::drop`, so
+        // the lock file survives and would block every later save for this
+        // topic forever. Treat a lock older than `LOCK_STALE` as abandoned
+        // and reclaim it once.
+        const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(30);
+        for attempt in 0..2 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    // Best-effort owner stamp for operators debugging a
+                    // stale lock.
+                    let _ = std::io::Write::write_all(
+                        &mut file,
+                        format!("{}", std::process::id()).as_bytes(),
+                    );
+                    return Ok(TopicLockGuard { path, _file: file });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                    let stale = fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|m| m.elapsed().unwrap_or_default() > LOCK_STALE)
+                        .unwrap_or(false);
+                    if stale {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    return Err(SummaryError::Write {
+                        path: path.display().to_string(),
+                        source: format!("could not acquire lock for topic {:?}: {}", topic, e),
+                    });
+                }
+                Err(e) => {
+                    return Err(SummaryError::Write {
+                        path: path.display().to_string(),
+                        source: format!("could not acquire lock for topic {:?}: {}", topic, e),
+                    })
+                }
+            }
+        }
+        Err(SummaryError::Write {
+            path: path.display().to_string(),
+            source: format!("could not acquire lock for topic {:?}: lock was reclaimed concurrently", topic),
+        })
+    }
+
+    /// Save `record` verbatim, **without** merging the previous file's
+    /// snapshot into its history.
+    ///
+    /// `save` is the normal append/merge path. Rollback is the one operation
+    /// that constructs the complete post-state itself (it removes the entry
+    /// being restored and appends the snapshot being superseded); merging
+    /// that with the on-disk record re-added the entry the caller had just
+    /// removed, so `summary rollback` never actually removed anything.
+    pub fn save_overwrite(&self, record: SummaryRecord) -> Result<WriteReport, SummaryError> {
+        record.validate()?;
+        let _proc = self.process_lock.lock().expect("process mutex poisoned");
+        let _topic_lock = self.acquire_topic_lock(&record.topic)?;
+        self.save_locked_with(record, false)
     }
 
     /// Inner helper that performs the atomic write. Caller MUST
     /// hold the topic lock.
     fn save_locked(&self, record: SummaryRecord) -> Result<WriteReport, SummaryError> {
+        self.save_locked_with(record, true)
+    }
+
+    fn save_locked_with(
+        &self,
+        record: SummaryRecord,
+        merge_previous: bool,
+    ) -> Result<WriteReport, SummaryError> {
         record.validate()?;
 
         // Decide whether this is an update or a fresh write
@@ -249,8 +307,8 @@ impl FileSummaryStore {
         let target = self.record_path(&record.topic)?;
         let overwritten = target.exists();
 
-        // Merge with the previous snapshot if one exists.
-        let record = if overwritten {
+        // Merge with the previous snapshot if one exists (normal save only).
+        let record = if overwritten && merge_previous {
             let raw = match fs::read_to_string(&target) {
                 Ok(s) => s,
                 Err(e) => {
@@ -297,34 +355,50 @@ impl FileSummaryStore {
                 .and_then(|s| s.to_str())
                 .unwrap_or("json")
         ));
+        // We hold the topic lock, so any leftover temp file is debris from a
+        // crashed previous save. Remove it before `create_new`; otherwise one
+        // crash permanently blocks every later write to this topic.
+        let _ = fs::remove_file(&tmp);
         let bytes = {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(|e| SummaryError::Write {
+            let write = (|| -> Result<usize, SummaryError> {
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)
+                    .map_err(|e| SummaryError::Write {
+                        path: tmp.display().to_string(),
+                        source: e.to_string(),
+                    })?;
+                f.write_all(&json).map_err(|e| SummaryError::Write {
                     path: tmp.display().to_string(),
                     source: e.to_string(),
                 })?;
-            f.write_all(&json).map_err(|e| SummaryError::Write {
-                path: tmp.display().to_string(),
-                source: e.to_string(),
-            })?;
-            f.sync_all().map_err(|e| SummaryError::Write {
-                path: tmp.display().to_string(),
-                source: e.to_string(),
-            })?;
-            json.len()
+                f.sync_all().map_err(|e| SummaryError::Write {
+                    path: tmp.display().to_string(),
+                    source: e.to_string(),
+                })?;
+                Ok(json.len())
+            })();
+            match write {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            }
         };
 
         // `rename` is atomic on the same filesystem on POSIX and on
         // NTFS. On macOS APFS it is also atomic. On `exfat` /
         // `fat32` it is *not* — but we document that here rather
         // than trying to detect the filesystem.
-        fs::rename(&tmp, &target).map_err(|e| SummaryError::Write {
-            path: target.display().to_string(),
-            source: format!("rename {} → {}: {}", tmp.display(), target.display(), e),
-        })?;
+        if let Err(e) = fs::rename(&tmp, &target) {
+            let _ = fs::remove_file(&tmp);
+            return Err(SummaryError::Write {
+                path: target.display().to_string(),
+                source: format!("rename {} → {}: {}", tmp.display(), target.display(), e),
+            });
+        }
 
         // Best-effort dir fsync. Some filesystems (e.g. tmpfs) reject
         // this; we ignore the error since the data file is already
@@ -401,15 +475,11 @@ impl SummaryStore for FileSummaryStore {
     }
 }
 
-/// RAII guard that removes the lock file on drop. We ignore
-/// removal errors because the file may already be gone (process
-/// crashed mid-save), and the *worst* outcome is a stale lock
-/// file that the next writer will overwrite via `create_new` on a
-/// different OS / filesystem combination.
+/// RAII guard that removes the lock file on drop.
 ///
-/// Actually: `create_new` will fail with `AlreadyExists` if the
-/// lock file is present, so we *do* want to remove it. We log
-/// (host-only) and move on.
+/// A process killed while holding it leaves the file behind; the next
+/// writer treats a lock older than 30 s as abandoned and reclaims it
+/// (see [`FileSummaryStore::acquire_topic_lock`]).
 struct TopicLockGuard {
     path: PathBuf,
     _file: fs::File,
@@ -458,17 +528,39 @@ pub fn rollback(
         updated_at: current.updated_at,
         kept: current.stats.kept,
         source_session_id: current.source.session_id.clone(),
+        head_tail_window: current.head_tail_window.clone(),
+        llm_summary: current.llm_summary.clone(),
+        stats: current.stats,
     });
     if new_history.len() > HISTORY_MAX {
         let drop = new_history.len() - HISTORY_MAX;
         new_history.drain(..drop);
     }
+    // Entries written before the snapshot fields existed have an empty
+    // window and no summary. For those, keep the historical (counter-only)
+    // behaviour rather than blanking the active content.
+    let legacy = entry.head_tail_window.is_empty() && entry.llm_summary.is_none();
+    let (head_tail_window, llm_summary, stats) = if legacy {
+        (
+            current.head_tail_window.clone(),
+            current.llm_summary.clone(),
+            crate::conversation::CompressionStats {
+                kept: entry.kept,
+                ..current.stats
+            },
+        )
+    } else {
+        (
+            entry.head_tail_window.clone(),
+            entry.llm_summary.clone(),
+            entry.stats,
+        )
+    };
     Ok(SummaryRecord {
         updated_at: now,
-        stats: crate::conversation::CompressionStats {
-            kept: entry.kept,
-            ..current.stats
-        },
+        head_tail_window,
+        llm_summary,
+        stats,
         history: new_history,
         ..current
     })
@@ -598,6 +690,11 @@ fn merge_with_prev(mut incoming: SummaryRecord, prev: SummaryRecord) -> SummaryR
         updated_at: prev.updated_at,
         kept: prev.stats.kept,
         source_session_id: prev.source.session_id.clone(),
+        // Persist the whole snapshot so rollback can restore the content,
+        // not just the counter.
+        head_tail_window: prev.head_tail_window.clone(),
+        llm_summary: prev.llm_summary.clone(),
+        stats: prev.stats,
     };
     let mut history = prev.history;
     history.push(entry);
@@ -1095,13 +1192,27 @@ mod tests {
     fn save_compress_messages_output() {
         let dir = scratch("integration");
         let store = FileSummaryStore::new(dir.clone());
+        // Each tool result is paired with the assistant call that owns it, so
+        // the compression under test only has to cut whole *pairs*: slicing
+        // drops the halves of a pair it splits, which would otherwise change
+        // the counts this test asserts on.
+        let call = |id: &str| {
+            Message::assistant_tool_call_id(
+                crate::agent_runner::ToolCall {
+                    name: "read_sensor".into(),
+                    arguments: Default::default(),
+                },
+                id,
+            )
+        };
         let mut v = vec![
             Message::system("SYS"),
             Message::user("orig task"),
+            call("c1"),
             Message::tool("c1", &"y".repeat(5_000)),
         ];
         for i in 0..30 {
-            v.push(Message::assistant_text(&format!("a{}", i)));
+            v.push(call(&format!("c{}", i)));
             v.push(Message::tool(&format!("c{}", i), &format!("out{}", i)));
         }
         let policy = CompressionPolicy {
@@ -1177,5 +1288,275 @@ mod tests {
         assert!(!report.overwritten);
         let stat = fs::metadata(&report.path).unwrap();
         assert_eq!(stat.len() as usize, report.bytes);
+    }
+
+    // ---------- free-function shims ----------
+
+    #[test]
+    fn free_function_shims_round_trip() {
+        let dir = scratch("free-shims");
+        let rec = SummaryBuilder::new("shim")
+            .unwrap()
+            .with_window(&[Message::user("hi")])
+            .build()
+            .unwrap();
+        let path = save(rec.clone(), &dir).expect("save");
+        assert!(path.exists());
+        assert_eq!(load("shim", &dir).expect("load"), rec);
+        assert_eq!(list(&dir).expect("list").len(), 1);
+        delete("shim", &dir).expect("delete");
+        assert!(list(&dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn open_default_uses_the_summaries_dir() {
+        let store = FileSummaryStore::open_default();
+        // The store is rooted at whatever `summaries_dir()` resolves to;
+        // saving under it must produce a path beneath it. Use a topic unique
+        // to this test so we don't collide with other tests.
+        let topic = "open-default-probe";
+        let rec = SummaryBuilder::new(topic)
+            .unwrap()
+            .with_window(&[Message::user("x")])
+            .build()
+            .unwrap();
+        let report = store.save(rec).unwrap();
+        assert!(report.path.starts_with(summaries_dir()));
+        // Clean up so a re-run starts fresh.
+        let _ = store.delete(topic);
+    }
+
+    #[test]
+    fn ensure_summaries_dir_creates_the_directory() {
+        let prev = std::env::var(SUMMARIES_DIR_ENV).ok();
+        let custom = scratch("ensure-dir");
+        // Scratch() already created the dir; remove it so we can observe
+        // ensure_summaries_dir recreating it.
+        let _ = fs::remove_dir_all(&custom);
+        // SAFETY: env mutation is process-global; this test is the only one
+        // that touches the summaries-dir override from this point, and it
+        // restores the prior value below.
+        unsafe { std::env::set_var(SUMMARIES_DIR_ENV, &custom) };
+        let got = ensure_summaries_dir().expect("ensure");
+        // SAFETY: restore the override to the value observed on entry.
+        unsafe {
+            if let Some(v) = prev {
+                std::env::set_var(SUMMARIES_DIR_ENV, v);
+            } else {
+                std::env::remove_var(SUMMARIES_DIR_ENV);
+            }
+        }
+        assert_eq!(got, custom);
+        assert!(got.is_dir());
+    }
+
+    #[test]
+    fn summaries_dir_falls_back_to_home_and_relative() {
+        let prev = std::env::var(SUMMARIES_DIR_ENV).ok();
+        let prev_xdg = std::env::var("XDG_DATA_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
+
+        // Empty SUMMARIES_DIR_ENV is treated as unset → falls through to XDG.
+        // SAFETY: env mutation is process-global; this test restores every
+        // variable it touches before returning.
+        unsafe {
+            std::env::set_var(SUMMARIES_DIR_ENV, "");
+            std::env::set_var("XDG_DATA_HOME", "/tmp/xdg-probe");
+        }
+        assert_eq!(
+            summaries_dir(),
+            PathBuf::from("/tmp/xdg-probe/magent/summaries")
+        );
+
+        // No XDG → falls through to HOME.
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::set_var("HOME", "/tmp/home-probe");
+        }
+        assert_eq!(
+            summaries_dir(),
+            PathBuf::from("/tmp/home-probe/.local/share/magent/summaries")
+        );
+
+        // Neither set → relative fallback.
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("HOME") };
+        assert_eq!(summaries_dir(), PathBuf::from("magent/summaries"));
+
+        // Restore the environment exactly as we found it.
+        // SAFETY: as above; this returns each variable to its entry value.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(SUMMARIES_DIR_ENV, v),
+                None => std::env::remove_var(SUMMARIES_DIR_ENV),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    // ---------- rollback ----------
+
+    #[test]
+    fn rollback_restores_an_earlier_snapshot() {
+        let dir = scratch("rollback");
+        let store = FileSummaryStore::new(dir.clone());
+        // Save three successive versions so history accumulates.
+        for kept in 1..=3u32 {
+            let rec = SummaryBuilder::new("rb")
+                .unwrap()
+                .with_window(&[Message::user("x")])
+                .with_stats(CompressionStats {
+                    kept: kept as usize,
+                    ..Default::default()
+                })
+                .build()
+                .unwrap();
+            store.save(rec).unwrap();
+        }
+        let current = store.load("rb").unwrap();
+        assert_eq!(current.history.len(), 2);
+        // Roll back to the first snapshot (kept == 1).
+        let restored = rollback(&store, "rb", 0).expect("rollback");
+        assert_eq!(restored.stats.kept, 1);
+    }
+
+    #[test]
+    fn rollback_rejects_an_out_of_range_index() {
+        let dir = scratch("rollback-range");
+        let store = FileSummaryStore::new(dir.clone());
+        let rec = SummaryBuilder::new("rb2")
+            .unwrap()
+            .with_window(&[Message::user("x")])
+            .build()
+            .unwrap();
+        store.save(rec).unwrap();
+        match rollback(&store, "rb2", 99) {
+            Err(SummaryError::InvalidMetadata(msg)) => {
+                assert!(msg.contains("out of range"), "got {msg}")
+            }
+            other => panic!("expected InvalidMetadata, got {other:?}"),
+        }
+    }
+
+    // ---------- error paths ----------
+
+    #[test]
+    fn load_reports_a_read_error_on_a_directory() {
+        let dir = scratch("load-dir");
+        let store = FileSummaryStore::new(dir.clone());
+        // Plant a *directory* where the record file would be. Reading it as a
+        // string fails with something other than NotFound → `SummaryError::Read`.
+        fs::create_dir_all(dir.join("isdir.json")).unwrap();
+        match store.load("isdir") {
+            Err(SummaryError::Read { .. }) => {}
+            other => panic!("expected Read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_reports_a_write_error_on_a_directory() {
+        let dir = scratch("delete-dir");
+        let store = FileSummaryStore::new(dir.clone());
+        // A non-empty directory can't be removed with remove_file → Write error.
+        let d = dir.join("nodir.json");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("child"), b"x").unwrap();
+        match store.delete("nodir") {
+            Err(SummaryError::Write { .. }) => {}
+            other => panic!("expected Write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_reports_corruption_of_an_existing_record() {
+        let dir = scratch("save-corrupt");
+        let store = FileSummaryStore::new(dir.clone());
+        // Plant a syntactically valid but unparseable record file so the
+        // update path's `fs::read_to_string` + `parse` fails.
+        let path = record_path("corrupt", &dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"{ this is not json").unwrap();
+        let rec = SummaryBuilder::new("corrupt")
+            .unwrap()
+            .with_window(&[Message::user("x")])
+            .build()
+            .unwrap();
+        match store.save(rec) {
+            Err(SummaryError::Parse { .. }) => {}
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    // ---------- merge / history caps ----------
+
+    #[test]
+    fn merge_with_prev_caps_history_at_the_limit() {
+        // Build an incoming record and a `prev` carrying a full history, so
+        // the push in `merge_with_prev` overflows and the drain branch runs.
+        let history: Vec<HistoryEntry> = (0..HISTORY_MAX)
+            .map(|i| HistoryEntry {
+                updated_at: i as u64,
+                kept: i,
+                source_session_id: None,
+                head_tail_window: Vec::new(),
+                llm_summary: None,
+                stats: crate::conversation::CompressionStats::default(),
+            })
+            .collect();
+        let incoming = SummaryBuilder::new("merge")
+            .unwrap()
+            .with_window(&[Message::user("x")])
+            .build()
+            .unwrap();
+        let prev = SummaryBuilder::new("merge")
+            .unwrap()
+            .with_window(&[Message::user("old")])
+            .with_history(history)
+            .build()
+            .unwrap();
+        let merged = merge_with_prev(incoming, prev);
+        assert_eq!(merged.history.len(), HISTORY_MAX);
+    }
+
+    #[test]
+    fn parse_rejects_a_future_schema_version() {
+        let path = PathBuf::from("/tmp/nonexistent-summary.json");
+        let mut rec = SummaryBuilder::new("future")
+            .unwrap()
+            .with_window(&[Message::user("x")])
+            .build()
+            .unwrap();
+        rec.schema_version = CURRENT_SCHEMA_VERSION + 1;
+        let raw = serde_json::to_string(&rec).unwrap();
+        match parse(&raw, &path) {
+            Err(SummaryError::UnsupportedSchema { found, supported, .. }) => {
+                assert_eq!(found, CURRENT_SCHEMA_VERSION + 1);
+                assert_eq!(supported, CURRENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected UnsupportedSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_locked_writes_a_fresh_record_without_a_prior_snapshot() {
+        // Exercises the `else { record }` (no-merge) arm of `save_locked`.
+        let dir = scratch("fresh-no-merge");
+        let store = FileSummaryStore::new(dir.clone());
+        let rec = SummaryBuilder::new("fresh")
+            .unwrap()
+            .with_window(&[Message::user("x")])
+            .build()
+            .unwrap();
+        let report = store.save(rec.clone()).unwrap();
+        assert!(!report.overwritten);
+        assert!(rec.history.is_empty(), "a fresh write keeps an empty history");
     }
 }

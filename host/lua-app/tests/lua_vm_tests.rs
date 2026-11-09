@@ -56,6 +56,32 @@ fn flash_read_out_of_range_is_an_error() {
     assert!(matches!(err, LuaHostError::Lua(_)));
 }
 
+/// A script-supplied read length must be bounded before the backend allocates
+/// a buffer of that size. `mlua`'s `usize` conversion rejects a negative
+/// integer, but the largest positive one (`i64::MAX`) reached `vec![0u8; len]`
+/// unchanged — an unrepresentable allocation that aborts the host instead of
+/// returning an error.
+#[test]
+fn out_of_range_read_length_is_an_error() {
+    let (vm, _) = new_vm();
+    for script in [
+        "hardware.flash_read(0x100, 9223372036854775807)",
+        "hardware.i2c_read(0x48, 0x10, 9223372036854775807)",
+        // `i2c_transfer`'s receive length takes the same allocation path and
+        // used to be the one read length left unchecked.
+        "hardware.i2c_transfer(0x48, 0x10, '', 9223372036854775807)",
+    ] {
+        let err = vm
+            .run_script(script)
+            .expect_err("an out-of-range read length must be an error");
+        assert!(matches!(err, LuaHostError::Lua(_)), "{script}: {err:?}");
+    }
+
+    // In-range reads still work (the bound must not break normal use).
+    vm.run_script("hardware.flash_read(0x100, 4096)").unwrap();
+    vm.run_script("hardware.i2c_read(0x48, 0x10, 256)").unwrap();
+}
+
 #[test]
 fn agent_reason_returns_nonempty_answer() {
     let (vm, _) = new_vm();
@@ -64,6 +90,53 @@ fn agent_reason_returns_nonempty_answer() {
          assert(type(a) == 'string'); \
          assert(#a > 0, 'answer should be non-empty')",
     )
+    .unwrap();
+}
+
+/// Flash can only clear bits. Rewriting a non-erased address used to return
+/// success while leaving `HELLO`/`WORLD` bit-ANDed together.
+#[test]
+fn rewriting_flash_without_an_erase_is_an_error() {
+    let (vm, _) = new_vm();
+    vm.run_script("hardware.flash_write(0x300, 'HELLO')").unwrap();
+    let err = vm
+        .run_script("hardware.flash_write(0x300, 'WORLD')")
+        .expect_err("non-erased flash must reject a bit-setting write");
+    assert!(matches!(err, LuaHostError::Lua(_)), "{err:?}");
+    // After erasing the sector the same write succeeds.
+    vm.run_script("hardware.flash_erase_sector(0x300)").unwrap();
+    vm.run_script("hardware.flash_write(0x300, 'WORLD')").unwrap();
+}
+
+/// Both engines must expose the same `hardware.*` surface:
+/// `flash_erase_sector` (previously piccolo-only) and `i2c_transfer`
+/// (previously mlua-only).
+#[test]
+fn erase_and_transfer_bindings_are_exposed() {
+    let (vm, _) = new_vm();
+    vm.run_script(
+        "hardware.flash_write(0x200, 'AB') \
+         hardware.flash_erase_sector(0x200) \
+         hardware.i2c_write(0x48, 0x02, 'CD') \
+         local o = hardware.i2c_transfer(0x48, 0x02, '', 2) \
+         assert(o == 'CD', tostring(o))",
+    )
+    .unwrap();
+}
+
+#[test]
+fn agent_reason_accepts_text_at_the_documented_limit() {
+    // The cap is on the *joined* task, which includes one separator space.
+    // A request that fills the cap exactly must reach the agent rather than
+    // being rejected later with an opaque TooLong error.
+    let (vm, _) = new_vm();
+    let total = magent_lua::hardware::MAX_REASON_LEN;
+    let left = total / 2;
+    let right = total - left - 1; // + 1 separator == total
+    vm.run_script(&format!(
+        "local a = agent.reason(string.rep('a', {left}), string.rep('b', {right})) \
+         assert(type(a) == 'string')"
+    ))
     .unwrap();
 }
 
@@ -139,10 +212,47 @@ fn sandbox_blocks_io_library() {
     assert!(matches!(err, LuaHostError::Lua(_)));
 }
 
+/// The Lua *base* library cannot be disabled via `StdLib` and defines
+/// `load` / `loadfile` / `dofile`. The first two are a filesystem-read and
+/// code-execution path that bypasses the absent `io`/`os` libs, and `load`
+/// accepts binary chunks by default — re-opening the malicious-bytecode path
+/// that `ChunkMode::Text` closes for the outer chunk. All three must be gone.
+#[test]
+fn sandbox_blocks_runtime_chunk_loaders() {
+    let (vm, _) = new_vm();
+    for name in ["load", "loadfile", "dofile"] {
+        vm.run_script(&format!("assert({name} == nil, '{name} is present')"))
+            .unwrap_or_else(|e| panic!("{name} must be removed from the sandbox: {e}"));
+    }
+    // And they cannot execute code.
+    let err = vm.run_script("return load('return 1')").unwrap_err();
+    assert!(matches!(err, LuaHostError::Lua(_)));
+}
+
 #[test]
 fn infinite_loop_hits_instruction_budget() {
     let (vm, _) = new_vm();
     let err = vm.run_script("while true do end").unwrap_err();
+    assert!(
+        err.to_string().contains("instruction budget"),
+        "unexpected error: {err}"
+    );
+}
+
+/// `pcall` must not be able to swallow the instruction-budget error.
+///
+/// The hook previously debited with `fetch_sub`, which wrapped the counter to
+/// `u64::MAX` once it reached zero: a loop that caught the first budget error
+/// with `pcall` disabled the budget and ran for ~1.8e19 instructions. Even
+/// with a saturating counter, a plain `pcall` would catch every subsequent
+/// trip and keep running, so the sandbox re-raises budget errors from
+/// `pcall`/`xpcall`. This script must terminate with a budget error, not hang.
+#[test]
+fn pcall_cannot_swallow_the_instruction_budget() {
+    let (vm, _) = new_vm();
+    let err = vm
+        .run_script("while true do pcall(function() while true do end end) end")
+        .unwrap_err();
     assert!(
         err.to_string().contains("instruction budget"),
         "unexpected error: {err}"

@@ -155,13 +155,35 @@ impl WearLeveler {
         }
     }
 
-    /// Increment write count
+    /// Increment write count and attribute the write to the sector the
+    /// strategy actually chose.
+    ///
+    /// The old body always recorded against `current_sector`, which the
+    /// static strategy never advanced — every write landed on sector 0 in
+    /// the accounting, so `is_worn_out()` fired after `max_writes` total
+    /// writes even though the physical writes were spread evenly.
     pub fn increment_write_count(&self) {
-        self.write_count.set(self.write_count.get() + 1);
+        let next = self.write_count.get().saturating_add(1);
+        self.write_count.set(next);
+
+        let sector = match self.strategy {
+            WearLevelingStrategy::Static => {
+                ((next.saturating_sub(1)) % self.sector_count) as usize
+            }
+            WearLevelingStrategy::Hybrid if next.is_multiple_of(100) => {
+                ((next.saturating_sub(1)) % self.sector_count) as usize
+            }
+            _ => self.current_sector.get() as usize,
+        };
+        if matches!(self.strategy, WearLevelingStrategy::Static)
+            || (matches!(self.strategy, WearLevelingStrategy::Hybrid)
+                && next.is_multiple_of(100))
+        {
+            self.current_sector.set(sector as u32);
+        }
 
         // Track per-sector writes
         let mut writes = self.sector_writes.get();
-        let sector = self.current_sector.get() as usize;
         if sector < writes.len() {
             writes[sector] += 1;
             self.sector_writes.set(writes);
@@ -360,6 +382,31 @@ mod tests {
         }
     }
 
+    /// Static leveling must attribute each write to the sector it rotates
+    /// to, not to sector 0 — otherwise `is_worn_out()` fires after
+    /// `max_writes` total writes regardless of the spread.
+    #[test]
+    fn static_leveling_does_not_report_wear_out_prematurely() {
+        let mut wl = WearLeveler::new(4, 10);
+        wl.set_strategy(WearLevelingStrategy::Static);
+
+        for _ in 0..40 {
+            wl.increment_write_count();
+        }
+        assert!(!wl.is_worn_out(), "40 writes over 4 sectors is 10 each");
+        let stats = wl.calculate_wear_distribution();
+        assert!(
+            stats.sectors.iter().all(|s| s.write_count == 10),
+            "writes must be evenly distributed: {:?}",
+            stats.sectors
+        );
+
+        for _ in 0..4 {
+            wl.increment_write_count();
+        }
+        assert!(wl.is_worn_out(), "44 writes = 11 per sector > limit");
+    }
+
     #[test]
     fn test_wear_distribution_tracking() {
         let wl = WearLeveler::new(4, 100);
@@ -487,5 +534,48 @@ mod tests {
         assert_eq!(wl.write_count(), 0);
         assert_eq!(wl.current_sector(), 0);
         assert!(!wl.is_worn_out());
+    }
+
+    #[test]
+    fn hybrid_strategy_uses_static_on_the_hundredth_write() {
+        let mut wl = WearLeveler::new(4, 1000);
+        wl.set_strategy(WearLevelingStrategy::Hybrid);
+        // Write count 0 is a multiple of 100 → static branch, which maps the
+        // first write to sector 0.
+        assert_eq!(wl.get_next_sector().unwrap(), 0);
+        // A non-multiple count takes the dynamic branch (no rotation yet).
+        wl.increment_write_count();
+        assert_eq!(wl.get_next_sector().unwrap(), 0);
+        // Exactly 100 → static branch again, non-zero count: (100-1) % 4 = 3.
+        for _ in 1..100 {
+            wl.increment_write_count();
+        }
+        assert_eq!(wl.write_count(), 100);
+        assert_eq!(wl.get_next_sector().unwrap(), 3);
+    }
+
+    #[test]
+    fn wear_level_is_zero_when_no_write_budget_is_configured() {
+        // `max_writes_per_sector == 0` makes the denominator zero; the code
+        // must return 0.0 rather than divide by zero (NaN/inf).
+        let wl = WearLeveler::new(4, 0);
+        assert_eq!(wl.calculate_wear_level(), 0.0);
+    }
+
+    #[test]
+    fn is_sector_worn_is_false_for_an_out_of_range_sector() {
+        let wl = WearLeveler::new(4, 3);
+        // Sector 99 is outside the tracked array → not worn (no panic).
+        assert!(!wl.is_sector_worn(99));
+    }
+
+    #[test]
+    fn default_wear_leveler_matches_with_defaults() {
+        let wl = WearLeveler::default();
+        assert_eq!(wl.sector_count(), 16);
+        assert_eq!(wl.max_writes_per_sector(), 10000);
+        assert_eq!(wl.strategy(), WearLevelingStrategy::Dynamic);
+        // Fresh instance: no sector stands out as most-worn.
+        assert_eq!(wl.get_most_worn_sector(), 0);
     }
 }

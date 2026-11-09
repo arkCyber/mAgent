@@ -260,6 +260,31 @@ impl BindingProof {
         Ok(())
     }
 
+    /// Whether the signed `message` names the same DID / address / chain as
+    /// the proof's public fields.
+    ///
+    /// `BindingClaim::encode` writes one `field:value` per line. A missing
+    /// field (or a malformed message) counts as a mismatch.
+    fn signed_metadata_matches(&self) -> bool {
+        let mut did = None;
+        let mut address = None;
+        let mut chain = None;
+        for line in self.message.lines() {
+            if let Some(v) = line.strip_prefix("did:") {
+                did = Some(v);
+            } else if let Some(v) = line.strip_prefix("address:") {
+                address = Some(v);
+            } else if let Some(v) = line.strip_prefix("chainId:") {
+                chain = Some(v);
+            }
+        }
+        let expected_address = self.address.to_hex();
+        let expected_chain = self.chain_id.to_string();
+        did == Some(self.did.as_str())
+            && address.is_some_and(|a| a.eq_ignore_ascii_case(&expected_address))
+            && chain == Some(expected_chain.as_str())
+    }
+
     /// Cryptographically verify the proof: recover the secp256k1
     /// public key from the signature over `self.message` (using the
     /// Ethereum personal-sign / EIP-191 prefix) and confirm it
@@ -287,6 +312,15 @@ impl BindingProof {
             }
             Err(e) => return Err(e),
         };
+
+        // The signature covers `message` (the canonical `BindingClaim`
+        // encoding), but the proof's own `did` / `address` / `chain_id`
+        // fields are what callers read. Without re-binding them, swapping
+        // `did` for another DID (or `chain_id` for another chain) left the
+        // signature valid and `verify()` returned true.
+        if !self.signed_metadata_matches() {
+            return Ok(false);
+        }
 
         // EIP-191 personal_sign prefix. Matches the layout used by
         // `TransactionSigner::sign_personal_message` exactly:
@@ -859,11 +893,25 @@ mod tests {
 
         let keypair = Secp256k1Keypair::generate_test();
         let addr = *keypair.address();
-        let msg = "I am the owner of this address";
-        let sig =
-            TransactionSigner::sign_personal_message(keypair.secret_key(), msg.as_bytes()).unwrap();
+        // The signed message must be the canonical claim encoding: the
+        // verifier re-binds the proof's DID/address/chain fields to it.
+        let claim = BindingClaim::new("did:key:z6Mktest", addr, 1, 3600);
+        let msg = claim.encode();
+        let sig = TransactionSigner::sign_personal_message(keypair.secret_key(), &msg).unwrap();
+        let message = String::from_utf8(msg).expect("claim encoding is ASCII");
 
-        let proof = BindingProof::new("did:key:z6Mktest", addr, 1, sig.to_hex(), msg);
+        let proof = BindingProof::new("did:key:z6Mktest", addr, 1, sig.to_hex(), message.clone());
         assert!(proof.verify_crypto().unwrap());
+
+        // Replacing the public `did` field while keeping the (valid)
+        // signature must fail: the DID is inside the signed claim.
+        let swapped = BindingProof::new(
+            "did:key:z6MkAttacker",
+            addr,
+            1,
+            sig.to_hex(),
+            message,
+        );
+        assert!(!swapped.verify_crypto().unwrap());
     }
 }

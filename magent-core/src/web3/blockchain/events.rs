@@ -144,6 +144,19 @@ impl Event {
         }
         parse_u64_be(&self.data)
     }
+
+    /// Parse data as a boolean (the low byte of the 32-byte slot).
+    ///
+    /// A standard event's data is one ABI-encoded word, so anything shorter
+    /// than 32 bytes is malformed and yields `None` — returning an `Option`
+    /// keeps the "short data" case with its siblings instead of leaving one
+    /// parser to index the raw bytes and panic.
+    pub fn data_as_bool(&self) -> Option<bool> {
+        if self.data.len() < 32 {
+            return None;
+        }
+        Some(self.data[31] != 0)
+    }
 }
 
 /// Parse u256 from big-endian bytes.
@@ -186,13 +199,16 @@ pub const ERC721_TRANSFER_SIGNATURE: &str =
 pub const ERC721_APPROVAL_SIGNATURE: &str =
     "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 
-/// ERC-721 ApprovalForAll event signature.
+/// ERC-721 ApprovalForAll event signature —
+/// `keccak256("ApprovalForAll(address,address,bool)")`.
+///
+/// (The previous value was a fabricated hex string that matched no event.)
 pub const ERC721_APPROVAL_FOR_ALL_SIGNATURE: &str =
-    "0x17307e15039eb7685ead1c26fbd2b2b09b3e4a9f8b0e8f8d4c9a8d7e6f5c4b3";
+    "0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31";
 
-/// DIDRegistry DIDSSet event signature.
-pub const DID_REGISTRY_DID_SET_SIGNATURE: &str =
-    "0x1234567890123456789012345678901234567890123456789012345678901234";
+// NOTE: the DIDRegistry event topic is deliberately not defined here. No
+// registry ABI is part of this repository, and the previous constant was a
+// placeholder hex string that could never match a real log.
 
 // ============================================================================
 // ERC-20 Event Types
@@ -384,11 +400,11 @@ impl Erc721ApprovalForAll {
             Web3ErrorKind::BlockchainError("failed to parse 'operator' address".to_string())
         })?;
 
-        let approved = if !event.data.is_empty() {
-            event.data[31] != 0
-        } else {
-            false
-        };
+        let approved = event.data_as_bool().ok_or_else(|| {
+            Web3ErrorKind::BlockchainError(
+                "ERC-721 ApprovalForAll requires a 32-byte data slot".to_string(),
+            )
+        })?;
 
         Ok(Self {
             event: event.clone(),
@@ -511,7 +527,11 @@ impl core::fmt::Display for BlockParam {
 // ============================================================================
 
 /// Raw event log from RPC.
+///
+/// The node sends camelCase keys; `address` / `topics` are hex strings (handled
+/// by the `Address` / `Hash` serde impls).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EventLog {
     /// Contract address.
     pub address: Address,
@@ -994,6 +1014,48 @@ mod tests {
             0,
         );
         assert_eq!(event.data_as_u64(), Some(7));
+    }
+
+    /// The `approved` flag lives in the low byte of the event's single
+    /// ABI-encoded data word. The parser indexed `event.data[31]` behind only
+    /// an `is_empty()` guard, so a 1–31 byte payload panicked the whole process
+    /// — inside a `Result`-returning function, where the caller expects an
+    /// error it can handle.
+    #[test]
+    fn erc721_approval_for_all_rejects_short_data_instead_of_panicking() {
+        let decode = |data: Vec<u8>| {
+            let event = Event::new(
+                Hash::zero(),
+                Address::ZERO,
+                vec![Hash::zero(); 3],
+                data,
+                0,
+                Hash::zero(),
+                Hash::zero(),
+                0,
+            );
+            Erc721ApprovalForAll::from_event(&event)
+        };
+
+        // Every length that has bytes but not a full word used to panic.
+        for len in 1..32usize {
+            let err = decode(vec![0xffu8; len])
+                .expect_err("short data must be a parse error, not a panic");
+            assert!(
+                format!("{err:?}").contains("32-byte data slot"),
+                "len {len}: {err:?}"
+            );
+        }
+        // Empty data was silently coerced to `false`; it is just as malformed.
+        assert!(decode(vec![]).is_err());
+
+        // A full word still decodes, in both directions.
+        let mut yes = vec![0u8; 32];
+        yes[31] = 1;
+        assert!(decode(yes).unwrap().approved);
+        let mut no = vec![0xffu8; 32];
+        no[31] = 0;
+        assert!(!decode(no).unwrap().approved);
     }
 
     #[test]

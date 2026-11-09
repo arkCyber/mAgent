@@ -48,7 +48,13 @@ impl HeartRateZone {
 
     /// Calculate zone from heart rate and age
     pub fn from_hr_and_age(hr: u16, age: u8) -> Self {
-        let max_hr = 220 - age as u16;
+        // Saturating subtraction: when age > 220 the max heart rate
+        // formula is undefined — clamp to 0 so the percentage is
+        // always 100 % of 0 → Danger zone (safest default).
+        let max_hr = 220u16.saturating_sub(age as u16);
+        if max_hr == 0 {
+            return HeartRateZone::Danger;
+        }
         let percentage = (hr as f32 / max_hr as f32) * 100.0;
 
         if percentage < 50.0 {
@@ -366,7 +372,7 @@ impl UserProfile {
     // for the public error contract.
     #[allow(clippy::unnecessary_fallible_conversions)]
     pub fn new(age: u8, emergency_contact: &str, emergency_phone: &str) -> Result<Self> {
-        let max_hr = 220 - age as u16;
+        let max_hr = 220u16.saturating_sub(age as u16);
         Ok(Self {
             age,
             resting_hr: 60,
@@ -387,9 +393,15 @@ impl UserProfile {
         })
     }
 
-    /// Calculate heart rate reserve (HRR)
+    /// Calculate heart rate reserve (HRR).
+    ///
+    /// Saturating: `UserProfile::new(250, …)` yields `max_hr == 0` while the
+    /// default resting rate is 60, so the old plain subtraction panicked in
+    /// debug and wrapped to ~65476 in release (producing nonsense target
+    /// zones). `resting_hr` is a public field and can be set past `max_hr`
+    /// anyway.
     pub fn heart_rate_reserve(&self) -> u16 {
-        self.max_hr - self.resting_hr
+        self.max_hr.saturating_sub(self.resting_hr)
     }
 
     /// Calculate target heart rate for a given zone
@@ -540,7 +552,7 @@ impl HealthSensorManager {
     /// Check if heart rate is elevated (for exercise detection)
     pub fn is_exercising(&self) -> bool {
         if let Some(hr) = self.latest_heart_rate() {
-            hr.hr > self.profile.resting_hr + 30
+            hr.hr > self.profile.resting_hr.saturating_add(30)
         } else {
             false
         }
@@ -754,6 +766,23 @@ mod tests {
         assert!(UserProfile::new(30, "A", &long_contact).is_err());
     }
 
+    /// `age > 220` makes `max_hr == 0`, below the default resting rate.
+    /// The reserve and the exercise threshold must saturate, not panic
+    /// (debug) or wrap (release).
+    #[test]
+    fn heart_rate_reserve_saturates_on_an_impossible_profile() {
+        let p = UserProfile::new(250, "A", "120").unwrap();
+        assert_eq!(p.max_hr, 0);
+        assert_eq!(p.heart_rate_reserve(), 0);
+        // Multiplying a zero reserve must stay in the resting band.
+        let (lo, hi) = p.target_hr(HeartRateZone::Cardio);
+        assert_eq!(lo, hi);
+
+        let mut manager = HealthSensorManager::new();
+        manager.profile = p;
+        assert!(!manager.is_exercising());
+    }
+
     #[test]
     fn target_hr_covers_all_zones() {
         let p = UserProfile::default(); // rest 60, max 190, hrr 130
@@ -817,5 +846,62 @@ mod tests {
             m.latest_heart_rate().unwrap().timestamp,
             MAX_HEALTH_HISTORY as u32 + 4
         );
+    }
+}
+
+/// The `std`-only simulation helpers back the CLI's `--sim`/demo paths and the
+/// `read_sensor` fallbacks. They're feature-gated, so they need their own
+/// `#[cfg(all(test, feature = "std"))]` module to be compiled at all.
+#[cfg(all(test, feature = "std"))]
+mod std_sim_tests {
+    use super::*;
+
+    #[test]
+    fn simulate_heart_rate_exercising_outranks_resting() {
+        let resting = HealthSensorManager::simulate_heart_rate(false, 0);
+        let active = HealthSensorManager::simulate_heart_rate(true, 0);
+        assert!(active.hr > resting.hr, "exercise must raise the simulated HR");
+        // The value is always clamped into the physical 50..=200 band.
+        for m in [0u32, 60, 600, 3600] {
+            let hr = HealthSensorManager::simulate_heart_rate(true, m).hr;
+            assert!((50..=200).contains(&hr), "hr {hr} out of band");
+        }
+        // The timestamp is the elapsed-minutes converted to milliseconds.
+        assert_eq!(HealthSensorManager::simulate_heart_rate(false, 3).timestamp, 180_000);
+    }
+
+    #[test]
+    fn simulate_glucose_rises_with_time_since_meal() {
+        let soon = HealthSensorManager::simulate_glucose(1.0);
+        let later = HealthSensorManager::simulate_glucose(3.0);
+        let much_later = HealthSensorManager::simulate_glucose(8.0);
+        // The trend flips from rising to falling as the meal is digested.
+        assert_eq!(soon.trend, 1, "within 2h the trend is up");
+        assert_eq!(later.trend, 0, "2..4h the trend is flat");
+        assert_eq!(much_later.trend, -1, "past 4h the trend is down");
+        assert!(much_later.glucose > soon.glucose, "still elevated later");
+    }
+
+    #[test]
+    fn simulate_ecg_flags_irregular_rhythm() {
+        let normal = HealthSensorManager::simulate_ecg(false);
+        assert_eq!(normal.rhythm, HeartRhythm::Normal);
+        let irregular = HealthSensorManager::simulate_ecg(true);
+        assert_eq!(irregular.rhythm, HeartRhythm::Irregular);
+        assert!(irregular.is_quality_acceptable(), "simulated ECG is clean");
+    }
+
+    #[test]
+    fn set_profile_and_history_accessors() {
+        let mut m = HealthSensorManager::new();
+        let profile = UserProfile::new(40, "Alice", "123").unwrap();
+        m.set_profile(profile);
+        assert_eq!(m.profile().age, 40);
+
+        m.add_glucose(GlucoseData::new(95.0, 0, 1)).unwrap();
+        m.add_ecg(EcgData::new(72, HeartRhythm::Normal, 833.0, 90, 1))
+            .unwrap();
+        assert_eq!(m.glucose_history().len(), 1);
+        assert_eq!(m.ecg_history().len(), 1);
     }
 }

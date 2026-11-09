@@ -201,12 +201,23 @@ impl Default for TtsConfig {
 impl TtsConfig {
     /// Set speech rate
     pub fn set_speech_rate(&mut self, rate: f32) {
-        self.speech_rate = rate.clamp(0.5, 2.0);
+        // NaN would propagate silently through clamp (NaN.clamp returns NaN).
+        // Treat NaN as the default rate (1.0) so a sensor/LLM that sends NaN
+        // doesn't leave the TTS config in an undefined state.
+        if rate.is_nan() {
+            self.speech_rate = 1.0;
+        } else {
+            self.speech_rate = rate.clamp(0.5, 2.0);
+        }
     }
 
     /// Set volume
     pub fn set_volume(&mut self, volume: f32) {
-        self.volume = volume.clamp(0.0, 1.0);
+        if volume.is_nan() {
+            self.volume = 0.8;
+        } else {
+            self.volume = volume.clamp(0.0, 1.0);
+        }
     }
 
     /// Get volume as percentage
@@ -987,5 +998,95 @@ mod tests {
         // Long messages are truncated to the bounded buffer, never panic.
         let long = EmergencyAlert::new(&"x".repeat(1000), false, false, 1);
         assert!(!long.sms_body().is_empty());
+    }
+
+    #[test]
+    fn channel_toggles_and_tts_config_round_trip() {
+        let mut mgr = VoiceNotificationManager::default();
+        // `default()` must equal `new()`.
+        assert!(mgr.is_voice_enabled());
+        assert!(!mgr.is_speaking());
+
+        mgr.set_vibration_enabled(false);
+        mgr.set_led_enabled(false);
+        mgr.set_screen_enabled(false);
+        // The toggles are observable only through behaviour, so assert the
+        // state that gates it: a disabled-voice manager still reports the flag.
+        mgr.set_voice_enabled(false);
+        assert!(!mgr.is_voice_enabled());
+
+        let mut cfg = TtsConfig::default();
+        cfg.set_speech_rate(1.5);
+        mgr.set_tts_config(cfg);
+        assert_eq!(mgr.tts_config().speech_rate, 1.5);
+    }
+
+    #[test]
+    fn clear_helpers_empty_the_queues() {
+        let mut mgr = VoiceNotificationManager::new();
+        assert!(mgr.send_coaching("breathe in", true, 0).is_ok());
+        assert!(mgr.send_encouragement("keep going", 0).is_ok());
+        assert!(mgr.send_health_alert("hr", 5, "high", "rest", 0).is_ok());
+        assert!(mgr.voice_queue_size() > 0);
+        assert!(!mgr.notification_history().is_empty());
+
+        mgr.clear_voice_queue();
+        mgr.clear_notifications();
+        assert_eq!(mgr.voice_queue_size(), 0);
+        assert!(mgr.notification_history().is_empty());
+    }
+
+    #[test]
+    fn coaching_routes_breathing_and_coaching_categories() {
+        let mut mgr = VoiceNotificationManager::new();
+        mgr.send_coaching("inhale", true, 0).unwrap();
+        mgr.send_coaching("faster", false, 0).unwrap();
+        let cats: Vec<VoiceCategory, 8> = mgr.pending_voices().iter().map(|m| m.category).collect();
+        assert!(cats.contains(&VoiceCategory::Breathing));
+        assert!(cats.contains(&VoiceCategory::Coaching));
+        // Breathing outranks plain coaching.
+        assert_eq!(mgr.pending_voices()[0].category, VoiceCategory::Breathing);
+    }
+
+    /// When the bounded queue is full and a new message outranks at least one
+    /// queued message, the insert-at-position fails and the lowest-priority
+    /// entry is evicted to make room — the new message must still land.
+    #[test]
+    fn a_full_queue_evicts_the_lowest_priority_for_a_newcomer() {
+        let mut mgr = VoiceNotificationManager::new();
+        // 31 high-priority entries then 1 low, so the queue is exactly full and
+        // the low entry sits last.
+        for _ in 0..(MAX_VOICE_QUEUE - 1) {
+            mgr.queue_voice("hi", 10, VoiceCategory::Alert, 0).unwrap();
+        }
+        mgr.queue_voice("low", 1, VoiceCategory::System, 0).unwrap();
+        assert_eq!(mgr.voice_queue_size(), MAX_VOICE_QUEUE);
+
+        // A mid-priority newcomer: position() finds the priority-1 tail, the
+        // insert overflows, the tail is popped, and the newcomer is placed.
+        mgr.queue_voice("mid", 5, VoiceCategory::Coaching, 0).unwrap();
+        assert_eq!(mgr.voice_queue_size(), MAX_VOICE_QUEUE);
+        assert!(
+            mgr.pending_voices().iter().any(|m| m.text.as_str() == "mid"),
+            "the newcomer must be queued after evicting the lowest-priority entry",
+        );
+        assert!(
+            !mgr.pending_voices().iter().any(|m| m.text.as_str() == "low"),
+            "the lowest-priority entry is the one evicted",
+        );
+    }
+
+    #[test]
+    fn default_manager_is_indistinguishable_from_new() {
+        // `Default::default()` delegates to `new()`; both must start with an
+        // empty queue and no history.
+        let d = VoiceNotificationManager::default();
+        let n = VoiceNotificationManager::new();
+        assert_eq!(d.voice_queue_size(), n.voice_queue_size());
+        assert_eq!(
+            d.notification_history().len(),
+            n.notification_history().len()
+        );
+        assert_eq!(d.is_voice_enabled(), n.is_voice_enabled());
     }
 }

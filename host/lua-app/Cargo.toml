@@ -56,6 +56,21 @@ futures = { version = "0.3", default-features = false, features = ["executor"] }
 [lints]
 workspace = true
 
+# The `mlua`-engine examples need the default feature; `--all-targets` on the
+# firmware's exact combo (`--no-default-features --features piccolo`) must not
+# build them (their imports/body are mlua-gated, leaving unused imports).
+[[example]]
+name = "demo"
+required-features = ["mlua"]
+
+[[example]]
+name = "apps"
+required-features = ["mlua"]
+
+[[example]]
+name = "event_loop"
+required-features = ["mlua"]
+
 [features]
 # Default engine: `mlua` (real Lua 5.4, C vendored). Disable with
 # `--no-default-features` to drop `mlua` entirely.
@@ -65,5 +80,9 @@ mlua = ["dep:mlua"]
 # (no C), so the ESP32-S3 firmware `lua` feature should build with
 # `--no-default-features --features piccolo`.
 piccolo = ["dep:piccolo"]
+# 8 MB octal-PSRAM profile (ESP32-S3-WROOM-1-N8R8): raises the Piccolo arena
+# cap from 512 KiB to 2 MiB. The quad-PSRAM dev board (2 MB total) keeps the
+# default. Forwarded by the firmware's `s3-8mb-psram` feature.
+s3-8mb-psram = ["magent-core/s3-8mb-psram"]
 
 [dev-dependencies]

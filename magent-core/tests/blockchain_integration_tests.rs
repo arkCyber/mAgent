@@ -47,7 +47,7 @@ fn integration_full_legacy_tx_sign_and_recover() {
     .expect("sign_hash must succeed");
     let recovered = magent_core::web3::blockchain::Secp256k1PublicKey::recover_from(
         signed.hash.as_bytes(),
-        &sig.as_bytes(),
+        sig.as_bytes(),
     )
     .expect("recover_from must not fail for a self-signed tx");
 
@@ -238,7 +238,7 @@ fn integration_ed25519_sign_and_verify_round_trip() {
     let payload = b"integration test payload";
     let signed = identity.sign(payload).expect("Ed25519 sign");
     assert!(
-        magent_core::web3::verify_signature(&identity.public_key(), &signed.signature_hex, payload),
+        magent_core::web3::verify_signature(identity.public_key(), &signed.signature_hex, payload),
         "signature must verify"
     );
 }

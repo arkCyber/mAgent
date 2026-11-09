@@ -12,7 +12,7 @@
 
 use magent_core::communication::link::IngressSource;
 use magent_core::communication::mqtt::MqttAdapter;
-use magent_core::ingress::{IngressGateway, IngressMode, MAX_ADAPTERS};
+use magent_core::ingress::{IngressGateway, IngressMode, MAX_ADAPTERS, MAX_PAYLOAD};
 use magent_core::web3::{verify_signed_message, Identity};
 
 /// Pull bytes out of a `heapless::Vec<u8, N>` for assertion convenience.
@@ -156,6 +156,12 @@ struct ChainedAdapter {
     /// When `true`, `send` always returns `Err`. Used to exercise the
     /// gateway's `AdapterSendFailed` path.
     send_fail: bool,
+    /// When `Some(n)`, the next `poll` reports `n` bytes read *without*
+    /// having written them — an adapter violating the `LinkAdapter`
+    /// contract, the shape a HAL produces when it narrows a `-1` C
+    /// return into `usize::MAX`. Used to prove the gateway discards the
+    /// frame instead of slicing out of range.
+    overreport: Option<usize>,
 }
 
 impl ChainedAdapter {
@@ -165,6 +171,7 @@ impl ChainedAdapter {
             connected,
             fail_once: false,
             send_fail: false,
+            overreport: None,
         }
     }
     fn push(&mut self, frame: &[u8]) {
@@ -178,6 +185,9 @@ impl magent_core::communication::link::LinkAdapter for ChainedAdapter {
     type Error = magent_core::communication::mqtt::MqttError;
 
     fn poll(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if let Some(n) = self.overreport.take() {
+            return Ok(n);
+        }
         if self.fail_once {
             self.fail_once = false;
             // Return a WouldBlock-shaped error path: the gateway must
@@ -272,6 +282,41 @@ fn failing_adapter_is_isolated() {
 
     let frame = gw.ingest().unwrap().expect("frame");
     assert_eq!(vec_to_slice(&frame.payload), b"recovered");
+}
+
+#[test]
+fn overreported_frame_is_discarded_not_panicked() {
+    // A HAL that narrows a negative C return into `usize::MAX` makes
+    // `poll` report a count larger than the buffer. The gateway must
+    // discard that frame (nothing was written) and carry on to the next
+    // adapter — never slice `&buf[..n]` and take the thread down.
+    let mut gw: IngressGateway<ChainedAdapter> = IngressGateway::new(IngressMode::Transparent);
+
+    let mut rogue = ChainedAdapter::new(true);
+    rogue.overreport = Some(usize::MAX);
+    let mut good = ChainedAdapter::new(true);
+    good.push(b"after-rogue");
+
+    gw.register(rogue).unwrap();
+    gw.register(good).unwrap();
+
+    let frame = gw
+        .ingest()
+        .unwrap()
+        .expect("frame from the healthy adapter");
+    assert_eq!(vec_to_slice(&frame.payload), b"after-rogue");
+}
+
+#[test]
+fn overreported_count_alone_yields_no_frame() {
+    // Same violation with no healthy adapter behind it: the round is a
+    // clean `Ok(None)`, not a panic.
+    let mut gw: IngressGateway<ChainedAdapter> = IngressGateway::new(IngressMode::Transparent);
+    let mut rogue = ChainedAdapter::new(true);
+    rogue.overreport = Some(MAX_PAYLOAD + 1);
+    gw.register(rogue).unwrap();
+
+    assert!(gw.ingest().unwrap().is_none());
 }
 
 #[test]

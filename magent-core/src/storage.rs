@@ -266,6 +266,11 @@ where
         // the answer is simply "key absent". `set` and `collect_live` already
         // bound themselves with `capacity`; this now matches them.
         let capacity = self.storage.capacity() as u32;
+        // `set` appends; it never rewrites an existing key. Lookup therefore
+        // returns the *last* matching entry (the newest write), not the first
+        // — otherwise `set("k","new")` after `set("k","old")` stored the new
+        // value but `get("k")` kept answering "old" forever.
+        let mut found: Option<Vec<u8, 256>> = None;
 
         while offset < capacity {
             // HARDENING (audit-2026-08 H1): previously a flash read
@@ -330,13 +335,13 @@ where
                         }
                     })?;
                 }
-                return Ok(Some(result));
+                found = Some(result);
             }
 
             offset += entry_size as u32;
         }
 
-        Ok(None)
+        Ok(found)
     }
 
     /// Set a value by key
@@ -542,10 +547,52 @@ where
         let live = self.collect_live(skip_key)?;
         self.erase_all()?;
         let mut offset = 0u32;
+        let mut written = 0usize;
+        let mut failed = None;
         for (k, v) in &live {
-            offset = self.write_entry_at(offset, k, v)?;
+            match self.write_entry_at(offset, k, v) {
+                Ok(next) => {
+                    offset = next;
+                    written += 1;
+                }
+                Err(e) => {
+                    // The store is now partially rewritten. `live` is still in
+                    // RAM, so a transient flash fault can be recovered by
+                    // erasing and redoing the whole pass once (option (a) in
+                    // the BACKLOG entry). A second failure is reported *after*
+                    // logging that the store may be incomplete — the returned
+                    // `StorageWriteFailed` alone would not say that.
+                    failed = Some(e);
+                    break;
+                }
+            }
         }
-        Ok(live.len())
+        if let Some(first) = failed {
+            log::warn!("[storage] compaction write failed ({first:?}); erasing and redoing the pass once");
+            self.erase_all()?;
+            offset = 0;
+            written = 0;
+            for (k, v) in &live {
+                match self.write_entry_at(offset, k, v) {
+                    Ok(next) => {
+                        offset = next;
+                        written += 1;
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "[storage] compaction failed after retry: {e:?}; \
+                             the store may be incomplete ({}/{} entries rewritten)",
+                            written,
+                            live.len()
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        // `written == live.len()` on both success paths; returning the
+        // counter also keeps the retry accounting honest.
+        Ok(written)
     }
 
     /// Delete a key
@@ -721,6 +768,8 @@ mod tests {
     struct MockFlash {
         data: Vec<u8>,
         fail_from: Option<u32>,
+        /// Address whose *next* write fails, then clears (transient fault).
+        fail_once_at: Option<u32>,
     }
 
     impl MockFlash {
@@ -728,11 +777,17 @@ mod tests {
             Self {
                 data: vec![0xFFu8; capacity],
                 fail_from: None,
+                fail_once_at: None,
             }
         }
 
         fn fail_from(&mut self, addr: u32) {
             self.fail_from = Some(addr);
+        }
+
+        /// Fail exactly one write at `addr`; later writes/erases succeed.
+        fn fail_next_write_at(&mut self, addr: u32) {
+            self.fail_once_at = Some(addr);
         }
 
         fn should_fail(&self, addr: u32) -> bool {
@@ -798,6 +853,10 @@ mod tests {
         const ERASE_SIZE: usize = 4096;
 
         fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+            if self.fail_once_at == Some(address) {
+                self.fail_once_at = None;
+                return Err(MockErr);
+            }
             if self.should_fail(address) {
                 return Err(MockErr);
             }
@@ -845,6 +904,234 @@ mod tests {
         let flash = MockFlash::new(4096);
         let storage = FlashStorage::new(flash);
         KvStore::new(storage, 0)
+    }
+
+    /// A flash view whose `WRITE_SIZE` is 4. `MockFlash` reports a
+    /// `WRITE_SIZE` of 1, so `is_multiple_of(page_size)` is always true and
+    /// the page-alignment guards in `FlashStorage::{read, write}` are
+    /// unreachable through it. This wrapper delegates to the same backing
+    /// store but advertises a 4-byte program unit, exactly like the real
+    /// NOR parts, so those guards can be exercised.
+    struct AlignedFlash(MockFlash);
+
+    impl embedded_storage::nor_flash::ErrorType for AlignedFlash {
+        type Error = MockErr;
+    }
+
+    impl embedded_storage::nor_flash::ReadNorFlash for AlignedFlash {
+        const READ_SIZE: usize = 1;
+
+        fn read(&mut self, address: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
+            <MockFlash as embedded_storage::nor_flash::ReadNorFlash>::read(&mut self.0, address, buf)
+        }
+
+        fn capacity(&self) -> usize {
+            <MockFlash as embedded_storage::nor_flash::ReadNorFlash>::capacity(&self.0)
+        }
+    }
+
+    impl embedded_storage::nor_flash::NorFlash for AlignedFlash {
+        const WRITE_SIZE: usize = 4;
+        const ERASE_SIZE: usize = 4096;
+
+        fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+            <MockFlash as embedded_storage::nor_flash::NorFlash>::write(&mut self.0, address, data)
+        }
+
+        fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+            <MockFlash as embedded_storage::nor_flash::NorFlash>::erase(&mut self.0, from, to)
+        }
+    }
+
+    fn aligned_storage() -> FlashStorage<AlignedFlash> {
+        FlashStorage::new(AlignedFlash(MockFlash::new(4096)))
+    }
+
+    #[test]
+    fn flash_storage_rejects_a_misaligned_read() {
+        let mut storage = aligned_storage();
+        let mut buf = [0u8; 4];
+        // offset 3 is not a multiple of the 4-byte write/page size.
+        match storage.read(3, &mut buf) {
+            Err(AgentError::StorageReadFailed {
+                address: 3,
+                reason: StorageError::BadAddress,
+            }) => {}
+            other => panic!("expected StorageReadFailed@3/BadAddress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flash_storage_rejects_a_misaligned_write() {
+        let mut storage = aligned_storage();
+        match storage.write(2, &[0u8; 4]) {
+            Err(AgentError::StorageWriteFailed {
+                address: 2,
+                reason: StorageError::BadAddress,
+            }) => {}
+            other => panic!("expected StorageWriteFailed@2/BadAddress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flash_storage_rejects_a_write_of_the_wrong_size() {
+        let mut storage = aligned_storage();
+        // Aligned offset, but 3 bytes is not a whole number of pages.
+        match storage.write(0, &[0u8; 3]) {
+            Err(AgentError::StorageWriteFailed {
+                address: 0,
+                reason: StorageError::BadAddress,
+            }) => {}
+            other => panic!("expected StorageWriteFailed@0/BadAddress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flash_storage_surfaces_a_program_fault() {
+        let mut storage = aligned_storage();
+        storage.flash.0.fail_from(0);
+        match storage.write(0, &[0u8; 4]) {
+            Err(AgentError::StorageWriteFailed {
+                address: 0,
+                reason: StorageError::WriteProtected,
+            }) => {}
+            other => panic!("expected StorageWriteFailed/WriteProtected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flash_storage_surfaces_an_erase_fault() {
+        let mut storage = aligned_storage();
+        storage.flash.0.fail_from(0);
+        match storage.erase(0) {
+            Err(AgentError::StorageWriteFailed {
+                reason: StorageError::EraseError,
+                ..
+            }) => {}
+            other => panic!("expected StorageWriteFailed/EraseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flash_storage_reports_its_geometry() {
+        let storage = aligned_storage();
+        assert_eq!(storage.page_size(), 4);
+        assert_eq!(storage.sector_size(), 4096);
+        assert_eq!(storage.capacity(), 4096);
+    }
+
+    #[test]
+    fn parse_kv_header_rejects_a_short_buffer() {
+        // Anything shorter than the maximal header cannot hold value_len.
+        assert!(parse_kv_header(&[]).is_none());
+        assert!(parse_kv_header(&[1, b'k']).is_none());
+        assert!(parse_kv_header(&[0u8; KV_HEADER_MAX - 1]).is_none());
+    }
+
+    #[test]
+    fn get_reports_corruption_when_the_crc_does_not_match() {
+        let mut kv = empty_kv();
+        kv.set("k", b"v").unwrap();
+        // entry = [key_len=1]['k'][val_len=1][0]['v'][crc_lo][crc_hi]; the
+        // value byte sits at 3 + key_len = 4. Flip a bit there so the stored
+        // CRC no longer matches the recomputed one.
+        kv.storage.flash.data[4] ^= 0x01;
+        match kv.get("k") {
+            Err(AgentError::StorageReadFailed {
+                reason: StorageError::CorruptedData,
+                ..
+            }) => {}
+            other => panic!("expected CorruptedData, got {other:?}"),
+        }
+    }
+
+    /// A transient write fault during compaction must not lose the entries
+    /// that were not yet rewritten: the retry pass erases and rewrites the
+    /// whole live set, so both keys survive.
+    #[test]
+    fn compact_recovers_from_a_transient_write_fault() {
+        let mut kv = empty_kv();
+        kv.set("a", b"1").unwrap();
+        kv.set("b", b"2").unwrap();
+
+        // Fail exactly the first write after the first erase; the retry's
+        // erase + writes succeed.
+        kv.storage.flash.fail_next_write_at(0);
+
+        let survivors = kv.garbage_collect().unwrap();
+        assert_eq!(survivors, 2);
+        assert_eq!(kv.get("a").unwrap().unwrap().as_slice(), b"1");
+        assert_eq!(kv.get("b").unwrap().unwrap().as_slice(), b"2");
+    }
+
+    #[test]
+    fn get_stats_counts_a_corrupted_entry() {
+        let mut kv = empty_kv();
+        kv.set("k", b"v").unwrap();
+        kv.storage.flash.data[4] ^= 0x01; // corrupt the value → CRC mismatch
+        let stats = kv.get_stats().unwrap();
+        assert_eq!(stats.total_entries, 1);
+        assert_eq!(stats.valid_entries, 0);
+        assert_eq!(stats.corrupted_entries, 1);
+        assert_eq!(stats.used_space, 0);
+    }
+
+    #[test]
+    fn set_reports_out_of_space_when_the_store_is_full() {
+        let mut kv = empty_kv();
+        // 3 + 1 + 250 + 2 = 256 bytes each ⇒ exactly 16 fill the 4096 region.
+        let value = [0x41u8; 250];
+        for i in 0..16u8 {
+            let key = alloc::format!("{}", (b'a' + i) as char);
+            kv.set(&key, &value).unwrap();
+        }
+        let r = kv.set("z", b"x");
+        assert!(
+            matches!(
+                r,
+                Err(AgentError::StorageWriteFailed {
+                    reason: StorageError::OutOfSpace,
+                    ..
+                })
+            ),
+            "expected OutOfSpace, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn set_stops_on_a_corrupt_header_during_the_slot_scan() {
+        let mut kv = empty_kv();
+        write_corrupt_value_len(&mut kv, 0);
+        let r = kv.set("new", b"v");
+        assert!(
+            matches!(
+                r,
+                Err(AgentError::StorageReadFailed {
+                    reason: StorageError::CorruptedData,
+                    ..
+                })
+            ),
+            "expected CorruptedData, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn delete_accepts_an_empty_key_as_a_no_op() {
+        let mut kv = empty_kv();
+        kv.set("keep", b"v").unwrap();
+        kv.delete("").unwrap();
+        // The unrelated entry is untouched.
+        assert_eq!(&kv.get("keep").unwrap().unwrap()[..], b"v");
+    }
+
+    #[test]
+    fn delete_rejects_a_key_over_32() {
+        let mut kv = empty_kv();
+        let key = "k".repeat(33);
+        assert!(matches!(
+            kv.delete(&key),
+            Err(AgentError::InputValidationFailed { .. })
+        ));
     }
 
     #[test]
@@ -915,6 +1202,17 @@ mod tests {
         let mut kv = empty_kv();
         kv.set("k", b"old").unwrap();
         kv.delete("k").unwrap();
+        kv.set("k", b"new").unwrap();
+        assert_eq!(kv.get("k").unwrap().unwrap(), b"new");
+    }
+
+    /// `set` appends rather than rewriting; lookup must therefore prefer the
+    /// newest entry. The old first-match scan made updates permanently
+    /// invisible (`get` answered the original value forever).
+    #[test]
+    fn setting_an_existing_key_makes_the_new_value_visible() {
+        let mut kv = empty_kv();
+        kv.set("k", b"old").unwrap();
         kv.set("k", b"new").unwrap();
         assert_eq!(kv.get("k").unwrap().unwrap(), b"new");
     }

@@ -495,12 +495,14 @@ impl core::fmt::Display for HttpError {
 // Blocking HTTP Client Implementation
 // ============================================================================
 
-/// Blocking HTTP client for ESP32
+/// Blocking JSON-RPC HTTP client for ESP32.
 ///
-/// This is a placeholder implementation. In production, integrate with:
-/// - `esp_idf_hal::http::client::EspHttpClient`
-/// - `smoltcp` with custom HTTP parser
-/// - `embedded-http` crate
+/// The wire backend is a [`Transport`] (see [`SharedTransport`]); the firmware
+/// installs the real esp-idf implementation of it as the process-wide default
+/// in `main` (`firmware/esp32-app/src/blockchain_transport.rs`) and host tests
+/// use [`MockTransport`]. The client itself owns request serialisation,
+/// response parsing, timeouts and error mapping, so it is not tied to one
+/// socket implementation.
 #[derive(Debug, Clone)]
 pub struct EspHttpClient {
     config: HttpClientConfig,
@@ -541,9 +543,17 @@ impl EspHttpClient {
     }
 
     /// Connect to server
+    /// Mark this client ready for [`Self::rpc`].
+    ///
+    /// [`Transport`] implementations open whatever connection they need **per
+    /// request**, so there is no socket to establish here and no I/O happens.
+    /// This only flips the bookkeeping flag [`Self::is_connected`] reports.
+    /// A transport-level failure still surfaces from the request itself; this
+    /// method never converts "not actually reachable" into a success.
+    ///
+    /// The `Result` return is retained for API compatibility (callers and the
+    /// [`HttpClientTrait`] shape expect it); it is currently always `Ok`.
     pub fn connect(&mut self) -> Result<(), HttpError> {
-        // In production, implement actual TCP/TLS connection
-        // using esp-idf or smoltcp
         self.connected = true;
         Ok(())
     }
@@ -691,6 +701,7 @@ impl HttpClientTrait for EspHttpClient {
 /// our `no_std` build doesn't want to pull in `num-bigint` just to
 /// parse them. Callers must hex-decode each field individually.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransactionReceiptResponse {
     /// Hash of the mined transaction.
     pub transaction_hash: String,
@@ -1073,13 +1084,16 @@ mod tests {
     }
 
     #[test]
-    fn test_esp_http_client_connect() {
+    fn connect_toggles_the_readiness_flag() {
+        // `connect` is bookkeeping (the Transport is per-request), but the
+        // flag it controls must still transition honestly. The old test
+        // asserted `is_ok() || is_err()`, which is a tautology.
         let mut client = EspHttpClient::from_url("https://eth.llamarpc.com");
-        // Connection will fail because it's a placeholder, but we can check the method works
-        // In real implementation, this would actually connect
-        let result = client.connect();
-        // Result depends on implementation status
-        assert!(result.is_ok() || result.is_err());
+        assert!(!client.is_connected());
+        client.connect().expect("bookkeeping connect");
+        assert!(client.is_connected());
+        client.disconnect();
+        assert!(!client.is_connected());
     }
 
     #[test]
@@ -1232,14 +1246,14 @@ mod tests {
     #[test]
     fn test_transaction_receipt_response_deserialization() {
         let json = r#"{
-            "transaction_hash": "0xabc123",
-            "block_number": "0x100",
-            "block_hash": "0xdef456",
-            "transaction_index": "0x0",
+            "transactionHash": "0xabc123",
+            "blockNumber": "0x100",
+            "blockHash": "0xdef456",
+            "transactionIndex": "0x0",
             "from": "0x123",
             "to": "0x456",
-            "cumulative_gas_used": "0x1000",
-            "gas_used": "0x1000",
+            "cumulativeGasUsed": "0x1000",
+            "gasUsed": "0x1000",
             "status": "0x1"
         }"#;
         let receipt: TransactionReceiptResponse = serde_json::from_str(json).unwrap();
@@ -1250,13 +1264,13 @@ mod tests {
     #[test]
     fn test_transaction_receipt_response_optional_to() {
         let json = r#"{
-            "transaction_hash": "0xabc123",
-            "block_number": "0x100",
-            "block_hash": "0xdef456",
-            "transaction_index": "0x0",
+            "transactionHash": "0xabc123",
+            "blockNumber": "0x100",
+            "blockHash": "0xdef456",
+            "transactionIndex": "0x0",
             "from": "0x123",
-            "cumulative_gas_used": "0x1000",
-            "gas_used": "0x1000",
+            "cumulativeGasUsed": "0x1000",
+            "gasUsed": "0x1000",
             "status": "0x1"
         }"#;
         let receipt: TransactionReceiptResponse = serde_json::from_str(json).unwrap();

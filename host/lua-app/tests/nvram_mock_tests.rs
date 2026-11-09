@@ -81,6 +81,77 @@ fn nvram_rejects_empty_key() {
     assert!(nvram::set(&mut hw, "", "v").is_err());
 }
 
+/// The device flash backend keys each exact address to its own NVS blob and
+/// errors for an address that was never written. The store must treat that
+/// as "empty" (not "corrupted"), and must survive a backend that returns
+/// fewer bytes than requested.
+#[test]
+fn nvram_handles_a_keyed_blob_backend_with_normal_loads() {
+    use std::collections::BTreeMap;
+
+    /// Mimics `firmware/esp32-app/src/nvs_flash.rs`.
+    struct KeyedBlobs {
+        blobs: BTreeMap<u32, Vec<u8>>,
+    }
+    impl magent_lua::HardwareBackend for KeyedBlobs {
+        fn gpio_write(&mut self, _: u8, _: u8) -> Result<(), String> {
+            Ok(())
+        }
+        fn gpio_read(&mut self, _: u8) -> Result<u8, String> {
+            Ok(0)
+        }
+        fn sensor_read(&mut self, _: &str) -> Result<f64, String> {
+            Ok(0.0)
+        }
+        fn flash_read(&mut self, address: u32, _len: usize) -> Result<Vec<u8>, String> {
+            match self.blobs.get(&address) {
+                Some(v) => Ok(v.clone()),
+                None => Err("flash_read: key not found".to_string()),
+            }
+        }
+        fn flash_write(&mut self, address: u32, data: &[u8]) -> Result<(), String> {
+            self.blobs.insert(address, data.to_vec());
+            Ok(())
+        }
+        fn flash_erase_sector(&mut self, address: u32) -> Result<(), String> {
+            self.blobs.remove(&address);
+            Ok(())
+        }
+        fn i2c_write(&mut self, _: u8, _: u8, _: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn i2c_read(&mut self, _: u8, _: u8, _: usize) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+        fn adc_read(&mut self, _: u8) -> Result<f64, String> {
+            Ok(0.0)
+        }
+        fn pwm_set(&mut self, _: u8, _: u8) -> Result<(), String> {
+            Ok(())
+        }
+        fn ble_send(&mut self, _: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn power_set(&mut self, _: u8) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let mut hw = KeyedBlobs {
+        blobs: BTreeMap::new(),
+    };
+    // Fresh device: never-written region reads as an empty store.
+    assert_eq!(nvram::get(&mut hw, "mode").unwrap(), None);
+    nvram::set(&mut hw, "mode", "eco").unwrap();
+    assert_eq!(nvram::get(&mut hw, "mode").unwrap().as_deref(), Some("eco"));
+    nvram::set(&mut hw, "threshold", "85").unwrap();
+    assert_eq!(nvram::get(&mut hw, "mode").unwrap().as_deref(), Some("eco"));
+    assert_eq!(
+        nvram::get(&mut hw, "threshold").unwrap().as_deref(),
+        Some("85")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // NVRAM (Lua bindings)
 // ---------------------------------------------------------------------------

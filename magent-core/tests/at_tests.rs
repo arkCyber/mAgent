@@ -165,10 +165,12 @@ fn esp_at_compat_at_cipstamac_query() {
 
 #[test]
 fn all_documented_verbs_parse() {
-    // One representative line per documented verb. The 28 entries must
-    // match docs/AT_COMMAND_REFERENCE.md §3 and `AtOp::name()` exactly;
-    // the count is pinned so adding a verb without updating this test is
-    // caught.
+    // One representative line per documented verb. The entries must match
+    // docs/AT_COMMAND_REFERENCE.md §3 and `AtOp::name()` exactly; the count is
+    // pinned so adding a verb without updating this test is caught. (It had
+    // already drifted to 31 by 2026-11-08 and omitted eight documented verbs,
+    // including OTA, TIME and LUAAPP — the count pinned a stale list rather
+    // than the docs.)
     let cases: &[(&[u8], AtOp)] = &[
         (b"AT", AtOp::Ping),
         (b"ATE0", AtOp::SetEcho { on: false }),
@@ -200,11 +202,19 @@ fn all_documented_verbs_parse() {
         (b"AT+AGENT=\"read the temperature\"", AtOp::Agent),
         (b"AT+WIFIPASSUPGRADE=1", AtOp::WifiPassUpgrade),
         (b"AT+HTTPGET=\"http://example.com/\"", AtOp::HttpGet),
+        (b"AT+OTA=\"https://example.com/fw.bin\"", AtOp::Ota),
         (b"AT+LLMCFG=\"deepseek-chat\",\"sk-abc\"", AtOp::LlmCfg),
+        (b"AT+AGENTCFG=node,20,524288,10,30,1,10,0", AtOp::AgentCfg),
+        (b"AT+FLIGHTCFG=\"kiwi\",\"token\"", AtOp::FlightCfg),
+        (b"AT+TIME?", AtOp::Time),
+        (b"AT+NTPSYNC", AtOp::NtpSync),
+        (b"AT+TIMEZONE=480", AtOp::Timezone),
+        (b"AT+BLE=STATE", AtOp::Ble),
+        (b"AT+LUAAPP=Zm9v", AtOp::LuaApp),
     ];
     assert_eq!(
         cases.len(),
-        31,
+        39,
         "documented verb count drifted; update this table"
     );
     for (line, expected) in cases {
@@ -217,6 +227,48 @@ fn all_documented_verbs_parse() {
             String::from_utf8_lossy(line)
         );
     }
+}
+
+/// The host-testable half of the firmware's `AT+AGENTCFG` path: parse the
+/// wire line, validate it into an `AgentConfig`, persist it through
+/// `ConfigStore`, then read it back. The only part this does not cover is the
+/// ESP-IDF NVS calls themselves (`firmware/esp32-app/src/config_nvs.rs`).
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
+#[test]
+fn agentcfg_at_line_round_trips_through_the_config_store() {
+    use magent_core::config_store::{ConfigStore, MemoryBackend};
+
+    let line = b"AT+AGENTCFG=node-1,20,524288,10,30,1,10,0";
+    let cmd = parse_line(line).expect("the documented form must parse");
+    let config =
+        magent_core::at_validate::validate_agentcfg_set(&cmd).expect("the form must validate");
+
+    let mut store = ConfigStore::new(MemoryBackend::new());
+    store.set_agent_config(&config).expect("store the config");
+    let loaded = store
+        .get_agent_config()
+        .expect("read it back")
+        .expect("an entry was written");
+
+    assert_eq!(loaded.name.as_str(), "node-1");
+    assert_eq!(loaded.max_iterations, 20);
+    assert_eq!(loaded.max_memory, 524_288);
+    assert_eq!(loaded.watchdog_timeout_secs, 10);
+    assert_eq!(loaded.ble_timeout_secs, 30);
+    assert!(loaded.skills_enabled);
+    assert_eq!(loaded.max_skills, 10);
+    assert!(!loaded.debug_enabled);
+
+    // `RESET` is the one-argument sentinel, and must be deleted cleanly.
+    let reset = parse_line(b"AT+AGENTCFG=RESET").expect("RESET parses");
+    assert!(magent_core::at_validate::agentcfg_is_reset(&reset));
+    store.delete_agent_config().expect("reset the store");
+    assert!(store.get_agent_config().expect("read after reset").is_none());
 }
 
 #[test]
@@ -254,7 +306,15 @@ fn every_op_has_a_stable_audit_name() {
         AtOp::Agent,
         AtOp::WifiPassUpgrade,
         AtOp::HttpGet,
+        AtOp::Ota,
         AtOp::LlmCfg,
+        AtOp::AgentCfg,
+        AtOp::FlightCfg,
+        AtOp::Time,
+        AtOp::NtpSync,
+        AtOp::Timezone,
+        AtOp::Ble,
+        AtOp::LuaApp,
     ] {
         assert!(!op.name().is_empty(), "{op:?} must have an audit name");
     }
@@ -325,13 +385,12 @@ fn default_wifi_credentials_env_is_provisioned() {
 #[test]
 fn wifi_credential_provisioning_round_trips_for_default_ap() {
     use heapless::{String as HString, Vec as HVec};
-    use magent_core::wifi_pass_seal;
 
     // Full pipeline for the default AP, exactly as the firmware does it:
     // AT+CWJAP= → parse → validate → seal → (persist to NVS) → open again
-    // at boot. `provision_and_load_wifi_credentials` seals the env-var
-    // default through `seal_and_store_wifi_pass`, which uses DBO1
-    // (`wifi_pass_seal`) — so that is the seal we exercise here.
+    // at boot. The write path is DBO2; the reader still accepts DBO1 and
+    // legacy plaintext. Without the `web3` feature (which supplies HKDF/HMAC)
+    // only the DBO1 fallback exists, so exercise that path instead.
     let cmd = parse_line(b"AT+CWJAP=\"MySSID\",\"password\"").expect("parse");
     let v = validate_cwjap_set(&cmd).expect("validate");
     assert_eq!(v.ssid.as_str(), "MySSID");
@@ -341,15 +400,40 @@ fn wifi_credential_provisioning_round_trips_for_default_ap() {
     // real Ed25519 seed; a fixed 32-byte test key is equivalent here).
     let key = [0x42u8; 32];
     let nonce = [0u8; 12];
-    let mut sealed: HString<{ wifi_pass_seal::MAX_ENCODED_LEN }> = HString::new();
-    wifi_pass_seal::seal_str(v.password.as_str(), &key, &nonce, &mut sealed).expect("seal");
-    assert!(sealed.starts_with("DBO1:"), "sealed form must be DBO1");
 
-    // Open it back at boot and confirm the exact passphrase round-trips.
-    let mut out: HVec<u8, { wifi_pass_seal::MAX_PLAINTEXT }> = HVec::new();
-    let outcome = wifi_pass_seal::open_sealed_bytes(&sealed, &key, &mut out).expect("open");
-    assert!(matches!(outcome, wifi_pass_seal::OpenOutcome::DecodedBytes));
-    assert_eq!(&out[..], b"password");
+    #[cfg(feature = "web3")]
+    {
+        use magent_core::wifi_pass_seal_v2;
+        let mut sealed: HString<{ wifi_pass_seal_v2::MAX_ENCODED_LEN }> = HString::new();
+        wifi_pass_seal_v2::seal_str(v.password.as_str(), &key, &nonce, &mut sealed)
+            .expect("seal");
+        assert!(sealed.starts_with("DBO2:"), "sealed form must be DBO2");
+
+        let mut out: HVec<u8, { wifi_pass_seal_v2::MAX_PLAINTEXT }> = HVec::new();
+        let outcome = wifi_pass_seal_v2::open_sealed_v2(&sealed, &key, &mut out).expect("open");
+        assert!(matches!(
+            outcome,
+            wifi_pass_seal_v2::OpenOutcome::Dbo2Decoded
+        ));
+        assert_eq!(&out[..], b"password");
+    }
+
+    #[cfg(not(feature = "web3"))]
+    {
+        use magent_core::wifi_pass_seal;
+        let mut sealed: HString<{ wifi_pass_seal::MAX_ENCODED_LEN }> = HString::new();
+        wifi_pass_seal::seal_str(v.password.as_str(), &key, &nonce, &mut sealed)
+            .expect("seal");
+        assert!(sealed.starts_with("DBO1:"), "legacy form must be DBO1");
+
+        let mut out: HVec<u8, { wifi_pass_seal::MAX_PLAINTEXT }> = HVec::new();
+        let outcome = wifi_pass_seal::open_sealed_bytes(&sealed, &key, &mut out).expect("open");
+        assert!(matches!(
+            outcome,
+            wifi_pass_seal::OpenOutcome::DecodedBytes
+        ));
+        assert_eq!(&out[..], b"password");
+    }
 }
 
 #[test]

@@ -762,3 +762,721 @@ fn skills_count_by_category_sums_to_total() {
         mgr.count()
     );
 }
+
+// ============================================================================
+// Conversation compression — bounded message counts and byte budgets
+// ============================================================================
+
+mod conversation_tests {
+    use magent_core::agent_runner::{Message, Role};
+
+    /// Build a conversation with the given number of messages (alternating
+    /// user/assistant with content "msg_{i}").
+    fn build_conversation(n: usize) -> Vec<Message> {
+        let mut msgs = Vec::with_capacity(n);
+        for i in 0..n {
+            let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
+            msgs.push(Message {
+                role,
+                content: format!("msg_{}", i),
+                tool_call: None,
+                tool_call_id: None,
+            });
+        }
+        msgs
+    }
+
+    proptest::proptest! {
+        /// `compress_messages` must never return more than `max_messages` messages
+        /// and must never increase the message count.
+        #[test]
+        fn compress_messages_respects_max_messages(
+            n in 1usize..=50,
+            cap in 4usize..=20,
+        ) {
+            let policy = magent_core::conversation::CompressionPolicy {
+                max_messages: cap,
+                tool_content_max_chars: 800,
+            };
+            let mut msgs = build_conversation(n);
+            let _stats = magent_core::conversation::compress_messages(&mut msgs, &policy);
+            // After compression, message count must not exceed `cap` (or at
+            // least 2 to preserve the task anchor).
+            let expected_max = cap.max(2);
+            proptest::prop_assert!(
+                msgs.len() <= expected_max,
+                "compress_messages kept {} messages but cap is {}",
+                msgs.len(),
+                cap,
+            );
+            // Compression never increases the count.
+            proptest::prop_assert!(
+                msgs.len() <= n,
+                "compression increased message count from {} to {}",
+                n,
+                msgs.len(),
+            );
+            // Always at least one message.
+            proptest::prop_assert!(!msgs.is_empty());
+        }
+    }
+}
+
+// ============================================================================
+// Recovery backoff — invariants
+// ============================================================================
+
+mod recovery_tests {
+    use magent_core::recovery::RecoveryManager;
+
+    proptest::proptest! {
+        /// `calculate_backoff` must never exceed 5000ms and returns 0 for
+        /// retry_count 0 regardless of base.
+        #[test]
+        fn backoff_capped_at_5s(retry_count in 0u8..=255u8) {
+            let r = RecoveryManager::new(10, 100);
+            let delay = r.calculate_backoff(retry_count);
+            proptest::prop_assert!(
+                delay <= 5000,
+                "backoff for retry_count={} is {} (>5000)",
+                retry_count,
+                delay,
+            );
+            if retry_count == 0 {
+                proptest::prop_assert_eq!(delay, 0,
+                    "backoff for retry_count=0 must be 0, got {}", delay);
+            } else {
+                proptest::prop_assert!(delay > 0,
+                    "backoff for retry_count={} must be >0", retry_count);
+            }
+        }
+
+        /// Different base backoff values scale proportionally but cap at the
+        /// same 5000ms ceiling.
+        #[test]
+        fn backoff_scale_proportional(retry_count in 1u8..=12u8, base in 10u32..=500u32) {
+            let r = RecoveryManager::new(5, base);
+            let delay = r.calculate_backoff(retry_count);
+            proptest::prop_assert!(delay <= 5000);
+            // The delay for a given retry_count and base matches:
+            // base * 2^(retry-1), capped at 5000.
+            let shift = (retry_count as u32 - 1).min(31);
+            let expected = base.checked_mul(1u32 << shift).map(|v| v.min(5000)).unwrap_or(5000);
+            proptest::prop_assert_eq!(delay, expected,
+                "backoff({}, base={}) = {}, expected {}",
+                retry_count, base, delay, expected);
+        }
+    }
+}
+
+// ============================================================================
+// VoiceMessage (VoiceNotification) — bounded-string invariants
+// ============================================================================
+
+mod voice_message_tests {
+    use magent_core::voice_notification::{VoiceCategory, VoiceMessage};
+
+    proptest::proptest! {
+        /// `VoiceMessage::new` must never panic on any input length.
+        #[test]
+        fn message_never_panics(text_len in 0usize..=500) {
+            let text = "x".repeat(text_len);
+            let msg = VoiceMessage::new(0, &text, 5, VoiceCategory::Alert, 1000);
+            // Message should always be constructable, text truncated at 256.
+            proptest::prop_assert!(msg.text.len() <= 256);
+        }
+    }
+}
+
+// ============================================================================
+// Health sensors — zone classification invariants
+// ============================================================================
+
+mod health_tests {
+    use magent_core::health_sensors::{
+        GlucoseStatus, HeartRateZone, HeartRateData, StressLevel, TemperatureData,
+    };
+
+    proptest::proptest! {
+        /// `from_hr_and_age` never panics for ANY u16/u8 combination, even
+        /// extreme (age > 220 causes saturating subtraction, max_hr = 0).
+        #[test]
+        fn heart_rate_zone_never_panics(hr in 0u16..=300u16, age in 0u8..=255u8) {
+            let zone = HeartRateZone::from_hr_and_age(hr, age);
+            // Must return one of the six defined variants
+            proptest::prop_assert!(matches!(zone,
+                HeartRateZone::Rest
+                | HeartRateZone::WarmUp
+                | HeartRateZone::FatBurn
+                | HeartRateZone::Cardio
+                | HeartRateZone::Peak
+                | HeartRateZone::Danger
+            ));
+        }
+
+        /// When max_hr is 0 (age > 220), `from_hr_and_age` must return Danger
+        /// (safest default) rather than panicking from division by zero.
+        #[test]
+        fn heart_rate_zone_very_old_age_returns_danger(hr in 0u16..=300u16) {
+            let zone = HeartRateZone::from_hr_and_age(hr, 221);
+            proptest::prop_assert_eq!(zone, HeartRateZone::Danger);
+        }
+
+        /// `StressLevel::from_hrv` never panics for ANY f32, including NaN,
+        /// infinity, and negative values.
+        #[test]
+        fn stress_level_never_panics(fuzz_hrv in proptest::num::f32::ANY) {
+            let level = StressLevel::from_hrv(fuzz_hrv);
+            proptest::prop_assert!(matches!(level,
+                StressLevel::Low
+                | StressLevel::Moderate
+                | StressLevel::High
+                | StressLevel::VeryHigh
+            ));
+        }
+
+        /// `GlucoseStatus::from_glucose` never panics for ANY f32, including
+        /// NaN, infinity, and negative values.
+        #[test]
+        fn glucose_status_never_panics(fuzz_glucose in proptest::num::f32::ANY) {
+            let status = GlucoseStatus::from_glucose(fuzz_glucose);
+            proptest::prop_assert!(matches!(status,
+                GlucoseStatus::Low
+                | GlucoseStatus::Normal
+                | GlucoseStatus::Elevated
+                | GlucoseStatus::High
+            ));
+        }
+
+        /// `HeartRateData::is_safe` boundaries at 40 and 180 are strict.
+        #[test]
+        fn heart_rate_safe_boundary(hr in 0u16..=250u16) {
+            let data = HeartRateData::new(hr, 50.0, Some(98), 0);
+            let safe = data.is_safe();
+            proptest::prop_assert_eq!(safe, hr >= 40 && hr <= 180);
+        }
+
+        /// `HeartRateData::stress_level` always returns a valid `StressLevel`.
+        #[test]
+        fn heart_rate_data_stress_never_panics(hr in 0u16..=250u16, hrv in proptest::num::f32::ANY) {
+            let data = HeartRateData::new(hr, hrv, None, 0);
+            let level = data.stress_level();
+            proptest::prop_assert!(matches!(level,
+                StressLevel::Low
+                | StressLevel::Moderate
+                | StressLevel::High
+                | StressLevel::VeryHigh
+            ));
+        }
+
+        /// `TemperatureData::is_normal()` and `has_fever()` are mutually exclusive.
+        #[test]
+        fn temperature_normal_and_fever_are_exclusive(temp in proptest::num::f32::ANY) {
+            let data = TemperatureData::new(temp, 0);
+            let normal = data.is_normal();
+            let fever = data.has_fever();
+            proptest::prop_assert!(!(normal && fever),
+                "temp={} cannot be both normal and fever", temp);
+        }
+
+        /// `TemperatureData::is_normal`: lower bound at 36.0, upper at 37.5.
+        #[test]
+        fn temperature_normal_boundary(temp in 3500u16..=3900u16) {
+            let data = TemperatureData::new(temp as f32 / 100.0, 0);
+            let normal = data.is_normal();
+            let expected = temp >= 3600 && temp <= 3750;
+            proptest::prop_assert_eq!(normal, expected);
+        }
+    }
+}
+
+// ============================================================================
+// Sleep manager — boundary invariants
+// ============================================================================
+
+mod sleep_tests {
+    use magent_core::sleep_manager::{
+        CircadianPhase, SleepManager, SleepQuality, SleepRecord, TimeOfDay,
+    };
+
+    proptest::proptest! {
+        /// `TimeOfDay::from_hour` never panics for ANY u8 value (0-255).
+        #[test]
+        fn time_of_day_never_panics(hour in 0u8..=255u8) {
+            let tod = TimeOfDay::from_hour(hour);
+            // Must return a valid variant with a non-empty name
+            proptest::prop_assert!(!tod.name().is_empty());
+            proptest::prop_assert!(!tod.ideal_activity().is_empty());
+        }
+
+        /// `SleepManager::update_circadian` never panics for ANY u32
+        /// timestamp (large millisecond values, near-wraparound).
+        #[test]
+        fn circadian_update_never_panics(time_min in 0u32..=u32::MAX) {
+            let mut mgr = SleepManager::new();
+            mgr.update_circadian(time_min);
+            let phase = mgr.circadian_phase();
+            proptest::prop_assert!(matches!(phase,
+                CircadianPhase::SleepPhase
+                | CircadianPhase::WakeTransition
+                | CircadianPhase::AlertPhase
+                | CircadianPhase::PeakAlertness
+                | CircadianPhase::WindDown
+            ));
+        }
+
+        /// `SleepQuality::new` never panics for ANY f32 efficiency value,
+        /// including NaN, infinity, and negative values.
+        #[test]
+        fn sleep_quality_never_panics(
+            dur in 0u32..=u32::MAX,
+            efficiency in proptest::num::f32::ANY,
+            deep in 0u16..=u16::MAX,
+            rem in 0u16..=u16::MAX,
+            wake in 0u8..=u8::MAX,
+            latency in 0u8..=u8::MAX,
+        ) {
+            let q = SleepQuality::new(dur, efficiency, deep, rem, wake, latency);
+            // Rating must be one of four expected strings.
+            proptest::prop_assert!(matches!(q.rating(), "Poor" | "Fair" | "Good" | "Excellent"));
+            // Score clamped to [0, 100].
+            proptest::prop_assert!(q.score <= 100);
+        }
+
+        /// `SleepRecord::duration_minutes` never panics and is always in
+        /// the valid range [0, 1440] for any u16 start/end combination.
+        #[test]
+        fn sleep_duration_bounded(start_min in 0u16..=1440u16, end_min in 0u16..=1440u16) {
+            let record = SleepRecord {
+                day_index: 0,
+                sleep_start_min: start_min,
+                wake_time_min: end_min,
+                quality: SleepQuality::new(480, 90.0, 90, 90, 1, 10),
+                sleep_hrv: 55.0,
+                sleep_hr: 60,
+                hrv_trend: 0,
+            };
+            let dur = record.duration_minutes();
+            // A sleep record cannot last longer than 24 hours (1440 min).
+            proptest::prop_assert!(dur <= 1440,
+                "duration {} > 1440 for start={}, end={}", dur, start_min, end_min);
+        }
+
+        /// `calculate_sleep_debt` always returns a non-negative value
+        /// and never exceeds 24h * recorded nights.
+        #[test]
+        fn sleep_debt_non_negative(days in 1usize..=30usize, steps in 1usize..=10usize) {
+            let mut mgr = SleepManager::new();
+            for i in 0..steps {
+                let dur = (420 + (i % 5) * 30) as u32;
+                let record = SleepRecord {
+                    day_index: i as u32,
+                    sleep_start_min: 23 * 60,
+                    wake_time_min: 6 * 60 + 30,
+                    quality: SleepQuality::new(dur, 90.0, 90, 90, 1, 10),
+                    sleep_hrv: 55.0,
+                    sleep_hr: 60,
+                    hrv_trend: 0,
+                };
+                mgr.add_sleep_record(record).unwrap();
+            }
+            let debt = mgr.calculate_sleep_debt(days);
+            proptest::prop_assert!(debt >= 0.0, "debt = {} < 0", debt);
+            // Max possible debt: 24h * recorded nights.
+            let max_debt = 24.0 * (days.min(steps) as f32);
+            proptest::prop_assert!(debt <= max_debt,
+                "debt {} > max {}", debt, max_debt);
+        }
+    }
+}
+
+// ============================================================================
+// Voice notification — bounded-string and TTS invariants
+// ============================================================================
+
+mod voice_tests {
+    use magent_core::voice_notification::{
+        EmergencyAlert, TtsConfig, VoiceCategory, VoiceMessage,
+        VoiceNotificationManager, prepare_for_tts,
+    };
+
+    proptest::proptest! {
+        #[test]
+        fn voice_message_bounded(text in ".*") {
+            let msg = VoiceMessage::new(0, &text, 5, VoiceCategory::System, 0);
+            proptest::prop_assert!(msg.text.len() <= 256);
+        }
+
+        #[test]
+        fn volume_percent_bounded(vol in proptest::num::f32::ANY) {
+            let mut cfg = TtsConfig::default();
+            cfg.set_volume(vol);
+            let pct = cfg.volume_percent();
+            proptest::prop_assert!(pct <= 100, "volume_percent = {}", pct);
+        }
+
+        #[test]
+        fn speech_rate_clamped(rate in proptest::num::f32::ANY) {
+            let mut cfg = TtsConfig::default();
+            cfg.set_speech_rate(rate);
+            proptest::prop_assert!(cfg.speech_rate >= 0.5 && cfg.speech_rate <= 2.0,
+                "speech_rate = {}", cfg.speech_rate);
+        }
+
+        #[test]
+        fn prepare_tts_never_panics(text in ".*") {
+            let cfg = TtsConfig::default();
+            let result = prepare_for_tts(&text, &cfg);
+            proptest::prop_assert!(result.len() <= 512);
+        }
+
+        #[test]
+        fn prepare_tts_extreme_rates(text in ".*", rate in proptest::num::f32::ANY) {
+            let mut cfg = TtsConfig::default();
+            cfg.set_speech_rate(rate);
+            let result = prepare_for_tts(&text, &cfg);
+            proptest::prop_assert!(result.len() <= 512);
+        }
+
+        #[test]
+        fn emergency_sms_body_non_empty(text in ".*") {
+            let alert = EmergencyAlert::new(&text, true, false, 0);
+            let body = alert.sms_body();
+            proptest::prop_assert!(!body.is_empty(), "sms_body empty for text len={}", text.len());
+        }
+
+        #[test]
+        fn dnd_period_never_panics(hour in 0u8..=255u8) {
+            let mut mgr = VoiceNotificationManager::new();
+            mgr.set_dnd(true, 9, 17);
+            let _ = mgr.is_in_dnd_period(hour);
+            mgr.set_dnd(true, 22, 7);
+            let _ = mgr.is_in_dnd_period(hour);
+            mgr.set_dnd(false, 0, 0);
+            proptest::prop_assert!(!mgr.is_in_dnd_period(hour));
+        }
+
+        #[test]
+        fn health_alert_never_panics(severity in 0u8..=255u8, msg_len in 0usize..=200) {
+            let mut mgr = VoiceNotificationManager::new();
+            let msg = "x".repeat(msg_len);
+            let rec = "y".repeat(msg_len);
+            let result = mgr.send_health_alert("test", severity, &msg, &rec, 0);
+            proptest::prop_assert!(result.is_ok());
+        }
+    }
+}
+
+// ============================================================================
+// Sports coach — coaching invariants
+// ============================================================================
+
+mod sports_tests {
+    use magent_core::health_sensors::HeartRateData;
+    use magent_core::sports_coach::{
+        CoachingMessage, CoachingMessageType, ExerciseGoal, ExerciseType, FitnessHistoryEntry,
+        SportsCoach,
+    };
+
+    proptest::proptest! {
+        /// `CoachingMessage::new` text is always bounded to 128.
+        #[test]
+        fn coaching_message_bounded(text in ".*") {
+            let msg = CoachingMessage::new(CoachingMessageType::Warning, &text, 8);
+            proptest::prop_assert!(msg.voice_text.len() <= 128);
+            proptest::prop_assert_eq!(msg.priority, 8);
+        }
+
+        /// `ExerciseGoal::new` for every exercise type produces valid defaults.
+        #[test]
+        fn exercise_goal_defaults_invariant(t in 0u8..=7u8) {
+            let et = match t {
+                0 => ExerciseType::Running,
+                1 => ExerciseType::Walking,
+                2 => ExerciseType::Cycling,
+                3 => ExerciseType::Swimming,
+                4 => ExerciseType::Strength,
+                5 => ExerciseType::Yoga,
+                6 => ExerciseType::Hiit,
+                _ => ExerciseType::Rest,
+            };
+            let goal = ExerciseGoal::new(et);
+            proptest::prop_assert!(!et.name().is_empty());
+            proptest::prop_assert!(goal.duration_min <= 480);
+            proptest::prop_assert!(goal.target_intensity >= 0.0 && goal.target_intensity <= 1.0);
+            let _summary = goal.format_summary();
+        }
+
+        /// `ExerciseGoal::add_adjustment` never panics for any string.
+        #[test]
+        fn add_adjustment_never_panics(text in ".*") {
+            let mut goal = ExerciseGoal::new(ExerciseType::Running);
+            goal.add_adjustment(&text);
+            proptest::prop_assert!(goal.adjustments.len() >= 1);
+        }
+
+        /// `FitnessHistoryEntry::fitness_score` is always non-negative and bounded.
+        #[test]
+        fn fitness_score_bounded(dur in 0u16..=u16::MAX, rpe in 0u8..=10u8, hr in 0u16..=250u16) {
+            let entry = FitnessHistoryEntry {
+                exercise_type: ExerciseType::Running,
+                duration_min: dur,
+                avg_hr: hr,
+                calories: 0,
+                rating: 3,
+                rpe,
+                timestamp: 0,
+            };
+            let score = entry.fitness_score();
+            proptest::prop_assert!(score >= 0.0, "negative fitness score {}", score);
+            proptest::prop_assert!(score <= 20000.0, "unreasonable fitness score {}", score);
+        }
+
+        /// `SportsCoach::session_progress` is always in [0, 100].
+        #[test]
+        fn session_progress_bounded(ex_type in 0u8..=7u8) {
+            let et = match ex_type {
+                0 => ExerciseType::Running,
+                1 => ExerciseType::Walking,
+                2 => ExerciseType::Cycling,
+                3 => ExerciseType::Swimming,
+                4 => ExerciseType::Strength,
+                5 => ExerciseType::Yoga,
+                6 => ExerciseType::Hiit,
+                _ => ExerciseType::Rest,
+            };
+            let mut coach = SportsCoach::new();
+            coach.set_goal(ExerciseGoal::new(et));
+            coach.start_session();
+            let progress = coach.session_progress();
+            proptest::prop_assert!(progress >= 0.0 && progress <= 100.0);
+        }
+
+        /// `SportsCoach::update` never panics for any delta_s.
+        #[test]
+        fn update_never_panics(delta in 0u32..=u32::MAX) {
+            let mut coach = SportsCoach::new();
+            coach.start_session();
+            let hr = HeartRateData::new(120, 50.0, Some(98), 0);
+            coach.update(&hr, None, delta);
+            proptest::prop_assert!(coach.session_duration() <= u32::MAX);
+        }
+
+        /// State machine transitions without panic for varied inputs.
+        #[test]
+        fn coach_no_panic_on_various_inputs(hr in 0u16..=250u16, hrv in 0u32..=u32::MAX) {
+            let mut coach = SportsCoach::new();
+            coach.start_session();
+            let data = HeartRateData::new(hr, hrv as f32, None, 0);
+            coach.update(&data, None, 100);
+            let state = coach.state();
+            proptest::prop_assert!(matches!(state,
+                magent_core::sports_coach::ExerciseState::Idle
+                | magent_core::sports_coach::ExerciseState::WarmUp
+                | magent_core::sports_coach::ExerciseState::Active
+                | magent_core::sports_coach::ExerciseState::CoolDown
+                | magent_core::sports_coach::ExerciseState::Finished
+            ));
+        }
+    }
+}
+
+// ============================================================================
+// Early warning system — sensor processing invariants
+// ============================================================================
+
+mod early_warning_tests {
+    use proptest::{prop_assert, prop_assert_eq};
+    use magent_core::early_warning::{
+        AlertSeverity, AlertType, EarlyWarningSystem, EmergencyContact, HealthAlert, Hospital,
+    };
+    use magent_core::health_sensors::{
+        EcgData, GlucoseData, HeartRateData, HeartRhythm, UserProfile,
+    };
+
+    proptest::proptest! {
+        /// `process_glucose` never panics for ANY f32 glucose value (NaN, Inf,
+        /// negative, extreme), any i8 trend, and any u32 timestamp.
+        #[test]
+        fn process_glucose_never_panics(
+            glucose in proptest::num::f32::ANY,
+            trend in -128i8..=127i8,
+            ts in 0u32..=u32::MAX,
+        ) {
+            let mut sys = EarlyWarningSystem::new();
+            let data = GlucoseData::new(glucose, trend, ts);
+            let profile = UserProfile::default();
+            let _result = sys.process_glucose(&data, &profile, ts);
+        }
+
+        /// `process_ecg` never panics for ANY heart rhythm, HR, quality, and timestamp.
+        #[test]
+        fn process_ecg_never_panics(
+            rhythm_val in 0u8..=4u8,
+            hr in 0u16..=300u16,
+            quality in 0u8..=255u8,
+            ts in 0u32..=u32::MAX,
+        ) {
+            let rhythm = match rhythm_val {
+                0 => HeartRhythm::Normal,
+                1 => HeartRhythm::Bradycardia,
+                2 => HeartRhythm::Tachycardia,
+                3 => HeartRhythm::Irregular,
+                _ => HeartRhythm::Other,
+            };
+            let mut sys = EarlyWarningSystem::new();
+            let ecg = EcgData::new(hr, rhythm, 0.0, quality, ts);
+            let _result = sys.process_ecg(&ecg, ts);
+        }
+
+        /// `process_heart_rate` never panics for ANY u16 HR and timestamp.
+        #[test]
+        fn process_heart_rate_never_panics(
+            hr in 0u16..=300u16,
+            ts in 0u32..=u32::MAX,
+        ) {
+            let mut sys = EarlyWarningSystem::new();
+            let data = HeartRateData::new(hr, 50.0, Some(98), ts);
+            let _result = sys.process_heart_rate(&data, ts);
+        }
+
+        /// `predict_glucose_trend` never panics for 0-20 glucose readings.
+        #[test]
+        fn predict_glucose_trend_never_panics(
+            n in 0usize..=20usize) {
+            let mut history: Vec<GlucoseData> = Vec::with_capacity(n);
+            for i in 0..n {
+                history.push(GlucoseData::new(i as f32 * 10.0, 0, i as u32 * 60_000));
+            }
+            let sys = EarlyWarningSystem::new();
+            let _result = sys.predict_glucose_trend(&history);
+        }
+
+        /// `predict_glucose_trend` with extreme values never panics.
+        #[test]
+        fn predict_glucose_trend_extreme_values(
+            g0 in proptest::num::f32::ANY,
+            g1 in proptest::num::f32::ANY,
+            g2 in proptest::num::f32::ANY,
+            t0 in 0u32..=u32::MAX,
+            t1 in 0u32..=u32::MAX,
+            t2 in 0u32..=u32::MAX,
+        ) {
+            let history = vec![
+                GlucoseData::new(g0, -1, t0),
+                GlucoseData::new(g1, 0, t1),
+                GlucoseData::new(g2, 1, t2),
+            ];
+            let sys = EarlyWarningSystem::new();
+            let _result = sys.predict_glucose_trend(&history);
+        }
+
+        /// `HealthAlert::new` message and recommendation are always bounded to 256.
+        #[test]
+        fn alert_message_bounded(
+            msg_len in 0usize..=400,
+            rec_len in 0usize..=400,
+        ) {
+            let msg = "x".repeat(msg_len);
+            let rec = "y".repeat(rec_len);
+            let alert = HealthAlert::new(
+                0, AlertType::GlucoseLow, AlertSeverity::Critical,
+                50.0, 70.0, &msg, &rec, 0,
+            );
+            prop_assert!(alert.message.len() <= 256);
+            prop_assert!(alert.recommendation.len() <= 256);
+        }
+
+        /// `EmergencyContact::new` never panics for any input length.
+        #[test]
+        fn emergency_contact_extreme_inputs(
+            name_len in 0usize..=200,
+            phone_len in 0usize..=200,
+            rel_len in 0usize..=200,
+            priority in 0u8..=255u8,
+        ) {
+            let contact = EmergencyContact::new(
+                &"n".repeat(name_len), &"p".repeat(phone_len),
+                &"r".repeat(rel_len), priority,
+            );
+            prop_assert!(contact.name.len() <= 64);
+            prop_assert!(contact.phone.len() <= 32);
+            prop_assert!(contact.relationship.len() <= 32);
+            prop_assert_eq!(contact.priority, priority);
+        }
+
+        /// `Hospital::new` never panics for any input length.
+        #[test]
+        fn hospital_extreme_inputs(
+            name_len in 0usize..=200,
+            addr_len in 0usize..=200,
+            phone_len in 0usize..=200,
+        ) {
+            let hospital = Hospital::new(
+                &"h".repeat(name_len), &"a".repeat(addr_len), &"p".repeat(phone_len),
+            );
+            prop_assert!(hospital.name.len() <= 64);
+            prop_assert!(hospital.address.len() <= 128);
+            prop_assert!(hospital.phone.len() <= 32);
+            let _dist = hospital.distance_string();
+            assert!(EarlyWarningSystem::new().nearest_er().is_none());
+        }
+
+        /// `acknowledge_alert` on non-existent ID returns false, never panics.
+        #[test]
+        fn acknowledge_nonexistent_alert(id in 0u32..=u32::MAX) {
+            let mut sys = EarlyWarningSystem::new();
+            prop_assert!(!sys.acknowledge_alert(id));
+        }
+
+        /// `AlertSeverity` ordering invariants.
+        #[test]
+        fn alert_severity_ordering(a0 in 0u8..=3u8, a1 in 0u8..=3u8) {
+            let s0 = match a0 {
+                0 => AlertSeverity::Low, 1 => AlertSeverity::Medium,
+                2 => AlertSeverity::High, _ => AlertSeverity::Critical,
+            };
+            let s1 = match a1 {
+                0 => AlertSeverity::Low, 1 => AlertSeverity::Medium,
+                2 => AlertSeverity::High, _ => AlertSeverity::Critical,
+            };
+            prop_assert_eq!(s0.requires_emergency(), s0 == AlertSeverity::Critical);
+            prop_assert!(!s0.name().is_empty());
+            if a0 < a1 { prop_assert!(s0 < s1); }
+            else if a0 == a1 { prop_assert_eq!(s0, s1); }
+        }
+
+        /// Multiple calls with extreme timestamps exercise the cooldown path.
+        #[test]
+        fn process_glucose_exercise_cooldown(
+            g0 in proptest::num::f32::ANY,
+            g1 in proptest::num::f32::ANY,
+            g2 in proptest::num::f32::ANY,
+            t0 in 0u32..=500_000u32,
+            t1 in 500_001u32..=1_000_000u32,
+            t2 in 0u32..=u32::MAX,
+        ) {
+            let mut sys = EarlyWarningSystem::new();
+            let profile = UserProfile::default();
+            let _ = sys.process_glucose(&GlucoseData::new(g0, 0, t0), &profile, t0);
+            let _ = sys.process_glucose(&GlucoseData::new(g1, 0, t1), &profile, t1);
+            let _ = sys.process_glucose(&GlucoseData::new(g2, 0, t2), &profile, t2);
+        }
+
+        /// Mixed ECG + HR processing never panics.
+        #[test]
+        fn mixed_ecg_hr_processing(
+            hr in 0u16..=300u16,
+            quality in 0u8..=255u8,
+            ts in 0u32..=u32::MAX,
+        ) {
+            let mut sys = EarlyWarningSystem::new();
+            let _ = sys.process_ecg(&EcgData::new(hr, HeartRhythm::Normal, 0.0, quality, ts), ts);
+            let _ = sys.process_heart_rate(&HeartRateData::new(hr, 50.0, None, ts), ts);
+            // Alert history queries never panic
+            let _ = sys.alert_history();
+            let _ = sys.unacknowledged_alerts();
+            let _ = sys.critical_alerts();
+        }
+    }
+}

@@ -459,6 +459,10 @@ blockchain = [
     "dep:reqwest",
     "std",
     "web3",
+    # The CLI's `web3 vc …` commands issue and verify verifiable credentials,
+    # which live behind this feature. It shares blockchain's Ed25519/bs58
+    # dependencies, so pulling it in adds no new crates.
+    "verifiable_credentials",
 ]
 
 # Backward-compatibility alias: old code used `embedded` to mean

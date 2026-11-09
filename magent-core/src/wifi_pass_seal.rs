@@ -114,6 +114,15 @@ pub enum SealError {
     /// Nonce length was zero (cannot seal with empty nonce —
     /// would collapse to a static substitution cipher).
     EmptyNonce,
+    /// Nonce was not exactly [`NONCE_LEN`] bytes.
+    ///
+    /// Opening requires a full-width nonce (`open_sealed_bytes`
+    /// splits off exactly `NONCE_LEN` bytes); sealing a shorter or
+    /// longer one used to produce a value its own opener could not
+    /// recover. Enforced on the seal side so the mismatch is
+    /// reported here rather than surfacing as garbage plaintext
+    /// later.
+    BadNonceLength,
 }
 
 /// Outcome of [`open_sealed_bytes`].
@@ -139,6 +148,7 @@ pub enum OpenOutcome<'a> {
 /// - `PlaintextTooLong` if `plain` is longer than `MAX_PLAINTEXT`.
 /// - `EmptyKey` if `device_key` is empty.
 /// - `EmptyNonce` if `nonce` is empty.
+/// - `BadNonceLength` if `nonce` is not exactly [`NONCE_LEN`] bytes.
 ///
 /// # Panics
 /// Never. The output buffer's capacity is `MAX_ENCODED_LEN`, which
@@ -156,6 +166,9 @@ pub fn seal_str(
     }
     if nonce.is_empty() {
         return Err(SealError::EmptyNonce);
+    }
+    if nonce.len() != NONCE_LEN {
+        return Err(SealError::BadNonceLength);
     }
     if plain.len() > MAX_PLAINTEXT {
         return Err(SealError::PlaintextTooLong);
@@ -480,6 +493,25 @@ mod tests {
         let mut out: HeaplessString<MAX_ENCODED_LEN> = HeaplessString::new();
         let r = seal_str("anything", TEST_KEY, &[], &mut out);
         assert_eq!(r, Err(SealError::EmptyNonce));
+    }
+
+    /// Sealing used to accept any non-empty nonce while opening always
+    /// split off exactly `NONCE_LEN` bytes, so a short nonce produced a
+    /// value that round-tripped to *garbage* with no error. The width
+    /// is now enforced on the seal side.
+    #[test]
+    fn non_full_width_nonce_rejected_on_seal() {
+        let mut out: HeaplessString<MAX_ENCODED_LEN> = HeaplessString::new();
+        for len in [1usize, NONCE_LEN - 1, NONCE_LEN + 1] {
+            let nonce = vec![0xABu8; len];
+            let r = seal_str("anything", TEST_KEY, &nonce, &mut out);
+            assert_eq!(r, Err(SealError::BadNonceLength), "len {len}");
+        }
+        // Full width still seals.
+        assert_eq!(
+            seal_str("anything", TEST_KEY, &test_nonce(), &mut out),
+            Ok(())
+        );
     }
 
     #[test]

@@ -198,6 +198,14 @@ pub mod config;
     feature = "embedded",
     feature = "std"
 ))]
+pub mod config_store;
+
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
 pub mod safety;
 
 #[cfg(any(

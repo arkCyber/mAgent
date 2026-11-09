@@ -98,6 +98,10 @@ function on_tick(now_ms)
     if STATE == "IDLE" then
         if in_band then
             set_state("OK", hr)
+        else
+            -- The device can boot while the vital sign is already out of
+            -- band. Without this arm the state stayed IDLE forever.
+            set_state("INFO", hr)
         end
     elseif STATE == "OK" then
         if in_band then
@@ -113,7 +117,9 @@ function on_tick(now_ms)
             COUNT = COUNT + 1
             if COUNT >= WINDOW then
                 set_state("WARN", hr)
-                return "BUZZER:50"
+                -- The buzzer was already driven on pin 4 by `set_state`;
+                -- returning BUZZER would make AppRuntime drive pin 3 too.
+                return "WARN"
             end
             return ""
         end
@@ -124,7 +130,7 @@ function on_tick(now_ms)
             return ""
         else
             set_state("ALARM", hr)
-            return "BUZZER:100"
+            return "ALARM"
         end
     elseif STATE == "ALARM" then
         if in_band then
@@ -132,7 +138,7 @@ function on_tick(now_ms)
             hardware.pwm_set(4, 0)
             return "SILENCED"
         end
-        return "BUZZER:100"
+        return "ALARM"
     end
 
     return ""

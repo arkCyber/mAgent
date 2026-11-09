@@ -577,17 +577,18 @@ fn backend_get_nonce(
 #[cfg(feature = "esp32")]
 fn backend_get_gas_price(backend: &mut BlockchainBackend) -> core::result::Result<u64, AgentError> {
     if let BlockchainBackend::Esp32 { client, .. } = backend {
-        // `EspHttpClient::get_gas_price` returns wei (u128) but the
-        // host-side `ChainClient::get_gas_price` returns gwei (u64).
-        // We match the host convention by truncating; satellite and
-        // IoT workloads never need sub-gwei precision.
+        // Both backends must return **wei**. The old ESP32 branch divided by
+        // 1e9 while the host branch did not, and the shared formatter divides
+        // by 1e9 again — so a 20 gwei quote displayed as `0.00 Gwei` on the
+        // device.
         let wei = client
             .get_gas_price()
             .map_err(|_| AgentError::ConfigurationError {
                 field: "blockchain",
                 reason: crate::error::ConfigError::NotConfigured,
             })?;
-        Ok((wei / Wei::GWEI.0) as u64)
+        // `EspHttpClient::get_gas_price` returns a raw `u128` in wei.
+        Ok(u64::try_from(wei).unwrap_or(u64::MAX))
     } else {
         Err(AgentError::ConfigurationError {
             field: "blockchain",
@@ -1301,7 +1302,7 @@ mod tests {
         };
         use alloc::sync::Arc;
 
-        let receipt = r#"{"jsonrpc":"2.0","id":1,"result":{"transaction_hash":"0xaa","block_number":"0x10","block_hash":"0xbb","transaction_index":"0x0","from":"0xcc","to":"0xdd","cumulative_gas_used":"0x5208","gas_used":"0x5208","status":"0x1"}}"#;
+        let receipt = r#"{"jsonrpc":"2.0","id":1,"result":{"transactionHash":"0xaa","blockNumber":"0x10","blockHash":"0xbb","transactionIndex":"0x0","from":"0xcc","to":"0xdd","cumulativeGasUsed":"0x5208","gasUsed":"0x5208","status":"0x1"}}"#;
         let client = EspHttpClient::with_transport(
             HttpClientConfig::from_url("https://example.com"),
             Arc::new(StaticTransport::posting(receipt)) as SharedTransport,
@@ -1350,7 +1351,7 @@ mod tests {
         };
         use alloc::sync::Arc;
 
-        let receipt = r#"{"jsonrpc":"2.0","id":1,"result":{"transaction_hash":"0xaa","block_number":"0x2a","block_hash":"0xbb","transaction_index":"0x0","from":"0xcc","to":"0xdd","cumulative_gas_used":"0x5208","gas_used":"0x5208","status":"0x0"}}"#;
+        let receipt = r#"{"jsonrpc":"2.0","id":1,"result":{"transactionHash":"0xaa","blockNumber":"0x2a","blockHash":"0xbb","transactionIndex":"0x0","from":"0xcc","to":"0xdd","cumulativeGasUsed":"0x5208","gasUsed":"0x5208","status":"0x0"}}"#;
         let client = EspHttpClient::with_transport(
             HttpClientConfig::from_url("https://example.com"),
             Arc::new(StaticTransport::posting(receipt)) as SharedTransport,

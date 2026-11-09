@@ -465,7 +465,11 @@ pub fn parse_http_authority(url: &str) -> Option<(&str, u16)> {
         // `?` covers the non-http(s) scheme: no prefix, no authority.
         None => (url.strip_prefix("http://")?, 80),
     };
-    let authority = rest.split(['/', '?', '#']).next()?;
+    // WHATWG treats `\` like `/` in special-scheme URLs. Without it,
+    // `http://127.0.0.1\@example.com/` parsed the authority as
+    // `127.0.0.1\@example.com` → userinfo-stripped host `example.com`, while
+    // reqwest dialled 127.0.0.1.
+    let authority = rest.split(['/', '?', '#', '\\']).next()?;
     let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     if authority.is_empty() {
         return None;
@@ -477,6 +481,15 @@ pub fn parse_http_authority(url: &str) -> Option<(&str, u16)> {
         if let Some(idx) = authority.rfind(':') {
             let (host, port_str) = (&authority[..idx], &authority[idx + 1..]);
             if !host.is_empty() {
+                // An empty port (`http://host:/`) is legal and means "the
+                // scheme default". Falling through with the authority verbatim
+                // would hand the classifier `host:`, which parses as neither
+                // v4 nor v6 nor a known name — so `http://127.0.0.1:/`,
+                // `http://169.254.169.254:/` and `http://localhost:/` would be
+                // waved through while the HTTP client dials the default port.
+                if port_str.is_empty() {
+                    return Some((host, default_port));
+                }
                 if let Ok(port) = port_str.parse::<u16>() {
                     return Some((host, port));
                 }
@@ -484,6 +497,55 @@ pub fn parse_http_authority(url: &str) -> Option<(&str, u16)> {
         }
     }
     Some((authority, default_port))
+}
+
+/// Resolve a `Location:` header against the URL that produced it, for callers
+/// that follow redirects **themselves**.
+///
+/// Both HTTP clients in this tree follow redirects by default, and neither lets
+/// the caller vet a hop *before* it is dialled: the host's `reqwest` resolves and
+/// follows internally but does return the final URL (so `magent_core::web` can
+/// re-check it after the fact), while the firmware's esp-idf-svc wrapper follows
+/// inside C and exposes no post-redirect URL at all. A caller that must keep
+/// [`public_fetch_target_refusal`] authoritative therefore turns the built-in
+/// following **off**, walks the chain one hop at a time, and uses this function
+/// to compute each next URL — re-running the classifier on every hop before it
+/// is dialled. That is how the host `magent_core::web` tools and the on-device
+/// `local_tools` fetch agree on what is reachable.
+///
+/// Only the three forms that cannot be mis-joined are accepted: absolute
+/// (`https://host/p`), protocol-relative (`//host/p`) and root-relative
+/// (`/p`). Anything else — a relative path, an opaque/blank `Location`, a
+/// non-http(s) scheme — returns `None`, meaning *do not follow*: the caller
+/// keeps the 3xx response rather than guessing a URL whose host it cannot vet.
+pub fn resolve_http_redirect(base: &str, location: &str) -> Option<alloc::string::String> {
+    let loc = location.trim();
+    if loc.starts_with("https://") || loc.starts_with("http://") {
+        return Some(alloc::string::String::from(loc));
+    }
+    let (scheme, authority) = split_scheme_authority(base)?;
+    if let Some(rest) = loc.strip_prefix("//") {
+        return Some(alloc::format!("{scheme}://{rest}"));
+    }
+    if loc.starts_with('/') {
+        return Some(alloc::format!("{scheme}://{authority}{loc}"));
+    }
+    None
+}
+
+/// `("https"|"http", "host[:port]")` for an absolute http(s) URL. The authority
+/// is sliced verbatim so an IPv6 literal round-trips with its brackets.
+fn split_scheme_authority(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = match url.strip_prefix("https://") {
+        Some(r) => ("https", r),
+        None => ("http", url.strip_prefix("http://")?),
+    };
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    if authority.is_empty() {
+        return None;
+    }
+    Some((scheme, authority))
 }
 
 /// Why an agent-facing web fetch must refuse `host`, or `None` when it is a
@@ -512,27 +574,59 @@ pub fn parse_http_authority(url: &str) -> Option<(&str, u16)> {
 /// private address is not caught, because this function never performs DNS;
 /// closing that needs the connection pinned to the vetted address, which the
 /// HTTP client does not expose.
+///
+/// **Redirects are the caller's duty.** This only ever sees the *initial* host,
+/// so a public URL that 302s to an internal one would sail past it. Every
+/// caller must therefore follow redirects one hop at a time with
+/// [`resolve_http_redirect`] and re-run this classifier on each new host — the
+/// same re-validation `magent_core::web` does host-side.
 pub fn public_fetch_target_refusal(host: &str, allow_private: bool) -> Option<&'static str> {
     let lower = host.to_ascii_lowercase();
+    // A trailing dot is the DNS "fully-qualified" spelling: `localhost.`
+    // resolves exactly like `localhost` but parsed as neither a known name
+    // nor an IP literal, so it sailed through this classifier.
+    let lower = lower.trim_end_matches('.');
+    if lower.is_empty() {
+        return Some("refusing empty host");
+    }
     if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
         return Some("refusing loopback/mDNS host");
     }
     // A bracketed IPv6 literal (`[::1]`) arrives with its brackets.
-    let lit = host.trim_start_matches('[').trim_end_matches(']');
+    let lit = lower.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = lit.parse::<core::net::Ipv4Addr>() {
         // `is_link_local` covers 169.254.0.0/16 — APIPA *and* the
-        // 169.254.169.254 cloud-metadata endpoint.
-        if ip.is_loopback() || ip.is_link_local() || (!allow_private && ip.is_private()) {
+        // 169.254.169.254 cloud-metadata endpoint. `0.0.0.0`/`0.0.0.0/8`
+        // ("this network") and the broadcast address are not fetch targets
+        // either, and `is_unspecified` alone misses 0.1.2.3.
+        if ip.octets()[0] == 0
+            || ip.is_loopback()
+            || ip.is_link_local()
+            || ip.is_broadcast()
+            || (!allow_private && ip.is_private())
+        {
             return Some("refusing non-public address");
         }
     }
     if let Ok(ip) = lit.parse::<core::net::Ipv6Addr>() {
         // `::ffff:127.0.0.1` is loopback wearing a v6 spelling; grade the
-        // embedded v4 rather than the wrapper.
+        // embedded v4 rather than the wrapper. `fc00::/7` (unique-local) is
+        // the IPv6 equivalent of RFC1918 and is refused even when private
+        // networks are allowed, matching the documented contract.
         let mapped_blocked = ip.to_ipv4_mapped().is_some_and(|v4| {
-            v4.is_loopback() || v4.is_link_local() || (!allow_private && v4.is_private())
+            v4.octets()[0] == 0
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || (!allow_private && v4.is_private())
         });
-        if ip.is_loopback() || ip.is_unicast_link_local() || mapped_blocked {
+        if ip.is_unspecified()
+            || ip.is_loopback()
+            || ip.is_unicast_link_local()
+            || ip.is_unique_local()
+            || ip.is_multicast()
+            || mapped_blocked
+        {
             return Some("refusing non-public address");
         }
     }
@@ -743,6 +837,113 @@ pub fn validate_httpget_set(cmd: &AtCommand<'_>) -> Result<HttpgetValidated, AtO
         scheme_https: scheme == "https://",
         url,
     })
+}
+
+// ---------------------------------------------------------------------------
+// `AT+AGENTCFG` — persisted core `AgentConfig`
+// ---------------------------------------------------------------------------
+
+/// Maximum agent-name length accepted by `AT+AGENTCFG=` (matches
+/// `AgentConfig`'s own `MAX_FIELD_LENGTH`).
+pub const AGENTCFG_NAME_MAX: usize = 64;
+
+/// True when an `AT+AGENTCFG=` line is the `RESET` sentinel
+/// (case-insensitive, exactly one argument).
+pub fn agentcfg_is_reset(cmd: &AtCommand<'_>) -> bool {
+    cmd.args.len() == 1
+        && cmd
+            .args
+            .first()
+            .and_then(crate::at::arg_token)
+            .is_some_and(|v| v.eq_ignore_ascii_case(b"RESET"))
+}
+
+/// Validate and build the core `AgentConfig` for
+/// `AT+AGENTCFG=<name>,<max_iter>,<max_mem>,<watchdog_secs>,<ble_secs>,<skills>,<max_skills>,<debug>`.
+///
+/// All eight fields are positional and required — a partial form would make
+/// "unset" ambiguous with "set to the default", and a config command should be
+/// explicit about what it changes. Booleans are `0`/`1`. `AgentConfig::validate`
+/// applies the range rules (iterations 1..=1000, memory ≤ the board ceiling,
+/// watchdog 1..=60 s, BLE 1..=120 s, skills 1..=50), so this helper only
+/// handles the byte/UTF-8/type boundary and then delegates.
+///
+/// Error codes follow the `+CMDER` table: `4` for a missing/malformed field,
+/// `7` for a numeric value the schema rejects (including a `u16` overflow),
+/// `8` for an over-long name.
+///
+/// `RESET` is handled by the caller via [`agentcfg_is_reset`] before this runs
+/// (it is not a valid eight-field form).
+#[cfg(any(
+    feature = "nrf52",
+    feature = "esp32",
+    feature = "embedded",
+    feature = "std"
+))]
+pub fn validate_agentcfg_set(cmd: &AtCommand<'_>) -> Result<crate::config::AgentConfig, AtOutcome> {
+    if cmd.args.len() != 8 {
+        return Err(AtOutcome::error(4));
+    }
+
+    // Field 0: name (quoted or token, ≤ 64 bytes, no NUL/control).
+    let mut name_dec: heapless::Vec<u8, AGENTCFG_NAME_MAX> = heapless::Vec::new();
+    let name_src = cmd
+        .args
+        .first()
+        .map(|a| arg_bytes_decoded(a, &mut name_dec))
+        .transpose()
+        .map_err(|_| AtOutcome::error(8))?
+        .ok_or_else(|| AtOutcome::error(4))?;
+    if name_src.is_empty() || name_src.len() > AGENTCFG_NAME_MAX {
+        return Err(AtOutcome::error(8));
+    }
+    if name_src.iter().any(|&c| c == 0 || is_control_byte(c)) {
+        return Err(AtOutcome::error(4));
+    }
+    // The query reply is an unquoted comma-separated line; a comma in the
+    // name would split it into more fields than the set form accepts, so the
+    // value could never be read back and re-sent. Reject it at the boundary
+    // rather than storing a name that breaks the command's own round-trip.
+    if name_src.contains(&b',') {
+        return Err(AtOutcome::error(4));
+    }
+    let name_str = core::str::from_utf8(name_src).map_err(|_| AtOutcome::error(4))?;
+    let mut name: heapless::String<AGENTCFG_NAME_MAX> = heapless::String::new();
+    name.push_str(name_str).map_err(|_| AtOutcome::error(8))?;
+
+    let num = |idx: usize| -> Result<u32, AtOutcome> {
+        let raw = cmd
+            .args
+            .get(idx)
+            .and_then(crate::at::arg_token)
+            .ok_or_else(|| AtOutcome::error(4))?;
+        crate::at::parse_u32(raw).ok_or_else(|| AtOutcome::error(4))
+    };
+    let flag = |idx: usize| -> Result<bool, AtOutcome> {
+        match num(idx)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(AtOutcome::error(4)),
+        }
+    };
+
+    // Numeric range failures are `+CMDER:7` ("number out of range"), not
+    // `:8` ("string too long") — the doc table in §4 of
+    // `docs/AT_COMMAND_REFERENCE.md` is the contract.
+    let u16_of = |v: u32| u16::try_from(v).map_err(|_| AtOutcome::error(7));
+
+    let config = crate::config::AgentConfig {
+        name,
+        max_iterations: u16_of(num(1)?)?,
+        max_memory: num(2)?,
+        watchdog_timeout_secs: u16_of(num(3)?)?,
+        ble_timeout_secs: u16_of(num(4)?)?,
+        skills_enabled: flag(5)?,
+        max_skills: u16_of(num(6)?)?,
+        debug_enabled: flag(7)?,
+    };
+    config.validate().map_err(|_| AtOutcome::error(7))?;
+    Ok(config)
 }
 
 // ---------------------------------------------------------------------------
@@ -1789,6 +1990,135 @@ mod tests {
         }
     }
 
+    /// An empty port is legal (`http://host:/`) and the URL client dials the
+    /// scheme default. The parser must drop the dangling colon so the
+    /// classifier sees the bare host; returning `"host:"` verbatim made the
+    /// SSRF guard wave the target through.
+    #[test]
+    fn parse_http_authority_drops_an_empty_port() {
+        assert_eq!(
+            parse_http_authority("http://127.0.0.1:/admin"),
+            Some(("127.0.0.1", 80))
+        );
+        assert_eq!(
+            parse_http_authority("https://example.com:/p"),
+            Some(("example.com", 443))
+        );
+        assert_eq!(
+            parse_http_authority("http://[::1]:/"),
+            Some(("[::1]", 80))
+        );
+        // Userinfo and an empty port together.
+        assert_eq!(
+            parse_http_authority("http://user:pass@10.0.0.1:/x"),
+            Some(("10.0.0.1", 80))
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_accepts_the_three_safe_forms() {
+        // Absolute: taken verbatim, scheme changes included.
+        assert_eq!(
+            resolve_http_redirect("https://a.example/x", "https://b.example/y").as_deref(),
+            Some("https://b.example/y")
+        );
+        assert_eq!(
+            resolve_http_redirect("https://a.example/x", "http://b.example/y").as_deref(),
+            Some("http://b.example/y")
+        );
+        // Protocol-relative inherits the base scheme.
+        assert_eq!(
+            resolve_http_redirect("https://a.example/x", "//b.example/y").as_deref(),
+            Some("https://b.example/y")
+        );
+        // Root-relative keeps scheme + authority (port included).
+        assert_eq!(
+            resolve_http_redirect("http://a.example:8080/x", "/y").as_deref(),
+            Some("http://a.example:8080/y")
+        );
+        // Surrounding whitespace is stripped.
+        assert_eq!(
+            resolve_http_redirect("https://a.example/x", "  https://b.example/y  ").as_deref(),
+            Some("https://b.example/y")
+        );
+        // An IPv6 literal round-trips with its brackets.
+        assert_eq!(
+            resolve_http_redirect("https://[fe80::1]:8443/x", "/y").as_deref(),
+            Some("https://[fe80::1]:8443/y")
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_refuses_what_it_cannot_revet() {
+        // Relative path: joining it needs the base path, which we do not keep.
+        assert_eq!(resolve_http_redirect("https://a.example/x/y", "z"), None);
+        assert_eq!(resolve_http_redirect("https://a.example/x/y", "../z"), None);
+        // Blank / opaque Location, and a non-http(s) scheme.
+        assert_eq!(resolve_http_redirect("https://a.example/x", ""), None);
+        assert_eq!(resolve_http_redirect("https://a.example/x", "  "), None);
+        assert_eq!(
+            resolve_http_redirect("https://a.example/x", "mailto:a@b"),
+            None
+        );
+        assert_eq!(
+            resolve_http_redirect("https://a.example/x", "ftp://a.example/"),
+            None
+        );
+        // A base with no authority cannot host a root-relative hop.
+        assert_eq!(resolve_http_redirect("https://", "/y"), None);
+    }
+
+    /// The pairing that closes the redirect hole: a public hop's `Location` is
+    /// resolved and then fed straight back to the classifier, which must refuse
+    /// the internal targets a hostile 302 would aim at.
+    #[test]
+    fn resolved_redirect_targets_are_classified() {
+        for (base, loc) in [
+            (
+                "https://evil.example/",
+                "http://169.254.169.254/latest/meta-data/",
+            ),
+            ("https://evil.example/", "http://127.0.0.1:80/admin"),
+            ("https://evil.example/", "//192.168.1.1/router"),
+            ("https://evil.example/", "//printer.local/status"),
+        ] {
+            let next = resolve_http_redirect(base, loc).expect("resolves");
+            let (host, _) = parse_http_authority(&next).expect("parses");
+            assert!(
+                public_fetch_target_refusal(host, false).is_some(),
+                "{next} should have been refused"
+            );
+        }
+        // …while a public redirect target still passes.
+        let next =
+            resolve_http_redirect("https://evil.example/", "//cdn.example/a").expect("resolves");
+        let (host, _) = parse_http_authority(&next).expect("parses");
+        assert_eq!(public_fetch_target_refusal(host, false), None);
+    }
+
+    /// End-to-end for the empty-port form: these URLs all parse as the default
+    /// port on a real URL client and are accepted by the socket layer, so the
+    /// guard must refuse every one of them.
+    #[test]
+    fn empty_port_targets_survive_the_full_guard() {
+        for url in [
+            "http://127.0.0.1:/admin",
+            "http://127.8.8.8:/x",
+            "http://169.254.169.254:/latest/meta-data/",
+            "http://localhost:/x",
+            "http://printer.local:/x",
+            "http://10.0.0.1:/x",
+            "http://[::1]:/",
+            "http://[fe80::1]:/",
+        ] {
+            let (host, _) = parse_http_authority(url).expect("parses");
+            assert!(
+                public_fetch_target_refusal(host, false).is_some(),
+                "{url} parsed to {host:?}, which the guard must refuse"
+            );
+        }
+    }
+
     #[test]
     fn public_fetch_refuses_loopback_names() {
         for h in ["localhost", "LOCALHOST", "foo.localhost", "printer.local"] {
@@ -1806,6 +2136,41 @@ mod tests {
     #[test]
     fn public_fetch_refuses_loopback_and_link_local_v4() {
         for h in ["127.0.0.1", "127.8.8.8", "169.254.169.254", "169.254.1.1"] {
+            assert!(
+                public_fetch_target_refusal(h, true).is_some(),
+                "{h} must be refused even with allow_private"
+            );
+        }
+    }
+
+    /// A trailing dot is the FQDN spelling of the same name; `0.0.0.0/8`
+    /// and the broadcast address are not fetch targets.
+    #[test]
+    fn public_fetch_refuses_trailing_dot_and_unspecified_v4() {
+        for h in [
+            "localhost.",
+            "127.0.0.1.",
+            "169.254.169.254.",
+            "0.0.0.0",
+            "0.1.2.3",
+            "255.255.255.255",
+        ] {
+            assert!(
+                public_fetch_target_refusal(h, false).is_some(),
+                "{h} must be refused"
+            );
+        }
+    }
+
+    /// IPv6 unique-local (`fc00::/7`), unspecified (`::`) and multicast are
+    /// never public targets, even with `allow_private`.
+    #[test]
+    fn public_fetch_refuses_ipv6_ula_unspecified_and_multicast() {
+        for h in ["[fd12:3456::1]", "[fc00::1]", "[::]", "[ff02::1]"] {
+            assert!(
+                public_fetch_target_refusal(h, false).is_some(),
+                "{h} must be refused"
+            );
             assert!(
                 public_fetch_target_refusal(h, true).is_some(),
                 "{h} must be refused even with allow_private"
@@ -1852,5 +2217,130 @@ mod tests {
         // A name that merely ends in "local" as a substring is not mDNS —
         // only the `.local` suffix is.
         assert!(public_fetch_target_refusal("localhost.evil.com", false).is_none());
+    }
+
+    // -- AT+AGENTCFG -------------------------------------------------------
+
+    #[cfg(any(
+        feature = "nrf52",
+        feature = "esp32",
+        feature = "embedded",
+        feature = "std"
+    ))]
+    fn agentcfg_args() -> [&'static [u8]; 8] {
+        [b"node-1", b"20", b"524288", b"10", b"30", b"1", b"10", b"0"]
+    }
+
+    #[cfg(any(
+        feature = "nrf52",
+        feature = "esp32",
+        feature = "embedded",
+        feature = "std"
+    ))]
+    #[test]
+    fn agentcfg_accepts_the_documented_eight_field_form() {
+        let cfg = validate_agentcfg_set(&cmd_token(AtOp::AgentCfg, &agentcfg_args()))
+            .expect("valid form must be accepted");
+        assert_eq!(cfg.name.as_str(), "node-1");
+        assert_eq!(cfg.max_iterations, 20);
+        assert_eq!(cfg.max_memory, 524288);
+        assert_eq!(cfg.watchdog_timeout_secs, 10);
+        assert_eq!(cfg.ble_timeout_secs, 30);
+        assert!(cfg.skills_enabled);
+        assert_eq!(cfg.max_skills, 10);
+        assert!(!cfg.debug_enabled);
+    }
+
+    #[cfg(any(
+        feature = "nrf52",
+        feature = "esp32",
+        feature = "embedded",
+        feature = "std"
+    ))]
+    #[test]
+    fn agentcfg_rejects_a_partial_form() {
+        let args = agentcfg_args();
+        for n in 0..8 {
+            let err = validate_agentcfg_set(&cmd_token(AtOp::AgentCfg, &args[..n]))
+                .expect_err("a partial form must be rejected");
+            assert_eq!(err, AtOutcome::error(4), "{n} fields must be a usage error");
+        }
+    }
+
+    #[cfg(any(
+        feature = "nrf52",
+        feature = "esp32",
+        feature = "embedded",
+        feature = "std"
+    ))]
+    #[test]
+    fn agentcfg_rejects_values_agent_config_would_refuse() {
+        // Zero iterations / memory / watchdog / skills are numeric range
+        // failures (`:7`); a boolean that is not 0/1 is a malformed argument
+        // (`:4`). Neither may be stored.
+        for (idx, bad, expected_code) in [
+            (1, b"0".as_slice(), 7), // max_iterations
+            (2, b"0".as_slice(), 7), // max_memory
+            (3, b"0".as_slice(), 7), // watchdog
+            (4, b"0".as_slice(), 7), // BLE timeout
+            (6, b"0".as_slice(), 7), // max_skills
+            (5, b"2".as_slice(), 4), // skills_enabled
+            (7, b"2".as_slice(), 4), // debug_enabled
+        ] {
+            let mut args = agentcfg_args();
+            args[idx] = bad;
+            let err = validate_agentcfg_set(&cmd_token(AtOp::AgentCfg, &args))
+                .expect_err("out-of-range value must be rejected");
+            assert_eq!(err, AtOutcome::error(expected_code), "field {idx}");
+        }
+    }
+
+    #[cfg(any(
+        feature = "nrf52",
+        feature = "esp32",
+        feature = "embedded",
+        feature = "std"
+    ))]
+    #[test]
+    fn agentcfg_rejects_a_comma_in_the_name() {
+        // A quoted name may legally contain a comma at the AT syntax layer,
+        // but the query reply is comma-separated and unquoted — storing one
+        // would make `AT+AGENTCFG?` unparseable as an eight-field line.
+        let mut args = agentcfg_args();
+        args[0] = b"node,1";
+        let err = validate_agentcfg_set(&cmd_token(AtOp::AgentCfg, &args))
+            .expect_err("a comma in the name must be rejected");
+        assert_eq!(err, AtOutcome::error(4));
+    }
+
+    #[cfg(any(
+        feature = "nrf52",
+        feature = "esp32",
+        feature = "embedded",
+        feature = "std"
+    ))]
+    #[test]
+    fn agentcfg_rejects_a_non_numeric_field() {
+        let mut args = agentcfg_args();
+        args[1] = b"twenty";
+        let err = validate_agentcfg_set(&cmd_token(AtOp::AgentCfg, &args))
+            .expect_err("non-numeric iterations must be rejected");
+        assert_eq!(err, AtOutcome::error(4));
+    }
+
+    #[test]
+    fn agentcfg_reset_sentinel_is_exactly_one_reset_token() {
+        assert!(agentcfg_is_reset(&cmd_token(AtOp::AgentCfg, &[b"RESET"])));
+        assert!(agentcfg_is_reset(&cmd_token(AtOp::AgentCfg, &[b"reset"])));
+        // A name literally spelled "RESET" plus the other fields is a *set*,
+        // not a reset — the sentinel requires exactly one argument.
+        assert!(!agentcfg_is_reset(&cmd_token(
+            AtOp::AgentCfg,
+            &[b"RESET", b"20"]
+        )));
+        assert!(!agentcfg_is_reset(&cmd_token(
+            AtOp::AgentCfg,
+            &[b"RESETME"]
+        )));
     }
 }

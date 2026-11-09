@@ -421,6 +421,7 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "read_heart_rate",
     "read_glucose",
     "read_ecg",
+    "check_stress_level",
     "voice_output",
     "send_notification",
 ];
@@ -442,8 +443,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
     const BUILTINS: &[(&str, &str, ToolType)] = &[
         (
             "read_sensor",
-            "Read a sensor value (temperature, accelerometer, humidity, \
-             pressure, light, heart_rate, hrv, glucose, ecg, stress, battery)",
+            // Must stay within `Tool::description`'s 128-char bound: the
+            // registration path used to blank an over-long description, which
+            // silently removed the tool from the prompt altogether.
+            "Read sensor (temperature, accelerometer, humidity, pressure, \
+             light, heart_rate, hrv, glucose, ecg, stress, battery, memory)",
             ToolType::ReadSensor,
         ),
         (
@@ -482,6 +486,11 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
             ToolType::ReadEcg,
         ),
         (
+            "check_stress_level",
+            "Read stress level (alias for read_sensor sensor=stress)",
+            ToolType::StressLevel,
+        ),
+        (
             "voice_output",
             "Queue a text-to-speech utterance",
             ToolType::VoiceOutput,
@@ -506,7 +515,24 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         };
         let desc_h = match heapless::String::<128>::try_from(*description) {
             Ok(s) => s,
-            Err(_) => heapless::String::new(),
+            Err(_) => {
+                // An over-long description used to become the EMPTY string,
+                // and `describe_served` skips empty descriptions — the tool
+                // vanished from the prompt with no diagnostic. Truncate on a
+                // character boundary and say so instead.
+                log::warn!(
+                    "[agent] tool '{}' description ({} B) exceeds 128 B; truncating",
+                    name,
+                    description.len()
+                );
+                let mut end = description.len().min(128);
+                while end > 0 && !description.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let mut s = heapless::String::<128>::new();
+                let _ = s.push_str(&description[..end]);
+                s
+            }
         };
         let tool = Tool {
             name: name_h,
@@ -518,6 +544,14 @@ fn register_builtin_tools(registry: &mut ToolRegistry) {
         let _ = registry.register(tool);
     }
 }
+
+/// Highest GPIO pin the natural-language heuristic accepts.
+///
+/// ESP32-S3 exposes 0..=48; nRF52840 and the other supported boards fit
+/// inside that range. Pin *validity* (strapping/flash pins) is a board fact,
+/// not something this chip-agnostic crate can know.
+#[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+const MAX_HEURISTIC_GPIO_PIN: u32 = 48;
 
 #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
 impl MiniAgent {
@@ -762,7 +796,10 @@ impl MiniAgent {
             // between `self.skills.all()` and `self.add_message()`.
             // We cap at 4 injected skills to keep the conversation buffer
             // from filling up before the loop has a chance to run.
-            let mut to_inject: heapless::Vec<heapless::String<512>, 4> = heapless::Vec::new();
+            let mut to_inject: heapless::Vec<
+                heapless::String<{ crate::skills::MAX_INJECTION_LEN }>,
+                4,
+            > = heapless::Vec::new();
             for skill in self.skills.all() {
                 if to_inject.is_full() {
                     break;
@@ -784,8 +821,11 @@ impl MiniAgent {
 
         // Surface the tool inventory to the LLM. We borrow the
         // registry mutably only because that's the access we have,
-        // but `describe()` is read-only.
-        let described = self.tools().describe();
+        // but `describe_served()` is read-only. It is the same promise as
+        // `build_llm_system_prompt` makes, so it must honour the installed
+        // handler too — an unservable tool listed here is one the model will
+        // call and the executor will refuse.
+        let described = self.tools().describe_served();
         if !described.is_empty() {
             let mut header = heapless::String::<16>::new();
             let _ = header.push_str("tools=");
@@ -843,11 +883,24 @@ impl MiniAgent {
                                 tool.as_str(),
                                 args.as_str()
                             );
-                            self.pending_tool = Some(ToolCall {
-                                name: heapless::String::try_from(tool.as_str()).unwrap_or_default(),
-                                arguments: heapless::String::try_from(args.as_str())
-                                    .unwrap_or_default(),
-                            });
+                            // Bounded the same way as a message: truncating a
+                            // tool name/args to "" used to execute the tool
+                            // with no arguments, which for `fetch_web` means a
+                            // request with no URL rather than a visible error.
+                            let name = heapless::String::try_from(tool.as_str()).map_err(|_| {
+                                AgentError::InputValidationFailed {
+                                    field: "tool_call.name",
+                                    reason: crate::error::ValidationError::TooLong,
+                                }
+                            })?;
+                            let arguments =
+                                heapless::String::try_from(args.as_str()).map_err(|_| {
+                                    AgentError::InputValidationFailed {
+                                        field: "tool_call.arguments",
+                                        reason: crate::error::ValidationError::TooLong,
+                                    }
+                                })?;
+                            self.pending_tool = Some(ToolCall { name, arguments });
                             self.add_message("assistant", reply.as_str())?;
                             self.state = AgentState::Executing;
                             return Ok(());
@@ -879,7 +932,7 @@ impl MiniAgent {
         // default pin=13.
         let arguments = if name == "write_gpio" {
             match self.extract_gpio_pin(task.as_str()) {
-                Some(pin) => {
+                Ok(Some(pin)) => {
                     // Decide the state from the task text directly ("low" /
                     // "off" / "0" → low), because pick_tool only checks for
                     // "off" and would mis-route "set gpio 7 low".
@@ -895,7 +948,14 @@ impl MiniAgent {
                     let _ = write!(a, "pin={pin},state={state}");
                     a
                 }
-                None => heapless::String::try_from(args).unwrap_or_default(),
+                Ok(None) => heapless::String::try_from(args).unwrap_or_default(),
+                Err(n) => {
+                    log::warn!("[agent] GPIO pin {n} is outside the supported 0..={MAX_HEURISTIC_GPIO_PIN} range");
+                    return Err(AgentError::InputValidationFailed {
+                        field: "task.gpio_pin",
+                        reason: crate::error::ValidationError::OutOfRange,
+                    });
+                }
             }
         } else {
             heapless::String::try_from(args).unwrap_or_default()
@@ -939,7 +999,14 @@ impl MiniAgent {
         // PATCHED (MicroAgent): a tool the prompt does not mention is a tool the
         // model cannot use — and it will honestly say so ("I don't have that
         // tool"). Report an overflow instead of dropping the tail silently.
-        let tools = self.tools.describe();
+        //
+        // `describe_served`, not `describe`: the registry holds the built-in
+        // hardware pack, but a real target implements only some of it. On the
+        // ESP32 seven of the fifteen registered names (the health sensors,
+        // `voice_output`, `send_notification`, `ble_send`) have no hardware, so
+        // advertising them only taught the model to call tools that answer "not
+        // implemented on this target".
+        let tools = self.tools.describe_served();
         if out.push_str(tools.as_str()).is_err() {
             log::warn!(
                 "[agent] LLM system prompt buffer ({} B) too small for the {}-byte tool list — \
@@ -1161,8 +1228,29 @@ impl MiniAgent {
                 reason: crate::error::ConfigError::MissingField,
             })?;
 
-        // Execute via the tool registry.
-        let result = self.tools.execute(&tool_call).await?;
+        // Execute via the tool registry. A malformed call (missing required
+        // argument, unknown tool) used to propagate out of `run()` and abort
+        // the whole task without ever showing the model what it got wrong.
+        // Record it as a failed tool result instead, matching what
+        // `RealAgentRunner` does, so the next ReAct iteration can recover.
+        let result = match self.tools.execute(&tool_call).await {
+            Ok(result) => result,
+            Err(err) => {
+                let mut data = heapless::String::<256>::new();
+                {
+                    use core::fmt::Write as _;
+                    let _ = write!(data, "{err}");
+                }
+                let mut error = heapless::String::<64>::new();
+                let _ = error.push_str("tool execution failed");
+                ToolResult {
+                    tool_name: tool_call.name.clone(),
+                    data,
+                    success: false,
+                    error: Some(error),
+                }
+            }
+        };
 
         // Update skill usage statistics: if a matching skill was
         // injected earlier, bump its counters so callers can see which
@@ -1196,6 +1284,19 @@ impl MiniAgent {
             result_msg.push_str("Tool error: ")
         };
         let _ = result_msg.push_str(result.data.as_str());
+        // `data` is empty for some refusals (the registry's "not implemented
+        // on this target" path); the reason lives in `error`. Without this
+        // the model saw a bare `Tool error: ` and the final answer repeated it.
+        if !result.success {
+            if let Some(reason) = result.error.as_ref() {
+                if !reason.is_empty() {
+                    if !result.data.is_empty() {
+                        let _ = result_msg.push_str(": ");
+                    }
+                    let _ = result_msg.push_str(reason.as_str());
+                }
+            }
+        }
         self.add_message("tool", result_msg.as_str())?;
         self.state = AgentState::Observing;
         Ok(())
@@ -1247,11 +1348,23 @@ impl MiniAgent {
             });
         }
 
-        let message = Message {
-            role: heapless::String::try_from(role).unwrap_or_else(|_| heapless::String::new()),
-            content: heapless::String::try_from(content)
-                .unwrap_or_else(|_| heapless::String::new()),
-        };
+        // A too-long model reply used to be coerced to an empty message, so
+        // `think` still marked the task `Finished` and `run()` returned
+        // `Ok("")` — the answer vanished with no error anywhere. Surface the
+        // overflow instead.
+        let role = heapless::String::try_from(role).map_err(|_| {
+            AgentError::InputValidationFailed {
+                field: "message.role",
+                reason: crate::error::ValidationError::TooLong,
+            }
+        })?;
+        let content = heapless::String::try_from(content).map_err(|_| {
+            AgentError::InputValidationFailed {
+                field: "message.content",
+                reason: crate::error::ValidationError::TooLong,
+            }
+        })?;
+        let message = Message { role, content };
 
         self.conversation
             .push(message)
@@ -1328,10 +1441,16 @@ impl MiniAgent {
         out
     }
     /// Extract an explicit GPIO pin number from a task's natural-language
-    /// text, e.g. "set gpio 5 high" or "pin 7 low". Returns `None` when no
-    /// pin is mentioned, so the caller falls back to `pick_tool`'s default.
-    /// The pin is bounded to a `u8` (ESP32 GPIOs are in 0..=48).
-    fn extract_gpio_pin(&self, task: &str) -> Option<u8> {
+    /// text, e.g. "set gpio 5 high" or "pin 7 low".
+    ///
+    /// * `Ok(None)` — no pin mentioned; the caller uses `pick_tool`'s default.
+    /// * `Ok(Some(pin))` — a usable pin in `0..=MAX_HEURISTIC_GPIO_PIN`.
+    /// * `Err(n)` — the text named a pin, but `n` is outside the board range.
+    ///
+    /// The third case used to collapse into `None`, so "set gpio 500 high"
+    /// silently drove the *default* pin 13, and pins 49..=255 were passed
+    /// through even though no board has them.
+    fn extract_gpio_pin(&self, task: &str) -> core::result::Result<Option<u8>, u32> {
         let lower = task.to_ascii_lowercase();
         for marker in ["pin", "gpio"] {
             let mut search: &str = lower.as_str();
@@ -1347,20 +1466,21 @@ impl MiniAgent {
                         Some(d) => {
                             n = n.saturating_mul(10).saturating_add(d);
                             any = true;
-                            if n > u32::from(u8::MAX) {
-                                break;
-                            }
                         }
                         None => break,
                     }
                 }
-                if any && n <= u32::from(u8::MAX) {
-                    return Some(n as u8);
+                if any {
+                    return if n <= MAX_HEURISTIC_GPIO_PIN {
+                        Ok(Some(n as u8))
+                    } else {
+                        Err(n)
+                    };
                 }
                 search = rest;
             }
         }
-        None
+        Ok(None)
     }
 }
 
@@ -1423,6 +1543,142 @@ mod tests {
         let (name, args) = agent.pick_tool("Read the temperature");
         assert_eq!(name, "read_sensor");
         assert!(args.contains("temperature"));
+    }
+
+    /// Round 21: the embedded prompt is built from the live registry, but a
+    /// real target serves only part of it. `describe_served` keeps the
+    /// unserved names out, so the model is not told it can read a sensor the
+    /// board does not have (the ESP32 advertised seven such tools).
+    #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+    #[test]
+    fn the_llm_prompt_omits_tools_the_installed_handler_cannot_serve() {
+        struct SensorOnly;
+        static SENSOR_ONLY: SensorOnly = SensorOnly;
+        impl crate::tools::ToolHandler for SensorOnly {
+            fn handle(&self, _call: &ToolCall) -> Option<ToolResult> {
+                None
+            }
+            fn serves(&self, name: &str) -> bool {
+                name == "read_sensor"
+            }
+        }
+
+        let mut agent = MiniAgent::new(make_cfg()).expect("agent");
+        // No handler: the whole built-in pack is advertised.
+        let full = agent.build_llm_system_prompt();
+        assert!(
+            full.contains("read_sensor") && full.contains("ble_send"),
+            "got {full}"
+        );
+
+        agent.set_tool_handler(&SENSOR_ONLY);
+        let served = agent.build_llm_system_prompt();
+        assert!(served.contains("read_sensor"), "got {served}");
+        for absent in [
+            "ble_send",
+            "voice_output",
+            "send_notification",
+            "read_heart_rate",
+        ] {
+            assert!(
+                !served.contains(absent),
+                "{absent} must not be advertised by the prompt: {served}"
+            );
+        }
+    }
+
+    /// Round 24: `serves()` filters whole *tools*, but `read_sensor` carries
+    /// twelve sensor names inside one description. A target that runs the tool
+    /// with only a temperature sensor still advertised battery/glucose/ECG/...
+    /// — the ESP32 answers every one of those with "unsupported sensor", so the
+    /// prompt promised readings the board cannot produce.
+    #[cfg(any(feature = "nrf52", feature = "esp32", feature = "embedded"))]
+    #[test]
+    fn the_llm_prompt_does_not_advertise_sensors_the_handler_cannot_read() {
+        struct TemperatureOnly;
+        static TEMPERATURE_ONLY: TemperatureOnly = TemperatureOnly;
+        impl crate::tools::ToolHandler for TemperatureOnly {
+            fn handle(&self, _call: &ToolCall) -> Option<ToolResult> {
+                None
+            }
+            fn serves(&self, name: &str) -> bool {
+                name == "read_sensor"
+            }
+            fn describe_tool(&self, name: &str) -> Option<&'static str> {
+                match name {
+                    "read_sensor" => Some("Read the chip temperature. args: sensor=temperature"),
+                    _ => None,
+                }
+            }
+        }
+
+        let mut agent = MiniAgent::new(make_cfg()).expect("agent");
+        // Before the fix (no override) the shared description leaked `battery`.
+        assert!(
+            agent.build_llm_system_prompt().contains("battery"),
+            "the registry description should name battery before the handler narrows it"
+        );
+
+        agent.set_tool_handler(&TEMPERATURE_ONLY);
+        let served = agent.build_llm_system_prompt();
+        assert!(served.contains("read_sensor"), "got {served}");
+        for absent in ["battery", "glucose", "ecg", "accelerometer"] {
+            assert!(
+                !served.contains(absent),
+                "the prompt must not advertise a sensor this board cannot read \
+                 ({absent}): {served}"
+            );
+        }
+    }
+
+    /// Every registration-time tool must actually reach the prompt. An
+    /// over-long description was silently replaced with `""`, and
+    /// `describe_served` skips empty descriptions, so the tool disappeared
+    /// entirely (this is how `read_sensor` vanished when `memory` was added).
+    #[test]
+    fn the_prompt_advertises_every_builtin_tool() {
+        let agent = MiniAgent::new(make_cfg()).expect("agent");
+        let prompt = agent.build_llm_system_prompt();
+        for name in [
+            "read_sensor",
+            "write_gpio",
+            "flash_read",
+            "flash_write",
+            "ble_send",
+            "read_heart_rate",
+            "read_glucose",
+            "read_ecg",
+            "check_stress_level",
+            "voice_output",
+            "send_notification",
+        ] {
+            assert!(prompt.contains(name), "`{name}` missing from prompt: {prompt}");
+        }
+        // `sensor=memory` is served by the executor and must be advertised.
+        assert!(prompt.contains("memory"), "memory sensor not advertised");
+    }
+
+    /// A model reply longer than `MAX_BUFFER_SIZE` used to be coerced to an
+    /// empty assistant message; the run still finished and returned `Ok("")`.
+    /// Over-long content must be an error the caller can see.
+    #[test]
+    fn an_over_long_message_is_an_error_not_an_empty_answer() {
+        let mut agent = MiniAgent::new(make_cfg()).expect("agent");
+        let long = "x".repeat(MAX_BUFFER_SIZE + 1);
+        let err = agent
+            .add_message("assistant", long.as_str())
+            .expect_err("over-long content must not be silently emptied");
+        assert!(matches!(
+            err,
+            AgentError::InputValidationFailed {
+                field: "message.content",
+                reason: crate::error::ValidationError::TooLong,
+            }
+        ));
+        assert!(!agent
+            .conversation
+            .iter()
+            .any(|m| m.role.as_str() == "assistant"));
     }
 
     #[test]
@@ -1590,14 +1846,19 @@ mod tests {
     #[test]
     fn extract_gpio_pin_from_task_text() {
         let agent = MiniAgent::new(make_cfg()).expect("agent");
-        assert_eq!(agent.extract_gpio_pin("set gpio 5 high"), Some(5));
-        assert_eq!(agent.extract_gpio_pin("turn pin 7 low"), Some(7));
-        assert_eq!(agent.extract_gpio_pin("gpio=12 high"), Some(12));
-        assert_eq!(agent.extract_gpio_pin("pin: 3"), Some(3));
-        assert_eq!(agent.extract_gpio_pin("led off"), None);
-        assert_eq!(agent.extract_gpio_pin("what is the temperature"), None);
-        // Pin out of u8 range falls back to None (not a truncated value).
-        assert_eq!(agent.extract_gpio_pin("gpio 500 high"), None);
+        assert_eq!(agent.extract_gpio_pin("set gpio 5 high"), Ok(Some(5)));
+        assert_eq!(agent.extract_gpio_pin("turn pin 7 low"), Ok(Some(7)));
+        assert_eq!(agent.extract_gpio_pin("gpio=12 high"), Ok(Some(12)));
+        assert_eq!(agent.extract_gpio_pin("pin: 3"), Ok(Some(3)));
+        assert_eq!(agent.extract_gpio_pin("led off"), Ok(None));
+        assert_eq!(
+            agent.extract_gpio_pin("what is the temperature"),
+            Ok(None)
+        );
+        // A pin outside the board range is *reported*, not silently dropped
+        // (which used to fall back to the default pin 13).
+        assert_eq!(agent.extract_gpio_pin("gpio 49 high"), Err(49));
+        assert_eq!(agent.extract_gpio_pin("set gpio 500 high"), Err(500));
     }
 
     #[test]
@@ -1974,5 +2235,211 @@ mod tests {
         agent.reset();
         assert_eq!(agent.state(), AgentState::Thinking);
         assert!(agent.conversation_snapshot().is_empty());
+    }
+}
+
+/// Tests for the helper types that are compiled into *every* build —
+/// including the host `std` build where `MiniAgent` itself is gated
+/// out. The embedded `tests` module above never runs under plain
+/// `--features std`, so `BoundedTokenSink`, `AgentTelemetry`, the
+/// `TokenSink` default, and the message structs would otherwise ship
+/// untested to the host consumer (the CLI).
+#[cfg(all(
+    test,
+    not(any(feature = "nrf52", feature = "esp32", feature = "embedded"))
+))]
+mod std_tests {
+    use super::*;
+
+    /// A sink that never overrides `on_end`, so the trait default is
+    /// what runs.
+    struct BareSink;
+    impl TokenSink for BareSink {
+        fn on_token(&mut self, _token: &str) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn default_on_end_is_a_noop() {
+        // The `TokenSink::on_end` default body must be reachable and
+        // side-effect free. Driving `on_token` too keeps the trait's
+        // required method on the implementation's covered path.
+        let mut sink = BareSink;
+        assert!(sink.on_token("keep going"));
+        sink.on_end(false);
+        sink.on_end(true);
+    }
+
+    #[test]
+    fn bounded_sink_collects_tokens_within_budget() {
+        let mut buf: heapless::String<MAX_BUFFER_SIZE> = heapless::String::new();
+        let (written, truncated) = {
+            let mut sink = BoundedTokenSink::new(&mut buf, 32);
+            assert!(sink.on_token("Hello"));
+            assert!(sink.on_token(", "));
+            assert!(sink.on_token("world!"));
+            (sink.written(), sink.was_truncated())
+        };
+        assert_eq!(written, 13);
+        assert!(!truncated);
+        assert_eq!(buf.as_str(), "Hello, world!");
+    }
+
+    #[test]
+    fn bounded_sink_aborts_at_budget() {
+        let mut buf: heapless::String<MAX_BUFFER_SIZE> = heapless::String::new();
+        let (written, truncated) = {
+            let mut sink = BoundedTokenSink::new(&mut buf, 5);
+            assert!(sink.on_token("abc"));
+            // 3 + 7 = 10 > 5 → abort, and the over-budget token is
+            // not written.
+            assert!(!sink.on_token("defghij"));
+            (sink.written(), sink.was_truncated())
+        };
+        assert!(truncated);
+        assert_eq!(written, 3);
+        assert_eq!(buf.as_str(), "abc");
+    }
+
+    #[test]
+    fn bounded_sink_ignores_empty_tokens() {
+        let mut buf: heapless::String<MAX_BUFFER_SIZE> = heapless::String::new();
+        let written = {
+            let mut sink = BoundedTokenSink::new(&mut buf, 5);
+            assert!(sink.on_token(""));
+            assert!(sink.on_token("a"));
+            sink.written()
+        };
+        assert_eq!(written, 1);
+        assert_eq!(buf.as_str(), "a");
+    }
+
+    #[test]
+    fn bounded_sink_caps_at_the_buffer_size() {
+        // A cap larger than the backing buffer must clamp to
+        // `MAX_BUFFER_SIZE` (never promise more room than exists).
+        let mut buf: heapless::String<MAX_BUFFER_SIZE> = heapless::String::new();
+        let mut sink = BoundedTokenSink::new(&mut buf, usize::MAX);
+        assert!(sink.on_token("ok"));
+        assert_eq!(sink.written(), 2);
+        assert!(!sink.was_truncated());
+    }
+
+    #[test]
+    fn bounded_sink_reports_truncation_when_the_backing_buffer_is_shorter_than_the_cap() {
+        // Defence-in-depth: `written` can lag the buffer's real fill.
+        // Prefill the buffer so `push_str` fails even though the cap
+        // check passed; the sink must report truncation instead of
+        // panicking.
+        let mut buf: heapless::String<MAX_BUFFER_SIZE> = heapless::String::new();
+        buf.push_str("xyz").expect("prefill");
+        let truncated = {
+            let mut sink = BoundedTokenSink::new(&mut buf, MAX_BUFFER_SIZE);
+            // `written` is 0, so the cap check passes, but the buffer already
+            // holds 3 bytes and the token is large → push_str overflows.
+            let token = "a".repeat(MAX_BUFFER_SIZE);
+            !sink.on_token(&token) && sink.was_truncated()
+        };
+        assert!(truncated, "backing-buffer overflow must set the flag");
+        assert_eq!(buf.as_str(), "xyz");
+    }
+
+    #[test]
+    fn telemetry_success_rate_none_when_no_runs() {
+        let t = AgentTelemetry::default();
+        assert_eq!(t.success_rate_pct(), None);
+        assert_eq!(t.runs_total, 0);
+        assert_eq!(t.last_err_code, 0);
+    }
+
+    #[test]
+    fn telemetry_success_rate_partial_and_full() {
+        let full = AgentTelemetry {
+            runs_total: 4,
+            runs_ok: 4,
+            ..Default::default()
+        };
+        assert_eq!(full.success_rate_pct(), Some(100));
+
+        let partial = AgentTelemetry {
+            runs_total: 4,
+            runs_ok: 3,
+            ..Default::default()
+        };
+        assert_eq!(partial.success_rate_pct(), Some(75));
+    }
+
+    #[test]
+    fn telemetry_success_rate_never_overflows() {
+        // `runs_ok * 100` is computed in u64, so near-u32::MAX runs
+        // must not panic/wrap.
+        let t = AgentTelemetry {
+            runs_total: u32::MAX,
+            runs_ok: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(t.success_rate_pct(), Some(100));
+    }
+
+    #[test]
+    fn telemetry_reset_zeroes_every_counter() {
+        let mut t = AgentTelemetry {
+            runs_total: 9,
+            runs_ok: 7,
+            runs_err: 2,
+            think_errors: 3,
+            execute_errors: 1,
+            watchdog_trips: 1,
+            llm_failures: 4,
+            last_err_code: 0x2B,
+        };
+        t.reset();
+        assert_eq!(t, AgentTelemetry::default());
+        assert_eq!(t.success_rate_pct(), None);
+    }
+
+    #[test]
+    fn message_tool_types_construct_and_clone() {
+        // These wire types are part of the host-visible API; make sure
+        // they can be built, cloned, and debugged without the embedded
+        // `MiniAgent` around them.
+        let msg = Message {
+            role: heapless::String::try_from("user").expect("fits"),
+            content: heapless::String::try_from("hi").expect("fits"),
+        };
+        let clone = msg.clone();
+        assert_eq!(clone.role.as_str(), "user");
+        let _ = alloc::format!("{msg:?}");
+
+        let call = ToolCall {
+            name: heapless::String::try_from("read_sensor").expect("fits"),
+            arguments: heapless::String::try_from("sensor=temperature").expect("fits"),
+        };
+        assert_eq!(call.name.as_str(), "read_sensor");
+
+        let result = ToolResult {
+            tool_name: heapless::String::try_from("read_sensor").expect("fits"),
+            data: heapless::String::try_from("temperature=35.2 C").expect("fits"),
+            success: true,
+            error: None,
+        };
+        assert!(result.success);
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn agent_state_variants_are_distinct_and_copy() {
+        for (state, byte) in [
+            (AgentState::Thinking, 0u8),
+            (AgentState::Executing, 1),
+            (AgentState::Observing, 2),
+            (AgentState::Finished, 3),
+        ] {
+            assert_eq!(state as u8, byte);
+            let copy = state;
+            assert_eq!(copy, state);
+        }
+        assert_ne!(AgentState::Thinking, AgentState::Finished);
     }
 }

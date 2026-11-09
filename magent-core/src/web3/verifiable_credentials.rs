@@ -39,11 +39,14 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
+use ed25519_dalek::Verifier as _;
+
 use crate::error::Web3ErrorKind;
 use crate::web3::Signature;
 
 /// Credential context URLs.
 pub const CREDENTIALS_V2_CONTEXT: &str = "https://www.w3.org/ns/credentials/v2";
+/// Credential context URL for the W3C VC Data Model 1.1.
 pub const CREDENTIALS_V1_CONTEXT: &str = "https://www.w3.org/2018/credentials/v1";
 
 /// Verifiable Credential.
@@ -152,6 +155,66 @@ impl VerifiableCredential {
             return until < &now;
         }
         false
+    }
+
+    /// Verify the credential's Ed25519 proof.
+    ///
+    /// `validate()` only checks the document's structure; this checks the
+    /// cryptographic proof. The issuer is a `did:key`, so the public key is
+    /// embedded in `proof.verification_method` — no external key lookup is
+    /// needed. The verification method's DID must also equal `issuer`, so a
+    /// credential cannot claim one issuer while carrying another key.
+    pub fn verify_proof(&self) -> Result<(), Web3ErrorKind> {
+        let proof = self.proof.as_ref().ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("credential has no proof".to_string())
+        })?;
+        match proof.proof_type {
+            ProofType::Ed25519Signature2020 | ProofType::Ed25519Signature2018 => {}
+            other => {
+                return Err(Web3ErrorKind::BlockchainError(format!(
+                    "unsupported credential proof type: {other:?}"
+                )))
+            }
+        }
+        let vm_did = proof
+            .verification_method
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if vm_did != self.issuer {
+            return Err(Web3ErrorKind::BlockchainError(format!(
+                "proof verification method {:?} does not match issuer {:?}",
+                vm_did, self.issuer
+            )));
+        }
+        let did = crate::web3::DidKey::from_string(vm_did)?;
+        let public_key = did.ed25519_public_key()?;
+        let pk_bytes: [u8; 32] = public_key.try_into().map_err(|_| {
+            Web3ErrorKind::BlockchainError("issuer public key is not 32 bytes".to_string())
+        })?;
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
+            .map_err(|e| Web3ErrorKind::BlockchainError(format!("invalid issuer key: {e}")))?;
+        let signature = Signature::from_hex(&proof.proof_value)?;
+        let dalek_sig = ed25519_dalek::Signature::from_bytes(signature.to_bytes());
+        verifying_key
+            .verify(&self.encode_for_signing(), &dalek_sig)
+            .map_err(|_| {
+                Web3ErrorKind::BlockchainError(
+                    "credential proof signature does not verify".to_string(),
+                )
+            })
+    }
+
+    /// Structural validation plus proof verification and expiry.
+    pub fn verify(&self) -> Result<(), Web3ErrorKind> {
+        self.validate()?;
+        if self.is_expired() {
+            return Err(Web3ErrorKind::BlockchainError(
+                "credential has expired".to_string(),
+            ));
+        }
+        self.verify_proof()
     }
 
     /// Encode for signing (canonical form).
@@ -305,9 +368,10 @@ impl CredentialProof {
 }
 
 /// Proof types supported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProofType {
     /// Ed25519 Signature 2020.
+    #[default]
     #[serde(rename = "Ed25519Signature2020")]
     Ed25519Signature2020,
     /// Ed25519 Signature 2018.
@@ -319,12 +383,6 @@ pub enum ProofType {
     /// JSON Web Signature (JWS).
     #[serde(rename = "JsonWebSignature2020")]
     JsonWebSignature2020,
-}
-
-impl Default for ProofType {
-    fn default() -> Self {
-        ProofType::Ed25519Signature2020
-    }
 }
 
 // ============================================================================
@@ -480,18 +538,43 @@ impl CredentialSchema {
     }
 
     /// Validate a credential against this schema.
+    ///
+    /// Implements the `required` keyword of the JSON Schema dialect the schema
+    /// declares: an *array* of property names, each of which must be present in
+    /// the credential subject. A name of `id` refers to the subject's DID, which
+    /// is a dedicated field rather than a claim.
+    ///
+    /// A `required` that is neither absent nor a well-formed array of strings is
+    /// reported as an error rather than skipped: silently ignoring a schema this
+    /// function cannot interpret is how a validator ends up always returning
+    /// `Ok`, which would let an unvalidated credential look conformant.
     pub fn validate(&self, credential: &VerifiableCredential) -> Result<(), Web3ErrorKind> {
-        // Basic validation: check required fields exist
         let subject = &credential.credential_subject;
 
-        if let Some(serde_json::Value::Object(map)) = self.schema.get("required") {
-            for field in map.keys() {
-                if field != "id" && !subject.claims.contains_key(field) {
-                    return Err(Web3ErrorKind::BlockchainError(format!(
-                        "missing required field: {}",
-                        field
-                    )));
-                }
+        let required = match self.schema.get("required") {
+            Some(value) => value.as_array().ok_or_else(|| {
+                Web3ErrorKind::BlockchainError(
+                    "schema `required` must be an array of property names".to_string(),
+                )
+            })?,
+            None => return Ok(()),
+        };
+
+        for entry in required {
+            let field = entry.as_str().ok_or_else(|| {
+                Web3ErrorKind::BlockchainError(
+                    "schema `required` entries must be strings".to_string(),
+                )
+            })?;
+            let present = if field == "id" {
+                !subject.id.is_empty()
+            } else {
+                subject.claims.contains_key(field)
+            };
+            if !present {
+                return Err(Web3ErrorKind::BlockchainError(format!(
+                    "missing required field: {field}"
+                )));
             }
         }
 
@@ -754,7 +837,7 @@ mod tests {
     #[test]
     fn test_credential_validation() {
         let subject = CredentialSubject::new("did:key:z6Mktest123");
-        let mut vc = VerifiableCredential::new(
+        let vc = VerifiableCredential::new(
             "urn:uuid:test",
             "did:key:z6Mkissuer",
             vec!["VerifiableCredential".to_string()],
@@ -801,6 +884,76 @@ mod tests {
             subject.get("verified"),
             Some(&serde_json::Value::Bool(true))
         );
+    }
+
+    /// JSON Schema defines `required` as an *array* of property names. The check
+    /// originally matched only `Value::Object`, so a spec-shaped schema took the
+    /// "not required" branch and `validate` returned `Ok(())` for every input —
+    /// a schema check that could never reject anything.
+    #[test]
+    fn schema_validate_enforces_required_fields() {
+        let schema = CredentialSchema::new(
+            "urn:schema:person",
+            "Person",
+            "1.0",
+            serde_json::json!({ "required": ["name", "degree"] }),
+        );
+
+        let vc = |subject: CredentialSubject| {
+            VerifiableCredential::new(
+                "urn:uuid:schema-test",
+                "did:key:z6Mkissuer",
+                vec!["VerifiableCredential".to_string()],
+                subject,
+            )
+        };
+
+        // Missing `degree`: must be rejected.
+        let missing =
+            vc(CredentialSubject::new("did:key:z6Mksubject").with_claim("name", &"Alice"));
+        let err = schema
+            .validate(&missing)
+            .expect_err("a missing required claim must fail validation");
+        assert!(
+            format!("{err:?}").contains("degree"),
+            "error should name the missing field: {err:?}"
+        );
+
+        // All required claims present: accepted.
+        let complete = vc(CredentialSubject::new("did:key:z6Mksubject")
+            .with_claim("name", &"Alice")
+            .with_claim("degree", &"MSc"));
+        assert!(schema.validate(&complete).is_ok());
+
+        // `id` resolves to the subject DID, not to a claim.
+        let id_schema = CredentialSchema::new(
+            "urn:schema:with-id",
+            "WithId",
+            "1.0",
+            serde_json::json!({ "required": ["id"] }),
+        );
+        assert!(id_schema
+            .validate(&vc(CredentialSubject::new("did:key:z6Mksubject")))
+            .is_ok());
+        assert!(id_schema.validate(&vc(CredentialSubject::new(""))).is_err());
+
+        // A `required` this function cannot interpret is an error, not a pass.
+        let malformed = CredentialSchema::new(
+            "urn:schema:bad",
+            "Bad",
+            "1.0",
+            serde_json::json!({ "required": "name" }),
+        );
+        assert!(malformed.validate(&complete).is_err());
+
+        // No `required` keyword at all: nothing to check.
+        let empty = CredentialSchema::new(
+            "urn:schema:empty",
+            "Empty",
+            "1.0",
+            serde_json::json!({ "type": "object" }),
+        );
+        assert!(empty.validate(&missing).is_ok());
     }
 
     #[test]
@@ -860,10 +1013,7 @@ mod tests {
             let v4_char = id.as_bytes()[v4_byte_idx];
             let variant_char = id.as_bytes()[variant_byte_idx];
             assert_eq!(v4_char, b'4', "expected version-4 in {id}");
-            let variant_top_two_bits = match variant_char {
-                b'8'..=b'b' => true,
-                _ => false,
-            };
+            let variant_top_two_bits = matches!(variant_char, b'8'..=b'b');
             assert!(
                 variant_top_two_bits,
                 "expected RFC 4122 variant-1 (8/9/a/b) in {id}, got '{variant_char}'"

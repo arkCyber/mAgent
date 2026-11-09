@@ -256,6 +256,30 @@ mod tests {
     }
 
     #[test]
+    fn idle_can_step_directly_down_to_deep_sleep() {
+        let pm = PowerManager::new();
+        pm.enter_idle().unwrap();
+        // Idle → DeepSleep is a permitted one-step drop.
+        pm.set_mode(PowerMode::DeepSleep).unwrap();
+        assert_eq!(pm.current_mode(), PowerMode::DeepSleep);
+    }
+
+    #[test]
+    fn deep_sleep_waking_to_low_power_is_rejected_with_deep_sleep_from() {
+        // DeepSleep → LowPower steps *up* without going through Active, so it
+        // is rejected; the error names DeepSleep as the source.
+        let pm = PowerManager::new();
+        pm.enter_deep_sleep().unwrap();
+        match pm.set_mode(PowerMode::LowPower).unwrap_err() {
+            AgentError::InvalidStateTransition { from, to } => {
+                assert_eq!(from, "DeepSleep");
+                assert_eq!(to, "LowPower");
+            }
+            other => panic!("expected InvalidStateTransition, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn convenience_entry_methods() {
         let pm = PowerManager::new();
         assert!(pm.enter_idle().is_ok());

@@ -32,7 +32,7 @@
 #![cfg(feature = "piccolo")]
 
 use piccolo::{
-    Callback, CallbackReturn, Closure, Error, Executor, FromMultiValue, Fuel, Function,
+    Callback, CallbackReturn, Closure, Error, Executor, Fuel, Function,
     FunctionPrototype, Lua, RuntimeError, StashedExecutor, String as LuaString, Table, Value,
     Variadic,
 };
@@ -40,7 +40,10 @@ use piccolo::{
 use crate::agent::{reason as agent_reason, SharedAgent};
 use crate::engine::LuaEngine;
 use crate::error::{LuaHostError, Result};
-use crate::hardware::SharedHardware;
+use crate::hardware::{
+    SharedHardware, MAX_FLASH_READ_LEN, MAX_I2C_READ_LEN, MAX_I2C_WRITE_LEN,
+    MAX_PAYLOAD_LEN, MAX_REASON_LEN,
+};
 use crate::nvram;
 
 /// Read one Lua string argument off the stack and decode it as UTF-8.
@@ -58,6 +61,51 @@ fn pop_i64<'gc>(ctx: piccolo::Context<'gc>, stack: &mut piccolo::Stack<'gc, '_>)
     stack
         .from_front(ctx)
         .map_err(|_| LuaHostError::Lua("expected integer argument".into()))
+}
+
+/// Read a `hardware.*` read length and bound it to `max`.
+///
+/// The value is script-supplied, and the backend allocates a buffer of that
+/// size, so an unchecked value is a host abort: a negative Lua integer wraps
+/// to a huge `usize` through the `as usize` cast the caller would apply, and a
+/// large positive one is just as fatal. Reject both here, at the boundary,
+/// where the value is still known to be untrusted.
+/// Convert a script-supplied Lua integer to `u8`, rejecting out-of-range
+/// values instead of truncating with `as u8`.
+///
+/// The mlua engine rejects these at the binding boundary; this engine used
+/// `as u8`, so `hardware.gpio_write(256, 1)` silently drove pin 0 and
+/// `i2c_write(0x148, …)` addressed device 0x48. Same script, different
+/// hardware action depending on the engine — the cast must be checked.
+fn to_u8_arg(value: i64, what: &str) -> Result<u8> {
+    u8::try_from(value)
+        .map_err(|_| LuaHostError::Lua(format!("{what} out of range 0..=255: {value}")))
+}
+
+/// Convert a script-supplied Lua integer to `u32` (flash addresses),
+/// rejecting negative or over-wide values instead of truncating.
+fn to_u32_arg(value: i64, what: &str) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| LuaHostError::Lua(format!("{what} out of range 0..=4294967295: {value}")))
+}
+
+fn pop_read_len<'gc>(
+    ctx: piccolo::Context<'gc>,
+    stack: &mut piccolo::Stack<'gc, '_>,
+    what: &str,
+    max: usize,
+) -> Result<usize> {
+    let raw = pop_i64(ctx, stack)?;
+    if raw < 0 {
+        return Err(LuaHostError::Lua(format!("{what}: negative length {raw}")));
+    }
+    let len = raw as usize;
+    if len > max {
+        return Err(LuaHostError::Lua(format!(
+            "{what}: length {len} exceeds maximum {max}"
+        )));
+    }
+    Ok(len)
 }
 
 /// A `piccolo`-backed sandboxed Lua VM.
@@ -104,8 +152,10 @@ impl PiccoloVm {
                 let mut backend = hw_gpio.lock().map_err(|_| {
                     to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
                 })?;
+                let pin = to_u8_arg(pin, "gpio_write pin").map_err(to_lua_error)?;
+                let level = to_u8_arg(level, "gpio_write level").map_err(to_lua_error)?;
                 backend
-                    .gpio_write(pin as u8, level as u8)
+                    .gpio_write(pin, level)
                     .map_err(|e| to_lua_error(LuaHostError::Hardware(e)))?;
                 stack.replace(ctx, ());
                 Ok(CallbackReturn::Return)
@@ -118,8 +168,9 @@ impl PiccoloVm {
                 let mut backend = hw_gpio_read.lock().map_err(|_| {
                     to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
                 })?;
+                let pin = to_u8_arg(pin, "gpio_read pin").map_err(to_lua_error)?;
                 let v = backend
-                    .gpio_read(pin as u8)
+                    .gpio_read(pin)
                     .map_err(|e| to_lua_error(LuaHostError::Hardware(e)))?;
                 stack.replace(ctx, v as i64);
                 Ok(CallbackReturn::Return)
@@ -130,12 +181,15 @@ impl PiccoloVm {
             let i2c_read = Callback::from_fn(&ctx, move |ctx, _exec, mut stack| {
                 let addr = pop_i64(ctx, &mut stack).map_err(to_lua_error)?;
                 let reg = pop_i64(ctx, &mut stack).map_err(to_lua_error)?;
-                let len = pop_i64(ctx, &mut stack).map_err(to_lua_error)?;
+                let len = pop_read_len(ctx, &mut stack, "i2c_read", MAX_I2C_READ_LEN)
+                    .map_err(to_lua_error)?;
                 let mut backend = hw_i2c_read.lock().map_err(|_| {
                     to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
                 })?;
+                let addr = to_u8_arg(addr, "i2c_read addr").map_err(to_lua_error)?;
+                let reg = to_u8_arg(reg, "i2c_read reg").map_err(to_lua_error)?;
                 let bytes = backend
-                    .i2c_read(addr as u8, reg as u8, len as usize)
+                    .i2c_read(addr, reg, len)
                     .map_err(|e| to_lua_error(LuaHostError::Hardware(e)))?;
                 let s = LuaString::from_slice(&ctx, &bytes);
                 stack.replace(ctx, s);
@@ -151,13 +205,50 @@ impl PiccoloVm {
                 let mut backend = hw_i2c_write.lock().map_err(|_| {
                     to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
                 })?;
+                let addr = to_u8_arg(addr, "i2c_write addr").map_err(to_lua_error)?;
+                let reg = to_u8_arg(reg, "i2c_write reg").map_err(to_lua_error)?;
+                if data.len() > MAX_I2C_WRITE_LEN {
+                    return Err(to_lua_error(LuaHostError::Lua(format!(
+                        "i2c_write payload too long ({} > {MAX_I2C_WRITE_LEN})",
+                        data.len()
+                    ))));
+                }
                 backend
-                    .i2c_write(addr as u8, reg as u8, data.as_bytes())
+                    .i2c_write(addr, reg, data.as_bytes())
                     .map_err(|e| to_lua_error(LuaHostError::Hardware(e)))?;
                 stack.replace(ctx, ());
                 Ok(CallbackReturn::Return)
             });
             let _ = hardware_table.set(ctx, "i2c_write", i2c_write);
+
+            // The mlua engine exposes `i2c_transfer`; without it here, an app
+            // debugged on the host failed on the S3 with "call a nil value".
+            let hw_i2c_transfer = hw.clone();
+            let i2c_transfer = Callback::from_fn(&ctx, move |ctx, _exec, mut stack| {
+                let addr = pop_i64(ctx, &mut stack).map_err(to_lua_error)?;
+                let reg = pop_i64(ctx, &mut stack).map_err(to_lua_error)?;
+                let tx = pop_str(ctx, &mut stack).map_err(to_lua_error)?;
+                let rx_len = pop_read_len(ctx, &mut stack, "i2c_transfer", MAX_I2C_READ_LEN)
+                    .map_err(to_lua_error)?;
+                if tx.len() > MAX_I2C_WRITE_LEN {
+                    return Err(to_lua_error(LuaHostError::Lua(format!(
+                        "i2c_transfer tx too long ({} > {MAX_I2C_WRITE_LEN})",
+                        tx.len()
+                    ))));
+                }
+                let addr = to_u8_arg(addr, "i2c_transfer addr").map_err(to_lua_error)?;
+                let reg = to_u8_arg(reg, "i2c_transfer reg").map_err(to_lua_error)?;
+                let mut backend = hw_i2c_transfer.lock().map_err(|_| {
+                    to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
+                })?;
+                let out = backend
+                    .i2c_transfer(addr, reg, tx.as_bytes(), rx_len)
+                    .map_err(|e| to_lua_error(LuaHostError::Hardware(e)))?;
+                let s = LuaString::from_slice(&ctx, &out);
+                stack.replace(ctx, s);
+                Ok(CallbackReturn::Return)
+            });
+            let _ = hardware_table.set(ctx, "i2c_transfer", i2c_transfer);
 
             let hw_adc = hw.clone();
             let adc_read = Callback::from_fn(&ctx, move |ctx, _exec, mut stack| {
@@ -165,8 +256,9 @@ impl PiccoloVm {
                 let mut backend = hw_adc.lock().map_err(|_| {
                     to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
                 })?;
+                let pin = to_u8_arg(pin, "adc_read pin").map_err(to_lua_error)?;
                 let v = backend
-                    .adc_read(pin as u8)
+                    .adc_read(pin)
                     .map_err(|e| to_lua_error(LuaHostError::Hardware(e)))?;
                 stack.replace(ctx, v);
                 Ok(CallbackReturn::Return)
@@ -180,8 +272,10 @@ impl PiccoloVm {
                 let mut backend = hw_pwm.lock().map_err(|_| {
                     to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
                 })?;
+                let pin = to_u8_arg(pin, "pwm_set pin").map_err(to_lua_error)?;
+                let duty = to_u8_arg(duty, "pwm_set duty").map_err(to_lua_error)?;
                 backend
-                    .pwm_set(pin as u8, duty as u8)
+                    .pwm_set(pin, duty)
                     .map_err(|e| to_lua_error(LuaHostError::Hardware(e)))?;
                 stack.replace(ctx, ());
                 Ok(CallbackReturn::Return)
@@ -191,12 +285,14 @@ impl PiccoloVm {
             let hw_flash = hw.clone();
             let flash_read = Callback::from_fn(&ctx, move |ctx, _exec, mut stack| {
                 let addr = pop_i64(ctx, &mut stack).map_err(to_lua_error)?;
-                let len = pop_i64(ctx, &mut stack).map_err(to_lua_error)?;
+                let len = pop_read_len(ctx, &mut stack, "flash_read", MAX_FLASH_READ_LEN)
+                    .map_err(to_lua_error)?;
                 let mut backend = hw_flash.lock().map_err(|_| {
                     to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
                 })?;
+                let addr = to_u32_arg(addr, "flash_read address").map_err(to_lua_error)?;
                 let bytes = backend
-                    .flash_read(addr as u32, len as usize)
+                    .flash_read(addr, len)
                     .map_err(|e| to_lua_error(LuaHostError::Hardware(e)))?;
                 let s = LuaString::from_slice(&ctx, &bytes);
                 stack.replace(ctx, s);
@@ -211,8 +307,9 @@ impl PiccoloVm {
                 let mut backend = hw_flash.lock().map_err(|_| {
                     to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
                 })?;
+                let addr = to_u32_arg(addr, "flash_write address").map_err(to_lua_error)?;
                 backend
-                    .flash_write(addr as u32, data.as_bytes())
+                    .flash_write(addr, data.as_bytes())
                     .map_err(|e| to_lua_error(LuaHostError::Hardware(e)))?;
                 stack.replace(ctx, ());
                 Ok(CallbackReturn::Return)
@@ -225,8 +322,9 @@ impl PiccoloVm {
                 let mut backend = hw_flash.lock().map_err(|_| {
                     to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
                 })?;
+                let addr = to_u32_arg(addr, "flash_erase address").map_err(to_lua_error)?;
                 backend
-                    .flash_erase_sector(addr as u32)
+                    .flash_erase_sector(addr)
                     .map_err(|e| to_lua_error(LuaHostError::Hardware(e)))?;
                 stack.replace(ctx, ());
                 Ok(CallbackReturn::Return)
@@ -269,6 +367,12 @@ impl PiccoloVm {
             let hw_ble = hw.clone();
             let ble_send = Callback::from_fn(&ctx, move |ctx, _exec, mut stack| {
                 let data = pop_str(ctx, &mut stack).map_err(to_lua_error)?;
+                if data.len() > MAX_PAYLOAD_LEN {
+                    return Err(to_lua_error(LuaHostError::Lua(format!(
+                        "ble_send payload too long ({} > {MAX_PAYLOAD_LEN})",
+                        data.len()
+                    ))));
+                }
                 let mut backend = hw_ble.lock().map_err(|_| {
                     to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
                 })?;
@@ -286,8 +390,9 @@ impl PiccoloVm {
                 let mut backend = hw_power.lock().map_err(|_| {
                     to_lua_error(LuaHostError::Hardware("hardware lock poisoned".into()))
                 })?;
+                let profile = to_u8_arg(profile, "power_set profile").map_err(to_lua_error)?;
                 backend
-                    .power_set(profile as u8)
+                    .power_set(profile)
                     .map_err(|e| to_lua_error(LuaHostError::Hardware(e)))?;
                 stack.replace(ctx, ());
                 Ok(CallbackReturn::Return)
@@ -302,6 +407,16 @@ impl PiccoloVm {
             let reason = Callback::from_fn(&ctx, move |ctx, _exec, mut stack| {
                 let context = pop_str(ctx, &mut stack).map_err(to_lua_error)?;
                 let prompt = pop_str(ctx, &mut stack).map_err(to_lua_error)?;
+                // Include the separator the agent inserts between the two
+                // parts, so a request at exactly the cap is not rejected
+                // later as a TooLong agent error.
+                let sep = usize::from(!context.is_empty() && !prompt.is_empty());
+                if context.len() + prompt.len() + sep > MAX_REASON_LEN {
+                    return Err(to_lua_error(LuaHostError::Lua(format!(
+                        "agent.reason text too long ({} > {MAX_REASON_LEN})",
+                        context.len() + prompt.len() + sep
+                    ))));
+                }
                 let out = agent_reason(&ag_reason, &context, &prompt).map_err(to_lua_error)?;
                 let s = LuaString::from_slice(&ctx, out.as_bytes());
                 stack.replace(ctx, s);
@@ -460,7 +575,7 @@ impl PiccoloVm {
                     Executor::start(ctx, Function::from(closure), Variadic(Vec::<Value>::new()));
                 Ok(ctx.stash(executor))
             })
-            .and_then(|stashed| execute_bounded::<()>(&mut self.lua, &stashed))?;
+            .and_then(|stashed| execute_bounded(&mut self.lua, &stashed).map(|_| ()))?;
         Ok(())
     }
 
@@ -492,7 +607,12 @@ impl PiccoloVm {
         });
         let stashed = stashed
             .ok_or_else(|| LuaHostError::Lua(format!("{fname} is not a callable global")))?;
-        execute_bounded::<String>(&mut self.lua, &stashed)
+        // Do NOT demand a string return: piccolo's `String: FromValue` rejects
+        // nil/number/boolean with a TypeError, while the mlua engine converts
+        // them (`on_tick` returning nil is the normal case for a hook that
+        // only performs actions). `execute_bounded` performs the same
+        // conversion.
+        execute_bounded(&mut self.lua, &stashed)
     }
 }
 
@@ -515,15 +635,19 @@ fn to_lua_error<'gc>(e: LuaHostError) -> Error<'gc> {
 /// refilled per iteration (as in `Lua::finish`) so the GC still runs between
 /// steps, while `MAX_FUEL` caps the *total* work any single `run_script`/`call`
 /// may do.
-fn execute_bounded<R>(lua: &mut Lua, stashed: &StashedExecutor) -> Result<R>
-where
-    R: for<'gc> FromMultiValue<'gc>,
-{
+fn execute_bounded(lua: &mut Lua, stashed: &StashedExecutor) -> Result<String> {
     const FUEL_PER_ITER: i32 = 4096; // per-step fuel (matches `Lua::finish`)
     const MAX_FUEL: i64 = 20_000_000; // total op budget (~tens of millions of ops)
-                                      // Bound the piccolo VM's total allocation (gc-arena bytes). Generous enough
-                                      // for the S3's 8 MB PSRAM, but a runaway allocation is still contained.
-    const MAX_MEMORY: usize = 8 * 1024 * 1024;
+    // Bound the piccolo VM's total allocation (gc-arena bytes). The cap has to
+    // follow the **board's** PSRAM, not the largest module: the shipped quad
+    // dev board has 2 MB total, shared with Wi-Fi/TLS/the agent, so the old
+    // flat 8 MiB allowed a script to exhaust the pool and abort the process.
+    // 512 KiB is the same bound the mlua sandbox uses; the N8R8 (8 MB octal)
+    // profile raises it to 2 MiB.
+    #[cfg(feature = "s3-8mb-psram")]
+    const MAX_MEMORY: usize = 2 * 1024 * 1024;
+    #[cfg(not(feature = "s3-8mb-psram"))]
+    const MAX_MEMORY: usize = 512 * 1024;
 
     let mut budget: i64 = MAX_FUEL;
     loop {
@@ -534,10 +658,28 @@ where
             return Err(LuaHostError::Lua("script memory limit exceeded".into()));
         }
         if done {
-            let result = lua.try_enter(|ctx| match ctx.fetch(stashed).take_result::<R>(ctx) {
-                Ok(Ok(r)) => Ok(r),
-                Ok(Err(e)) => Err(e),
-                Err(_mode) => Err(to_lua_error(LuaHostError::Lua("bad executor mode".into()))),
+            // Convert the value to an owned String *inside* the arena closure:
+            // a piccolo `Value` borrows the GC arena, so it cannot be returned
+            // through `try_enter`.
+            let result = lua.try_enter(|ctx| {
+                match ctx.fetch(stashed).take_result::<piccolo::Value>(ctx) {
+                    Ok(Ok(value)) => match value {
+                        piccolo::Value::String(s) => Ok(std::str::from_utf8(s.as_bytes())
+                            .unwrap_or_default()
+                            .to_owned()),
+                        piccolo::Value::Integer(i) => Ok(i.to_string()),
+                        piccolo::Value::Number(n) => Ok(n.to_string()),
+                        piccolo::Value::Boolean(b) => Ok(b.to_string()),
+                        piccolo::Value::Nil => Ok(String::new()),
+                        other => Err(to_lua_error(LuaHostError::Lua(format!(
+                            "call: unsupported return type {other:?}"
+                        )))),
+                    },
+                    Ok(Err(e)) => Err(e),
+                    Err(_mode) => {
+                        Err(to_lua_error(LuaHostError::Lua("bad executor mode".into())))
+                    }
+                }
             });
             return result.map_err(|e| LuaHostError::Lua(e.to_string()));
         }
@@ -638,7 +780,10 @@ fn do_string_format(fmt: &str, args: &[String]) -> String {
                     out.push_str(&prec_digits);
                     continue;
                 };
-                let prec: usize = prec_digits.parse().unwrap_or(0);
+                // Cap the precision: `%.1000000000f` used to allocate ~1 GiB
+                // on the host heap (outside the arena memory limit) and
+                // `%.18446744073709551615f` hit a capacity overflow panic.
+                let prec: usize = prec_digits.parse().unwrap_or(0).min(32);
                 if conv == 'f' {
                     if let Some(a) = args.next() {
                         let n = a.parse::<f64>().unwrap_or(0.0);
@@ -689,6 +834,11 @@ fn v_to_owned_string(v: piccolo::Value<'_>) -> String {
 /// but only the first group's contents are surfaced (consumers that need
 /// every capture should split the input with `string.find` instead).
 /// Unsupported patterns return `None`.
+/// Comparison budget for a single `string.match` call. ~1M byte comparisons
+/// is well under a millisecond on the host and a few ms on the S3, while a
+/// pathological pattern would otherwise run for minutes.
+const MAX_MATCH_STEPS: usize = 1_000_000;
+
 fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
     // `init` is a Lua 1-based index into a *byte* string. This shim holds a
     // `&str`, so a script passing an index that lands inside a multi-byte
@@ -723,16 +873,14 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
         tok: Class,
         quant: Quant,
         capture: bool,
-        // `inner` holds nested instruction groups; kept (and cloned) for the
-        // parser but not read by the current matcher. Silence the dead-code
-        // lint rather than remove it so future group-capture work can use it.
-        #[allow(dead_code)]
+        /// Non-empty for a capture group: the group's own instruction
+        /// program. The matcher runs it recursively (including nested
+        /// groups) so the whole group — not just its first atom — is
+        /// matched and captured.
         inner: Vec<Inst>,
     }
 
     let pb = pat.as_bytes();
-    let mut code: Vec<Inst> = Vec::new();
-    let mut i = 0;
 
     /// Parse one atomic (class + optional quantifier), advancing `i`.
     fn parse_atomic(pb: &[u8], i: &mut usize) -> Option<(Class, Quant)> {
@@ -784,78 +932,103 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
         Some((tok, quant))
     }
 
-    while i < pb.len() {
-        let c = pb[i];
-        // Anchors: `^` only at the very start, `$` only at the very end.
-        if c == b'^' && i == 0 {
-            i += 1;
-            continue;
-        }
-        if c == b'$' && i + 1 == pb.len() {
-            i += 1;
-            continue;
-        }
-        if c == b'(' {
-            // Parse a capture group until the matching `)`.
-            i += 1;
-            let mut depth = 1;
-            let group_start = i;
-            while i < pb.len() && depth > 0 {
-                match pb[i] {
-                    b'(' => {
-                        depth += 1;
-                        i += 1;
-                    }
-                    b')' => {
-                        depth -= 1;
-                        if depth == 0 {
+    /// Parse a pattern body into instructions, recursing into `(...)` groups.
+    ///
+    /// A group becomes one `Inst` with a non-empty `inner` program and the
+    /// quantifier written after `)` applied to the *whole* group. The old
+    /// parser inlined the group's atoms (capturing only the first) and never
+    /// consumed the trailing quantifier, so `(ab)` captured just `"a"` and
+    /// `(ab)+` failed (the `+` became a literal).
+    fn parse_group(pb: &[u8]) -> Option<Vec<Inst>> {
+        let mut out: Vec<Inst> = Vec::new();
+        let mut i = 0;
+        while i < pb.len() {
+            let c = pb[i];
+            // Anchors: `^` only at the very start, `$` only at the very end.
+            if c == b'^' && i == 0 {
+                i += 1;
+                continue;
+            }
+            // `$` is only an anchor at the end and only when it is not
+            // escaped (`%$` is a literal dollar).
+            if c == b'$' && i + 1 == pb.len() && !is_escaped(pb, i) {
+                i += 1;
+                continue;
+            }
+            if c == b'(' {
+                i += 1;
+                let mut depth = 1usize;
+                let group_start = i;
+                while i < pb.len() && depth > 0 {
+                    match pb[i] {
+                        b'(' => {
+                            depth += 1;
                             i += 1;
-                            break;
                         }
-                        i += 1;
-                    }
-                    _ => {
-                        i += 1;
+                        b')' => {
+                            depth -= 1;
+                            i += 1;
+                        }
+                        _ => i += 1,
                     }
                 }
-            }
-            // Re-tokenize the group body so we can attach it as `inner`.
-            let body = &pb[group_start..i.saturating_sub(1)];
-            let mut inner: Vec<Inst> = Vec::new();
-            let mut j = 0;
-            while j < body.len() {
-                if let Some((tok, quant)) = parse_atomic(body, &mut j) {
-                    inner.push(Inst {
-                        tok,
-                        quant,
-                        capture: false,
-                        inner: Vec::new(),
-                    });
-                } else {
-                    break;
+                if depth != 0 {
+                    return None; // unterminated capture
                 }
+                let body = &pb[group_start..i - 1];
+                let inner = parse_group(body)?;
+                let mut quant = Quant::Once;
+                if i < pb.len() {
+                    match pb[i] {
+                        b'*' => {
+                            quant = Quant::Star;
+                            i += 1;
+                        }
+                        b'+' => {
+                            quant = Quant::Plus;
+                            i += 1;
+                        }
+                        b'?' => {
+                            quant = Quant::Opt;
+                            i += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                out.push(Inst {
+                    tok: Class::Lit(0),
+                    quant,
+                    capture: true,
+                    inner,
+                });
+                continue;
             }
-            // Inline the inner program; mark the *first* inner instruction
-            // so the matcher records the capture span when it runs.
-            let inner_start = code.len();
-            let inner_len = inner.len();
-            code.extend(inner);
-            if inner_len > 0 {
-                code[inner_start].capture = true;
+            if let Some((tok, quant)) = parse_atomic(pb, &mut i) {
+                out.push(Inst {
+                    tok,
+                    quant,
+                    capture: false,
+                    inner: Vec::new(),
+                });
+            } else {
+                return None;
             }
-            continue;
         }
-        if let Some((tok, quant)) = parse_atomic(pb, &mut i) {
-            code.push(Inst {
-                tok,
-                quant,
-                capture: false,
-                inner: Vec::new(),
-            });
-        } else {
-            break;
-        }
+        Some(out)
     }
+
+    /// Whether the byte at `idx` is preceded by an odd number of `%` escapes.
+    fn is_escaped(pb: &[u8], idx: usize) -> bool {
+        let mut count = 0usize;
+        let mut j = idx;
+        while j > 0 && pb[j - 1] == b'%' {
+            count += 1;
+            j -= 1;
+        }
+        count % 2 == 1
+    }
+
+    let code = parse_group(pb)?;
 
     fn matches_class(c: &Class, b: u8) -> bool {
         match c {
@@ -872,38 +1045,112 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
         }
     }
 
+    /// Charge one comparison against the shared budget. Returns `false`
+    /// when the budget is exhausted.
+    fn bump(steps: &mut usize) -> bool {
+        *steps += 1;
+        *steps <= MAX_MATCH_STEPS
+    }
+
     // Match a sub-program greedily from `pos`; returns (final_pos,
     // first_capture_span). An instruction marked `capture = true` records
     // the span it consumed (the bytes from before it runs to where it
     // leaves `p`).
-    fn match_sub(code: &[Inst], s: &[u8], pos: usize) -> Option<(usize, Option<(usize, usize)>)> {
+    fn match_sub(
+        code: &[Inst],
+        s: &[u8],
+        pos: usize,
+        steps: &mut usize,
+    ) -> Option<(usize, Option<(usize, usize)>)> {
         let mut p = pos;
         let mut capture: Option<(usize, usize)> = None;
         for inst in code {
+            if !inst.inner.is_empty() {
+                // Capture group: run the inner program, repeating it when the
+                // group itself carries `+`/`*`/`?`. The captured span is the
+                // first repetition's match, so `(ab)` captures "ab" rather
+                // than just its first atom.
+                let group_start = p;
+                let mut first_end: Option<usize> = None;
+                let required = matches!(inst.quant, Quant::Once | Quant::Plus);
+                let max_reps = s.len().saturating_add(1);
+                let mut reps = 0usize;
+                loop {
+                    if reps >= max_reps {
+                        break;
+                    }
+                    let before = p;
+                    match match_sub(&inst.inner, s, p, steps) {
+                        Some((end, _)) => {
+                            if reps == 0 {
+                                first_end = Some(end);
+                            }
+                            p = end;
+                            reps += 1;
+                            // A zero-width repetition can never advance; stop
+                            // rather than loop forever.
+                            if end == before {
+                                break;
+                            }
+                            match inst.quant {
+                                Quant::Once | Quant::Opt => break,
+                                Quant::Star | Quant::Plus => {}
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                if required && reps == 0 {
+                    return None;
+                }
+                if inst.capture && capture.is_none() {
+                    if let Some(end) = first_end {
+                        if end > group_start {
+                            capture = Some((group_start, end));
+                        }
+                    }
+                }
+                continue;
+            }
             let inst_start = p;
             match inst.quant {
                 Quant::Once => {
-                    if p >= s.len() || !matches_class(&inst.tok, s[p]) {
+                    if !bump(steps) || p >= s.len() || !matches_class(&inst.tok, s[p]) {
                         return None;
                     }
                     p += 1;
                 }
                 Quant::Opt => {
+                    if !bump(steps) {
+                        return None;
+                    }
                     if p < s.len() && matches_class(&inst.tok, s[p]) {
                         p += 1;
                     }
                 }
                 Quant::Plus => {
-                    if p >= s.len() || !matches_class(&inst.tok, s[p]) {
+                    if !bump(steps) || p >= s.len() || !matches_class(&inst.tok, s[p]) {
                         return None;
                     }
                     p += 1;
-                    while p < s.len() && matches_class(&inst.tok, s[p]) {
+                    while p < s.len() {
+                        if !bump(steps) {
+                            return None;
+                        }
+                        if !matches_class(&inst.tok, s[p]) {
+                            break;
+                        }
                         p += 1;
                     }
                 }
                 Quant::Star => {
-                    while p < s.len() && matches_class(&inst.tok, s[p]) {
+                    while p < s.len() {
+                        if !bump(steps) {
+                            return None;
+                        }
+                        if !matches_class(&inst.tok, s[p]) {
+                            break;
+                        }
                         p += 1;
                     }
                 }
@@ -919,8 +1166,33 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
 
     // Try starting the match at every position.
     let sb = s_tail.as_bytes();
-    for pos in 0..=sb.len() {
-        if let Some((end, cap)) = match_sub(&code, sb, pos) {
+    // `^` anchors the match to the start of the (post-`init`) subject;
+    // `$` requires it to end at the very end. Both were previously parsed
+    // and then silently ignored, so `match("xabc", "^abc")` returned a
+    // match at offset 1 and validation patterns could be bypassed.
+    let anchored_start = pb.first() == Some(&b'^');
+    // `%$` is an escaped literal dollar, not the end anchor.
+    let anchored_end =
+        pb.last() == Some(&b'$') && !is_escaped(pb, pb.len().saturating_sub(1));
+    let starts: std::ops::RangeInclusive<usize> = if anchored_start {
+        0..=0
+    } else {
+        0..=sb.len()
+    };
+    // Total comparisons across every start position. Without this cap the
+    // matcher is O(n·m) *inside one Rust callback*, which piccolo's fuel
+    // cannot preempt: two ~200 KiB strings and `match(s, s)` locked the S3
+    // Lua thread for minutes. Exceeding the cap returns "no match".
+    let mut steps = 0usize;
+    for pos in starts {
+        let matched = match_sub(&code, sb, pos, &mut steps);
+        if steps > MAX_MATCH_STEPS {
+            return None;
+        }
+        if let Some((end, cap)) = matched {
+            if anchored_end && end != sb.len() {
+                continue;
+            }
             if let Some((gs, ge)) = cap {
                 if gs < ge && ge <= sb.len() {
                     return Some(

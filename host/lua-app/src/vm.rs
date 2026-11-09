@@ -11,7 +11,7 @@ use mlua::Lua;
 
 use crate::agent::{reason as agent_reason, SharedAgent};
 use crate::error::{LuaHostError, Result};
-use crate::hardware::SharedHardware;
+use crate::hardware::{SharedHardware, MAX_FLASH_READ_LEN, MAX_I2C_READ_LEN};
 use crate::nvram;
 use crate::sandbox;
 use crate::sandbox::Budget;
@@ -19,11 +19,25 @@ use crate::sandbox::Budget;
 /// Upper bound (bytes) for a byte payload passed to `hardware.*` (BLE, I2C)
 /// from a script — a defensive cap so a hostile script cannot force an
 /// unbounded host-side allocation.
-pub const MAX_PAYLOAD_LEN: usize = 4096;
+pub use crate::hardware::{MAX_PAYLOAD_LEN, MAX_REASON_LEN};
 /// Upper bound (bytes) for a single I2C write payload.
-pub const MAX_I2C_LEN: usize = 256;
-/// Upper bound (bytes) for the combined `agent.reason(context, prompt)` text.
-pub const MAX_REASON_LEN: usize = 2048;
+pub use crate::hardware::MAX_I2C_WRITE_LEN as MAX_I2C_LEN;
+
+/// Bound a script-supplied `hardware.*` read length.
+///
+/// The backend allocates a buffer of this size, so an unbounded value is a
+/// host abort (`vec![0u8; len]` overflows the allocation for a huge `usize`).
+/// `mlua`'s `usize` conversion already rejects negative integers, but it
+/// accepts any positive one, so the upper bound has to be checked here and
+/// must match the piccolo engine's (`hardware::MAX_*_READ_LEN`).
+fn check_read_len(what: &str, len: usize, max: usize) -> mlua::Result<usize> {
+    if len > max {
+        return Err(mlua::Error::RuntimeError(format!(
+            "{what}: length {len} exceeds maximum {max}"
+        )));
+    }
+    Ok(len)
+}
 
 /// A sandboxed Lua 5.4 interpreter with the mAgent bindings registered.
 pub struct LuaVm {
@@ -185,6 +199,7 @@ impl LuaVm {
         let hw_flash_read = hw.clone();
         let flash_read = lua
             .create_function(move |lua, (address, len): (u32, usize)| {
+                let len = check_read_len("flash_read", len, MAX_FLASH_READ_LEN)?;
                 let mut backend = hw_flash_read
                     .lock()
                     .map_err(|_| mlua::Error::RuntimeError("hardware lock poisoned".into()))?;
@@ -215,9 +230,28 @@ impl LuaVm {
             .set("flash_write", flash_write)
             .map_err(LuaHostError::from)?;
 
+        // The piccolo engine always exposed this; without it here, a script
+        // using `hardware.flash_erase_sector` worked on the S3 and failed on
+        // the host.
+        let hw_flash_erase = hw.clone();
+        let flash_erase_sector = lua
+            .create_function(move |_, address: u32| {
+                let mut backend = hw_flash_erase
+                    .lock()
+                    .map_err(|_| mlua::Error::RuntimeError("hardware lock poisoned".into()))?;
+                backend
+                    .flash_erase_sector(address)
+                    .map_err(mlua::Error::RuntimeError)
+            })
+            .map_err(LuaHostError::from)?;
+        table
+            .set("flash_erase_sector", flash_erase_sector)
+            .map_err(LuaHostError::from)?;
+
         let hw_i2c_read = hw.clone();
         let i2c_read = lua
             .create_function(move |lua, (addr, reg, len): (u8, u8, usize)| {
+                let len = check_read_len("i2c_read", len, MAX_I2C_READ_LEN)?;
                 let mut backend = hw_i2c_read
                     .lock()
                     .map_err(|_| mlua::Error::RuntimeError("hardware lock poisoned".into()))?;
@@ -244,6 +278,10 @@ impl LuaVm {
                             tx_bytes.len()
                         )));
                     }
+                    // `rx_len` ends up in the backend's `Vec::with_capacity`,
+                    // exactly like `i2c_read`'s length — bound it or a huge
+                    // script-supplied value aborts the host on allocation.
+                    let rx_len = check_read_len("i2c_transfer", rx_len, MAX_I2C_READ_LEN)?;
                     let mut backend = hw_i2c_transfer
                         .lock()
                         .map_err(|_| mlua::Error::RuntimeError("hardware lock poisoned".into()))?;
@@ -385,10 +423,14 @@ impl LuaVm {
 
         let reason = lua
             .create_function(move |_, (context, prompt): (String, String)| {
-                if context.len() + prompt.len() > MAX_REASON_LEN {
+                // Include the separator the agent inserts between the two
+                // parts, so a request at exactly the cap is not rejected
+                // later as a TooLong agent error.
+                let sep = usize::from(!context.is_empty() && !prompt.is_empty());
+                if context.len() + prompt.len() + sep > MAX_REASON_LEN {
                     return Err(mlua::Error::RuntimeError(format!(
                         "agent.reason text too long ({} > {MAX_REASON_LEN})",
-                        context.len() + prompt.len()
+                        context.len() + prompt.len() + sep
                     )));
                 }
                 agent_reason(&agent, &context, &prompt)

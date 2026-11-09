@@ -373,8 +373,11 @@ impl Esp32BlockchainClient {
             _ => return Ok(None),
         };
 
-        self.state = BlockchainState::CheckingStatus;
-
+        // Do NOT overwrite `state` with `CheckingStatus` here: `poll()` calls
+        // this method and then matches on `WaitingForConfirmation` to mark the
+        // transaction `Completed`. Changing the state inside the check made
+        // that arm unreachable, so a mined transaction stayed `Idle` forever
+        // and the poll counter never advanced.
         let mut client = EspHttpClient::from_url(&self.rpc_url);
         match client.get_transaction_receipt(&tx_hash.to_hex()) {
             Ok(Some(response)) => Ok(Some(receipt_from_response(&response)?)),

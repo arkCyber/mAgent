@@ -376,6 +376,16 @@ pub struct HistoryEntry {
     /// if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_session_id: Option<String>,
+    /// The superseded window itself. Without this, rollback could only
+    /// restore the `kept` counter and left the newest content active.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub head_tail_window: Vec<MessageDto>,
+    /// The superseded `llm_summary`, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_summary: Option<String>,
+    /// Full compression counters of the superseded snapshot.
+    #[serde(default)]
+    pub stats: CompressionStats,
 }
 
 // ---------------------------------------------------------------------------
@@ -952,6 +962,9 @@ mod tests {
                 updated_at: i as u64,
                 kept: 0,
                 source_session_id: None,
+                head_tail_window: Vec::new(),
+                llm_summary: None,
+                stats: CompressionStats::default(),
             })
             .collect();
         assert!(matches!(
@@ -1027,5 +1040,109 @@ mod tests {
         assert!(s.contains("already exists"));
         assert!(s.contains("dup"));
         assert!(s.contains("--save-summary-overwrite"));
+    }
+
+    /// The IO-flavoured `Display` arms (DirIo / Parse /
+    /// UnsupportedSchema / Write / Read) carry a path and a source
+    /// string that an operator needs to see verbatim; make sure each
+    /// arm renders both fields.
+    #[test]
+    fn error_display_renders_path_and_source_arms() {
+        let e = SummaryError::InvalidMetadata("desc too long".into());
+        assert!(e.to_string().contains("invalid summary metadata"));
+        assert!(e.to_string().contains("desc too long"));
+
+        let e = SummaryError::DirIo {
+            path: "/tmp/summaries".into(),
+            source: "permission denied".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("/tmp/summaries"), "got {s}");
+        assert!(s.contains("permission denied"), "got {s}");
+
+        let e = SummaryError::Parse {
+            path: "/tmp/x.json".into(),
+            source: "expected `{`".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("/tmp/x.json"), "got {s}");
+        assert!(s.contains("expected"), "got {s}");
+
+        let e = SummaryError::UnsupportedSchema {
+            path: "/tmp/future.json".into(),
+            found: 99,
+            supported: 3,
+        };
+        let s = e.to_string();
+        assert!(s.contains("/tmp/future.json"), "got {s}");
+        assert!(s.contains("99") && s.contains('3'), "got {s}");
+
+        let e = SummaryError::Write {
+            path: "/tmp/w.json".into(),
+            source: "disk full".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("/tmp/w.json"), "got {s}");
+        assert!(s.contains("disk full"), "got {s}");
+
+        let e = SummaryError::Read {
+            path: "/tmp/r.json".into(),
+            source: "no such file".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("/tmp/r.json"), "got {s}");
+        assert!(s.contains("no such file"), "got {s}");
+    }
+
+    /// `with_window_slice` re-seats the window from pre-built DTOs and
+    /// `with_llm_summary_opt` accepts a `None` (clearing the summary).
+    #[test]
+    fn builder_window_slice_and_optional_summary() {
+        let dtos = vec![
+            MessageDto {
+                role: "user".into(),
+                content: "hi".into(),
+                had_tool_call: false,
+                tool_call_id: None,
+            },
+            MessageDto {
+                role: "assistant".into(),
+                content: "hello".into(),
+                had_tool_call: false,
+                tool_call_id: None,
+            },
+        ];
+        let rec = SummaryBuilder::new("topic")
+            .unwrap()
+            .with_window_slice(&dtos)
+            .with_llm_summary_opt(None)
+            .build()
+            .unwrap();
+        assert_eq!(rec.head_tail_window.len(), 2);
+        assert_eq!(rec.head_tail_window[0].role, "user");
+        assert!(rec.llm_summary.is_none());
+
+        // And the `Some` path sets it.
+        let rec2 = SummaryBuilder::new("topic2")
+            .unwrap()
+            .with_llm_summary_opt(Some("summary text".into()))
+            .build()
+            .unwrap();
+        assert_eq!(rec2.llm_summary.as_deref(), Some("summary text"));
+    }
+
+    /// An assistant DTO that (unusually) carries a `tool_call_id` must
+    /// still rehydrate as plain assistant text — the id is ignored.
+    #[test]
+    fn dto_assistant_with_tool_call_id_is_treated_as_text() {
+        let d = MessageDto {
+            role: "assistant".into(),
+            content: "plain answer".into(),
+            had_tool_call: false,
+            tool_call_id: Some("c9".into()),
+        };
+        let m = d.into_message();
+        assert_eq!(m.role, Role::Assistant);
+        assert_eq!(m.content, "plain answer");
     }
 }

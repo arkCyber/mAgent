@@ -54,18 +54,48 @@ mod real_crypto {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
-    /// 96-bit (12-byte) AES-GCM nonce. Picked deterministically per-message
-    /// from a 4-byte counter + the 8-byte message length so two encrypts of
-    /// the same plaintext on the same key produce different ciphertexts
-    /// (GCM's nonce-misuse-resistance requirement).
+    /// 96-bit (12-byte) AES-GCM nonce:
+    /// `boot_salt(4) || process_counter(4) || message_length(4)`.
+    ///
+    /// The counter alone restarted at zero on every boot while the key is a
+    /// compile-time constant, so the first message of each boot reused the
+    /// same (key, nonce) pair for the same length — GCM keystream reuse. The
+    /// boot salt makes that collision require both a counter and a salt match.
     const NONCE_LEN: usize = 12;
     const COUNTER_LEN: usize = 4;
 
-    /// Derive the per-message 96-bit nonce from a monotonic counter.
+    /// Per-boot random-ish salt.
+    ///
+    /// On hosted builds this mixes the process id with the sub-second clock;
+    /// on `no_std` targets there is no entropy source in this module (the
+    /// device path never reaches it — see the module-level security notice),
+    /// so it is zero and the counter alone provides within-boot uniqueness.
+    pub(super) fn boot_salt() -> u32 {
+        #[cfg(feature = "std")]
+        {
+            use std::sync::OnceLock;
+            static SALT: OnceLock<u32> = OnceLock::new();
+            *SALT.get_or_init(|| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0);
+                nanos ^ std::process::id().rotate_left(7)
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            0
+        }
+    }
+
+    /// Derive the per-message 96-bit nonce.
     fn nonce_for(counter: u32, msg_len: u64) -> [u8; NONCE_LEN] {
         let mut n = [0u8; NONCE_LEN];
-        n[..COUNTER_LEN].copy_from_slice(&counter.to_be_bytes());
-        n[COUNTER_LEN..].copy_from_slice(&msg_len.to_be_bytes());
+        n[..COUNTER_LEN].copy_from_slice(&boot_salt().to_be_bytes());
+        n[COUNTER_LEN..2 * COUNTER_LEN].copy_from_slice(&counter.to_be_bytes());
+        // The plaintext cap is 484 bytes, so the low 32 bits are lossless.
+        n[2 * COUNTER_LEN..].copy_from_slice(&(msg_len as u32).to_be_bytes());
         n
     }
 
@@ -590,6 +620,50 @@ mod std_tests {
         assert!(sm.verify_auth_tag(b"payload", tag.as_str()).unwrap());
         assert!(!sm.verify_auth_tag(b"tampered", tag.as_str()).unwrap());
     }
+
+    #[test]
+    fn with_defaults_and_enable_encryption_round_out_the_api() {
+        let mut sm = SecurityManager::with_defaults();
+        sm.disable_encryption();
+        assert!(!sm.is_encryption_enabled());
+        sm.enable_encryption();
+        assert!(sm.is_encryption_enabled());
+        // A re-enabled manager transforms rather than passes through.
+        assert_ne!(&sm.encrypt(b"secret").unwrap()[..], b"secret");
+    }
+
+    /// `copy_to_vec` (the disabled-encryption passthrough) fails closed on a
+    /// payload past the 512-byte bound instead of truncating silently.
+    #[test]
+    fn passthrough_encrypt_rejects_oversized_plaintext() {
+        let mut sm = SecurityManager::new();
+        sm.disable_encryption();
+        let big = [0u8; 513];
+        let err = sm.encrypt(&big).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::BufferOverflow {
+                capacity: 512,
+                attempted: 513
+            }
+        ));
+    }
+
+    /// The XOR simulator helpers (`simulate_encrypt` / `simulate_decrypt`) also
+    /// bound their output rather than panicking on an oversized payload.
+    #[test]
+    fn simulated_encrypt_and_decrypt_reject_oversized_plaintext() {
+        let sm = SecurityManager::new();
+        let big = [0u8; 513];
+        assert!(matches!(
+            sm.simulate_encrypt(&big).unwrap_err(),
+            AgentError::BufferOverflow { capacity: 512, .. }
+        ));
+        assert!(matches!(
+            sm.simulate_decrypt(&big).unwrap_err(),
+            AgentError::BufferOverflow { capacity: 512, .. }
+        ));
+    }
 }
 
 /// Real-crypto tests: build with `web3`, so `encrypt` / `decrypt` use real
@@ -768,13 +842,15 @@ mod web3_tests {
     }
 
     #[test]
-    fn encrypt_nonce_prefix_encodes_counter() {
-        // `real_crypto` lays the 4-byte big-endian counter into the first 4
-        // bytes of the 12-byte nonce. Assert the wire prefix reflects the
-        // counter so nonce uniqueness is observable and regressions in the
-        // nonce derivation are caught.
+    fn encrypt_nonce_layout_includes_boot_salt_and_counter() {
+        // The 12-byte nonce is `boot_salt(4) || counter(4) || msg_len(4)`.
+        // The salt keeps the first message of each boot from reusing the
+        // counter-only nonce the previous boot used (keystream reuse under
+        // the fixed key).
         let ct = real_crypto::encrypt_aes_gcm(0x0102_0304, b"x").unwrap();
-        assert_eq!(&ct[..4], &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(&ct[..4], &real_crypto::boot_salt().to_be_bytes());
+        assert_eq!(&ct[4..8], &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(&ct[8..12], &1u32.to_be_bytes());
         // Nonce length is 12 bytes regardless of message length.
         assert_eq!(ct.len(), 12 + b"x".len() + 16);
     }

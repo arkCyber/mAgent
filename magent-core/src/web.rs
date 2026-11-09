@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::format;
 use std::io::Read;
+use std::net::ToSocketAddrs;
 use std::string::{String, ToString};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -382,6 +383,52 @@ fn validate_fetch_url(url: &str) -> Result<(), String> {
     }
 }
 
+/// Like [`validate_fetch_url`], but also resolves the host and vets every
+/// returned address.
+///
+/// The lexical guard cannot see a *name* that resolves inward:
+/// `http://127.0.0.1.nip.io/` (or a numeric spelling such as
+/// `http://2130706433/`) is not an IP literal and passed it. Every hop is run
+/// through this before the request is sent. DNS rebinding between this
+/// resolution and reqwest's own is still theoretically possible (reqwest
+/// exposes no pinned-address hook); the immediate bypass is closed.
+fn validate_resolved_fetch_target(url: &str) -> Result<(), String> {
+    validate_fetch_url(url)?;
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL {url}: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("URL has no host: {url}"))?;
+    // An IP literal is its own resolution; the lexical check above sufficed.
+    if host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+    {
+        return Ok(());
+    }
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| format!("URL has no port: {url}"))?;
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution for {host} failed: {e}"))?;
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        let ip = addr.ip().to_string();
+        if let Some(reason) =
+            crate::at_validate::public_fetch_target_refusal(&ip, ALLOW_PRIVATE_NETWORKS)
+        {
+            return Err(format!("{reason}: {host} resolved to {ip}"));
+        }
+    }
+    if !any {
+        return Err(format!("no address for {host}"));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -408,8 +455,26 @@ pub fn web_search(args: &str) -> std::result::Result<String, String> {
         );
     }
 
+    let hits = parse_search_results(&body);
+    if hits.is_empty() {
+        return Err(
+            "web_search: no results (DDG returned no recognisable hits; \
+             the page layout may have changed)"
+                .to_string(),
+        );
+    }
+
+    serde_json::to_string_pretty(&hits).map_err(|e| format!("web_search: serialise: {e}"))
+}
+
+/// Parse a DDG HTML response body into ranked [`SearchHit`]s.
+///
+/// Split out from [`web_search`] so the markup-parsing logic — both
+/// the legacy and modern layouts, the empty-hit skip, and the result
+/// cap — is testable without a live network round-trip.
+fn parse_search_results(body: &str) -> Vec<SearchHit> {
     let mut hits: Vec<SearchHit> = Vec::new();
-    for cap in ddg_block_regex().captures_iter(&body) {
+    for cap in ddg_block_regex().captures_iter(body) {
         // Branch 1 (legacy): groups 1-3; Branch 2 (modern): groups 4-6.
         // We try branch 1 first, then branch 2. Each branch has a
         // self-contained href/title/snippet set, so they never bleed
@@ -439,16 +504,7 @@ pub fn web_search(args: &str) -> std::result::Result<String, String> {
             break;
         }
     }
-
-    if hits.is_empty() {
-        return Err(
-            "web_search: no results (DDG returned no recognisable hits; \
-             the page layout may have changed)"
-                .to_string(),
-        );
-    }
-
-    serde_json::to_string_pretty(&hits).map_err(|e| format!("web_search: serialise: {e}"))
+    hits
 }
 
 /// Top-level tool: fetch a URL and return its plain-text body.
@@ -835,9 +891,13 @@ fn http_client() -> &'static reqwest::blocking::Client {
         reqwest::blocking::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .user_agent(USER_AGENT)
-            // Cap redirects so a hostile page cannot bounce us through a
-            // long chain to an internal address.
-            .redirect(reqwest::redirect::Policy::limited(5))
+            // Redirects are followed manually in `blocking_get_with_meta`:
+            // reqwest's built-in policy dials every hop before returning, so
+            // the SSRF guard could only re-check the final URL *after* an
+            // internal GET (and its side effects) had already occurred.
+            // `Policy::none()` makes each hop explicit and vetted before it
+            // is dialled.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest Client must build — check TLS backend availability")
     })
@@ -880,15 +940,56 @@ struct ResponseMeta {
     bytes: usize,
 }
 
+/// Maximum redirects followed by the host web tools.
+const MAX_REDIRECTS: usize = 5;
+
 fn blocking_get_with_meta(url: &str) -> std::result::Result<ResponseMeta, String> {
-    let resp = http_client()
-        .get(url)
-        .header(
-            "Accept",
-            "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-        )
-        .send()
-        .map_err(|e| format!("GET {url}: {e}"))?;
+    // Follow redirects one hop at a time so every target is vetted *before*
+    // it is dialled. The old flow let reqwest follow internally (Policy
+    // limited(5)) and only re-checked the final URL, which meant a public
+    // page could 302 the client onto an internal service and the GET — with
+    // any side effects — had already been sent by the time the guard ran.
+    let client = http_client();
+    let mut current = url.to_string();
+    let mut hops = 0usize;
+    let resp = loop {
+        validate_resolved_fetch_target(&current).map_err(|e| format!("GET {current}: {e}"))?;
+        let resp = client
+            .get(&current)
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+            )
+            .send()
+            .map_err(|e| format!("GET {current}: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_redirection() {
+            break resp;
+        }
+        let Some(location) = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string)
+        else {
+            break resp; // 3xx without Location: report it as-is below.
+        };
+        if hops >= MAX_REDIRECTS {
+            return Err(format!("GET {url}: more than {MAX_REDIRECTS} redirects"));
+        }
+        match crate::at_validate::resolve_http_redirect(&current, &location) {
+            Some(next) => {
+                current = next;
+                hops += 1;
+            }
+            None => {
+                return Err(format!(
+                    "GET {current}: refusing redirect to {location:?} (cannot vet the target)"
+                ))
+            }
+        }
+    };
 
     let status = resp.status().as_u16();
     let final_url = resp.url().to_string();
@@ -898,11 +999,6 @@ fn blocking_get_with_meta(url: &str) -> std::result::Result<ResponseMeta, String
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-
-    // SSRF guard: even if the initial URL was public, a redirect can
-    // land on an internal address (or the metadata endpoint). Re-check
-    // the post-redirect host before reading anything.
-    validate_fetch_url(&final_url).map_err(|e| format!("GET {url}: {e}"))?;
 
     // Respect the size cap before reading the full body.
     let declared = resp.content_length().unwrap_or(0) as usize;
@@ -1137,6 +1233,133 @@ mod tests {
     }
 
     #[test]
+    fn url_decode_maps_literal_plus_to_space() {
+        // The `+` form (as opposed to `%2B`) is the query-encoding for a
+        // space; it hits a distinct match arm from the percent branch.
+        assert_eq!(url_decode("a+b+c").unwrap(), "a b c");
+        assert_eq!(url_decode("+").unwrap(), " ");
+    }
+
+    #[test]
+    fn url_decode_passes_unreserved_bytes_through() {
+        // Bytes that are neither `+` nor `%` take the generic copy arm.
+        assert_eq!(url_decode("plain-._~text").unwrap(), "plain-._~text");
+    }
+
+    #[test]
+    fn url_decode_rejects_non_utf8_escape() {
+        // `%FF` alone is not a valid UTF-8 sequence, so the final
+        // `String::from_utf8` fails and the error is surfaced.
+        assert!(url_decode("%FF").is_err());
+    }
+
+    #[test]
+    fn hex_digit_accepts_the_full_alphanumeric_ranges() {
+        assert_eq!(hex_digit(b'0').unwrap(), 0);
+        assert_eq!(hex_digit(b'9').unwrap(), 9);
+        assert_eq!(hex_digit(b'a').unwrap(), 10);
+        assert_eq!(hex_digit(b'f').unwrap(), 15);
+        assert_eq!(hex_digit(b'A').unwrap(), 10);
+        assert_eq!(hex_digit(b'F').unwrap(), 15);
+    }
+
+    #[test]
+    fn unwrap_ddg_redirect_falls_back_when_the_escape_is_invalid() {
+        // A malformed percent escape inside `uddg` makes `url_decode`
+        // fail; the helper must return the original href, not panic.
+        let raw = "//duckduckgo.com/l/?uddg=%ZZ&ss=foo";
+        assert_eq!(unwrap_ddg_redirect(raw), raw);
+    }
+
+    #[test]
+    fn extract_json_value_parses_whitespace_and_ignores_trailing_comma() {
+        // The hand parser must skip whitespace/commas and handle a
+        // trailing comma without falling off the end.
+        assert_eq!(
+            extract_json_value(r#"{ "url" : "https://x" , }"#, "url").unwrap(),
+            "https://x"
+        );
+    }
+
+    #[test]
+    fn extract_json_value_rejects_non_object_and_non_string_values() {
+        assert!(extract_json_value("not json", "url").is_none());
+        assert!(extract_json_value(r#"{"url": 42}"#, "url").is_none());
+        // A key that isn't a string at all.
+        assert!(extract_json_value("{42: \"x\"}", "url").is_none());
+    }
+
+    #[test]
+    fn extract_json_value_skips_a_non_matching_key_then_finds_the_target() {
+        // Exercises the "value is a string, key doesn't match, keep
+        // scanning" path and the final `None` when the key is absent.
+        assert_eq!(
+            extract_json_value(r#"{"a":"1","b":"2"}"#, "b").unwrap(),
+            "2"
+        );
+        assert!(extract_json_value(r#"{"a":"1"}"#, "b").is_none());
+    }
+
+    #[test]
+    fn extract_json_value_handles_escaped_quotes_in_key_and_value() {
+        // A backslash escape inside key or value must not terminate the
+        // scan early (i += 2 skip). The parser does not unescape, so the
+        // extracted substring keeps the literal backslash.
+        assert_eq!(
+            extract_json_value(r#"{"a\"b":"v"}"#, r#"a\"b"#).unwrap(),
+            "v"
+        );
+        assert_eq!(
+            extract_json_value(r#"{"url":"v\"w"}"#, "url").unwrap(),
+            r#"v\"w"#
+        );
+    }
+
+    #[test]
+    fn parse_search_results_reads_the_legacy_layout() {
+        let body = r#"<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2F">Example &amp; Co</a>
+            <a class="result__snippet">A snippet here.</a>"#;
+        let hits = parse_search_results(body);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://example.com/");
+        assert_eq!(hits[0].title, "Example & Co");
+        assert_eq!(hits[0].snippet, "A snippet here.");
+    }
+
+    #[test]
+    fn parse_search_results_reads_the_modern_layout() {
+        let body = r#"<a data-testid="result-title-a" href="https://modern.example/">Modern</a>
+            <div data-testid="result-snippet">Modern snippet.</div>"#;
+        let hits = parse_search_results(body);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://modern.example/");
+        assert_eq!(hits[0].title, "Modern");
+        assert_eq!(hits[0].snippet, "Modern snippet.");
+    }
+
+    #[test]
+    fn parse_search_results_returns_empty_for_unrecognised_markup() {
+        assert!(parse_search_results("<html><body>nothing here</body></html>").is_empty());
+    }
+
+    #[test]
+    fn parse_search_results_caps_the_result_count() {
+        // Build more than MAX_SEARCH_RESULTS recognisable blocks and
+        // confirm the loop stops at the cap.
+        let mut body = String::new();
+        for i in 0..(MAX_SEARCH_RESULTS + 3) {
+            body.push_str(&format!(
+                r#"<a class="result__a" href="https://example.com/{i}">Title {i}</a>"#
+            ));
+            body.push_str(&format!(
+                r#"<a class="result__snippet">Snippet {i}</a>"#
+            ));
+        }
+        let hits = parse_search_results(&body);
+        assert_eq!(hits.len(), MAX_SEARCH_RESULTS);
+    }
+
+    #[test]
     fn decode_html_entities_handles_named_and_numeric() {
         assert_eq!(decode_html_entities("A &amp; B"), "A & B");
         assert_eq!(decode_html_entities("&lt;tag&gt;"), "<tag>");
@@ -1272,11 +1495,40 @@ mod tests {
         assert!(validate_fetch_url("").is_err());
     }
 
+    /// An `http(s)://` URL whose authority is empty parses as "no host" — the
+    /// distinct branch from "not an http(s) URL at all". Both must refuse, but
+    /// they report different reasons, and the empty-authority form is the one a
+    /// crafted redirect would use to slip past a scheme-only check.
+    #[test]
+    fn validate_fetch_url_rejects_an_http_url_with_no_host() {
+        assert!(validate_fetch_url("http://").is_err());
+        assert!(validate_fetch_url("http:///path").is_err());
+        assert!(validate_fetch_url("https://?q=1").is_err());
+    }
+
     #[test]
     fn validate_fetch_url_rejects_loopback_hostname() {
         assert!(validate_fetch_url("http://localhost/").is_err());
         assert!(validate_fetch_url("http://foo.localhost/x").is_err());
         assert!(validate_fetch_url("http://printer.local/").is_err());
+    }
+
+    /// Trailing dots, unspecified addresses, IPv6 ULA, and the backslash
+    /// authority confusion all passed the old classifier while the HTTP
+    /// client dialled the local/LAN target.
+    #[test]
+    fn validate_fetch_url_rejects_classifier_bypasses() {
+        for url in [
+            "http://localhost./admin",
+            "http://127.0.0.1./x",
+            "http://0.0.0.0:8080/",
+            "http://[::]:8080/",
+            "http://[fd12:3456::1]/",
+            "http://[fc00::1]/",
+            "http://127.0.0.1\\@example.com/",
+        ] {
+            assert!(validate_fetch_url(url).is_err(), "{url} must be refused");
+        }
     }
 
     #[test]
@@ -1291,6 +1543,21 @@ mod tests {
         assert!(validate_fetch_url("http://10.0.0.1/").is_err());
         assert!(validate_fetch_url("http://172.16.0.1/").is_err());
         assert!(validate_fetch_url("http://192.168.1.1/").is_err());
+    }
+
+    /// An empty port (`http://127.0.0.1:/`) is accepted by the URL client,
+    /// which then dials the scheme default. The guard must still refuse these
+    /// targets; it used to see `"127.0.0.1:"`, which is not a parseable
+    /// address, and let them through to the network.
+    #[test]
+    fn validate_fetch_url_rejects_an_empty_port_authority() {
+        assert!(validate_fetch_url("http://127.0.0.1:/admin").is_err());
+        assert!(validate_fetch_url("http://169.254.169.254:/latest/meta-data/").is_err());
+        assert!(validate_fetch_url("http://localhost:/x").is_err());
+        assert!(validate_fetch_url("http://10.0.0.1:/x").is_err());
+        assert!(validate_fetch_url("http://[::1]:/").is_err());
+        // A public host with an explicit empty port is still a public host.
+        assert!(validate_fetch_url("https://example.com:/page").is_ok());
     }
 
     #[test]

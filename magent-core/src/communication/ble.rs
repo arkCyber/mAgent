@@ -506,4 +506,106 @@ mod tests {
         assert_eq!(MessageType::LlmRequest as u8, 0);
         assert_eq!(MessageType::Error as u8, 5);
     }
+
+    /// A full outbound queue must surface `BufferOverflow`, not grow
+    /// unboundedly or drop the request silently.
+    #[test]
+    fn send_request_reports_buffer_overflow_when_the_queue_is_full() {
+        let mut c = BleClient::new(1000);
+        assert!(block_on(c.connect()).is_ok());
+        // Each call queues one frame (and then times out waiting for a
+        // reply the driver never delivers).
+        for _ in 0..BLE_QUEUE_DEPTH {
+            assert!(block_on(c.send_request("x")).is_err());
+        }
+        assert_eq!(c.pending_outbound(), BLE_QUEUE_DEPTH);
+
+        let err = block_on(c.send_request("one too many")).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::BufferOverflow {
+                capacity: BLE_QUEUE_DEPTH,
+                attempted
+            } if attempted == BLE_QUEUE_DEPTH + 1
+        ));
+    }
+
+    /// `receive_response` on a disconnected client must report
+    /// `ConnectionRefused` before it even looks at the inbound queue.
+    #[test]
+    fn receive_response_fails_when_disconnected() {
+        let mut c = BleClient::new(1000);
+        let err = block_on(c.receive_response()).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::NetworkConnectionFailed {
+                reason: NetworkError::ConnectionRefused
+            }
+        ));
+    }
+
+    /// `enqueue_response` is a bounded driver hook: the (N+1)th frame
+    /// must be rejected with `BufferOverflow`.
+    #[test]
+    fn enqueue_response_reports_buffer_overflow_when_full() {
+        let mut c = BleClient::new(1000);
+        let make = || LlmResponse {
+            content: heapless::String::try_from("r").unwrap(),
+            tool_calls: Vec::new(),
+            finish_reason: heapless::String::try_from("stop").unwrap(),
+        };
+        for _ in 0..BLE_QUEUE_DEPTH {
+            assert!(c.enqueue_response(make()).is_ok());
+        }
+        let err = c.enqueue_response(make()).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::BufferOverflow {
+                capacity: BLE_QUEUE_DEPTH,
+                attempted
+            } if attempted == BLE_QUEUE_DEPTH + 1
+        ));
+    }
+
+    /// `send_tool_result` shares the outbound queue and must report the
+    /// same `BufferOverflow` when it is full.
+    #[test]
+    fn send_tool_result_reports_buffer_overflow_when_full() {
+        let result = ToolResult {
+            tool_name: heapless::String::try_from("noop").unwrap(),
+            data: heapless::String::try_from("ok").unwrap(),
+            success: true,
+            error: None,
+        };
+        let mut c = BleClient::new(1000);
+        assert!(block_on(c.connect()).is_ok());
+        for _ in 0..BLE_QUEUE_DEPTH {
+            assert!(block_on(c.send_tool_result(&result)).is_ok());
+        }
+        let err = block_on(c.send_tool_result(&result)).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::BufferOverflow {
+                capacity: BLE_QUEUE_DEPTH,
+                attempted
+            } if attempted == BLE_QUEUE_DEPTH + 1
+        ));
+    }
+
+    /// A maximal payload pushes the postcard encoding past the 512-byte
+    /// scratch buffer, so `to_bytes` must report a configuration error
+    /// rather than truncating the frame.
+    #[test]
+    fn to_bytes_reports_serialization_overflow() {
+        let payload = "z".repeat(MAX_MESSAGE_SIZE);
+        let msg = BleMessage::new(MessageType::LlmRequest, u32::MAX, &payload).unwrap();
+        let err = msg.to_bytes().unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::ConfigurationError {
+                field: "serialization",
+                ..
+            }
+        ));
+    }
 }

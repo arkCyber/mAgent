@@ -49,11 +49,19 @@ impl Gpio for EspGpio {
     type Error = EspError;
 
     fn configure(&mut self, mode: PinMode) -> Result<(), Self::Error> {
+        // ESP32-S3 GPIOs are 0..=48. Reject an out-of-range pin instead of
+        // reporting success for a pin the hardware cannot address.
+        if self.pin > 48 {
+            return Err(EspError::OutOfRange);
+        }
         self.mode = mode;
         Ok(())
     }
 
     fn set_level(&mut self, level: PinLevel) -> Result<(), Self::Error> {
+        if self.pin > 48 {
+            return Err(EspError::OutOfRange);
+        }
         if matches!(
             self.mode,
             PinMode::Input | PinMode::InputPullUp | PinMode::InputPullDown
@@ -65,6 +73,9 @@ impl Gpio for EspGpio {
     }
 
     fn read_level(&self) -> Result<PinLevel, Self::Error> {
+        if self.pin > 48 {
+            return Err(EspError::OutOfRange);
+        }
         Ok(self.level)
     }
 }
@@ -104,21 +115,30 @@ impl Flash for EspFlash {
 
     fn read(&self, address: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
         let start = address as usize;
-        let end = start + buf.len();
-        if end > self.data.len() {
-            return Err(EspError::OutOfRange);
-        }
+        let end = start
+            .checked_add(buf.len())
+            .filter(|&end| end <= self.data.len())
+            .ok_or(EspError::OutOfRange)?;
         buf.copy_from_slice(&self.data[start..end]);
         Ok(())
     }
 
     fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
         let start = address as usize;
-        let end = start + data.len();
-        if end > self.data.len() {
+        if start
+            .checked_add(data.len())
+            .is_none_or(|end| end > self.data.len())
+        {
             return Err(EspError::OutOfRange);
         }
-        // Flash can only clear bits, not set them.
+        // NOR flash can only clear bits; a write that would need to set one
+        // means the target was not erased. Report it instead of silently
+        // AND-ing and returning success.
+        for (i, byte) in data.iter().enumerate() {
+            if self.data[start + i] & *byte != *byte {
+                return Err(EspError::NotErased);
+            }
+        }
         for (i, byte) in data.iter().enumerate() {
             self.data[start + i] &= *byte;
         }
@@ -276,6 +296,8 @@ pub enum EspError {
     OutOfRange,
     /// Tried to send over BLE while not connected.
     NotConnected,
+    /// A flash write would have to set a bit (target not erased).
+    NotErased,
 }
 
 impl fmt::Display for EspError {
@@ -284,6 +306,7 @@ impl fmt::Display for EspError {
             EspError::InvalidMode => f.write_str("invalid pin mode for operation"),
             EspError::OutOfRange => f.write_str("address out of range"),
             EspError::NotConnected => f.write_str("BLE link is not connected"),
+            EspError::NotErased => f.write_str("flash target is not erased"),
         }
     }
 }
@@ -307,6 +330,14 @@ mod tests {
         let mut p = EspGpio::new(2);
         // Default mode is Input
         assert_eq!(p.set_level(PinLevel::High), Err(EspError::InvalidMode));
+    }
+
+    #[test]
+    fn gpio_rejects_a_pin_the_chip_does_not_have() {
+        let mut p = EspGpio::new(200);
+        assert_eq!(p.configure(PinMode::Output), Err(EspError::OutOfRange));
+        assert_eq!(p.set_level(PinLevel::High), Err(EspError::OutOfRange));
+        assert_eq!(p.read_level(), Err(EspError::OutOfRange));
     }
 
     #[test]
@@ -385,12 +416,14 @@ mod extra_tests {
         assert_eq!(f.capacity(), 1024);
         assert_eq!(f.read(1000, &mut [0u8; 100]), Err(EspError::OutOfRange));
         assert_eq!(f.write(1000, &[0u8; 100]), Err(EspError::OutOfRange));
-        // AND-only semantics (flash can only clear bits).
+        // Flash can only clear bits: a write that needs to set one is a
+        // NotErased error, not a silent partial write.
         f.write(0, &[0xF0]).unwrap();
-        f.write(0, &[0x0F]).unwrap();
+        assert_eq!(f.write(0, &[0x0F]), Err(EspError::NotErased));
+        f.write(0, &[0xE0]).unwrap(); // still clearing bits: legal
         let mut b = [0u8; 1];
         f.read(0, &mut b).unwrap();
-        assert_eq!(b[0], 0x00);
+        assert_eq!(b[0], 0xE0);
         // Erase restores 0xFF.
         f.erase_sector(0).unwrap();
         f.read(0, &mut b).unwrap();

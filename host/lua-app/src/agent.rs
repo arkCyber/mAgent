@@ -24,9 +24,21 @@ pub type SharedAgent = Arc<Mutex<MiniAgent>>;
 /// own `MAX_BUFFER_SIZE`. The returned `heapless` answer is converted to an
 /// owned [`String`].
 pub fn reason(agent: &SharedAgent, context: &str, prompt: &str) -> Result<String> {
-    let mut task = String::with_capacity(context.len() + prompt.len() + 1);
+    // The joined task must fit the agent's own buffer, including the single
+    // separator space. Callers cap `context.len() + prompt.len()`, so a
+    // request at exactly that limit previously produced a 2049-byte task and
+    // failed inside the agent with an opaque TooLong error.
+    let sep = usize::from(!context.is_empty() && !prompt.is_empty());
+    if context.len() + prompt.len() + sep > crate::hardware::MAX_REASON_LEN {
+        return Err(LuaHostError::Lua(format!(
+            "agent.reason text too long ({} > {})",
+            context.len() + prompt.len() + sep,
+            crate::hardware::MAX_REASON_LEN
+        )));
+    }
+    let mut task = String::with_capacity(context.len() + prompt.len() + sep);
     task.push_str(context);
-    if !context.is_empty() && !prompt.is_empty() {
+    if sep == 1 {
         task.push(' ');
     }
     task.push_str(prompt);

@@ -138,6 +138,79 @@ pub enum KnownChain {
 }
 
 impl KnownChain {
+    /// Every configured chain, in presentation order.
+    ///
+    /// `Custom` is deliberately excluded: it carries no id, no currency and no
+    /// RPC of its own (all three have to be supplied), so it is a slot for a
+    /// caller's own [`ChainConfig`], not one of the chains this build knows.
+    /// Enumerating it would advertise a chain that cannot be used as-is.
+    pub const ALL: [KnownChain; 8] = [
+        KnownChain::Ethereum,
+        KnownChain::Sepolia,
+        KnownChain::Polygon,
+        KnownChain::Amoy,
+        KnownChain::Arbitrum,
+        KnownChain::Optimism,
+        KnownChain::Base,
+        KnownChain::Gnosis,
+    ];
+
+    /// Resolve a chain from a user-supplied name.
+    ///
+    /// Accepts the canonical name (`"ethereum"`, `"polygon"`, …), the enum name
+    /// (`"Ethereum"`) and a decimal chain id (`"1"`, `"137"`), case-insensitively
+    /// for the names. An unknown name is an error rather than a silent fallback
+    /// to Ethereum, which would query the wrong chain with the user's address.
+    pub fn from_name(name: &str) -> Result<KnownChain, Web3ErrorKind> {
+        let needle = name.trim();
+        if let Ok(id) = needle.parse::<u64>() {
+            if let Some(chain) = Self::ALL.iter().copied().find(|c| c.chain_id() == id) {
+                return Ok(chain);
+            }
+            return Err(Web3ErrorKind::BlockchainError(format!(
+                "unknown chain id {id} (known: {})",
+                Self::known_names()
+            )));
+        }
+        let lower = needle.to_ascii_lowercase();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|c| {
+                c.name().to_ascii_lowercase() == lower || c.canonical_name() == Some(lower.as_str())
+            })
+            .ok_or_else(|| {
+                Web3ErrorKind::BlockchainError(format!(
+                    "unknown chain {needle:?} (known: {})",
+                    Self::known_names()
+                ))
+            })
+    }
+
+    /// The short, lowercase key users type (`"ethereum"`, `"sepolia"`, …).
+    pub fn canonical_name(&self) -> Option<&'static str> {
+        Some(match self {
+            KnownChain::Ethereum => "ethereum",
+            KnownChain::Sepolia => "sepolia",
+            KnownChain::Polygon => "polygon",
+            KnownChain::Amoy => "amoy",
+            KnownChain::Arbitrum => "arbitrum",
+            KnownChain::Optimism => "optimism",
+            KnownChain::Base => "base",
+            KnownChain::Gnosis => "gnosis",
+            KnownChain::Custom => return None,
+        })
+    }
+
+    /// Comma-separated list of the canonical names, for error messages.
+    fn known_names() -> String {
+        Self::ALL
+            .iter()
+            .filter_map(KnownChain::canonical_name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Get the chain ID for this known chain.
     pub fn chain_id(&self) -> u64 {
         match self {
@@ -306,8 +379,43 @@ impl ChainConfig {
 // ============================================================================
 
 /// A 20-byte Ethereum address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Address([u8; 20]);
+
+impl Serialize for Address {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // JSON-RPC uses `"0x…"`, not a 20-element number array.
+        s.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for Address {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct AddressVisitor;
+        impl<'de> serde::de::Visitor<'de> for AddressVisitor {
+            type Value = Address;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a 0x-prefixed 20-byte address string or a 20-byte array")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Address, E> {
+                Address::from_hex(v).map_err(E::custom)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Address, A::Error> {
+                let mut bytes = [0u8; 20];
+                for (i, slot) in bytes.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Ok(Address(bytes))
+            }
+        }
+        d.deserialize_any(AddressVisitor)
+    }
+}
 
 impl Address {
     /// The zero address.
@@ -493,8 +601,43 @@ impl From<[u8; 20]> for Address {
 // ============================================================================
 
 /// Wei amount (smallest Ethereum unit).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Wei(pub u128);
+
+impl Serialize for Wei {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // JSON-RPC quantities are hex strings.
+        s.serialize_str(&alloc::format!("0x{:x}", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Wei {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct WeiVisitor;
+        impl<'de> serde::de::Visitor<'de> for WeiVisitor {
+            type Value = Wei;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a hex quantity string or an unsigned integer")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Wei, E> {
+                let raw = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v);
+                if raw.is_empty() {
+                    return Ok(Wei(0));
+                }
+                u128::from_str_radix(raw, 16)
+                    .map(Wei)
+                    .map_err(|e| E::custom(alloc::format!("invalid wei quantity {v:?}: {e}")))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Wei, E> {
+                Ok(Wei(v as u128))
+            }
+            fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<Wei, E> {
+                Ok(Wei(v))
+            }
+        }
+        d.deserialize_any(WeiVisitor)
+    }
+}
 
 impl Wei {
     /// Zero wei.
@@ -581,8 +724,42 @@ impl Nonce {
 // ============================================================================
 
 /// A 32-byte hash (used for transaction hashes, block hashes, etc.).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hash([u8; 32]);
+
+impl Serialize for Hash {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for Hash {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct HashVisitor;
+        impl<'de> serde::de::Visitor<'de> for HashVisitor {
+            type Value = Hash;
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a 0x-prefixed 32-byte hash string or a 32-byte array")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Hash, E> {
+                Hash::from_hex(v).map_err(E::custom)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Hash, A::Error> {
+                let mut bytes = [0u8; 32];
+                for (i, slot) in bytes.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Ok(Hash(bytes))
+            }
+        }
+        d.deserialize_any(HashVisitor)
+    }
+}
 
 impl Hash {
     /// Create a hash from 32 bytes.
@@ -644,18 +821,23 @@ impl From<[u8; 32]> for Hash {
 
 /// A block header.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Block {
     /// Block number.
+    #[serde(with = "serde_helpers::hex_u64")]
     pub number: u64,
     /// Block hash.
     pub hash: Hash,
     /// Parent block hash.
     pub parent_hash: Hash,
     /// Timestamp.
+    #[serde(with = "serde_helpers::hex_u64")]
     pub timestamp: u64,
     /// Gas limit.
+    #[serde(with = "serde_helpers::hex_u64")]
     pub gas_limit: u64,
     /// Gas used.
+    #[serde(with = "serde_helpers::hex_u64")]
     pub gas_used: u64,
     /// Miner/validator address.
     pub miner: Address,
@@ -666,14 +848,17 @@ pub struct Block {
 
 /// A transaction in a block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BlockTransaction {
     /// Transaction hash.
     pub hash: Hash,
     /// Block number.
+    #[serde(with = "serde_helpers::hex_u64")]
     pub block_number: u64,
     /// Block hash.
     pub block_hash: Hash,
     /// Transaction index in block.
+    #[serde(with = "serde_helpers::hex_u64")]
     pub transaction_index: u64,
     /// From address.
     pub from: Address,
@@ -685,17 +870,113 @@ pub struct BlockTransaction {
     /// Gas price.
     pub gas_price: Wei,
     /// Gas limit.
+    #[serde(with = "serde_helpers::hex_u64")]
     pub gas: u64,
     /// Input data.
     pub input: String,
     /// Nonce.
+    #[serde(with = "serde_helpers::hex_u64")]
     pub nonce: u64,
     /// Signature v.
+    #[serde(with = "serde_helpers::hex_u64")]
     pub v: u64,
     /// Signature r.
+    #[serde(with = "serde_helpers::hex_bytes32")]
     pub r: [u8; 32],
     /// Signature s.
+    #[serde(with = "serde_helpers::hex_bytes32")]
     pub s: [u8; 32],
+}
+
+// ============================================================================
+// Serde helpers for JSON-RPC wire shapes
+// ============================================================================
+
+/// Adapters for the Ethereum JSON-RPC conventions: quantities are `"0x…"`
+/// strings (not JSON numbers) and byte strings are hex, not arrays.
+pub(crate) mod serde_helpers {
+    use serde::{Deserializer, Serializer};
+
+    /// `u64` encoded as a `0x` quantity; also accepts a JSON number.
+    pub mod hex_u64 {
+        use super::*;
+        pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&alloc::format!("0x{:x}", v))
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = u64;
+                fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str("a hex quantity string or an unsigned integer")
+                }
+                fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<u64, E> {
+                    let raw = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v);
+                    if raw.is_empty() {
+                        return Ok(0);
+                    }
+                    u64::from_str_radix(raw, 16)
+                        .map_err(|e| E::custom(alloc::format!("invalid quantity {v:?}: {e}")))
+                }
+                fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u64, E> {
+                    Ok(v)
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+
+    /// `u8` (e.g. receipt `status`) encoded as a `0x` quantity.
+    pub mod hex_u8 {
+        use super::*;
+        pub fn serialize<S: Serializer>(v: &u8, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&alloc::format!("0x{:x}", v))
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+            let n = hex_u64::deserialize(d)?;
+            u8::try_from(n).map_err(|_| serde::de::Error::custom("quantity does not fit u8"))
+        }
+    }
+
+    /// 32 raw bytes encoded as a `0x` data string; also accepts an array.
+    pub mod hex_bytes32 {
+        use super::*;
+        pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&alloc::format!("0x{}", super::super::hex_encode(v)))
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = [u8; 32];
+                fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str("a 0x-prefixed 32-byte data string or a 32-byte array")
+                }
+                fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<[u8; 32], E> {
+                    let raw = v.strip_prefix("0x").unwrap_or(v);
+                    if raw.len() != 64 {
+                        return Err(E::custom("expected 64 hex characters"));
+                    }
+                    let bytes = super::super::hex_decode(raw).map_err(E::custom)?;
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&bytes);
+                    Ok(out)
+                }
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> Result<[u8; 32], A::Error> {
+                    let mut out = [0u8; 32];
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        *slot = seq
+                            .next_element()?
+                            .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                    }
+                    Ok(out)
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
 }
 
 // ============================================================================
@@ -778,8 +1059,75 @@ impl Web3ErrorKind {
 // ============================================================================
 
 #[cfg(test)]
+mod real_rpc_serde_tests {
+    use super::*;
+
+    /// Real `eth_getBlockByNumber` shape: camelCase keys, hex quantities,
+    /// hex hashes/addresses.
+    #[test]
+    fn block_deserialises_from_a_real_rpc_payload() {
+        let hash = format!("0x{}", "aa".repeat(32));
+        let parent = format!("0x{}", "bb".repeat(32));
+        let miner = format!("0x{}", "cc".repeat(20));
+        let json = format!(
+            r#"{{"number":"0x10","hash":"{hash}","parentHash":"{parent}","timestamp":"0x65","gasLimit":"0x1c9c380","gasUsed":"0x5208","miner":"{miner}","extraData":"0x"}}"#
+        );
+        let block: Block = serde_json::from_str(&json).unwrap();
+        assert_eq!(block.number, 16);
+        assert_eq!(block.timestamp, 0x65);
+        assert_eq!(block.gas_limit, 30_000_000);
+        assert_eq!(block.gas_used, 21_000);
+        assert_eq!(block.hash.to_hex(), hash);
+        assert_eq!(block.miner.to_hex(), miner);
+    }
+
+    #[test]
+    fn address_and_hash_accept_the_legacy_byte_array_form() {
+        let address_json = serde_json::to_string(&alloc::vec![1u8; 20]).unwrap();
+        let address: Address = serde_json::from_str(&address_json).unwrap();
+        assert_eq!(address.to_hex(), format!("0x{}", "01".repeat(20)));
+
+        let hash_json = serde_json::to_string(&alloc::vec![2u8; 32]).unwrap();
+        let hash: Hash = serde_json::from_str(&hash_json).unwrap();
+        assert_eq!(hash.to_hex(), format!("0x{}", "02".repeat(32)));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ALL` is what `magent web3 chain list` prints, and `from_name` is what
+    /// every other chain-taking command resolves through. A chain added to one
+    /// and not the other is a chain the list shows but no command accepts.
+    #[test]
+    fn every_advertised_chain_resolves_by_name_and_id() {
+        assert!(!KnownChain::ALL.contains(&KnownChain::Custom));
+        for chain in KnownChain::ALL {
+            let name = chain
+                .canonical_name()
+                .expect("every advertised chain has a canonical name");
+            assert_eq!(KnownChain::from_name(name).unwrap(), chain);
+            assert_eq!(
+                KnownChain::from_name(chain.name()).unwrap(),
+                chain,
+                "the display name must resolve too"
+            );
+            assert_eq!(
+                KnownChain::from_name(&chain.chain_id().to_string()).unwrap(),
+                chain,
+                "the chain id must resolve too"
+            );
+        }
+        // Case-insensitive, and an unknown name errors rather than falling
+        // back to a default chain.
+        assert_eq!(
+            KnownChain::from_name("POLYGON").unwrap(),
+            KnownChain::Polygon
+        );
+        assert!(KnownChain::from_name("solana").is_err());
+        assert!(KnownChain::from_name("999999").is_err());
+    }
 
     #[test]
     fn test_address_from_hex() {

@@ -129,6 +129,9 @@ pub trait LinkAdapter {
     ///   should move on to the next adapter rather than spinning.
     /// * `Ok(n)` with `n <= buf.len()` is a valid frame; the gateway
     ///   will treat the bytes as opaque payload.
+    /// * `Ok(n)` with `n > buf.len()` violates this contract: nothing
+    ///   beyond `buf` was written, so the gateway discards the frame and
+    ///   logs a warning rather than slicing out of range.
     /// * `Err(_)` means the adapter is in a failure state. The gateway
     ///   will log the error and skip the adapter for this round.
     fn poll(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error>;
@@ -173,6 +176,8 @@ pub trait LinkAdapter {
 ///   should resolve immediately (or after a tiny delay) rather than
 ///   block forever; the gateway treats `Ok(0)` as "move on".
 /// * `Ok(n)` future with `n <= buf.len()` — a valid frame.
+/// * `Ok(n)` future with `n > buf.len()` — contract violation; the
+///   gateway discards the frame (nothing past `buf` was written).
 /// * `Err(_)` future — adapter in a failure state; gateway logs + skips.
 pub trait AsyncLinkAdapter {
     /// Adapter-specific error type. Must be `Debug` so the gateway can
@@ -197,4 +202,62 @@ pub trait AsyncLinkAdapter {
 
     /// Connection liveness, same as [`LinkAdapter::is_connected`].
     fn is_connected(&self) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `IngressSource` variant must map to its stable `tag()`
+    /// string — log scrapers group events on these, so a rename here
+    /// (or a missing arm) is a breaking change.
+    #[test]
+    fn every_source_variant_has_a_stable_tag() {
+        let mqtt = IngressSource::Mqtt {
+            topic: String::try_from("sensors/temp").expect("fits"),
+        };
+        let rs232 = IngressSource::Rs232 {
+            port: String::try_from("UART0").expect("fits"),
+        };
+        let spi = IngressSource::Spi { cs_pin: 7 };
+        let manual = IngressSource::Manual;
+        let other = IngressSource::Other {
+            label: String::try_from("ble:adv").expect("fits"),
+        };
+
+        assert_eq!(mqtt.tag(), "mqtt");
+        assert_eq!(rs232.tag(), "rs232");
+        assert_eq!(spi.tag(), "spi");
+        assert_eq!(manual.tag(), "manual");
+        assert_eq!(other.tag(), "other");
+    }
+
+    /// `tag()` ignores the payload: two different MQTT topics still
+    /// share the `"mqtt"` tag (the source *kind*, not the instance).
+    #[test]
+    fn tag_is_independent_of_the_payload() {
+        let a = IngressSource::Mqtt {
+            topic: String::try_from("a").expect("fits"),
+        };
+        let b = IngressSource::Mqtt {
+            topic: String::try_from("a/very/different/topic").expect("fits"),
+        };
+        assert_eq!(a.tag(), b.tag());
+
+        let p1 = IngressSource::Spi { cs_pin: 0 };
+        let p2 = IngressSource::Spi { cs_pin: 255 };
+        assert_eq!(p1.tag(), p2.tag());
+    }
+
+    /// The enum derives `PartialEq`/`Eq`/`Clone`; equal payloads must
+    /// compare equal and clone to an equal value.
+    #[test]
+    fn sources_compare_and_clone_by_value() {
+        let src = IngressSource::Other {
+            label: String::try_from("lora").expect("fits"),
+        };
+        let copy = src.clone();
+        assert_eq!(src, copy);
+        assert_ne!(src, IngressSource::Manual);
+    }
 }

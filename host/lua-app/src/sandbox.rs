@@ -16,7 +16,7 @@
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mlua::{HookTriggers, Lua, LuaOptions, StdLib, VmState};
+use mlua::{Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Value, VmState};
 
 /// Maximum Lua heap in bytes. Generous for a business app but far below the
 /// budget of a memory-rich chip (ESP32-S3 ~8 MB PSRAM), so a runaway
@@ -25,6 +25,28 @@ pub const MEMORY_LIMIT: usize = 512 * 1024;
 
 /// Instruction budget per script before the interpreter is stopped.
 pub const INSTRUCTION_BUDGET: u64 = 2_000_000;
+
+/// Runtime-error text raised when the instruction budget is exhausted.
+///
+/// Shared by the hook and the `pcall`/`xpcall` wrapper so the wrapper can
+/// recognise a *budget* error and re-raise it instead of letting the script
+/// catch it and keep running.
+const BUDGET_MESSAGE: &str = "script instruction budget exceeded (infinite loop?)";
+
+/// Whether a Lua error value is the instruction-budget error.
+fn is_budget_error(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s
+            .to_str()
+            .map(|s| s.contains(BUDGET_MESSAGE))
+            .unwrap_or(false),
+        // mlua surfaces a Rust-side `Error` returned from a hook (or a
+        // callback) to Lua as a wrapped-error userdata, which `pcall`
+        // hands back as `Value::Error` — not a string.
+        Value::Error(err) => err.to_string().contains(BUDGET_MESSAGE),
+        _ => false,
+    }
+}
 
 /// Resettable per-script instruction budget handle.
 ///
@@ -50,10 +72,31 @@ impl Budget {
 /// the single construction site for every VM in the crate, so the sandbox
 /// cannot be bypassed accidentally.
 pub fn new_sandbox() -> mlua::Result<Lua> {
-    Lua::new_with(
+    let lua = Lua::new_with(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH,
         LuaOptions::default(),
-    )
+    )?;
+
+    // The Lua *base* library cannot be deselected through `StdLib`
+    // (mlua's construction calls `luaopen_base` unconditionally), and
+    // in Lua 5.4 the base library itself defines the three chunk
+    // loaders:
+    //
+    //   * `dofile` / `loadfile` open and execute a file through C
+    //     `fopen` — bypassing the absent `io` / `os` libraries
+    //     entirely;
+    //   * `load` defaults to accepting *binary* chunks, which
+    //     `run_script`'s `ChunkMode::Text` restriction does not cover
+    //     (it only applies to the outer chunk), re-opening the
+    //     "malicious bytecode can crash the interpreter" path.
+    //
+    // Remove all three. Business scripts have no legitimate need to
+    // load code at runtime, and every script entry point goes through
+    // `run_script`.
+    for name in ["load", "loadfile", "dofile"] {
+        lua.globals().set(name, mlua::Value::Nil)?;
+    }
+    Ok(lua)
 }
 
 /// Enforce the heap and instruction budgets on `lua`, returning the resettable
@@ -70,20 +113,51 @@ pub fn enforce_budget(lua: &Lua) -> crate::Result<Budget> {
 
     // Instruction hook: every 1024 ops, debit the budget. When exhausted the
     // hook returns `Err`, which stops the script with a runtime error.
+    //
+    // The debit is *saturating* and the exhausted state is sticky: the
+    // previous `fetch_sub` wrapped a zero counter to `u64::MAX`, so a script
+    // that caught the first budget error with `pcall` (pcall can catch a hook
+    // error like any other runtime error) disabled the budget and could loop
+    // indefinitely. Once the counter reaches zero it now stays zero, and every
+    // later hook invocation raises again.
     let instructions = Rc::new(AtomicU64::new(INSTRUCTION_BUDGET));
     let hook_budget = Rc::clone(&instructions);
     lua.set_hook(
         HookTriggers::new().every_nth_instruction(1024),
         move |_lua, _dbg| {
-            let remaining = hook_budget.fetch_sub(1024, Ordering::Relaxed);
-            if remaining <= 1024 {
-                return Err(mlua::Error::RuntimeError(
-                    "script instruction budget exceeded (infinite loop?)".into(),
-                ));
+            let previous = hook_budget
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1024))
+                })
+                .unwrap_or(0);
+            if previous <= 1024 {
+                return Err(mlua::Error::RuntimeError(BUDGET_MESSAGE.into()));
             }
             Ok(VmState::Continue)
         },
     );
+
+    // The hook error is an ordinary Lua runtime error, so `pcall` /
+    // `xpcall` can catch it. A script that wraps its body in `pcall`
+    // therefore survives every budget trip and keeps running (the sticky
+    // counter above at least prevents the old wrap-around, but does not by
+    // itself end the script). Wrap both protected-call functions: when the
+    // caught error is the budget error, re-raise it so it propagates out of
+    // the script instead of being swallowed.
+    for name in ["pcall", "xpcall"] {
+        let Ok(original) = lua.globals().get::<Function>(name) else {
+            continue;
+        };
+        let wrapped = lua.create_function(move |_, args: MultiValue| {
+            let result: MultiValue = original.call(args)?;
+            let failed = matches!(result.front(), Some(Value::Boolean(false)));
+            if failed && result.iter().skip(1).any(is_budget_error) {
+                return Err(mlua::Error::RuntimeError(BUDGET_MESSAGE.into()));
+            }
+            Ok(result)
+        })?;
+        lua.globals().set(name, wrapped)?;
+    }
 
     Ok(Budget { instructions })
 }

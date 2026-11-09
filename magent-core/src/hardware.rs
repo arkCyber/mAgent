@@ -404,6 +404,22 @@ mod tests {
     }
 
     #[test]
+    fn spi_sensor_write_fails_before_init() {
+        // The uninitialized guard must cover `write` too, not just
+        // `read` — a driver that forgets `init` must fail loudly on
+        // the first write rather than silently succeeding.
+        let s = SpiSensor::new(5);
+        let err = s.write(0x00, 0xAB).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::SensorReadFailed {
+                sensor: "I2C",
+                reason: SensorError::NotInitialized
+            }
+        ));
+    }
+
+    #[test]
     fn spi_sensor_init_then_read_axis() {
         let mut s = SpiSensor::new(5);
         assert!(s.init().is_ok());

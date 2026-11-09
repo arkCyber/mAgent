@@ -514,4 +514,95 @@ mod tests {
         b.reset_time();
         assert_eq!(b.iteration_usage(), 0);
     }
+
+    #[test]
+    fn fault_detector_captures_different_error_types() {
+        let d = FaultDetector::new(10);
+        let err1 = AgentError::ConfigurationError {
+            field: "test",
+            reason: crate::error::ConfigError::Empty,
+        };
+        let err2 = AgentError::MemoryBudgetExhausted { used: 100, limit: 50 };
+        let _ = d.report_error(&err1);
+        assert_eq!(
+            d.last_error_type(),
+            Some(crate::error::ErrorCategory::Validation)
+        );
+        let _ = d.report_error(&err2);
+        assert_eq!(
+            d.last_error_type(),
+            Some(crate::error::ErrorCategory::Memory)
+        );
+    }
+
+    #[test]
+    fn fault_detector_threshold_compare_semantics() {
+        // With threshold=0, even the first report triggers the fault.
+        let d = FaultDetector::new(0);
+        let err = d.report_error(&AgentError::Unknown { code: 0 }).unwrap_err();
+        assert!(matches!(err, AgentError::Unknown { code: 0xDEAD }));
+        assert_eq!(d.error_count(), 1);
+    }
+
+    #[test]
+    fn memory_guard_free_exact_amount() {
+        let g = MemoryGuard::new(100);
+        g.allocate(50).unwrap();
+        assert_eq!(g.usage(), 50);
+        g.free(50);
+        assert_eq!(g.usage(), 0);
+        // Free again (saturating) stays at zero.
+        g.free(10);
+        assert_eq!(g.usage(), 0);
+    }
+
+    #[test]
+    fn memory_guard_allocate_zero() {
+        let g = MemoryGuard::new(100);
+        assert!(g.allocate(0).is_ok());
+        assert_eq!(g.usage(), 0);
+    }
+
+    #[test]
+    fn memory_guard_capacity_is_correct() {
+        let g = MemoryGuard::new(42);
+        assert_eq!(g.capacity(), 42);
+    }
+
+    #[test]
+    fn budget_enforcer_reset_time_clears() {
+        let b = BudgetEnforcer::new(10, 100, 5000);
+        // time_budget is internal — verifying reset doesn't crash or corrupt.
+        b.reset_time();
+        assert_eq!(b.iteration_usage(), 0);
+        assert_eq!(b.memory_usage(), 0);
+    }
+
+    #[test]
+    fn budget_enforcer_consume_iteration_at_limit_edge() {
+        let b = BudgetEnforcer::new(1, 100, 1000);
+        // The first consumption uses the 1 slot.
+        assert!(b.consume_iteration().is_ok());
+        // Second consumption must fail (used >= limit).
+        let err = b.consume_iteration().unwrap_err();
+        assert!(matches!(err, AgentError::IterationBudgetExhausted { .. }));
+    }
+
+    #[test]
+    fn stack_monitor_with_defaults_no_crash() {
+        let m = StackMonitor::with_defaults();
+        assert_eq!(m.stack_limit(), crate::AGENT_STACK_SIZE);
+        // stack_base=0 with any SP will be < stack_limit if the default is reasonable
+        // This test just verifies with_defaults doesn't panic.
+        let _ = m.check_depth(crate::AGENT_STACK_SIZE);
+    }
+
+    #[test]
+    fn watchdog_with_defaults() {
+        let w = Watchdog::with_defaults();
+        assert_eq!(
+            w.timeout_ms(),
+            (crate::WATCHDOG_TIMEOUT_SECS * 1000) as u32
+        );
+    }
 }

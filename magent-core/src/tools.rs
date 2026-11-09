@@ -47,6 +47,44 @@ pub trait ToolHandler {
     /// for a tool this target can run, or `None` for one it cannot — the
     /// registry will not fall back to a simulated value.
     fn handle(&self, call: &ToolCall) -> Option<ToolResult>;
+
+    /// Whether this handler can actually run `name`.
+    ///
+    /// The registry advertises every *registered* tool to the model, but a
+    /// real target implements only a subset: the ESP32 runs GPIO, its internal
+    /// temperature sensor and flash, and has no heart-rate or glucose hardware
+    /// at all. Returning `false` keeps that tool out of the LLM system prompt
+    /// (see [`ToolRegistry::describe_served`]), so the model is not told it can
+    /// read a sensor the board does not have.
+    ///
+    /// The default assumes a handler serves its whole registration, which is
+    /// the behaviour before this hook existed and what a fully-implemented
+    /// handler wants.
+    fn serves(&self, name: &str) -> bool {
+        let _ = name;
+        true
+    }
+
+    /// How `name` should be described in the LLM tool list, or `None` to use
+    /// the description the tool was registered with.
+    ///
+    /// [`Self::serves`] filters *which* tools a target advertises; this
+    /// filters *what* a served tool claims. Some tools take an argument that
+    /// names a capability — `read_sensor sensor=<name>` being the one that
+    /// matters here — and a target can serve the tool while supporting only
+    /// part of that argument space. The shared registry description for
+    /// `read_sensor` lists twelve sensors; the ESP32 runs the tool but has no
+    /// accelerometer, humidity, pressure, light, heart-rate, HRV, glucose, ECG,
+    /// stress or battery hardware, so advertising the shared text promised ten
+    /// readings the board answers "unsupported sensor" to. A handler that
+    /// knows its real capability returns its own description here.
+    ///
+    /// The default returns `None`, so every existing handler and the simulated
+    /// (handler-less) registry are unchanged.
+    fn describe_tool(&self, name: &str) -> Option<&'static str> {
+        let _ = name;
+        None
+    }
 }
 
 /// Tool registry
@@ -120,6 +158,29 @@ pub(crate) fn arg<'a>(
     default
 }
 
+/// Every canonical sensor name `read_sensor` resolves.
+///
+/// Single source of truth for the sensor vocabulary: the executor below,
+/// the host simulator ([`crate::simulator`]) and the system prompt the
+/// model is handed all have to agree on it, or a prompt tuned with
+/// `--mock` behaves differently from the device it is tuned for. Each of
+/// those places has a guard test that iterates this list, so a name added
+/// here and nowhere else fails a test instead of silently diverging.
+pub const SENSOR_NAMES: [&str; 12] = [
+    "temperature",
+    "accelerometer",
+    "humidity",
+    "pressure",
+    "light",
+    "heart_rate",
+    "hrv",
+    "glucose",
+    "ecg",
+    "stress",
+    "battery",
+    "memory",
+];
+
 /// Map a user-supplied sensor name (e.g. `"heartrate"`, `"HRV"`,
 /// `"temp"`) to the canonical token used by the simulated value
 /// table. The previous flat `if/else` chain relied on input order,
@@ -139,6 +200,7 @@ fn normalize_sensor(name: &str) -> &str {
         "ecg" | "ekg" => "ecg",
         "stress" | "stress_level" => "stress",
         "battery" | "batt" => "battery",
+        "memory" | "mem" | "heap" | "free_heap" | "sram" => "memory",
         _ => name,
     }
 }
@@ -279,6 +341,23 @@ fn arg_parse<T: FromStr>(args: &Vec<(&str, &str), 8>, key: &str, default: T) -> 
     default
 }
 
+/// Parse a tool argument the call has to name. An absent key is a *missing
+/// field* and a value that will not parse is an *invalid* one. `arg_parse`'s
+/// `default` silently substituted `0` for an absent `pin`/`address`, turning a
+/// malformed call into a real action on pin 0 or flash address 0.
+fn required_arg_parse<T: FromStr>(args: &Vec<(&str, &str), 8>, key: &'static str) -> Result<T> {
+    match args.iter().find(|(k, _)| *k == key) {
+        None => Err(AgentError::ConfigurationError {
+            field: key,
+            reason: crate::error::ConfigError::MissingField,
+        }),
+        Some((_, v)) => v.parse::<T>().map_err(|_| AgentError::ConfigurationError {
+            field: key,
+            reason: crate::error::ConfigError::InvalidValue,
+        }),
+    }
+}
+
 impl ToolRegistry {
     /// Create a new tool registry
     pub fn new() -> Self {
@@ -359,9 +438,16 @@ impl ToolRegistry {
             ToolType::FlashRead => self.execute_flash_read(&call.arguments).await,
             ToolType::FlashWrite => self.execute_flash_write(&call.arguments).await,
             ToolType::BleSend => self.execute_ble_send(&call.arguments).await,
-            ToolType::ReadHeartRate => self.execute_read_sensor(&call.arguments).await,
-            ToolType::ReadGlucose => self.execute_read_sensor(&call.arguments).await,
-            ToolType::ReadEcg => self.execute_read_sensor(&call.arguments).await,
+            ToolType::ReadHeartRate => {
+                self.execute_read_sensor_as("heart_rate", &call.arguments)
+                    .await
+            }
+            ToolType::ReadGlucose => {
+                self.execute_read_sensor_as("glucose", &call.arguments)
+                    .await
+            }
+            ToolType::ReadEcg => self.execute_read_sensor_as("ecg", &call.arguments).await,
+            ToolType::StressLevel => self.execute_read_sensor_as("stress", &call.arguments).await,
             ToolType::VoiceOutput => self.execute_voice_output(&call.arguments).await,
             ToolType::SendNotification => self.execute_send_notification(&call.arguments).await,
             // Network tools have no simulation: they are only meaningful when a
@@ -438,6 +524,15 @@ impl ToolRegistry {
 
     /// Execute sensor read
     async fn execute_read_sensor(&self, args: &str) -> Result<ToolResult> {
+        self.execute_read_sensor_as("", args).await
+    }
+
+    /// Execute a sensor read on behalf of an alias tool
+    /// (`read_heart_rate`, `read_glucose`, `read_ecg`) that the system prompt
+    /// documents as taking no arguments. `implied` is the sensor the alias
+    /// stands for; it is used only when the caller named no sensor, so an
+    /// explicit `sensor=` argument still wins.
+    async fn execute_read_sensor_as(&self, implied: &str, args: &str) -> Result<ToolResult> {
         // Parse the args once with the shared parser so the sensor
         // keywords are matched against the *value* of `sensor=...` (or
         // a bare word) rather than against the whole input string.
@@ -448,7 +543,8 @@ impl ToolRegistry {
         let parsed = parse_args(args);
         let sensor = {
             // Prefer an explicit `sensor=` key, fall back to the first
-            // bare token, then to "unknown" if neither is present.
+            // bare token, then to the alias's implied sensor, then to
+            // "" if none of those is present.
             let explicit = arg(&parsed, "sensor", "");
             if !explicit.is_empty() {
                 explicit
@@ -457,7 +553,7 @@ impl ToolRegistry {
                 let mut iter = parsed.iter().filter(|(k, _)| k.is_empty());
                 match iter.next() {
                     Some((_, v)) => *v,
-                    None => "",
+                    None => implied,
                 }
             }
         };
@@ -546,7 +642,7 @@ impl ToolRegistry {
         // `"1"` appears in `"10"`. Parsing the structured args side-
         // steps that completely.
         let parsed = parse_args(args);
-        let pin = arg_parse::<u32>(&parsed, "pin", 0);
+        let pin = required_arg_parse::<u32>(&parsed, "pin")?;
         // State must be a single token. We accept the explicit
         // `state=high|low|1|0` form; bare numeric values are NOT
         // treated as state (that's the whole point of the parse).
@@ -605,7 +701,7 @@ impl ToolRegistry {
         // Parse arguments (format: "address=XX,length=YY") using the
         // shared parser so numeric values are validated.
         let parsed = parse_args(args);
-        let address = arg_parse::<u32>(&parsed, "address", 0);
+        let address = required_arg_parse::<u32>(&parsed, "address")?;
         let length = arg_parse::<u32>(&parsed, "length", 256);
 
         // In real implementation, this would read from flash
@@ -631,7 +727,7 @@ impl ToolRegistry {
         // shared parser so `data_len` is computed from the raw value
         // length rather than from a substring search.
         let parsed = parse_args(args);
-        let address = arg_parse::<u32>(&parsed, "address", 0);
+        let address = required_arg_parse::<u32>(&parsed, "address")?;
         let data_len = arg(&parsed, "data", "").len() as u32;
 
         // In real implementation, this would write to flash
@@ -726,11 +822,46 @@ impl ToolRegistry {
     /// Each entry is now committed only if it fits as a whole (a half-entry could
     /// never be parsed by the model anyway) and any omission is logged.
     pub fn describe(&self) -> String<2048> {
+        self.describe_filtered(false)
+    }
+
+    /// Like [`Self::describe`], but lists only the tools the installed handler
+    /// can actually serve ([`ToolHandler::serves`]). With no handler installed
+    /// (the simulated default) this is identical to `describe`.
+    ///
+    /// This is what the LLM system prompt must use. A tool that is advertised
+    /// but unservable is a promise the model will act on and the executor will
+    /// refuse: on the ESP32 that covered seven of the fifteen advertised names
+    /// (`ble_send`, the health sensors, `voice_output`, `send_notification`),
+    /// none of which the board has hardware for.
+    pub fn describe_served(&self) -> String<2048> {
+        self.describe_filtered(true)
+    }
+
+    fn describe_filtered(&self, served_only: bool) -> String<2048> {
         let mut out = String::<2048>::new();
         let mut dropped = 0usize;
+        let mut unserved = 0usize;
+        let mut described = 0usize;
         for tool in self.tools.iter() {
             if tool.description.is_empty() {
                 continue;
+            }
+            // A handler may override *what* a served tool claims (see
+            // [`ToolHandler::describe_tool`]); that override is part of the
+            // served-view contract, so only apply it when filtering.
+            let mut description = tool.description.as_str();
+            if served_only {
+                if let Some(handler) = self.handler {
+                    if !handler.serves(tool.name.as_str()) {
+                        unserved += 1;
+                        continue;
+                    }
+                    if let Some(override_desc) = handler.describe_tool(tool.name.as_str()) {
+                        description = override_desc;
+                        described += 1;
+                    }
+                }
             }
             let before = out.len();
             let fits = {
@@ -741,7 +872,7 @@ impl ToolRegistry {
                 ok &= out.push_str("- ").is_ok();
                 ok &= out.push_str(tool.name.as_str()).is_ok();
                 ok &= out.push_str(": ").is_ok();
-                ok &= out.push_str(tool.description.as_str()).is_ok();
+                ok &= out.push_str(description).is_ok();
                 ok
             };
             if !fits {
@@ -753,6 +884,18 @@ impl ToolRegistry {
             log::warn!(
                 "[tools] describe(): {dropped} tool(s) omitted — the description buffer (2048 B) is full; \
                  the LLM prompt will not advertise them"
+            );
+        }
+        if unserved > 0 {
+            log::info!(
+                "[tools] describe_served(): {unserved} registered tool(s) not served by the installed \
+                 handler — the LLM prompt will not advertise them"
+            );
+        }
+        if described > 0 {
+            log::info!(
+                "[tools] describe_served(): {described} tool description(s) overridden by the installed \
+                 handler to match the hardware it actually has"
             );
         }
         out
@@ -808,6 +951,8 @@ pub enum ToolType {
     VoiceOutput = 8,
     /// Send notification
     SendNotification = 9,
+    /// Read the stress level (alias for `read_sensor sensor=stress`)
+    StressLevel = 11,
     /// Network fetch (HTTP GET) — e.g. `fetch_web` / `get_weather` /
     /// `get_news`. These have no simulation: they are executed by the
     /// target's real-hardware [`ToolHandler`] (the ESP32 firmware implements
@@ -922,6 +1067,28 @@ mod tests {
                 "Send a smartwatch notification",
                 ToolType::SendNotification,
             ),
+            // Registered by `register_builtin_tools` on real targets; the
+            // fixture has to carry them or the alias dispatch is untested.
+            (
+                "read_heart_rate",
+                "Read heart rate (alias for read_sensor sensor=heart_rate)",
+                ToolType::ReadHeartRate,
+            ),
+            (
+                "read_glucose",
+                "Read glucose level (alias for read_sensor sensor=glucose)",
+                ToolType::ReadGlucose,
+            ),
+            (
+                "read_ecg",
+                "Read ECG trace (alias for read_sensor sensor=ecg)",
+                ToolType::ReadEcg,
+            ),
+            (
+                "check_stress_level",
+                "Read stress level (alias for read_sensor sensor=stress)",
+                ToolType::StressLevel,
+            ),
         ];
         for (name, desc, ty) in entries {
             // HARDENING (audit-2026-08 unwrap sweep): the previous
@@ -1033,9 +1200,9 @@ mod tests {
         assert!(desc
             .as_str()
             .contains("send_notification: Send a smartwatch notification"));
-        // Newline separated. We have 7 entries.
+        // Newline separated. We have 11 entries.
         let line_count = desc.as_str().matches('\n').count() + 1;
-        assert_eq!(line_count, 7);
+        assert_eq!(line_count, 11);
     }
 
     #[test]
@@ -1060,7 +1227,9 @@ mod tests {
         let r = populated_registry();
         let names = r.names();
         // Names are in registration order.
-        let expected = "read_sensor, write_gpio, flash_read, flash_write, ble_send, voice_output, send_notification";
+        let expected = "read_sensor, write_gpio, flash_read, flash_write, ble_send, \
+                        voice_output, send_notification, read_heart_rate, read_glucose, \
+                        read_ecg, check_stress_level";
         assert_eq!(names.as_str(), expected);
     }
 
@@ -1082,6 +1251,39 @@ mod tests {
         // runs on the executor baked into the firmware — but the
         // unit tests need *some* way to .await a value.
         futures::executor::block_on(fut)
+    }
+
+    /// The prompt advertises `read_heart_rate()`, `read_glucose()` and
+    /// `read_ecg()` with **no arguments**, and `register_builtin_tools`
+    /// registers them as aliases for `read_sensor`. The dispatch handed
+    /// `execute_read_sensor` the caller's empty argument string, so the alias
+    /// never supplied the sensor it is an alias *for* and every advertised
+    /// zero-arg call answered "Unknown sensor".
+    #[test]
+    fn sensor_aliases_supply_their_own_sensor() {
+        let r = populated_registry();
+        for (tool, needle) in [
+            ("read_heart_rate", "BPM"),
+            ("read_glucose", "mg/dL"),
+            ("read_ecg", "Rhythm"),
+            ("check_stress_level", "Moderate"),
+        ] {
+            let out = run_async(r.execute(&make_call(tool, ""))).unwrap();
+            assert!(
+                out.success,
+                "{tool}() with no args must resolve, got {:?}",
+                out.error
+            );
+            assert!(
+                out.data.as_str().contains(needle),
+                "{tool} produced {}",
+                out.data.as_str()
+            );
+        }
+        // An explicit sensor still wins over the alias's implied one.
+        let out = run_async(r.execute(&make_call("read_heart_rate", "sensor=hrv"))).unwrap();
+        assert!(out.success);
+        assert!(out.data.as_str().contains("55ms"), "got {}", out.data);
     }
 
     #[test]
@@ -1248,12 +1450,36 @@ mod tests {
         assert_eq!(out.data.as_str(), "Unknown sensor");
     }
 
+    /// A call that names no `pin` used to drive pin **0**: `arg_parse`'s `0`
+    /// default turned a malformed call into a real side effect on the first
+    /// pin. An absent argument is a missing field, not a request for zero.
     #[test]
-    fn execute_write_gpio_missing_pin_defaults_to_zero() {
+    fn a_missing_pin_or_flash_address_is_an_error_not_a_zero() {
         let r = populated_registry();
-        let out = run_async(r.execute(&make_call("write_gpio", "state=low"))).unwrap();
-        assert!(out.success);
-        assert_eq!(out.data.as_str(), "Pin 0 set to low");
+        let err = run_async(r.execute(&make_call("write_gpio", "state=low"))).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgentError::ConfigurationError {
+                    field: "pin",
+                    reason: crate::error::ConfigError::MissingField
+                }
+            ),
+            "got {err:?}"
+        );
+        for tool in ["flash_read", "flash_write"] {
+            let err = run_async(r.execute(&make_call(tool, "data=x"))).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    AgentError::ConfigurationError {
+                        field: "address",
+                        reason: crate::error::ConfigError::MissingField
+                    }
+                ),
+                "{tool} got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1271,6 +1497,32 @@ mod tests {
         assert_eq!(normalize_sensor("garbage"), "garbage");
         assert_eq!(normalize_sensor(""), "");
     }
+
+    #[test]
+    fn pin_to_str_pre_renders_the_common_range_and_caps_above_it() {
+        // The pre-rendered table is the contract for every number a
+        // tool result embeds in a fixed reply string. Spot the range
+        // ends and the sparse high values, plus the `>9999` cap.
+        assert_eq!(pin_to_str(0), "0");
+        assert_eq!(pin_to_str(9), "9");
+        assert_eq!(pin_to_str(10), "10");
+        assert_eq!(pin_to_str(99), "99");
+        assert_eq!(pin_to_str(100), "100");
+        assert_eq!(pin_to_str(200), "200");
+        assert_eq!(pin_to_str(256), "256");
+        assert_eq!(pin_to_str(512), "512");
+        assert_eq!(pin_to_str(1000), "1000");
+        assert_eq!(pin_to_str(1024), "1024");
+        assert_eq!(pin_to_str(2048), "2048");
+        assert_eq!(pin_to_str(4096), "4096");
+        assert_eq!(pin_to_str(8192), "8192");
+        assert_eq!(pin_to_str(9999), "9999");
+        // Above the table everything collapses to the bounded cap so a
+        // crafted large pin can never blow the reply buffer.
+        assert_eq!(pin_to_str(10_000), ">9999");
+        assert_eq!(pin_to_str(u32::MAX), ">9999");
+    }
+
 
     #[test]
     fn registry_query_methods() {
@@ -1355,6 +1607,20 @@ mod tests {
             ("battery", "3700mV"),
             ("memory", "free_heap"),
         ];
+        // The canonical list is the contract; this table must cover it
+        // exactly, so adding a sensor in one place and not the other fails
+        // here rather than silently producing "Unknown sensor" at runtime.
+        for name in SENSOR_NAMES {
+            assert!(
+                cases.iter().any(|(s, _)| *s == name),
+                "SENSOR_NAMES has {name} but the value table does not"
+            );
+        }
+        assert_eq!(
+            cases.len(),
+            SENSOR_NAMES.len(),
+            "the value table has entries that are not in SENSOR_NAMES"
+        );
         for (sensor, needle) in cases {
             let args = format!("sensor={sensor}");
             let out = run_async(r.execute(&make_call("read_sensor", &args))).unwrap();
@@ -1444,6 +1710,132 @@ mod tests {
                 None
             }
         }
+
+        fn serves(&self, name: &str) -> bool {
+            name == "read_sensor"
+        }
+    }
+
+    /// A real-target handler that serves `read_sensor` but has no hardware for
+    /// ten of the twelve sensors the shared description names — the ESP32 case.
+    struct TemperatureOnlySensor;
+    static TEMPERATURE_ONLY_SENSOR: TemperatureOnlySensor = TemperatureOnlySensor;
+
+    impl ToolHandler for TemperatureOnlySensor {
+        fn handle(&self, call: &ToolCall) -> Option<ToolResult> {
+            if call.name.as_str() == "read_sensor" {
+                Some(ToolResult {
+                    tool_name: call.name.clone(),
+                    data: String::try_from("temperature=42.0 C").unwrap(),
+                    success: true,
+                    error: None,
+                })
+            } else {
+                None
+            }
+        }
+
+        fn serves(&self, name: &str) -> bool {
+            name == "read_sensor"
+        }
+
+        fn describe_tool(&self, name: &str) -> Option<&'static str> {
+            match name {
+                "read_sensor" => {
+                    Some("Read the chip temperature or free heap. args: sensor=temperature|memory")
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// Round 24: a served tool must not over-claim its argument space.
+    ///
+    /// `serves()` (round 21) keeps unserved *tools* out of the prompt, but
+    /// `read_sensor` is one tool with twelve sensor names. A target that runs
+    /// the tool but has no battery/accelerometer/... hardware still inherited
+    /// the shared description and so advertised readings it answers
+    /// "unsupported sensor" to. `describe_tool` lets the handler say what it
+    /// really reads.
+    #[test]
+    fn a_handler_can_narrow_a_served_tools_description() {
+        // Model the real registry: `register_builtin_tools` registers
+        // `read_sensor` with the shared twelve-sensor description.
+        let mut r = ToolRegistry::new();
+        r.register(Tool {
+            name: String::try_from("read_sensor").unwrap(),
+            description: String::try_from(
+                "Read a sensor value (temperature, accelerometer, humidity, \
+                 pressure, light, heart_rate, hrv, glucose, ecg, stress, battery)",
+            )
+            .unwrap(),
+            tool_type: ToolType::ReadSensor,
+        })
+        .unwrap();
+        // The shared description names twelve sensors, `battery` among them.
+        assert!(r
+            .describe()
+            .contains("read_sensor: Read a sensor value (temperature"));
+        assert!(r.describe().contains("battery"));
+
+        r.set_handler(&TEMPERATURE_ONLY_SENSOR);
+        let served = r.describe_served();
+        assert!(
+            served.contains("read_sensor: Read the chip temperature or free heap"),
+            "the handler's description must replace the registered one: {served}"
+        );
+        // The over-claimed sensors are gone...
+        assert!(
+            !served.contains("battery"),
+            "a sensor the board cannot read must not be advertised: {served}"
+        );
+        // ...while `memory`, which the board *can* read, is now named.
+        assert!(
+            served.contains("memory"),
+            "a sensor the board can read must be advertised: {served}"
+        );
+        // `describe()` is the unfiltered registry view and stays as registered.
+        assert!(r.describe().contains("battery"));
+    }
+
+    /// Round 21: a registered-but-unserved tool must not reach the LLM prompt.
+    /// On the ESP32 seven of the fifteen registered names had no handler arm, so
+    /// the prompt advertised the health sensors, `voice_output`,
+    /// `send_notification` and `ble_send` on a board that has none of them.
+    #[test]
+    fn the_prompt_lists_only_the_tools_the_handler_can_serve() {
+        let mut r = populated_registry();
+        // With no handler installed, every registered tool is advertised — the
+        // simulated default must not change.
+        let full = r.describe();
+        assert_eq!(
+            full,
+            r.describe_served(),
+            "no handler must leave the listing unchanged"
+        );
+        assert!(full.contains("ble_send"));
+
+        // With a handler that serves one tool, only that one is advertised.
+        r.set_handler(&READ_SENSOR_ONLY);
+        let served = r.describe_served();
+        assert!(
+            served.contains("read_sensor: Read a sensor value"),
+            "got {served}"
+        );
+        for absent in [
+            "ble_send",
+            "voice_output",
+            "send_notification",
+            "flash_write",
+        ] {
+            assert!(
+                !served.contains(absent),
+                "{absent} must not be advertised: {served}"
+            );
+        }
+        // `describe()` itself still lists everything — only the prompt path
+        // filters, so nothing else that reads the registry changes behaviour.
+        assert!(r.describe().contains("ble_send"));
     }
 
     #[test]
@@ -1506,5 +1898,96 @@ mod tests {
             run_async(r.execute(&make_call("flash_write", "address=2048,data=hello"))).unwrap();
         assert!(out.success);
         assert_eq!(out.data.as_str(), "Wrote 5 bytes to address 2048");
+    }
+
+    #[test]
+    fn required_arg_parse_reports_an_invalid_value() {
+        // A *present* but unparseable `pin` is an invalid value, distinct from
+        // the missing-field case covered above.
+        let r = populated_registry();
+        let err = run_async(r.execute(&make_call("write_gpio", "pin=notanumber,state=low")))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgentError::ConfigurationError {
+                    field: "pin",
+                    reason: crate::error::ConfigError::InvalidValue
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn read_sensor_with_no_sensor_named_is_an_unknown_sensor() {
+        // With no explicit `sensor=` and no bare token, the implied sensor is
+        // empty → the executor answers "Unknown sensor" rather than guessing.
+        let r = populated_registry();
+        let out = run_async(r.execute(&make_call("read_sensor", ""))).unwrap();
+        assert!(!out.success);
+        assert_eq!(out.data.as_str(), "Unknown sensor");
+        assert_eq!(out.error.as_deref(), Some("Invalid sensor type"));
+    }
+
+    #[test]
+    fn a_web_tool_without_a_handler_is_a_configuration_error() {
+        // A real-target registry registers `web_fetch` but only a handler can
+        // execute it. Without one, the executor refuses rather than inventing a
+        // response body.
+        let mut r = ToolRegistry::new();
+        r.register(Tool {
+            name: try_heapless::<32>("web_fetch"),
+            description: try_heapless::<128>("Fetch a web page"),
+            tool_type: ToolType::WebFetch,
+        })
+        .unwrap();
+        let err = run_async(r.execute(&make_call("web_fetch", "url=https://example.com"))).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgentError::ConfigurationError {
+                    field: "tool",
+                    reason: crate::error::ConfigError::NotConfigured
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn default_tool_registry_matches_new() {
+        let a = ToolRegistry::default();
+        let b = ToolRegistry::new();
+        assert_eq!(a.count(), b.count());
+        assert_eq!(a.names(), b.names());
+        assert!(!a.has_tool("read_sensor"));
+    }
+
+    #[test]
+    fn describe_omits_entries_that_do_not_fit() {
+        // Fill the registry with long descriptions so the 2048-byte listing
+        // buffer overflows and the tail entries are dropped whole (with a
+        // warning) rather than truncated mid-entry.
+        let mut r = ToolRegistry::new();
+        let long = "x".repeat(120);
+        for i in 0..MAX_TOOLS {
+            r.register(Tool {
+                name: try_heapless::<32>(&alloc::format!("tool_{i:02}")),
+                description: try_heapless::<128>(&long),
+                tool_type: ToolType::ReadSensor,
+            })
+            .unwrap();
+        }
+        let desc = r.describe();
+        assert!(desc.len() <= 2048);
+        // The first entry always fits; a later one is dropped.
+        assert!(desc.contains("tool_00"));
+        assert!(!desc.contains("tool_15"), "the overflow must be omitted, not truncated");
+        // Every advertised line is a complete `- name: description` entry.
+        for line in desc.as_str().lines() {
+            assert!(line.starts_with("- "), "half an entry leaked: {line}");
+            assert!(line.contains(": "), "half an entry leaked: {line}");
+        }
     }
 }

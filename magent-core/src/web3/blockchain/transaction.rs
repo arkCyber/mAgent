@@ -3,7 +3,7 @@
 //! This module provides utilities for building, signing, and encoding
 //! Ethereum transactions for submission to the blockchain.
 
-use alloc::string::{String, ToString};
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
@@ -175,80 +175,115 @@ impl TransactionRequest {
 
     /// Encode the transaction for signing.
     ///
-    /// For legacy transactions, returns the RLP-encoded transaction.
-    /// For EIP-1559/EIP-2930, returns the EIP-2718 encoded transaction.
+    /// For a legacy transaction this is the EIP-155 signing form — the six
+    /// transaction fields, the chain id, then two zero placeholders standing in
+    /// for `r` and `s` (the chain id takes the `v` slot), nine items in total.
+    /// For EIP-1559/EIP-2930 it is the EIP-2718 envelope without a signature.
     pub fn encode_for_signing(&self) -> Vec<u8> {
         match self.tx_type {
             TransactionType::Legacy => self.encode_legacy_rlp(),
-            TransactionType::Eip1559 => self.encode_eip1559(),
-            TransactionType::Eip2930 => self.encode_eip2930(),
+            TransactionType::Eip1559 | TransactionType::Eip2930 => self.encode_typed_unsigned(),
         }
     }
 
-    /// Encode as legacy RLP.
+    /// Encode the destination, or an empty string for contract creation.
+    fn encode_to_rlp(&self) -> Vec<u8> {
+        match &self.to {
+            Some(addr) => rlp_encode_address(addr),
+            None => vec![0x80],
+        }
+    }
+
+    /// The EIP-155 signing form of a legacy transaction.
     fn encode_legacy_rlp(&self) -> Vec<u8> {
         let items = vec![
             rlp_encode_uint(self.nonce),
             rlp_encode_uint128(self.gas_price.as_wei()),
             rlp_encode_uint(self.gas_limit),
-            match &self.to {
-                Some(addr) => rlp_encode_address(addr),
-                None => vec![0x80], // Empty address
-            },
+            self.encode_to_rlp(),
             rlp_encode_uint128(self.value.as_wei()),
             rlp_encode_bytes(&self.data),
             rlp_encode_uint(self.chain_id),
-            vec![0x80],         // v = 0
-            rlp_encode_uint(0), // r = 0
-            rlp_encode_uint(0), // s = 0
+            vec![0x80], // 0 — placeholder for `r`
+            vec![0x80], // 0 — placeholder for `s`
         ];
 
         rlp_encode_list(&items)
     }
 
-    /// Encode as EIP-1559.
-    fn encode_eip1559(&self) -> Vec<u8> {
-        let mut result = Vec::new();
-        result.push(TransactionType::Eip1559.type_byte());
-
+    /// Encode the *signed* form of a legacy transaction: the six fields, then
+    /// `v`, `r` and `s` as their own items.
+    ///
+    /// A legacy transaction is a plain RLP list, not an EIP-2718 envelope, so
+    /// the signed encoding cannot be produced by appending the 65 signature
+    /// bytes to the signing payload — and `v` must be encoded as a full integer
+    /// (309 for Polygon), not as the signature's single `v` byte.
+    fn encode_legacy_signed(&self, v: u64, r: &[u8; 32], s: &[u8; 32]) -> Vec<u8> {
         let items = vec![
-            rlp_encode_uint(self.chain_id),
-            rlp_encode_uint(self.nonce),
-            rlp_encode_uint128(self.max_priority_fee_per_gas.unwrap_or(Wei::ZERO).as_wei()),
-            rlp_encode_uint128(self.max_fee_per_gas.unwrap_or(self.gas_price).as_wei()),
-            rlp_encode_uint(self.gas_limit),
-            match &self.to {
-                Some(addr) => rlp_encode_address(addr),
-                None => vec![0x80],
-            },
-            rlp_encode_uint128(self.value.as_wei()),
-            rlp_encode_bytes(&self.data),
-            self.encode_access_list_rlp(),
-        ];
-
-        result.extend(rlp_encode_list(&items));
-        result
-    }
-
-    /// Encode as EIP-2930.
-    fn encode_eip2930(&self) -> Vec<u8> {
-        let mut result = Vec::new();
-        result.push(TransactionType::Eip2930.type_byte());
-
-        let items = vec![
-            rlp_encode_uint(self.chain_id),
             rlp_encode_uint(self.nonce),
             rlp_encode_uint128(self.gas_price.as_wei()),
             rlp_encode_uint(self.gas_limit),
-            match &self.to {
-                Some(addr) => rlp_encode_address(addr),
-                None => vec![0x80],
-            },
+            self.encode_to_rlp(),
             rlp_encode_uint128(self.value.as_wei()),
             rlp_encode_bytes(&self.data),
-            self.encode_access_list_rlp(),
+            rlp_encode_uint(v),
+            rlp_encode_u256_be(r),
+            rlp_encode_u256_be(s),
         ];
 
+        rlp_encode_list(&items)
+    }
+
+    /// The RLP field list a typed transaction shares between its unsigned and
+    /// signed encodings — everything before the signature.
+    fn typed_unsigned_items(&self) -> Vec<Vec<u8>> {
+        match self.tx_type {
+            TransactionType::Eip1559 => vec![
+                rlp_encode_uint(self.chain_id),
+                rlp_encode_uint(self.nonce),
+                rlp_encode_uint128(self.max_priority_fee_per_gas.unwrap_or(Wei::ZERO).as_wei()),
+                rlp_encode_uint128(self.max_fee_per_gas.unwrap_or(self.gas_price).as_wei()),
+                rlp_encode_uint(self.gas_limit),
+                self.encode_to_rlp(),
+                rlp_encode_uint128(self.value.as_wei()),
+                rlp_encode_bytes(&self.data),
+                self.encode_access_list_rlp(),
+            ],
+            // Legacy is never routed here — it is an RLP list, not an EIP-2718
+            // envelope — but the arm has to exist for the match to be total.
+            TransactionType::Eip2930 | TransactionType::Legacy => vec![
+                rlp_encode_uint(self.chain_id),
+                rlp_encode_uint(self.nonce),
+                rlp_encode_uint128(self.gas_price.as_wei()),
+                rlp_encode_uint(self.gas_limit),
+                self.encode_to_rlp(),
+                rlp_encode_uint128(self.value.as_wei()),
+                rlp_encode_bytes(&self.data),
+                self.encode_access_list_rlp(),
+            ],
+        }
+    }
+
+    /// Encode a typed transaction (EIP-1559 / EIP-2930) without a signature.
+    fn encode_typed_unsigned(&self) -> Vec<u8> {
+        let mut result = vec![self.tx_type.type_byte()];
+        result.extend(rlp_encode_list(&self.typed_unsigned_items()));
+        result
+    }
+
+    /// Encode the *signed* form of a typed transaction: the type byte, the
+    /// field list, then `y_parity`, `r` and `s`.
+    ///
+    /// A typed signature carries the raw `y_parity` (0 or 1), not the
+    /// `recid + 27` that [`crate::web3::blockchain::EthereumSignature`] stores
+    /// for `personal_sign`/recovery.
+    fn encode_typed_signed(&self, y_parity: u64, r: &[u8; 32], s: &[u8; 32]) -> Vec<u8> {
+        let mut items = self.typed_unsigned_items();
+        items.push(rlp_encode_uint(y_parity));
+        items.push(rlp_encode_u256_be(r));
+        items.push(rlp_encode_u256_be(s));
+
+        let mut result = vec![self.tx_type.type_byte()];
         result.extend(rlp_encode_list(&items));
         result
     }
@@ -270,15 +305,47 @@ impl TransactionRequest {
                     .collect();
                 rlp_encode_list(&items.iter().map(|i| rlp_encode_list(i)).collect::<Vec<_>>())
             }
-            None => vec![0x80], // Empty list
+            // RLP: an *empty list* is 0xc0; 0x80 is the empty *string*, which
+            // nodes reject with "expected input list". `eip1559()` never sets
+            // an access list, so every typed transaction hit this branch.
+            None => vec![0xc0],
         }
     }
 
-    /// Calculate the transaction hash (for display purposes only).
-    pub fn transaction_hash(&self, _signature: &[u8; 65]) -> Hash {
-        // In a real implementation, this would compute the keccak256 hash
-        // of the signed transaction encoding
-        Hash::zero()
+    /// Compute the keccak256 hash of this transaction as signed by
+    /// `signature`.
+    ///
+    /// `signature` is the 65-byte `r ‖ s ‖ v` form
+    /// ([`crate::web3::blockchain::EthereumSignature`]),
+    /// whose `v` byte is the canonical `recid + 27`. For a legacy request the
+    /// on-chain `v` is reconstructed as the EIP-155 value
+    /// `chain_id * 2 + 35 + y_parity`, exactly as [`TransactionBuilder::sign`]
+    /// encodes it; a typed request carries the raw `y_parity`.
+    ///
+    /// This is the hash of the *signed* encoding — the one an RPC echoes back
+    /// for the submitted transaction and the one `poll_transaction` looks up —
+    /// not the hash of the signing payload. The previous implementation
+    /// returned `Hash::zero()` for every input, so a caller that displayed the
+    /// result would print an all-zero hash that resolves to nothing.
+    #[cfg(feature = "web3")]
+    pub fn transaction_hash(&self, signature: &[u8; 65]) -> Hash {
+        let sig = crate::web3::blockchain::EthereumSignature::from_bytes(*signature);
+        let y_parity = u64::from(sig.recovery_id().saturating_sub(27));
+        let raw = match self.tx_type {
+            TransactionType::Legacy => {
+                let v = self
+                    .chain_id
+                    .saturating_mul(2)
+                    .saturating_add(35 + y_parity);
+                self.encode_legacy_signed(v, sig.r(), sig.s())
+            }
+            TransactionType::Eip2930 | TransactionType::Eip1559 => {
+                self.encode_typed_signed(y_parity, sig.r(), sig.s())
+            }
+        };
+        let mut hasher = Keccak256::new();
+        hasher.update(&raw);
+        Hash::from_bytes(hasher.finalize().into())
     }
 }
 
@@ -454,20 +521,41 @@ impl TransactionBuilder {
         hasher.update(&encoded);
         let tx_hash: [u8; 32] = hasher.finalize().into();
 
-        let sig = match self.request.tx_type {
+        // (`signature` keeps the canonical `recid + 27` byte so it can be fed
+        // back to `verify`/`recover_from`; `v` is the value that goes on-chain.)
+        let (signature, v) = match self.request.tx_type {
             TransactionType::Legacy => {
                 TransactionSigner::sign_legacy_eip155(keypair.secret_key(), &tx_hash, chain_id)?
             }
             TransactionType::Eip2930 | TransactionType::Eip1559 => {
-                TransactionSigner::sign_hash(keypair.secret_key(), &tx_hash)?
+                let sig = TransactionSigner::sign_hash(keypair.secret_key(), &tx_hash)?;
+                let y_parity = u64::from(sig.recovery_id().saturating_sub(27));
+                (sig, y_parity)
             }
         };
 
-        let mut raw = encoded;
-        raw.extend_from_slice(sig.as_bytes());
+        // Build the transaction as it goes on the wire. For legacy that is an
+        // RLP list with `v`, `r`, `s` as their own items — appending the 65
+        // signature bytes to the signing payload is not a valid transaction at
+        // all — and for a typed transaction it is the EIP-2718 envelope with
+        // the raw `y_parity` (0/1) in the signature slot.
+        let raw = match self.request.tx_type {
+            TransactionType::Legacy => {
+                self.request
+                    .encode_legacy_signed(v, signature.r(), signature.s())
+            }
+            TransactionType::Eip2930 | TransactionType::Eip1559 => self
+                .request
+                .encode_typed_signed(v, signature.r(), signature.s()),
+        };
+
+        // The hash of the signed transaction, not of the signing payload.
+        let mut hasher = Keccak256::new();
+        hasher.update(&raw);
+        let tx_hash_signed: [u8; 32] = hasher.finalize().into();
 
         Ok(SignedTransaction {
-            hash: Hash::from_bytes(tx_hash),
+            hash: Hash::from_bytes(tx_hash_signed),
             tx_type: self.request.tx_type,
             from: *from,
             to,
@@ -477,26 +565,15 @@ impl TransactionBuilder {
             gas_limit,
             input,
             chain_id,
-            // EIP-155 legacy: v = chain_id * 2 + 35 + y_parity.
-            // EIP-2930 / EIP-1559: v = raw y_parity (0 or 1).
-            // The signature stores recid+27, so subtract 27 for
-            // the typed-tx paths. For the legacy path the
-            // EIP-155 transformation is performed inside
-            // `sign_legacy_eip155`.
-            v: match self.request.tx_type {
-                TransactionType::Legacy => sig.recovery_id() as u64,
-                TransactionType::Eip2930 | TransactionType::Eip1559 => {
-                    (sig.recovery_id().saturating_sub(27)) as u64
-                }
-            },
+            v,
             r: {
                 let mut out = [0u8; 32];
-                out.copy_from_slice(sig.r());
+                out.copy_from_slice(signature.r());
                 out
             },
             s: {
                 let mut out = [0u8; 32];
-                out.copy_from_slice(sig.s());
+                out.copy_from_slice(signature.s());
                 out
             },
             raw_transaction: raw,
@@ -613,6 +690,17 @@ fn encode_uint128_be(n: u128) -> Vec<u8> {
     }
 }
 
+/// Encode a 256-bit big-endian integer as RLP, stripping leading zero bytes.
+///
+/// `r` and `s` are fixed-width 32-byte values, but RLP encodes them as
+/// integers: a signature whose top byte is zero must not be written as a
+/// 32-byte string, or the encoding (and the transaction hash it produces) is
+/// wrong.
+fn rlp_encode_u256_be(bytes: &[u8; 32]) -> Vec<u8> {
+    let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    rlp_encode_bytes(&bytes[first_nonzero..])
+}
+
 /// Encode an address.
 fn rlp_encode_address(addr: &Address) -> Vec<u8> {
     rlp_encode_bytes(addr.as_bytes())
@@ -653,13 +741,15 @@ fn encode_length(len: usize) -> Vec<u8> {
 /// This follows the EIP-191 specification for personal_sign:
 /// `\x19Ethereum Signed Message:\n` + len(message) + message
 pub fn personal_sign_hash(message: &[u8]) -> Hash {
-    let prefix = format!(
-        "\x19Ethereum Signed Message:\n{}{}",
-        message.len(),
-        String::from_utf8_lossy(message)
-    );
-    let hash = keccak256(prefix.as_bytes());
-    Hash::from_bytes(hash)
+    // Byte-concatenate, never `from_utf8_lossy`: replacing a non-UTF-8 byte
+    // with U+FFFD changes the hashed bytes while the length prefix still
+    // describes the original, so signing and verification disagreed for any
+    // binary message.
+    let mut data = Vec::new();
+    data.extend_from_slice(b"\x19Ethereum Signed Message:\n");
+    data.extend_from_slice(message.len().to_string().as_bytes());
+    data.extend_from_slice(message);
+    Hash::from_bytes(keccak256(&data))
 }
 
 /// Construct the sign typed data hash (EIP-712).
@@ -749,6 +839,22 @@ mod tests {
         assert!(tx.max_fee_per_gas.is_some());
     }
 
+    /// EIP-1559's access-list field must be an RLP *list* even when empty.
+    /// The old `None => 0x80` encoded an empty string, which nodes reject.
+    #[test]
+    fn eip1559_empty_access_list_encodes_as_a_list() {
+        let to = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
+        let tx = TransactionBuilder::new(Some(to), 1)
+            .eip1559(Wei::from_gwei(2), Wei::from_gwei(50), 21_000)
+            .build()
+            .clone();
+        let encoded = tx.encode_for_signing();
+        assert_eq!(encoded[0], 0x02, "EIP-1559 type byte");
+        // The access list is the final field of the typed payload; an empty
+        // RLP list is the single byte 0xc0 (0x80 would be an empty string).
+        assert_eq!(encoded.last(), Some(&0xc0), "empty access list must be 0xc0");
+    }
+
     #[test]
     fn test_personal_sign_hash() {
         let message = b"Hello, Ethereum!";
@@ -756,6 +862,41 @@ mod tests {
 
         assert!(!hash.is_zero());
         assert_eq!(hash.to_hex().len(), 66); // 0x + 64 chars
+    }
+
+    /// EIP-191 hashes the raw message bytes. The old `from_utf8_lossy` path
+    /// replaced 0xFF with the 3-byte U+FFFD while keeping the 2-byte length
+    /// prefix, so the digest did not match what the signer signed.
+    #[test]
+    fn personal_sign_hash_keeps_raw_non_utf8_bytes() {
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"\x19Ethereum Signed Message:\n2h");
+        expected.push(0xff);
+        assert_eq!(
+            personal_sign_hash(b"h\xff"),
+            Hash::from_bytes(keccak256(&expected))
+        );
+    }
+
+    /// A real `eth_getTransactionReceipt` response: camelCase keys, hex
+    /// quantity strings, hex addresses/hashes. The derive used to expect
+    /// snake_case and JSON numbers, so every real node response failed to
+    /// deserialise.
+    #[test]
+    fn receipt_deserialises_from_a_real_rpc_payload() {
+        let hash = format!("0x{}", "aa".repeat(32));
+        let block_hash = format!("0x{}", "bb".repeat(32));
+        let from = format!("0x{}", "cc".repeat(20));
+        let json = format!(
+            r#"{{"transactionHash":"{hash}","transactionIndex":"0x0","blockHash":"{block_hash}","blockNumber":"0x10","from":"{from}","to":null,"gasUsed":"0x5208","cumulativeGasUsed":"0x5208","contractAddress":null,"logs":[],"status":"0x1","effectiveGasPrice":"0x3b9aca00"}}"#
+        );
+        let receipt: TransactionReceipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(receipt.block_number, 16);
+        assert_eq!(receipt.transaction_index, 0);
+        assert_eq!(receipt.status, 1);
+        assert_eq!(receipt.gas_used, 21_000);
+        assert_eq!(receipt.effective_gas_price, Some(Wei(1_000_000_000)));
+        assert_eq!(receipt.transaction_hash.to_hex(), hash);
     }
 
     #[test]
@@ -775,7 +916,7 @@ mod tests {
     #[cfg(feature = "web3")]
     #[test]
     fn test_transaction_builder_sign_legacy_eip155() {
-        use crate::web3::blockchain::{Secp256k1Keypair, TransactionSigner};
+        use crate::web3::blockchain::Secp256k1Keypair;
 
         // Sign a real transaction and check EIP-155 v.
         let to = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
@@ -788,32 +929,70 @@ mod tests {
 
         let signed = tx.sign(&kp).unwrap();
 
-        // The signed payload must:
-        // - produce a transaction that has the 65-byte signature appended
-        //   to the encoded transaction
-        // - use EIP-155 v (>= 37) since the chain_id is 1
-        // - have a known `from` address (the signer's)
-        assert!(signed.raw_transaction.len() > tx.encode_for_signing().len());
-        assert!(signed.v >= 37, "expected EIP-155 v, got {}", signed.v);
         assert_eq!(signed.from.to_hex(), kp.address().to_hex());
         assert_eq!(signed.tx_type, TransactionType::Legacy);
-
-        // Verify EIP-155 v encoding: (v - 35) / 2 == chain_id.
         assert_eq!((signed.v - 35) / 2, 1, "EIP-155 chain_id mismatch");
 
-        // Verify the recovered address matches the signer's by
-        // re-deriving a fresh signature with the *same* secret on the
-        // same unsigned payload and recovering from it (EIP-155 v
-        // values are too large to feed into recovery directly).
-        let unsigned_len = tx.encode_for_signing().len();
+        // The signing payload is the EIP-155 form: nine items, the chain id
+        // taking the `v` slot.
+        assert_eq!(rlp_list_items(&tx.encode_for_signing()).len(), 9);
+
+        // The signed transaction is an RLP list too, with `v`, `r` and `s` as
+        // their own items — not the signing payload with 65 bytes glued on.
+        let items = rlp_list_items(&signed.raw_transaction);
+        assert_eq!(items.len(), 9);
+        assert_eq!(rlp_item_u64(&items[6]), signed.v);
+        assert_eq!(rlp_encode_bytes(&items[7]), rlp_encode_u256_be(&signed.r));
+        assert_eq!(rlp_encode_bytes(&items[8]), rlp_encode_u256_be(&signed.s));
+
+        // And it is a *valid* signature over that payload: rebuild a
+        // recoverable 65-byte signature from the encoded `r`/`s` plus the
+        // y_parity that `v` carries and recover the signer.
         let mut hasher = Keccak256::new();
-        hasher.update(&signed.raw_transaction[..unsigned_len]);
+        hasher.update(tx.encode_for_signing());
         let hash: [u8; 32] = hasher.finalize().into();
-        let fresh = TransactionSigner::sign_hash(kp.secret_key(), &hash).unwrap();
+        let mut recoverable = [0u8; 65];
+        recoverable[..32].copy_from_slice(&signed.r);
+        recoverable[32..64].copy_from_slice(&signed.s);
+        recoverable[64] = (27 + signed.v - (signed.chain_id * 2 + 35)) as u8;
         let recovered =
-            crate::web3::blockchain::Secp256k1PublicKey::recover_from(&hash, fresh.as_bytes())
-                .unwrap();
+            crate::web3::blockchain::Secp256k1PublicKey::recover_from(&hash, &recoverable).unwrap();
         assert_eq!(recovered.to_address().to_hex(), kp.address().to_hex());
+    }
+
+    /// A legacy transaction on a chain whose EIP-155 `v` does not fit in a byte.
+    ///
+    /// `v = chain_id * 2 + 35 + y_parity` reaches 309 on Polygon (137), and
+    /// `309 as u8` is 53. The signature is stored in a 65-byte array with a
+    /// single `v` byte, so the old code truncated: the signed transaction
+    /// carried `v = 53` and `(53 - 35) / 2 != 137`, and no node would accept
+    /// it.
+    #[cfg(feature = "web3")]
+    #[test]
+    fn sign_legacy_keeps_v_full_width_above_chain_id_110() {
+        use crate::web3::blockchain::Secp256k1Keypair;
+        let to = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
+        let kp = Secp256k1Keypair::generate();
+        let tx = TransactionBuilder::new(Some(to), 137)
+            .value(Wei::from_gwei(100))
+            .nonce(7)
+            .gas_price(Wei::from_gwei(20))
+            .gas_limit(21_000);
+
+        let signed = tx.sign(&kp).unwrap();
+
+        assert!(
+            signed.v == 309 || signed.v == 310,
+            "expected EIP-155 v for chain 137, got {}",
+            signed.v
+        );
+        assert_eq!((signed.v - 35) / 2, 137, "EIP-155 chain_id mismatch");
+
+        // The value in the encoded transaction is the full-width v, not a byte.
+        let items = rlp_list_items(&signed.raw_transaction);
+        assert_eq!(items.len(), 9);
+        assert_eq!(rlp_item_u64(&items[6]), signed.v);
+        assert_ne!(items[6], rlp_encode_uint(u64::from(signed.v as u8)));
     }
 
     #[cfg(feature = "web3")]
@@ -830,11 +1009,124 @@ mod tests {
         let signed = tx.sign(&kp).unwrap();
         // For EIP-1559 / EIP-2930 transactions, v must be 0 or 1
         // (y_parity), NOT the EIP-155-formatted v (which would be >= 37).
-        assert!(
-            signed.v == 0 || signed.v == 1 || signed.v == 27 || signed.v == 28,
-            "unexpected EIP-1559 v={}",
-            signed.v
+        assert!(signed.v <= 1, "unexpected EIP-1559 v={}", signed.v);
+
+        // The raw bytes must agree with `v`: a typed signature carries the raw
+        // y_parity, whereas `EthereumSignature` stores `recid + 27`. Appending
+        // the signature verbatim put 27/28 on the wire.
+        let items = rlp_list_items(&signed.raw_transaction[1..]);
+        assert_eq!(items.len(), 12, "9 fields + y_parity + r + s");
+        assert_eq!(rlp_item_u64(&items[9]), signed.v);
+        assert_eq!(rlp_encode_bytes(&items[10]), rlp_encode_u256_be(&signed.r));
+        assert_eq!(rlp_encode_bytes(&items[11]), rlp_encode_u256_be(&signed.s));
+    }
+
+    /// `transaction_hash` must return the hash of the *signed* encoding.
+    ///
+    /// The old body was a stub that returned `Hash::zero()` for every input,
+    /// so a caller that displayed the result would print an all-zero hash that
+    /// resolves to no transaction. Signing now produces the real hash, and
+    /// this checks the standalone method agrees with it for both container
+    /// formats.
+    #[cfg(feature = "web3")]
+    #[test]
+    fn transaction_hash_matches_the_signed_encoding() {
+        use crate::web3::blockchain::Secp256k1Keypair;
+
+        let to = Address::from_hex("0x742d35Cc6634C0532925a3b844Bc9e7595f8bE21").unwrap();
+        let kp = Secp256k1Keypair::generate();
+
+        // Legacy on a chain whose EIP-155 `v` does not fit in a byte: the
+        // method has to reconstruct `chain_id * 2 + 35 + y_parity`, since the
+        // 65-byte signature only carries `recid + 27`.
+        let legacy = TransactionBuilder::new(Some(to), 137)
+            .value(Wei::from_gwei(100))
+            .nonce(7)
+            .gas_price(Wei::from_gwei(20))
+            .gas_limit(21_000);
+        let signed = legacy.sign(&kp).unwrap();
+        let mut sig = [0u8; 65];
+        sig[..32].copy_from_slice(&signed.r);
+        sig[32..64].copy_from_slice(&signed.s);
+        sig[64] = (27 + signed.v - (signed.chain_id * 2 + 35)) as u8;
+        let hash = legacy.build().transaction_hash(&sig);
+        assert_ne!(hash, Hash::zero(), "a real signature must not hash to zero");
+        assert_eq!(hash, signed.hash, "legacy hash mismatch");
+
+        // Typed: the wire signature slot carries the raw y_parity, not
+        // recid + 27, so a legacy-only reconstruction would hash the wrong
+        // bytes.
+        let typed = TransactionBuilder::new(Some(to), 1).eip1559(
+            Wei::from_gwei(2),
+            Wei::from_gwei(50),
+            21_000,
         );
+        let signed = typed.sign(&kp).unwrap();
+        let mut sig = [0u8; 65];
+        sig[..32].copy_from_slice(&signed.r);
+        sig[32..64].copy_from_slice(&signed.s);
+        sig[64] = (27 + signed.v) as u8;
+        let hash = typed.build().transaction_hash(&sig);
+        assert_eq!(hash, signed.hash, "eip-1559 hash mismatch");
+    }
+
+    /// Read the items of a top-level RLP list, returning each item's content
+    /// bytes (test helper — the module only ships encoders).
+    fn rlp_list_items(data: &[u8]) -> Vec<Vec<u8>> {
+        let (payload_start, payload_len) = match data[0] {
+            0xc0..=0xf7 => (1usize, (data[0] - 0xc0) as usize),
+            0xf8..=0xff => {
+                let n = (data[0] - 0xf7) as usize;
+                let mut len = 0usize;
+                for &b in &data[1..1 + n] {
+                    len = (len << 8) | b as usize;
+                }
+                (1 + n, len)
+            }
+            other => panic!("not an RLP list header: 0x{other:02x}"),
+        };
+
+        let end = payload_start + payload_len;
+        let mut items = Vec::new();
+        let mut i = payload_start;
+        while i < end {
+            match data[i] {
+                0x00..=0x7f => {
+                    items.push(vec![data[i]]);
+                    i += 1;
+                }
+                0x80..=0xb7 => {
+                    let l = (data[i] - 0x80) as usize;
+                    items.push(data[i + 1..i + 1 + l].to_vec());
+                    i += 1 + l;
+                }
+                0xb8..=0xbf => {
+                    let n = (data[i] - 0xb7) as usize;
+                    let mut l = 0usize;
+                    for &b in &data[i + 1..i + 1 + n] {
+                        l = (l << 8) | b as usize;
+                    }
+                    let s = i + 1 + n;
+                    items.push(data[s..s + l].to_vec());
+                    i = s + l;
+                }
+                // Nested list (e.g. the EIP-1559 access list). Keep its
+                // encoded form as the item; tests that inspect later
+                // positions only need the item boundaries.
+                0xc0..=0xf7 => {
+                    let l = (data[i] - 0xc0) as usize;
+                    items.push(data[i..i + 1 + l].to_vec());
+                    i += 1 + l;
+                }
+                other => panic!("unexpected nested list / bad RLP at {i}: 0x{other:02x}"),
+            }
+        }
+        items
+    }
+
+    /// Interpret an RLP item's content as a big-endian unsigned integer.
+    fn rlp_item_u64(item: &[u8]) -> u64 {
+        item.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
     }
 
     #[test]
@@ -997,29 +1289,39 @@ impl Transaction {
 }
 
 /// A transaction receipt returned from `eth_getTransactionReceipt`.
+///
+/// The wire shape is camelCase and every quantity is a `0x` hex string; the
+/// serde helpers mirror that so a real node response deserialises. (The old
+/// derive expected snake_case keys and JSON numbers, which no node sends.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransactionReceipt {
     /// Transaction hash.
     pub transaction_hash: Hash,
     /// Transaction index in block.
+    #[serde(with = "crate::web3::blockchain::serde_helpers::hex_u64")]
     pub transaction_index: u64,
     /// Block hash.
     pub block_hash: Hash,
     /// Block number.
+    #[serde(with = "crate::web3::blockchain::serde_helpers::hex_u64")]
     pub block_number: u64,
     /// Sender address.
     pub from: Address,
     /// Recipient address.
     pub to: Option<Address>,
     /// Gas used by this transaction.
+    #[serde(with = "crate::web3::blockchain::serde_helpers::hex_u64")]
     pub gas_used: u64,
     /// Cumulative gas used in the block up to and including this tx.
+    #[serde(with = "crate::web3::blockchain::serde_helpers::hex_u64")]
     pub cumulative_gas_used: u64,
     /// Contract address (for contract-creation transactions).
     pub contract_address: Option<Address>,
     /// Logs emitted by this transaction.
     pub logs: Vec<crate::web3::blockchain::events::EventLog>,
     /// Status: 1 = success, 0 = failure (EIP-658).
+    #[serde(with = "crate::web3::blockchain::serde_helpers::hex_u8")]
     pub status: u8,
     /// Effective gas price (EIP-1559).
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -38,8 +38,11 @@ function on_tick(now_ms)
 
     -- (b) No need to ask the agent for nominal conditions.
     if temp <= THERMAL_HIGH then
-        -- Idle: make sure the fan isn't stuck on from a prior tick.
+        -- Idle: make sure the fan isn't stuck on from a prior tick, and
+        -- silence the buzzer — no other branch clears pin 3, so a critical
+        -- event used to leave it sounding forever.
         hardware.pwm_set(1, 0)
+        hardware.pwm_set(3, 0)
         return "IDLE"
     end
 
@@ -74,8 +77,11 @@ function on_tick(now_ms)
     end
 
     hardware.pwm_set(1, duty)
+    -- Leaving the critical band must also silence the buzzer.
+    hardware.pwm_set(3, 0)
 
-    -- (f) Returned action is recognised by `apply_action` and will be
-    --     applied to hardware (here we returned it as a string anyway).
-    return string.format("SET_COOLING_PULSE:%d", duty)
+    -- (f) The actuator has already been driven directly above. Returning a
+    --     recognised action string would make `AppRuntime` drive it a second
+    --     time (and on a *different* pin), so report state only.
+    return string.format("COOLING:%d", duty)
 end

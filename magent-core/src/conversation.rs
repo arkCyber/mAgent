@@ -14,10 +14,14 @@
 //!    head + tail window with a marker showing how many bytes were
 //!    dropped. The LLM still sees the envelope (which tool was called
 //!    and what it returned) without paying for the irrelevant middle.
-//! 2. **Message slicing** — once the message list is short enough that
-//!    `tool_call` ↔ `tool` cross-references would be broken, the runner
-//!    drops the oldest messages. The system prompt and the
-//!    most-recent user request are always preserved.
+//! 2. **Message slicing / byte-GC** — past the configured message cap (or
+//!    the hard byte budget) the oldest messages are dropped. The system
+//!    prompt and the most-recent user request are always preserved.
+//! 3. **Pair repair** — both of the above cut the history at an index, so
+//!    a boundary can fall between an assistant `tool_calls` message and its
+//!    `tool` result. The provider rejects half a pair, so
+//!    [`prune_dangling_tool_pairs`] removes the orphaned half; every
+//!    function here that drops messages calls it before returning.
 //!
 //! Both steps are pure, deterministic, and never touch the network. They
 //! are safe to call before every LLM call; the call is cheap enough that
@@ -257,8 +261,10 @@ pub fn slice_messages(messages: &mut Vec<Message>, max_messages: usize) -> usize
     let len = messages.len();
     let budget = max_messages - preserved_system;
     if len - preserved_system <= budget {
-        // Everything after the system head fits — nothing else to drop.
-        return original_len - len;
+        // Everything after the system head fits — nothing else to drop, but
+        // the system-head trim above may have split a pair.
+        prune_dangling_tool_pairs(messages);
+        return original_len - messages.len();
     }
 
     let tail_start = len - budget;
@@ -278,6 +284,9 @@ pub fn slice_messages(messages: &mut Vec<Message>, max_messages: usize) -> usize
         }
     }
     *messages = new_messages;
+    // The window boundary is a raw index, so it can fall between a tool call
+    // and its result — repair before returning.
+    prune_dangling_tool_pairs(messages);
     original_len - messages.len()
 }
 
@@ -391,19 +400,109 @@ pub fn gc_to_budget(messages: &mut Vec<Message>, max_bytes: usize) -> Compressio
         return stats;
     }
     while estimate_bytes(messages) > max_bytes {
-        // Preserve the system prompt: only ever drop the oldest non-system.
-        let Some(drop_idx) = messages.iter().position(|m| m.role != Role::System) else {
+        // Preserve, in order of priority:
+        //   * every system message (the prompt),
+        //   * the newest message (the current turn's latest output),
+        //   * the **last user message** — the request being answered.
+        //
+        // The previous "drop the oldest non-system message" rule dropped the
+        // active request first: `[system, user, assistant-call, tool(huge)]`
+        // removed `user`, then pruned the call/tool pair, leaving only the
+        // system prompt. `current_turn_task()` returned "" and the next model
+        // call had no question at all.
+        let last_user = messages.iter().rposition(|m| m.role == Role::User);
+        let newest = messages.len().saturating_sub(1);
+        let Some(drop_idx) = messages
+            .iter()
+            .enumerate()
+            .position(|(i, m)| m.role != Role::System && i != newest && Some(i) != last_user)
+        else {
             break;
         };
-        // Never drop the newest message (the current turn).
-        if drop_idx >= messages.len().saturating_sub(1) {
-            break;
-        }
         messages.remove(drop_idx);
         stats.dropped += 1;
     }
+    // Trimming the oldest turns one message at a time cuts at that arbitrary
+    // index, which can land inside a tool-call pair — repair before returning.
+    // Gated on `dropped` so a history that fit the budget is handed back
+    // exactly as it came in, even if it already contained a lone half.
+    if stats.dropped > 0 {
+        stats.dropped += prune_dangling_tool_pairs(messages);
+    }
     stats.kept = messages.len();
     stats
+}
+
+/// Drop the halves of tool-call pairs that compression cut in two.
+///
+/// The provider wire format pairs an assistant message carrying
+/// `tool_calls: [{id: N}]` with a `tool` message carrying `tool_call_id: N`;
+/// OpenAI-compatible APIs (DeepSeek included) reject a request where either
+/// half is missing — an unanswered `tool_calls` entry, or a `tool` message
+/// with no preceding call, is a 400 and the run dies on a cause the user can
+/// neither see nor fix.
+///
+/// Both [`slice_messages`] and [`gc_to_budget`] keep or drop whole messages
+/// chosen by index, so a window boundary can fall between a call and its
+/// result. A half-pair has to go: it cannot be completed (the other half is
+/// already gone, and its content can't be reconstructed without inventing
+/// it) and it cannot stay (it is malformed on the wire). Both budget
+/// functions therefore call this before returning, so no caller can forget.
+///
+/// A well-formed conversation is left untouched. Returns the number of
+/// messages dropped.
+///
+/// Note that an *unanswered* call is only possible here if compression
+/// removed its result: the ReAct loop pushes the result in the same
+/// iteration it pushes the call, so the live history never contains a lone
+/// half on its own.
+///
+/// Matching is by **id and position**, not by id alone. The live runner now
+/// issues session-unique ids (see `RealAgentRunner::call_id_seq`), but a
+/// message list can still repeat one: a history persisted by an older
+/// version, one assembled by hand, or a window in which compression dropped a
+/// call while a later turn's result carries the same id. Under a bare
+/// membership test a later call would vouch for an earlier orphaned result,
+/// and the malformed request this function exists to prevent would survive.
+/// So a `tool` is kept only by a call that *precedes* it, and a call only by
+/// a result that *follows* it. The two rules agree (keeping a result keeps
+/// its owner, because the owner precedes it), so one pass suffices.
+pub fn prune_dangling_tool_pairs(messages: &mut Vec<Message>) -> usize {
+    let is_call = |m: &Message| m.role == Role::Assistant && m.tool_call.is_some();
+    let is_result = |m: &Message| m.role == Role::Tool;
+
+    let mut keep = vec![true; messages.len()];
+    for (i, m) in messages.iter().enumerate() {
+        if is_result(m) {
+            // A result needs a call before it; a result with no id has
+            // nothing to match and is left to its own device.
+            let Some(id) = m.tool_call_id.as_deref() else {
+                continue;
+            };
+            keep[i] = messages[..i]
+                .iter()
+                .any(|p| is_call(p) && p.tool_call_id.as_deref() == Some(id));
+        } else if is_call(m) {
+            // A call needs a result after it. A call carrying no id predates
+            // the id-pairing convention (and is not produced by the loop), so
+            // there is nothing to match it against.
+            let Some(id) = m.tool_call_id.as_deref() else {
+                continue;
+            };
+            keep[i] = messages[i + 1..]
+                .iter()
+                .any(|n| is_result(n) && n.tool_call_id.as_deref() == Some(id));
+        }
+    }
+
+    let before = messages.len();
+    let mut idx = 0;
+    messages.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
+    before - messages.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +523,7 @@ fn byte_offset_after_chars(s: &str, n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_runner::Message;
+    use crate::agent_runner::{Message, ToolCall};
 
     fn user(s: &str) -> Message {
         Message::user(s)
@@ -436,6 +535,20 @@ mod tests {
 
     fn tool(id: &str, s: &str) -> Message {
         Message::tool(id, s)
+    }
+
+    /// The assistant half of a tool-call pair: the message that *owns*
+    /// `id`, which the following `tool(id, …)` answers. A fixture that
+    /// pairs them the way the ReAct loop does, so it models a conversation
+    /// the provider would accept.
+    fn call(id: &str) -> Message {
+        Message::assistant_tool_call_id(
+            ToolCall {
+                name: "read_sensor".to_string(),
+                arguments: std::collections::HashMap::new(),
+            },
+            id,
+        )
     }
 
     fn system(s: &str) -> Message {
@@ -597,10 +710,10 @@ mod tests {
         let mut v = vec![
             system("SYS"),
             user("orig task"),
-            assistant("a"),
+            call("c1"),
             tool("c1", "c"),
             user("u2"),
-            assistant("a2"),
+            call("c2"),
             tool("c2", "c2"),
         ];
         let dropped = slice_messages(&mut v, 4);
@@ -665,7 +778,7 @@ mod tests {
             user("task A"),
             assistant("aA"),
             user("task B"),
-            assistant("aB"),
+            call("c1"),
             tool("c1", "t1"),
         ];
         let dropped = slice_messages(&mut v, 4);
@@ -705,10 +818,11 @@ mod tests {
     fn compress_runs_both_steps() {
         let mut v = vec![system("SYS"), user("orig task")];
         // Add long tool result that should be truncated.
+        v.push(call("c1"));
         v.push(tool("c1", &"y".repeat(5_000)));
         // Pad with extra turns so the message count exceeds the cap.
         for i in 0..30 {
-            v.push(assistant(&format!("a{}", i)));
+            v.push(call(&format!("c{}", i)));
             v.push(tool(&format!("c{}", i), &format!("out{}", i)));
         }
         let original_len = v.len();
@@ -820,6 +934,28 @@ mod tests {
         assert_eq!(v.last().unwrap().content, "latest");
     }
 
+    /// The current user request must survive GC even when the only thing
+    /// that can be dropped is the tool-call/tool-result pair. The old
+    /// "drop the oldest non-system" rule removed the user message first,
+    /// leaving the next model call with no question.
+    #[test]
+    fn gc_to_budget_preserves_the_current_user_request() {
+        let mut v = vec![
+            system("SYS"),
+            user("what is the weather in Shanghai?"),
+            call("c1"),
+            tool("c1", &"x".repeat(600)),
+        ];
+        let stats = gc_to_budget(&mut v, 200);
+        assert!(stats.dropped > 0);
+        assert!(
+            v.iter()
+                .any(|m| m.role == Role::User && m.content.contains("Shanghai")),
+            "current user request was dropped: {v:?}"
+        );
+        assert_eq!(v.first().unwrap().role, Role::System);
+    }
+
     #[test]
     fn gc_to_budget_zero_is_noop() {
         let mut v = vec![user("a"), assistant("b")];
@@ -836,5 +972,239 @@ mod tests {
         let stats = gc_to_budget(&mut v, usize::MAX);
         assert_eq!(stats.dropped, 0);
         assert_eq!(v, original);
+    }
+
+    /// The wire contract every pruning test checks: no `tool` message without
+    /// an assistant call to answer, and no assistant call left unanswered.
+    fn assert_no_dangling_pairs(v: &[Message]) {
+        for (i, m) in v.iter().enumerate() {
+            match m.role {
+                Role::Tool => {
+                    let id = m.tool_call_id.as_deref();
+                    assert!(
+                        id.is_some_and(|id| v[..i].iter().any(|p| {
+                            p.role == Role::Assistant
+                                && p.tool_call.is_some()
+                                && p.tool_call_id.as_deref() == Some(id)
+                        })),
+                        "orphaned tool message at {i}: {m:?}",
+                    );
+                }
+                Role::Assistant if m.tool_call.is_some() => {
+                    if let Some(id) = m.tool_call_id.as_deref() {
+                        assert!(
+                            v[i + 1..].iter().any(|n| {
+                                n.role == Role::Tool && n.tool_call_id.as_deref() == Some(id)
+                            }),
+                            "unanswered tool call at {i}: {m:?}",
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn prune_leaves_a_well_formed_conversation_alone() {
+        let mut v = vec![
+            system("SYS"),
+            user("task"),
+            call("c1"),
+            tool("c1", "21°C"),
+            assistant("done"),
+        ];
+        let original = v.clone();
+        assert_eq!(prune_dangling_tool_pairs(&mut v), 0);
+        assert_eq!(v, original);
+    }
+
+    #[test]
+    fn prune_drops_both_halves_of_a_split_pair() {
+        // The tool result lost its call …
+        let mut orphan_result = vec![user("task"), tool("c1", "21°C")];
+        assert_eq!(prune_dangling_tool_pairs(&mut orphan_result), 1);
+        assert_eq!(orphan_result.len(), 1);
+
+        // … and the call lost its result.
+        let mut orphan_call = vec![user("task"), call("c1")];
+        assert_eq!(prune_dangling_tool_pairs(&mut orphan_call), 1);
+        assert_eq!(orphan_call.len(), 1);
+        assert_eq!(orphan_call[0].role, Role::User);
+    }
+
+    #[test]
+    fn prune_keeps_a_call_that_carries_no_id() {
+        // `Message::assistant_tool_call` predates the id-pairing convention
+        // and has nothing to match against, so it is not pruned.
+        let mut v = vec![
+            user("task"),
+            Message::assistant_tool_call(ToolCall {
+                name: "read_sensor".to_string(),
+                arguments: std::collections::HashMap::new(),
+            }),
+        ];
+        assert_eq!(prune_dangling_tool_pairs(&mut v), 0);
+        assert_eq!(v.len(), 2);
+    }
+
+    /// The bug this repair exists for: `slice_messages` keeps a window chosen
+    /// by index, and index 3 of this history is a `tool` message whose owning
+    /// call sits just outside the window. The provider rejects a request
+    /// carrying half a pair outright, so the slice must not produce one.
+    #[test]
+    fn a_slice_boundary_inside_a_pair_does_not_orphan_the_result() {
+        let mut v = vec![
+            system("SYS"),
+            user("task one"),
+            call("call_1"),
+            tool("call_1", "21°C"),
+            assistant("answer one"),
+            user("task two"),
+            call("call_2"),
+            tool("call_2", "22°C"),
+            assistant("answer two"),
+        ];
+        let dropped = slice_messages(&mut v, 7);
+
+        assert_eq!(v[0].content, "SYS");
+        assert_no_dangling_pairs(&v);
+        // The window keeps 7, and the repair then drops the orphaned result.
+        assert_eq!(v.len(), 6);
+        // The current turn's request is still there.
+        assert!(v
+            .iter()
+            .any(|m| m.role == Role::User && m.content == "task two"));
+        // Two messages were cut by the window and one orphaned result by the
+        // repair, so the count is the total, not just the window's.
+        assert_eq!(dropped, 3);
+    }
+
+    /// A history that repeats an id — persisted by an older version, or built
+    /// by hand like this one. An orphaned result from turn one must not be
+    /// kept just because turn two happens to reuse its id — that is exactly
+    /// the half-pair the provider rejects.
+    #[test]
+    fn prune_survives_a_session_that_re_uses_tool_call_ids() {
+        let mut v = vec![
+            system("SYS"),
+            user("turn one"),
+            // Turn one's call was dropped, leaving this result behind.
+            tool("call_1", "orphaned: its call was dropped"),
+            assistant("answer one"),
+            user("turn two"),
+            call("call_1"),
+            tool("call_1", "22°C"),
+            assistant("answer two"),
+        ];
+        assert_eq!(prune_dangling_tool_pairs(&mut v), 1);
+        assert_no_dangling_pairs(&v);
+        // Turn two's own pair is intact.
+        assert!(v
+            .iter()
+            .any(|m| m.role == Role::Tool && m.content == "22°C"));
+    }
+
+    /// Same hazard on the byte-GC path, which drops messages one at a time
+    /// and so walks straight through the middle of a pair.
+    #[test]
+    fn a_byte_gc_cut_does_not_orphan_the_result() {
+        let mut v = vec![
+            system("SYS"),
+            user("task one"),
+            call("call_1"),
+            tool("call_1", &"x".repeat(400)),
+            assistant("answer one"),
+            user("task two"),
+        ];
+        let stats = gc_to_budget(&mut v, 300);
+        assert!(stats.dropped > 0);
+        assert_no_dangling_pairs(&v);
+        assert_eq!(v.first().unwrap().role, Role::System);
+        assert_eq!(v.last().unwrap().content, "task two");
+    }
+
+    #[test]
+    fn approx_total_tokens_counts_tool_call_arguments() {
+        // A tool call's argument map contributes tokens on top of the
+        // message content (best-effort JSON-like sum).
+        let mut args = std::collections::HashMap::new();
+        args.insert("sensor".to_string(), serde_json::json!("temperature"));
+        let m = Message::assistant_tool_call(ToolCall {
+            name: "read_sensor".to_string(),
+            arguments: args,
+        });
+        let v = vec![m];
+        let with_args = approx_total_tokens(&v);
+        // Content is empty; the tokens come entirely from the key/value.
+        assert!(with_args > 0, "args were not counted: {with_args}");
+    }
+
+    #[test]
+    fn estimate_bytes_counts_tool_call_id_and_arguments() {
+        // A tool-result message carries a `tool_call_id`, and an
+        // assistant message carries a `tool_call` with arguments — both
+        // add to the byte estimate beyond the fixed per-message overhead.
+        let mut args = std::collections::HashMap::new();
+        args.insert("sensor".to_string(), serde_json::json!("temperature"));
+        let v = vec![
+            user("hi"),
+            call("c1"),
+            tool("c1", "22°C"),
+        ];
+        let bytes = estimate_bytes(&v);
+        // More than the bare content + 3×64 overhead, because the id and
+        // the argument map were tallied too.
+        assert!(
+            bytes > "hi".len() + "22°C".len() + 3 * 64,
+            "tool metadata was not counted: {bytes}"
+        );
+    }
+
+    #[test]
+    fn truncate_tool_content_refuses_a_zero_budget() {
+        let mut m = tool("c1", &"x".repeat(500));
+        assert!(!truncate_tool_content(&mut m, 0), "0 is opt-out");
+        assert_eq!(m.content.len(), 500);
+    }
+
+    #[test]
+    fn slice_prunes_a_pair_split_by_a_system_head_trim() {
+        // `max_messages = 2` with two system messages + a task: the oldest
+        // system is shed to leave room for the task, and the resulting trim
+        // can split a pair. `slice_messages` must repair it (the
+        // `prune_dangling_tool_pairs` short-circuit path).
+        let mut v = vec![
+            system("SYS1"),
+            system("SYS2"),
+            user("task"),
+            call("c1"),
+            tool("c1", "ok"),
+        ];
+        let dropped = slice_messages(&mut v, 4);
+        assert!(dropped > 0);
+        assert!(v.len() <= 4);
+        assert_no_dangling_pairs(&v);
+    }
+
+    #[test]
+    fn gc_to_budget_keeps_a_lone_user_message_when_too_big_to_drop() {
+        // A single over-budget message that is also the newest one cannot be
+        // dropped (the "never drop the newest message" guard), so the loop
+        // breaks and leaves the message in place.
+        let mut v = vec![user(&"x".repeat(500))];
+        let stats = gc_to_budget(&mut v, 10);
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn gc_to_budget_stops_when_only_system_messages_remain() {
+        // With only system messages left there is no droppable non-system
+        // message, so the `position(...)` returns `None` and the loop stops.
+        let mut v = vec![system(&"s".repeat(500))];
+        let stats = gc_to_budget(&mut v, 10);
+        assert_eq!(stats.dropped, 0);
+        assert_eq!(v.len(), 1);
     }
 }

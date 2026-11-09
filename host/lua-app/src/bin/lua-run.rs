@@ -14,16 +14,23 @@
 //! used. This is the host-side "Lua working environment" for the ESP32-S3
 //! (whose real Lua VM is gated behind the firmware `lua` feature).
 
+#[cfg(feature = "mlua")]
 use std::path::PathBuf;
+#[cfg(feature = "mlua")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "mlua")]
 use magent_core::MiniAgent;
+#[cfg(feature = "mlua")]
 use magent_lua::hardware::SimHardware;
+#[cfg(feature = "mlua")]
 use magent_lua::runtime::AppRuntime;
 #[cfg(feature = "mlua")]
 use magent_lua::LuaVm;
+#[cfg(feature = "mlua")]
 use magent_lua::{install_mock_agent, HardwareBackend, SharedAgent, SharedHardware};
 
+#[cfg(feature = "mlua")]
 fn usage() -> &'static str {
     "magent-lua developer CLI\n\
      \n\

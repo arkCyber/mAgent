@@ -512,22 +512,32 @@ impl TransactionSigner {
         Self::sign_hash(secret, tx_hash)
     }
 
-    /// Sign a transaction using EIP-155 (v = chain_id * 2 + 35 + recid).
+    /// Sign a legacy transaction with EIP-155 replay protection, returning the
+    /// signature and the EIP-155 `v` value.
     ///
-    /// Used for legacy transactions: the signature `v` value is computed
-    /// from the chain id to prevent replay attacks across chains.
+    /// EIP-155 defines `v = chain_id * 2 + 35 + y_parity`, which stops fitting
+    /// in a byte at `chain_id > 110` — Polygon's 137 gives 309, and `309 as u8`
+    /// is 53. [`EthereumSignature`] stores `v` in one byte, so the value cannot
+    /// be carried there: the returned signature keeps the canonical
+    /// `recid + 27` byte that `verify`/`recover_from` expect, and the full-width
+    /// `v` comes back as a `u64` for the caller to RLP-encode.
     #[cfg(feature = "web3")]
     pub fn sign_legacy_eip155(
         secret: &Secp256k1SecretKey,
         tx_hash: &[u8; 32],
         chain_id: u64,
-    ) -> Result<EthereumSignature, Web3ErrorKind> {
-        let mut sig = Self::sign_hash(secret, tx_hash)?;
-        // EIP-155: v = chain_id * 2 + 35 + recovery_id (0 or 1)
-        // recid = sig.recovery_id() - 27 (y_parity)
-        let y_parity = sig.recovery_id().saturating_sub(27);
-        sig.bytes[64] = (chain_id * 2 + 35 + y_parity as u64) as u8;
-        Ok(sig)
+    ) -> Result<(EthereumSignature, u64), Web3ErrorKind> {
+        let sig = Self::sign_hash(secret, tx_hash)?;
+        let y_parity = u64::from(sig.recovery_id().saturating_sub(27));
+        let v = chain_id
+            .checked_mul(2)
+            .and_then(|doubled| doubled.checked_add(35 + y_parity))
+            .ok_or_else(|| {
+                Web3ErrorKind::BlockchainError(format!(
+                    "EIP-155 v overflows u64 for chain_id {chain_id}"
+                ))
+            })?;
+        Ok((sig, v))
     }
 
     /// Verify an Ethereum signature
@@ -855,31 +865,27 @@ mod tests {
     #[cfg(feature = "web3")]
     #[test]
     fn test_sign_legacy_eip155() {
-        // EIP-155 v = chain_id * 2 + 35 + y_parity
+        // EIP-155 v = chain_id * 2 + 35 + y_parity.
         let kp = Secp256k1Keypair::generate();
         let tx_hash: [u8; 32] = [0x42; 32];
-        let chain_id = 1u64;
+        // Polygon: 137 * 2 + 35 = 309, which does not fit in a byte.
+        let chain_id = 137u64;
 
-        let sig =
+        let (sig, v) =
             TransactionSigner::sign_legacy_eip155(kp.secret_key(), &tx_hash, chain_id).unwrap();
 
-        // Re-derive the expected v from a fresh signature's recid, because
-        // sign_legacy_eip155 overwrites the v byte in-place.
-        let fresh_sig = TransactionSigner::sign_hash(kp.secret_key(), &tx_hash).unwrap();
-        let y_parity = fresh_sig.recovery_id().saturating_sub(27);
-        let expected_v = (chain_id * 2 + 35 + y_parity as u64) as u8;
-        assert_eq!(sig.recovery_id(), expected_v);
-
-        // v must be >= 37 (EIP-155 boundary for chain_id == 0).
-        assert!(sig.recovery_id() >= 37);
+        let y_parity = sig.recovery_id().saturating_sub(27);
+        assert_eq!(v, chain_id * 2 + 35 + u64::from(y_parity));
         // v must encode the chain_id (EIP-155: (v - 35) / 2 == chain_id).
-        assert_eq!((sig.recovery_id() - 35) / 2, chain_id as u8);
+        assert_eq!((v - 35) / 2, chain_id);
+        // The whole point of returning `v` separately: it survives a chain id
+        // above 110 instead of being truncated to `v as u8` == 53.
+        assert!(v > 255, "v was truncated: {v}");
 
-        // Verify against the recovered key using a copy of the signature with
-        // the raw y_parity (EIP-155 v values are too large to recover
-        // directly; recovery only needs the y_parity bit).
-        let fresh_sig = TransactionSigner::sign_hash(kp.secret_key(), &tx_hash).unwrap();
-        assert!(TransactionSigner::verify(&tx_hash, &fresh_sig, kp.address()).unwrap());
+        // The signature keeps the canonical `recid + 27` byte, so it is still
+        // recoverable (an EIP-155 v of 309 is not).
+        assert_eq!(sig.recovery_id(), 27 + y_parity);
+        assert!(TransactionSigner::verify(&tx_hash, &sig, kp.address()).unwrap());
     }
 
     #[cfg(feature = "web3")]

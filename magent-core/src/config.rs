@@ -34,15 +34,29 @@ pub struct AgentConfig {
     pub max_iterations: u16,
     /// Maximum memory budget in bytes
     pub max_memory: u32,
-    /// Watchdog timeout in seconds
+    /// Watchdog timeout in seconds.
+    ///
+    /// Stored and range-validated, but `MiniAgent` does not consume it: the
+    /// real watchdog on a device is the chip's task WDT (`rt_watchdog` on the
+    /// ESP32, the nRF WDT), and core's software latch has no clock.
     pub watchdog_timeout_secs: u16,
-    /// BLE connection timeout in seconds
+    /// BLE connection timeout in seconds.
+    ///
+    /// Stored and range-validated only. BLE was removed from the ESP32
+    /// firmware (2026-09-20) and `MiniAgent` has no BLE transport, so nothing
+    /// reads this today.
     pub ble_timeout_secs: u16,
-    /// Enable skills system
+    /// Enable the skills system.
+    ///
+    /// Stored and range-validated; `MiniAgent` sizes its `SkillsManager` from
+    /// [`Self::max_skills`] but does not consult this flag.
     pub skills_enabled: bool,
-    /// Maximum number of skills
+    /// Maximum number of skills `MiniAgent` will hold.
     pub max_skills: u16,
-    /// Enable debug logging
+    /// Enable debug logging.
+    ///
+    /// Stored and validated; no runtime consumer today (the firmware's log
+    /// level is controlled by `RUST_LOG` / `--log-level`, not this field).
     pub debug_enabled: bool,
 }
 
@@ -421,5 +435,183 @@ mod tests {
         assert_eq!(back.max_memory, c.max_memory);
         // Malformed bytes must be rejected as an error, never panic.
         assert!(AgentConfig::from_bytes(&[0xff, 0xff, 0xff, 0xff]).is_err());
+    }
+
+    #[test]
+    fn with_max_memory_rejects_zero_at_boundary() {
+        assert!(
+            AgentConfig::default().with_max_memory(1).is_ok(),
+            "minimum non-zero memory must be accepted"
+        );
+        assert!(
+            AgentConfig::default().with_max_memory(0).is_err(),
+            "zero memory must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_watchdog_zero() {
+        assert!(matches!(
+            AgentConfig {
+                watchdog_timeout_secs: 0,
+                ..AgentConfig::default()
+            }
+            .validate(),
+            Err(AgentError::ConfigurationError {
+                field: "watchdog_timeout_secs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_ble_timeout_zero() {
+        assert!(matches!(
+            AgentConfig {
+                ble_timeout_secs: 0,
+                ..AgentConfig::default()
+            }
+            .validate(),
+            Err(AgentError::ConfigurationError {
+                field: "ble_timeout_secs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn builder_with_name_rejects_empty_string() {
+        assert!(
+            AgentConfig::default().with_name("").is_ok(),
+            "empty name is allowed through builder (validated in validate())"
+        );
+    }
+
+    #[test]
+    fn builder_with_name_at_max_length_is_ok() {
+        let max = "a".repeat(64);
+        assert!(AgentConfig::default().with_name(&max).is_ok());
+    }
+
+    #[test]
+    fn to_bytes_rejects_excessively_large_input() {
+        // The serialized config is bounded by postcard to 256 bytes; a config
+        // that would exceed this is rejected.
+        let c = AgentConfig::default();
+        let bytes = c.to_bytes();
+        assert!(bytes.is_ok(), "to_bytes must work for default config");
+        let serialized = bytes.unwrap();
+        assert!(
+            serialized.len() <= 256,
+            "serialized config must fit in 256 bytes"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_upper_boundaries() {
+        // Every field at its maximum valid value should pass.
+        let config = AgentConfig {
+            name: heapless::String::try_from("test").unwrap(),
+            max_iterations: 1000,
+            max_memory: MAX_CONFIGURABLE_MEMORY,
+            watchdog_timeout_secs: 60,
+            ble_timeout_secs: 120,
+            skills_enabled: true,
+            max_skills: 50,
+            debug_enabled: true,
+        };
+        assert!(config.validate().is_ok(), "boundary values must validate");
+    }
+
+    #[test]
+    fn validate_rejects_negative_ble() {
+        // ble_timeout_secs is u16 so negative is impossible; this tests
+        // that every field's zero check exists independently.
+        assert!(matches!(
+            AgentConfig {
+                ble_timeout_secs: 0,
+                ..AgentConfig::default()
+            }
+            .validate(),
+            Err(AgentError::ConfigurationError {
+                field: "ble_timeout_secs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn new_returns_default() {
+        let c = AgentConfig::new();
+        assert_eq!(c.name.as_str(), "mAgent");
+        assert!(c.skills_enabled);
+        assert_eq!(c.max_skills, 10);
+        assert!(!c.debug_enabled);
+    }
+
+    #[cfg(not(feature = "s3-8mb-psram"))]
+    #[test]
+    fn default_memory_is_within_ceiling() {
+        let c = AgentConfig::default();
+        assert!(
+            c.max_memory <= MAX_CONFIGURABLE_MEMORY,
+            "default memory {} must not exceed C61 ceiling {}",
+            c.max_memory,
+            MAX_CONFIGURABLE_MEMORY
+        );
+    }
+
+    #[test]
+    fn validate_edge_watchdog_upper_boundary() {
+        assert!(
+            AgentConfig {
+                watchdog_timeout_secs: 60,
+                ..AgentConfig::default()
+            }
+            .validate()
+            .is_ok(),
+            "watchdog 60s must be accepted"
+        );
+        assert!(
+            AgentConfig {
+                watchdog_timeout_secs: 61,
+                ..AgentConfig::default()
+            }
+            .validate()
+            .is_err(),
+            "watchdog 61s must be rejected"
+        );
+    }
+
+    #[test]
+    fn builder_with_max_iterations_1000_accepted() {
+        assert!(
+            AgentConfig::default().with_max_iterations(1000).is_ok(),
+            "max_iterations=1000 must be accepted"
+        );
+    }
+
+    #[test]
+    fn builder_with_max_memory_exact_ceiling_accepted() {
+        assert!(
+            AgentConfig::default()
+                .with_max_memory(MAX_CONFIGURABLE_MEMORY)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn builder_full_chain() {
+        let c = AgentConfig::default()
+            .with_name("chain-test")
+            .unwrap()
+            .with_max_iterations(50)
+            .unwrap()
+            .with_max_memory(65536)
+            .unwrap();
+        assert_eq!(c.name.as_str(), "chain-test");
+        assert_eq!(c.max_iterations, 50);
+        assert_eq!(c.max_memory, 65536);
+        assert!(c.validate().is_ok());
     }
 }

@@ -147,12 +147,6 @@ impl ExerciseGoal {
     }
 }
 
-impl core::fmt::Write for ExerciseGoal {
-    fn write_str(&mut self, _s: &str) -> core::fmt::Result {
-        Ok(())
-    }
-}
-
 impl ExerciseType {
     /// Get exercise name
     pub fn name(&self) -> &'static str {
@@ -427,7 +421,7 @@ impl SportsCoach {
         let recent_hr = health_mgr.latest_heart_rate();
         if let Some(hr_data) = recent_hr {
             if hr_data.hr > 150 && hr_data.zone() == HeartRateZone::Cardio {
-                self.high_hr_streak += 1;
+                self.high_hr_streak = self.high_hr_streak.saturating_add(1);
                 if self.high_hr_streak > 3 {
                     self.goal.target_intensity *= 0.9;
                     self.goal
@@ -507,7 +501,7 @@ impl SportsCoach {
         temp_data: Option<&TemperatureData>,
         delta_s: u32,
     ) {
-        self.session_duration_s += delta_s;
+        self.session_duration_s = self.session_duration_s.saturating_add(delta_s);
 
         let zone = hr_data.zone();
 
@@ -654,6 +648,15 @@ mod tests {
         HeartRateData {
             hr,
             hrv: 50.0,
+            spo2: Some(98),
+            timestamp: ts,
+        }
+    }
+
+    fn hr_data_hrv(hr: u16, hrv: f32, ts: u32) -> HeartRateData {
+        HeartRateData {
+            hr,
+            hrv,
             spo2: Some(98),
             timestamp: ts,
         }
@@ -964,5 +967,183 @@ mod tests {
         let msg = CoachingMessage::new(CoachingMessageType::Warning, &long, 8);
         assert_eq!(msg.voice_text.len(), 128); // bounded, never panics
         assert_eq!(msg.priority, 8);
+    }
+
+    #[test]
+    fn exercise_type_name_covers_every_variant() {
+        for ty in [
+            ExerciseType::Running,
+            ExerciseType::Walking,
+            ExerciseType::Cycling,
+            ExerciseType::Swimming,
+            ExerciseType::Strength,
+            ExerciseType::Yoga,
+            ExerciseType::Hiit,
+            ExerciseType::Rest,
+        ] {
+            assert!(!ty.name().is_empty());
+            // `default_duration`/`default_intensity` must be in-band for
+            // every variant so a goal can always be constructed.
+            assert!(ty.default_intensity() >= 0.0 && ty.default_intensity() <= 1.0);
+            let _ = ty.default_duration();
+        }
+        assert_eq!(ExerciseType::Cycling.default_duration(), 40);
+        assert_eq!(ExerciseType::Swimming.default_intensity(), 0.60);
+        assert_eq!(ExerciseType::Running.name(), "Running");
+    }
+
+    #[test]
+    fn exercise_goal_format_summary_includes_every_optional_field() {
+        let mut goal = ExerciseGoal::new(ExerciseType::Cycling);
+        goal.distance_m = Some(12_000);
+        goal.calories = Some(400);
+        let plain = goal.format_summary();
+        assert!(plain.as_str().contains("Cycling for 40 minutes"));
+        assert!(plain.as_str().contains("distance 12000m"));
+        assert!(plain.as_str().contains("burn 400 cal"));
+        assert!(plain.as_str().contains("Cardio") || plain.as_str().contains("Fat Burn"));
+        assert!(!plain.as_str().contains("(adjusted)"));
+
+        goal.add_adjustment("something changed");
+        assert!(goal.format_summary().as_str().contains("(adjusted)"));
+    }
+
+    #[test]
+    fn sports_coach_default_matches_new() {
+        let a = SportsCoach::default();
+        let b = SportsCoach::new();
+        assert_eq!(a.state(), b.state());
+        assert_eq!(a.session_duration(), b.session_duration());
+        assert_eq!(a.breathing_pattern(), b.breathing_pattern());
+        assert_eq!(a.goal().duration_min, b.goal().duration_min);
+    }
+
+    #[test]
+    fn adjust_goal_reduces_intensity_on_low_hrv() {
+        let mut coach = SportsCoach::new();
+        let mut health = HealthSensorManager::default();
+        // hrv < 30 → fatigue branch cuts intensity and records an adjustment.
+        health.add_heart_rate(hr_data_hrv(120, 20.0, 0)).unwrap();
+        let before = coach.goal().target_intensity;
+        coach.adjust_goal_for_conditions(&health, 20.0);
+        assert!(
+            coach.goal().target_intensity < before,
+            "low HRV must cut intensity"
+        );
+        assert!(coach
+            .goal()
+            .adjustments
+            .iter()
+            .any(|a| a.contains("Low HRV")));
+    }
+
+    #[test]
+    fn adjust_goal_reduces_intensity_after_sustained_high_hr() {
+        let mut coach = SportsCoach::new();
+        let mut health = HealthSensorManager::default();
+        // hr 151 at age 30 ⇒ 79.5 % of max (190) ⇒ Cardio zone, and > 150.
+        health.add_heart_rate(hr_data_hrv(151, 50.0, 0)).unwrap();
+
+        // Three consecutive samples build the streak to 3 (no change yet).
+        for _ in 0..3 {
+            coach.adjust_goal_for_conditions(&health, 20.0);
+        }
+        let mid = coach.goal().target_intensity;
+
+        // The fourth sample pushes the streak past 3 → intensity cut + warning.
+        coach.adjust_goal_for_conditions(&health, 20.0);
+        assert!(
+            coach.goal().target_intensity < mid,
+            "sustained high HR must cut intensity"
+        );
+        assert!(coach
+            .goal()
+            .adjustments
+            .iter()
+            .any(|a| a.contains("High HR sustained")));
+        let msgs = coach.get_messages();
+        assert!(
+            msgs.iter().any(|m| m.msg_type == CoachingMessageType::Warning),
+            "a sustained-high-HR warning must be queued"
+        );
+    }
+
+    #[test]
+    fn adjust_goal_resets_the_high_hr_streak_when_hr_recovers() {
+        let mut coach = SportsCoach::new();
+        let mut health = HealthSensorManager::default();
+        health.add_heart_rate(hr_data_hrv(151, 50.0, 0)).unwrap();
+        // Build the streak to 3.
+        for _ in 0..3 {
+            coach.adjust_goal_for_conditions(&health, 20.0);
+        }
+        // Drop back to an easy zone → the streak resets to zero…
+        health.add_heart_rate(hr_data_hrv(90, 50.0, 1)).unwrap();
+        coach.adjust_goal_for_conditions(&health, 20.0);
+        let baseline = coach.goal().target_intensity;
+        // …so a single high sample back on top must NOT trigger the cut.
+        health.add_heart_rate(hr_data_hrv(151, 50.0, 2)).unwrap();
+        coach.adjust_goal_for_conditions(&health, 20.0);
+        assert_eq!(coach.goal().target_intensity, baseline);
+    }
+
+    #[test]
+    fn generate_encouragement_covers_every_zone() {
+        let coach = SportsCoach::new();
+        for (zone, needle) in [
+            (HeartRateZone::WarmUp, "保持"),
+            (HeartRateZone::FatBurn, "脂肪"),
+            (HeartRateZone::Cardio, "心肺"),
+            (HeartRateZone::Peak, "节奏"),
+            (HeartRateZone::Rest, "坚持"),
+            (HeartRateZone::Danger, "坚持"),
+        ] {
+            let text = coach.generate_encouragement(zone);
+            assert!(text.contains(needle), "zone {zone:?} → {text}");
+        }
+    }
+
+    #[test]
+    fn add_warning_queues_a_warning_message() {
+        let mut coach = SportsCoach::new();
+        coach.add_warning("take it easy");
+        let msgs = coach.get_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].msg_type, CoachingMessageType::Warning);
+        assert_eq!(msgs[0].priority, 8);
+        // Reading the queue drains it.
+        assert!(coach.get_messages().is_empty());
+    }
+
+    #[test]
+    fn get_messages_drains_the_queue() {
+        let mut coach = SportsCoach::new();
+        coach.start_session();
+        assert_eq!(coach.get_messages().len(), 1); // StartExercise
+        assert!(coach.get_messages().is_empty());
+    }
+
+    #[test]
+    fn set_goal_replaces_the_active_goal() {
+        let mut coach = SportsCoach::new();
+        let goal = ExerciseGoal::new(ExerciseType::Yoga);
+        coach.set_goal(goal);
+        assert_eq!(coach.goal().exercise_type, ExerciseType::Yoga);
+        assert_eq!(coach.goal().duration_min, 30);
+    }
+
+    #[test]
+    fn update_emits_breathing_correction_in_peak_zone() {
+        let mut coach = SportsCoach::new();
+        coach.start_session();
+        // Advance to Active, then hit Peak zone (age 30, max 190 → hr ~152-170).
+        coach.update(&hr_data(140, 0), None, 400);
+        assert_eq!(coach.state(), ExerciseState::Active);
+        // Peak zone + > 30 s since the last correction → a correction is queued.
+        coach.update(&hr_data(160, 0), None, 100);
+        let msgs = coach.get_messages();
+        assert!(msgs
+            .iter()
+            .any(|m| m.msg_type == CoachingMessageType::BreathingCorrection));
     }
 }

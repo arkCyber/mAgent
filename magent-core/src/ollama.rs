@@ -228,13 +228,51 @@ impl OllamaClient {
         Ok(())
     }
 
-    /// Serialize request to JSON (simplified for embedded)
+    /// Append `s` to `out`, JSON-escaping `"`, `\`, control characters.
+    ///
+    /// The serializer used to concatenate content verbatim, so any message
+    /// containing a quote (extremely common in model replies) or a newline
+    /// produced invalid JSON and the request was rejected by the backend.
+    fn push_json_escaped(out: &mut heapless::String<2048>, s: &str) {
+        use core::fmt::Write as _;
+        for c in s.chars() {
+            match c {
+                '"' => {
+                    let _ = out.push_str("\\\"");
+                }
+                '\\' => {
+                    let _ = out.push_str("\\\\");
+                }
+                '\n' => {
+                    let _ = out.push_str("\\n");
+                }
+                '\r' => {
+                    let _ = out.push_str("\\r");
+                }
+                '\t' => {
+                    let _ = out.push_str("\\t");
+                }
+                c if (c as u32) < 0x20 => {
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
+                c => {
+                    let _ = out.push(c);
+                }
+            }
+        }
+    }
+
+    /// Serialize request to JSON (simplified for embedded).
+    ///
+    /// Emits `tools` when present — `add_tools` populated the field but the
+    /// serializer ignored it, so a caller that supplied tools sent none and
+    /// the model never used function calling.
     pub fn serialize_request(&self, request: &OllamaRequest) -> heapless::String<2048> {
         let mut json = heapless::String::new();
 
         // Model and stream
         let _ = json.push_str(r#"{"model":""#);
-        let _ = json.push_str(&request.model);
+        Self::push_json_escaped(&mut json, &request.model);
         let _ = json.push_str(r#"","stream":"#);
         if request.stream {
             let _ = json.push_str("true");
@@ -252,13 +290,56 @@ impl OllamaClient {
             first = false;
 
             let _ = json.push_str(r#"{"role":""#);
-            let _ = json.push_str(&msg.role);
+            Self::push_json_escaped(&mut json, &msg.role);
             let _ = json.push_str(r#"","content":""#);
-            let _ = json.push_str(&msg.content);
+            Self::push_json_escaped(&mut json, &msg.content);
             let _ = json.push_str(r#""}"#);
         }
+        let _ = json.push(']');
 
-        let _ = json.push_str("]}");
+        if let Some(tools) = &request.tools {
+            let _ = json.push_str(r#","tools":["#);
+            for (i, tool) in tools.iter().enumerate() {
+                if i > 0 {
+                    let _ = json.push(',');
+                }
+                let _ = json.push_str(r#"{"type":""#);
+                Self::push_json_escaped(&mut json, &tool.tool_type);
+                let _ = json.push_str(r#"","function":{"name":""#);
+                Self::push_json_escaped(&mut json, &tool.function.name);
+                let _ = json.push_str(r#"","description":""#);
+                Self::push_json_escaped(&mut json, &tool.function.description);
+                let params = &tool.function.parameters;
+                let _ = json.push_str(r#"","parameters":{"type":""#);
+                Self::push_json_escaped(&mut json, &params.schema_type);
+                let _ = json.push_str(r#"","properties":{"#);
+                for (j, prop) in params.properties.iter().enumerate() {
+                    if j > 0 {
+                        let _ = json.push(',');
+                    }
+                    let _ = json.push('"');
+                    Self::push_json_escaped(&mut json, &prop.name);
+                    let _ = json.push_str(r#"":{"type":""#);
+                    Self::push_json_escaped(&mut json, &prop.param_type);
+                    let _ = json.push_str(r#"","description":""#);
+                    Self::push_json_escaped(&mut json, &prop.description);
+                    let _ = json.push_str(r#""}"#);
+                }
+                let _ = json.push_str(r#"},"required":["#);
+                for (j, req) in params.required.iter().enumerate() {
+                    if j > 0 {
+                        let _ = json.push(',');
+                    }
+                    let _ = json.push('"');
+                    Self::push_json_escaped(&mut json, req);
+                    let _ = json.push('"');
+                }
+                let _ = json.push_str("]}}}");
+            }
+            let _ = json.push(']');
+        }
+
+        let _ = json.push('}');
 
         json
     }
@@ -523,6 +604,44 @@ mod tests {
         assert!(s.contains("\"role\":\"user\""));
         assert!(s.contains("\"content\":\"hi\""));
         assert!(s.ends_with("]}"));
+    }
+
+    /// Quotes/newlines in message content must be escaped; the old
+    /// concatenation produced invalid JSON for any model reply containing
+    /// them.
+    #[test]
+    fn serialize_request_escapes_message_content() {
+        let mut c = OllamaClient::new("http://h", "qwen", 1000).unwrap();
+        let mut req = c.build_request();
+        c.add_message(&mut req, "user", "say \"hi\"\nplease\\now")
+            .unwrap();
+        let json = c.serialize_request(&req);
+        // The escaped form is valid JSON.
+        let parsed: serde_json::Value = serde_json::from_str(json.as_str()).unwrap();
+        assert_eq!(parsed["messages"][0]["content"], "say \"hi\"\nplease\\now");
+    }
+
+    /// `add_tools` populated `request.tools`, but the serializer dropped it.
+    #[test]
+    fn serialize_request_emits_tool_definitions() {
+        let mut c = OllamaClient::new("http://h", "qwen", 1000).unwrap();
+        let mut req = c.build_request();
+        let tools: (&str, &str, &[(&str, &str, &str)]) = (
+            "read_sensor",
+            "Read a sensor",
+            &[("sensor", "string", "sensor name")],
+        );
+        c.add_tools(&mut req, &[tools]).unwrap();
+        let json = c.serialize_request(&req);
+        let parsed: serde_json::Value = serde_json::from_str(json.as_str()).unwrap();
+        let tool = &parsed["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["function"]["name"], "read_sensor");
+        assert_eq!(
+            tool["function"]["parameters"]["properties"]["sensor"]["type"],
+            "string"
+        );
+        assert_eq!(tool["function"]["parameters"]["required"][0], "sensor");
     }
 
     #[test]

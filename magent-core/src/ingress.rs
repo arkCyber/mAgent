@@ -97,6 +97,15 @@ pub enum IngressError {
         /// Actual byte size of the offending payload.
         size: usize,
     },
+    /// The signed envelope would not fit [`MAX_PAYLOAD`] even though the raw
+    /// payload did. Hex encoding roughly doubles the payload and the signer
+    /// DID / signature add a fixed overhead.
+    EnvelopeTooLarge {
+        /// Raw payload size that was submitted.
+        size: usize,
+        /// Largest raw payload that fits the envelope buffer.
+        max: usize,
+    },
     /// The adapter's [`LinkAdapter::send`] reported a failure while we were
     /// trying to reply over that link.
     AdapterSendFailed,
@@ -112,6 +121,10 @@ impl core::fmt::Display for IngressError {
             Self::PayloadTooLarge { size } => {
                 write!(f, "ingress payload {size}B exceeds {MAX_PAYLOAD}B cap")
             }
+            Self::EnvelopeTooLarge { size, max } => write!(
+                f,
+                "ingress payload {size}B exceeds the {max}B that fits a signed envelope"
+            ),
             Self::AdapterSendFailed => f.write_str("ingress adapter send failed"),
             Self::Web3(e) => write!(f, "ingress web3 error: {e:?}"),
         }
@@ -227,7 +240,21 @@ impl<A: LinkAdapter> IngressGateway<A> {
             }
             let n = match adapter.poll(&mut scratch) {
                 Ok(0) => continue,
-                Ok(n) => n,
+                // The `LinkAdapter::poll` contract caps the count at
+                // `buf.len()`. A count above that is an adapter bug (e.g. a
+                // HAL narrowing a negative C `int` into `usize::MAX`), and
+                // trusting it would panic on the slice below — on the ESP32
+                // that is the Core-1 real-time ingress thread. Drop the
+                // frame instead of letting the violation take the core down.
+                Ok(n) if n <= scratch.len() => n,
+                Ok(n) => {
+                    log::warn!(
+                        "ingress adapter {:?} reported {n}B into a {}B buffer — discarding frame",
+                        adapter.source_kind(),
+                        scratch.len()
+                    );
+                    continue;
+                }
                 Err(e) => {
                     log::warn!(
                         "ingress adapter {:?} poll error: {:?}",
@@ -265,6 +292,23 @@ impl<A: LinkAdapter> IngressGateway<A> {
                     IngressError::Web3(Web3ErrorKind::InvalidSignature { actual_len: 0 })
                 })?;
                 let signed: SignedMessage = signer.sign(bytes).map_err(IngressError::Web3)?;
+                // The envelope is `{"signer":"<did>","payload_hex":"<2n>",
+                // "signature_hex":"<128>"}`: 177 fixed bytes plus the DID
+                // and twice the payload. Reject a raw payload that cannot fit
+                // *before* serialising; the old code accepted up to
+                // MAX_PAYLOAD and then failed with a misleading
+                // `PayloadTooLarge { size }` (claiming the size it just
+                // accepted) while dropping the frame.
+                const ENVELOPE_FIXED_OVERHEAD: usize = 177;
+                let max_raw = MAX_PAYLOAD
+                    .saturating_sub(ENVELOPE_FIXED_OVERHEAD + signed.signer.len())
+                    / 2;
+                if bytes.len() > max_raw {
+                    return Err(IngressError::EnvelopeTooLarge {
+                        size: bytes.len(),
+                        max: max_raw,
+                    });
+                }
                 // PATCHED (MicroAgent): serialise into a bounded stack buffer
                 // via `to_json_into` instead of the per-frame heap allocation
                 // of `to_json()` (see `communication/mod.rs` TODO).
@@ -279,5 +323,145 @@ impl<A: LinkAdapter> IngressGateway<A> {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::communication::link::{IngressSource, LinkAdapter};
+
+    /// Minimal adapter for unit tests — always disconnected and empty.
+    #[derive(Debug)]
+    struct NullAdapter;
+    impl LinkAdapter for NullAdapter {
+        type Error = ();
+        fn poll(&mut self, _buf: &mut [u8]) -> Result<usize, Self::Error> {
+            Ok(0)
+        }
+        fn send(&mut self, _buf: &[u8]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn source_kind(&self) -> IngressSource {
+            IngressSource::Other {
+                label: heapless::String::try_from("null").unwrap(),
+            }
+        }
+        fn is_connected(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn display_adapter_pool_full() {
+        let e = IngressError::AdapterPoolFull;
+        assert_eq!(format!("{e}"), "ingress gateway adapter pool full");
+    }
+
+    #[test]
+    fn display_no_adapters() {
+        let e = IngressError::NoAdapters;
+        assert_eq!(format!("{e}"), "ingress gateway has no adapters registered");
+    }
+
+    /// A raw payload that fits MAX_PAYLOAD can still overflow the signed
+    /// envelope (hex doubles it); it must be rejected up front with a
+    /// truthful error instead of failing during serialisation.
+    #[test]
+    fn signed_envelope_rejects_a_payload_that_cannot_fit() {
+        let mut gw: IngressGateway<NullAdapter> = IngressGateway::new(IngressMode::Signed);
+        gw.set_signer(Identity::from_secret_bytes(&[7u8; 32]).unwrap());
+        let source = IngressSource::Other {
+            label: heapless::String::try_from("test").unwrap(),
+        };
+
+        let big = alloc::vec![b'x'; 1_200];
+        assert!(matches!(
+            gw.build_frame(source.clone(), &big),
+            Err(IngressError::EnvelopeTooLarge { .. })
+        ));
+
+        let small = alloc::vec![b'x'; 300];
+        let frame = gw.build_frame(source, &small).expect("small frame fits");
+        assert!(frame.envelope_json.is_some());
+    }
+
+    #[test]
+    fn display_payload_too_large() {
+        let e = IngressError::PayloadTooLarge { size: 9999 };
+        let msg = format!("{e}");
+        assert!(msg.contains("9999"), "Display must include the byte size: {msg}");
+        assert!(msg.contains(&format!("{MAX_PAYLOAD}")), "Display must include the cap");
+    }
+
+    #[test]
+    fn display_adapter_send_failed() {
+        let e = IngressError::AdapterSendFailed;
+        assert_eq!(format!("{e}"), "ingress adapter send failed");
+    }
+
+    #[test]
+    fn mode_accessor_returns_configured_mode() {
+        let gw: IngressGateway<NullAdapter> = IngressGateway::new(IngressMode::Transparent);
+        assert_eq!(gw.mode(), IngressMode::Transparent);
+
+        let gw: IngressGateway<NullAdapter> = IngressGateway::new(IngressMode::Signed);
+        assert_eq!(gw.mode(), IngressMode::Signed);
+    }
+
+    #[test]
+    fn new_gateway_is_empty() {
+        let gw: IngressGateway<NullAdapter> = IngressGateway::new(IngressMode::Transparent);
+        assert_eq!(gw.adapter_count(), 0);
+    }
+
+    #[test]
+    fn set_mode_updates_mode() {
+        let mut gw: IngressGateway<NullAdapter> = IngressGateway::new(IngressMode::Transparent);
+        assert_eq!(gw.mode(), IngressMode::Transparent);
+        gw.set_mode(IngressMode::Signed);
+        assert_eq!(gw.mode(), IngressMode::Signed);
+        gw.set_mode(IngressMode::Transparent);
+        assert_eq!(gw.mode(), IngressMode::Transparent);
+    }
+
+    #[test]
+    fn register_increases_count() {
+        let mut gw: IngressGateway<NullAdapter> = IngressGateway::new(IngressMode::Transparent);
+        gw.register(NullAdapter).unwrap();
+        assert_eq!(gw.adapter_count(), 1);
+        gw.register(NullAdapter).unwrap();
+        assert_eq!(gw.adapter_count(), 2);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn set_signer_does_not_crash_in_transparent_mode() {
+        let id = crate::web3::Identity::generate().unwrap();
+        let mut gw: IngressGateway<NullAdapter> = IngressGateway::new(IngressMode::Transparent);
+        gw.set_signer(id);
+        // Transparent mode ignores the signer; no-op is safe.
+        assert_eq!(gw.mode(), IngressMode::Transparent);
+    }
+
+    #[cfg(feature = "web3")]
+    #[test]
+    fn from_web3_error_preserves_kind() {
+        // IngressError::Web3 round-trips a Web3ErrorKind.
+        let kind = crate::error::Web3ErrorKind::InvalidSignature { actual_len: 0 };
+        let err: IngressError = kind.into();
+        match err {
+            IngressError::Web3(_) => {} // expected
+            other => panic!("expected Web3 variant, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn ingress_error_implements_std_error() {
+        // This validates that IngressError: std::error::Error, which is
+        // only compiled when `std` is active.
+        fn _assert_std_error<E: std::error::Error>() {}
+        _assert_std_error::<IngressError>();
     }
 }

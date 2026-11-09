@@ -408,3 +408,74 @@ mod tests {
         assert_eq!(slice.len(), 32);
     }
 }
+
+/// Tests for the feature-OFF build path. On a host build without
+/// `boot-key` the `derive` symbol is a fail-closed stub (it cannot
+/// reach the Keccak256 path), and the `BootKey` newtype helpers are
+/// still compiled — both must behave without panicking.
+#[cfg(all(test, not(feature = "boot-key")))]
+mod disabled_tests {
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn derive_stub_is_feature_disabled_never_ok() {
+        // Without the feature the stub must fail closed with a
+        // distinct error rather than panicking or inventing a key.
+        let err = derive(b"anything").expect_err("stub must not derive");
+        assert_eq!(err, BootKeyError::FeatureDisabled);
+        // Even an empty slice takes the same stub path (the empty /
+        // too-long checks live in the feature-gated `derive`).
+        assert_eq!(derive(b"").unwrap_err(), BootKeyError::FeatureDisabled);
+    }
+
+    #[test]
+    fn boot_key_from_bytes_and_accessors_are_consistent() {
+        // `from_bytes` / `as_bytes` / `as_ref` are always compiled,
+        // even without the hash feature. Exercise them directly.
+        let bytes = [0x5Au8; 32];
+        let bk = BootKey::from_bytes(bytes);
+        assert_eq!(bk.as_bytes(), &bytes);
+        let slice: &[u8] = bk.as_ref();
+        assert_eq!(slice, &bytes[..]);
+        assert_eq!(slice.len(), 32);
+    }
+
+    #[test]
+    fn boot_key_is_copy_and_debug() {
+        // The newtype derives `Copy` + `Debug`; a copy must compare
+        // equal to the original and both must render.
+        let bk = BootKey::from_bytes([1u8; 32]);
+        let copy = bk;
+        assert_eq!(copy.as_bytes(), bk.as_bytes());
+        let _ = alloc::format!("{bk:?}");
+    }
+
+    #[test]
+    fn algorithm_identifiers_are_stable_without_the_feature() {
+        // The audit identifiers are constant expressions, not gated on
+        // the hash feature.
+        assert_eq!(alg_name(), "BTDK1");
+        assert_eq!(alg_id(), 0x01);
+        assert_eq!(MAG_BTDK_DOMAIN_V1, b"magent/btk/v1");
+        assert_eq!(BTDK_VERSION_V1, 0x01);
+        assert_eq!(MAX_MATERIAL_LEN, 128);
+    }
+
+    #[test]
+    fn derive_stub_matches_the_in_range_check_free_contract() {
+        // A regression guard: regardless of input length the stub is
+        // always `FeatureDisabled` (it never inspects `material`),
+        // and never allocates. Run a spread of lengths.
+        let owned: Vec<u8> = vec![0xCD; MAX_MATERIAL_LEN + 8];
+        for len in [0usize, 1, MAX_MATERIAL_LEN, MAX_MATERIAL_LEN + 8] {
+            let slice = &owned[..len.min(owned.len())];
+            assert_eq!(
+                derive(slice).unwrap_err(),
+                BootKeyError::FeatureDisabled,
+                "len={len}"
+            );
+        }
+    }
+}

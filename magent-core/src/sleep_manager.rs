@@ -147,7 +147,7 @@ impl SleepQuality {
         // Calculate overall score
         let duration_score = (duration_min as f32 / 480.0 * 30.0).min(30.0);
         let efficiency_score = efficiency * 0.25;
-        let structure_score = ((deep_sleep_min + rem_sleep_min) as f32 / 180.0 * 25.0).min(25.0);
+        let structure_score = ((deep_sleep_min as u32 + rem_sleep_min as u32) as f32 / 180.0 * 25.0).min(25.0);
         let latency_score = if onset_latency_min < 15 {
             10.0
         } else {
@@ -439,14 +439,28 @@ impl SleepManager {
         Some(sum as f32 / count as f32)
     }
 
-    /// Calculate sleep debt (hours below 8h target)
+    /// Calculate sleep debt (hours below the 8 h/night target) over the last
+    /// `days` nights that were **actually recorded**.
+    ///
+    /// The window is capped at the size of the history, exactly as
+    /// [`Self::average_sleep_score`] caps its own. It did not used to be: with
+    /// three recorded nights, `days = 7` assumed four nights of *zero* sleep and
+    /// reported `56 h - 18 h = 38 h` of debt. A device that has been worn three
+    /// nights cannot claim a week of debt, and the number is not a conservative
+    /// guess — it is a health claim about nights nobody has data for, which
+    /// `get_sleep_recommendations` then turned into "sleep more". No recorded
+    /// nights means no debt, not maximum debt.
     pub fn calculate_sleep_debt(&self, days: usize) -> f32 {
-        let target_hours = 8.0 * days as f32;
+        let count = days.min(self.sleep_history.len());
+        if count == 0 {
+            return 0.0;
+        }
+        let target_hours = 8.0 * count as f32;
         let actual_hours: f32 = self
             .sleep_history
             .iter()
             .rev()
-            .take(days)
+            .take(count)
             .map(|r| r.duration_minutes() as f32 / 60.0)
             .sum();
         (target_hours - actual_hours).max(0.0)
@@ -467,8 +481,12 @@ impl SleepManager {
         self.last_stress_check = current_time_ms;
 
         // Check if intervention needed
+        // Saturating: a clock that goes backwards (reboot, time sync, or a
+        // u32 millisecond wrap at ~49 days) used to panic in debug and wrap
+        // to a huge value in release — bypassing the cooldown entirely.
         if stress_score >= self.stress_threshold
-            && (current_time_ms - self.last_meditation_offer) > self.meditation_cooldown_ms
+            && current_time_ms.saturating_sub(self.last_meditation_offer)
+                > self.meditation_cooldown_ms
         {
             self.last_meditation_offer = current_time_ms;
             event.meditation_offered = true;
@@ -483,13 +501,24 @@ impl SleepManager {
                 stress_score,
             };
 
-            let _ = self.stress_log.push(event);
+            self.push_stress_event(event);
 
             return Some(recommendation);
         }
 
-        let _ = self.stress_log.push(event);
+        self.push_stress_event(event);
         None
+    }
+
+    /// Append a stress event, evicting the oldest when the bounded log is
+    /// full (matching `add_sleep_record`). The plain `push` silently failed
+    /// once 100 entries existed, so stress logging stopped forever and
+    /// `record_meditation` marked a stale event.
+    fn push_stress_event(&mut self, event: StressEvent) {
+        if let Err(returned) = self.stress_log.push(event) {
+            let _ = self.stress_log.remove(0);
+            let _ = self.stress_log.push(returned);
+        }
     }
 
     /// Calculate stress score (0-100)
@@ -504,7 +533,7 @@ impl SleepManager {
             0
         };
 
-        (hrv_score + hr_contribution).min(100)
+        (hrv_score.saturating_add(hr_contribution)).min(100)
     }
 
     /// Generate appropriate stress message
@@ -529,7 +558,7 @@ impl SleepManager {
 
     /// Record meditation completion
     pub fn record_meditation(&mut self, session: MeditationSession) -> Result<()> {
-        self.today_meditation_min += session.duration_min;
+        self.today_meditation_min = self.today_meditation_min.saturating_add(session.duration_min);
 
         // Update the most recent stress event with meditation info
         if let Some(event) = self.stress_log.last_mut() {
@@ -831,15 +860,20 @@ mod tests {
 
     #[test]
     fn sleep_debt_is_zero_with_enough_sleep_and_positive_when_short() {
-        // No records → full target is treated as debt (conservative: no
-        // data = worst case), i.e. 8h × 7 days.
-        assert_eq!(SleepManager::new().calculate_sleep_debt(7), 56.0);
+        // No records → no debt. The window is capped at the recorded nights, so
+        // an unworn device reports nothing rather than a week of debt it has no
+        // data for.
+        assert_eq!(SleepManager::new().calculate_sleep_debt(7), 0.0);
         // Two 6-hour nights (wake 05:00 from 23:00) vs 8h target → 4h debt.
         let mut m = SleepManager::new();
         m.add_sleep_record(make_record(0, 5 * 60)).unwrap(); // 360 min
         m.add_sleep_record(make_record(1, 5 * 60)).unwrap(); // 360 min
         let debt = m.calculate_sleep_debt(2);
         assert!((debt - 4.0).abs() < 0.01);
+        // Asking for more nights than exist must not inflate the target: two
+        // recorded nights against `days = 7` is still two nights of debt.
+        let debt7 = m.calculate_sleep_debt(7);
+        assert!((debt7 - 4.0).abs() < 0.01, "inflated to {debt7}");
     }
 
     #[test]
@@ -877,6 +911,23 @@ mod tests {
         // A second check 1s later — well within the 15-min cooldown — is
         // suppressed (no duplicate nagging).
         assert!(m.check_stress_intervention(10.0, 160, 1_001_000).is_none());
+
+        // A backwards clock (reboot / u32 ms wrap) must not wrap the cooldown
+        // subtraction into "cooldown elapsed".
+        assert!(m.check_stress_intervention(10.0, 160, 500_000).is_none());
+    }
+
+    /// The stress log is bounded at 100; once full it must evict the oldest
+    /// entry rather than silently dropping every later event.
+    #[test]
+    fn stress_log_evicts_oldest_when_full() {
+        let mut m = SleepManager::new();
+        for i in 0..101u32 {
+            m.push_stress_event(StressEvent::new(i, StressLevel::Low, 10));
+        }
+        assert_eq!(m.stress_log().len(), 100);
+        assert_eq!(m.stress_log().last().unwrap().timestamp, 100);
+        assert_eq!(m.stress_log()[0].timestamp, 1, "oldest evicted");
     }
 
     #[test]
@@ -924,5 +975,111 @@ mod tests {
         assert!(default
             .check_stress_intervention(10.0, 160, 1_000_000)
             .is_some());
+    }
+
+    #[test]
+    fn circadian_phase_names_and_light_advice_cover_all_variants() {
+        for p in [
+            CircadianPhase::SleepPhase,
+            CircadianPhase::WakeTransition,
+            CircadianPhase::AlertPhase,
+            CircadianPhase::PeakAlertness,
+            CircadianPhase::WindDown,
+        ] {
+            assert!(!p.name().is_empty());
+            assert!(!p.light_recommendation().is_empty());
+        }
+        assert_eq!(CircadianPhase::PeakAlertness.name(), "Peak Alertness");
+        assert!(CircadianPhase::SleepPhase
+            .light_recommendation()
+            .contains("dark"));
+    }
+
+    #[test]
+    fn set_meditation_goal_changes_the_daily_target() {
+        let mut m = SleepManager::new();
+        m.set_meditation_goal(25);
+        assert_eq!(m.today_meditation_progress(), (0, 25));
+    }
+
+    #[test]
+    fn stress_messages_and_priorities_cover_every_band() {
+        let m = SleepManager::new();
+        assert!(m
+            .generate_stress_message(StressLevel::VeryHigh, 90)
+            .contains("冥想"));
+        assert!(m
+            .generate_stress_message(StressLevel::High, 75)
+            .contains("呼吸"));
+        assert!(m
+            .generate_stress_message(StressLevel::Moderate, 60)
+            .contains("休息"));
+        assert!(m
+            .generate_stress_message(StressLevel::Low, 10)
+            .contains("正常"));
+
+        assert_eq!(m.calculate_priority(0), 3);
+        assert_eq!(m.calculate_priority(50), 3);
+        assert_eq!(m.calculate_priority(60), 5);
+        assert_eq!(m.calculate_priority(80), 7);
+        assert_eq!(m.calculate_priority(100), 9);
+    }
+
+    #[test]
+    fn record_meditation_updates_the_most_recent_stress_event() {
+        let mut m = SleepManager::new();
+        // Push a stress event into the log first, then record a completion.
+        assert!(m
+            .check_stress_intervention(10.0, 160, 1_000_000)
+            .is_some());
+        let session = MeditationSession::new(MeditationType::EmergencyCalm, 3, 80);
+        m.record_meditation(session).unwrap();
+        let event = m.stress_log().last().unwrap();
+        assert!(event.meditation_accepted);
+        assert!(event.session_completed.is_some());
+        assert_eq!(m.today_meditation_progress(), (3, 10));
+    }
+
+    #[test]
+    fn recommendations_reflect_sleep_debt_quality_and_phase() {
+        // Poor recent quality (< 60 avg) adds the "reduce screen time" advice.
+        let mut poor = SleepManager::new();
+        for i in 0..5u32 {
+            poor.add_sleep_record(record(30, 450)).unwrap();
+            let _ = i;
+        }
+        let recs = poor.get_sleep_recommendations();
+        assert!(recs.iter().any(|r| r.contains("屏幕")));
+
+        // Wind-down phase adds its own advice; with no records there is no debt
+        // or quality line, so the phase advice is present verbatim.
+        let mut wind = SleepManager::new();
+        wind.update_circadian(21 * 60 + 30); // WindDown
+        let recs = wind.get_sleep_recommendations();
+        assert!(recs.iter().any(|r| r.contains("调暗灯光")));
+
+        // Alert phase yields its own line.
+        let mut alert = SleepManager::new();
+        alert.update_circadian(10 * 60);
+        assert!(alert
+            .get_sleep_recommendations()
+            .iter()
+            .any(|r| r.contains("复杂任务")));
+
+        // Sleep phase with no data falls through to the default habit advice.
+        let mut sleep = SleepManager::new();
+        sleep.update_circadian(0);
+        let recs = sleep.get_sleep_recommendations();
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].contains("固定作息"));
+    }
+
+    #[test]
+    fn default_sleep_manager_matches_new() {
+        let a = SleepManager::default();
+        let b = SleepManager::new();
+        assert_eq!(a.circadian_phase(), b.circadian_phase());
+        assert_eq!(a.today_meditation_progress(), b.today_meditation_progress());
+        assert!(a.sleep_history().is_empty());
     }
 }

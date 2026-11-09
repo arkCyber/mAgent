@@ -39,7 +39,9 @@
 //!
 //! Lines are terminated by `\r`, `\n`, or `\r\n` (any combination).
 //! Commands must start with case-insensitive `AT` followed by one of
-//! `+ = ? , ;` or end-of-line. Lines that aren't AT commands are
+//! `+ = ? , ;` or end-of-line. The op keyword is case-insensitive too
+//! (`at+cwmode=1` and `AT+CWMODE=1` are the same command); argument values
+//! keep their case. Lines that aren't AT commands are
 //! signalled via [`AtParseErrorKind::NotAnAtCommand`] so the caller can
 //! route them back to the natural-language agent path.
 //!
@@ -71,9 +73,12 @@ pub const MAX_LINE: usize = 256;
 /// script sends excess parameters.
 pub const MAX_ARGUMENTS: usize = 12;
 
-/// Maximum parameter payload length (post-escape-decoding). 64 is the
-/// ESP-AT max for WPA passwords; larger values are clamped.
-pub const MAX_PARAM_LEN: usize = 64;
+/// Longest op keyword the parser case-folds before classification.
+///
+/// The longest current keyword is `WIFIPASSUPGRADE` (15); the extra room is
+/// deliberate headroom, and a longer keyword is treated as unknown rather than
+/// truncated (a truncated fold could collide with a different op).
+const MAX_OP_KEYWORD_LEN: usize = 24;
 
 /// Maximum SSID length (bytes). ESP-AT allows up to 32 bytes for SSIDs.
 pub const MAX_SSID_LEN: usize = 32;
@@ -104,9 +109,9 @@ pub enum AtVerb {
     Execute,
     /// `AT+NAME?` (query).
     Query,
-    /// `AT+NAME=...` (set, possibly with trailing `?` for `AT+NAME=?`).
+    /// `AT+NAME=...` (set).
     Set,
-    /// `AT+NAME=?` (test — what values are accepted).
+    /// `AT+NAME=?` (test — parameter discovery; recognised, not implemented).
     Test,
 }
 
@@ -159,7 +164,10 @@ pub enum AtCommandKind {
     Query,
     /// Set form (`=` followed by zero or more comma-separated args).
     Set,
-    /// Test form (`=?` suffix; callable to discover accepted values).
+    /// Test form (`=?` suffix). **Recognised, not implemented:** no command
+    /// currently answers parameter-discovery queries, so the dispatcher
+    /// rejects the form uniformly with `+CMDER:4` instead of executing it as a
+    /// zero-argument `Set`.
     Test,
     /// Pure ping or echo-toggle — no further payload.
     Control,
@@ -281,6 +289,12 @@ pub enum AtOp {
     /// `AT+LLMCFG?` / `AT+LLMCFG=<model>,<api_key>` — set / query the
     /// LLM backend parameters (model name + API key) used by the agent.
     LlmCfg,
+    /// `AT+AGENTCFG?` / `AT+AGENTCFG=<name>,<max_iter>,<max_mem>,
+    /// <watchdog_secs>,<ble_secs>,<skills>,<max_skills>,<debug>` /
+    /// `AT+AGENTCFG=RESET` — query, persist, or reset the core `AgentConfig`
+    /// the agent boots with. Takes effect on the next reboot (the agent thread
+    /// reads it once at startup). `RESET` deletes the persisted entry.
+    AgentCfg,
     /// `AT+FLIGHTCFG=<provider>,<token>` / `AT+FLIGHTCFG?` — configure the
     /// flight-price data provider used by the on-device `get_flight_price` tool.
     FlightCfg,
@@ -349,6 +363,7 @@ impl AtOp {
             AtOp::HttpGet => "+HTTPGET",
             AtOp::Ota => "+OTA",
             AtOp::LlmCfg => "+LLMCFG",
+            AtOp::AgentCfg => "+AGENTCFG",
             AtOp::FlightCfg => "+FLIGHTCFG",
             AtOp::Time => "+TIME",
             AtOp::NtpSync => "+NTPSYNC",
@@ -556,6 +571,14 @@ pub fn parse_line(line: &[u8]) -> Result<AtCommand<'_>, AtParseError> {
     p.expect_at()?;
     let verb = p.scan_verb()?;
     let (op, kind, args) = p.parse_op(verb)?;
+    // `scan_verb` only sees the `AT+` prefix, so it reports `Execute` for
+    // every `+NAME…` line. Promote the look-ahead verb to `Test` when the
+    // payload form is `=?`, keeping `verb` and `kind` consistent.
+    let verb = if kind == AtCommandKind::Test {
+        AtVerb::Test
+    } else {
+        verb
+    };
     Ok(AtCommand {
         op,
         kind,
@@ -692,8 +715,17 @@ impl<'a> Parser<'a> {
             }
             Some(b'=') => {
                 self.pos = kw_end + 1;
-                self.parse_set_args()?;
-                AtCommandKind::Set
+                if self.line.get(self.pos).copied() == Some(b'?') {
+                    // `=?` is ESP-AT's parameter-discovery form. Classify it
+                    // as `Test` so the dispatcher does not execute it as a
+                    // zero-argument `Set` (which is a different command shape
+                    // for e.g. CWJAP).
+                    self.pos += 1;
+                    AtCommandKind::Test
+                } else {
+                    self.parse_set_args()?;
+                    AtCommandKind::Set
+                }
             }
             Some(_) => {
                 return Err(AtParseError::new(AtParseErrorKind::InvalidArgument, kw_end));
@@ -722,11 +754,6 @@ impl<'a> Parser<'a> {
     /// Parse the comma-separated argument list after the `=` sign of a
     /// Set or Test command.
     fn parse_set_args(&mut self) -> Result<(), AtParseError> {
-        // Accept `=?` (test) as zero-arg set with kind=Test later.
-        if self.line.get(self.pos).copied() == Some(b'?') {
-            self.pos += 1;
-            return Ok(());
-        }
         loop {
             // Skip optional whitespace before each arg.
             self.skip_ws();
@@ -759,16 +786,22 @@ impl<'a> Parser<'a> {
         while probe < self.line.len() {
             let c = self.line[probe];
             if c == b'=' {
-                // Confirm `key` starts with a letter (so '=' inside a
-                // quoted string doesn't get mis-classified).
-                if let Some(&start_c) = self.line.get(save) {
-                    if start_c.is_ascii_alphabetic() {
-                        let key = &self.line[save..probe];
-                        self.pos = probe + 1; // skip '='
-                        let (val, _q) = self.parse_value()?;
-                        self.push_arg(AtArg::Named { key, val })?;
-                        return Ok(());
-                    }
+                // Only a bare identifier can be a named argument. The old
+                // check accepted any letter-initial prefix, so an unquoted
+                // URL or OTA path with a query string
+                // (`AT+HTTPGET=http://x/?q=1`) was split into
+                // `Named { key: "http://x/?q", val: "1" }` and rejected by
+                // the command validator as a malformed argument.
+                let key = &self.line[save..probe];
+                let identifier = key.first().is_some_and(u8::is_ascii_alphabetic)
+                    && key
+                        .iter()
+                        .all(|c| c.is_ascii_alphanumeric() || *c == b'_');
+                if identifier && key.len() <= 32 {
+                    self.pos = probe + 1; // skip '='
+                    let (val, _q) = self.parse_value()?;
+                    self.push_arg(AtArg::Named { key, val })?;
+                    return Ok(());
                 }
                 break;
             }
@@ -839,7 +872,17 @@ impl<'a> Parser<'a> {
 }
 
 fn classify_op(kw: &[u8]) -> Option<(AtOp, AtCommandKind)> {
-    Some(match kw {
+    // ESP-AT command keywords are case-insensitive (`at+cwmode=1` is as valid
+    // as `AT+CWMODE=1`). Only the keyword is folded — the rest of the line
+    // (SSIDs, API keys, JSON payloads) must keep its case.
+    let mut folded = [0u8; MAX_OP_KEYWORD_LEN];
+    if kw.len() > folded.len() {
+        return None;
+    }
+    for (dst, &b) in folded.iter_mut().zip(kw) {
+        *dst = b.to_ascii_uppercase();
+    }
+    Some(match &folded[..kw.len()] {
         b"GMR" => (AtOp::GetVersion, AtCommandKind::Execute),
         b"RST" => (AtOp::Reset, AtCommandKind::Execute),
         b"SYSRAM" => (AtOp::SysRam, AtCommandKind::Query),
@@ -869,6 +912,7 @@ fn classify_op(kw: &[u8]) -> Option<(AtOp, AtCommandKind)> {
         b"HTTPGET" => (AtOp::HttpGet, AtCommandKind::Set),
         b"OTA" => (AtOp::Ota, AtCommandKind::Set),
         b"LLMCFG" => (AtOp::LlmCfg, AtCommandKind::Set),
+        b"AGENTCFG" => (AtOp::AgentCfg, AtCommandKind::Set),
         b"FLIGHTCFG" => (AtOp::FlightCfg, AtCommandKind::Set),
         b"TIME" => (AtOp::Time, AtCommandKind::Query),
         b"NTPSYNC" => (AtOp::NtpSync, AtCommandKind::Execute),
@@ -883,6 +927,16 @@ fn classify_op(kw: &[u8]) -> Option<(AtOp, AtCommandKind)> {
 // Validation helpers — exported so the firmware dispatcher can re-use
 // them after parsing.
 // ---------------------------------------------------------------------------
+
+/// Payload bytes of an argument that carries no key (`Token` or `Quoted`).
+/// Returns `None` for a `Named { key, val }` argument, whose payload is not a
+/// positional value.
+pub fn arg_token<'a>(arg: &AtArg<'a>) -> Option<&'a [u8]> {
+    match arg {
+        AtArg::Token(v) | AtArg::Quoted(v) => Some(*v),
+        AtArg::Named { .. } => None,
+    }
+}
 
 /// Parse a decimal ASCII byte slice into a `u32`, rejecting any
 /// non-digit. Returns `(value, Ok(()) )` on success.
@@ -1343,6 +1397,19 @@ mod tests {
         assert_eq!(cmd.args.len(), 2);
     }
 
+    /// An unquoted URL with a query string must stay one token; the parser
+    /// used to split it at `=` as `Named { key: "http://…?q", val: "1" }`.
+    #[test]
+    fn a_url_query_string_is_not_a_named_argument() {
+        let cmd = parse_line(b"AT+HTTPGET=http://example.com/?q=1").unwrap();
+        assert_eq!(cmd.op, AtOp::HttpGet);
+        assert_eq!(cmd.args.len(), 1);
+        match &cmd.args[0] {
+            AtArg::Token(t) => assert_eq!(*t, b"http://example.com/?q=1"),
+            other => panic!("expected one token, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_named_args() {
         // `+HEAP` doesn't accept args, but parser should still scan the
@@ -1412,6 +1479,68 @@ mod tests {
         let cmd = parse_line(b"AT+LLMCFG=deepseek,sk-abc123").unwrap();
         assert_eq!(cmd.op, AtOp::LlmCfg);
         assert_eq!(cmd.kind, AtCommandKind::Set);
+    }
+
+    /// ESP-AT command keywords are case-insensitive. The parser already folded
+    /// the `AT` prefix; before 2026-11-08 it did not fold the op keyword, so
+    /// `at+gmr` was an unknown command. Arguments must keep their case.
+    #[test]
+    fn op_keywords_are_case_insensitive() {
+        assert_eq!(parse_line(b"at+gmr").unwrap().op, AtOp::GetVersion);
+        assert_eq!(parse_line(b"AT+CwMode=1").unwrap().op, AtOp::CwMode);
+        assert_eq!(parse_line(b"AT+agentcfg?").unwrap().op, AtOp::AgentCfg);
+
+        let cmd = parse_line(b"AT+LLMCFG=DeepSeek,Sk-AbC").unwrap();
+        assert_eq!(arg_token(cmd.arg(0).unwrap()), Some(&b"DeepSeek"[..]));
+        assert_eq!(arg_token(cmd.arg(1).unwrap()), Some(&b"Sk-AbC"[..]));
+    }
+
+    /// ESP-AT's `=?` parameter-discovery form is recognised as `Test`, not as
+    /// a zero-argument `Set` (the two have different dispatcher semantics).
+    #[test]
+    fn parses_the_test_form_distinctly_from_a_set() {
+        let t = parse_line(b"AT+CWMODE=?").unwrap();
+        assert_eq!(t.kind, AtCommandKind::Test);
+        assert_eq!(t.verb, AtVerb::Test);
+        assert!(t.args.is_empty());
+
+        let t = parse_line(b"AT+AGENTCFG=?").unwrap();
+        assert_eq!(t.kind, AtCommandKind::Test);
+        assert!(t.args.is_empty());
+
+        // The neighbouring forms keep their kinds.
+        assert_eq!(
+            parse_line(b"AT+CWMODE=1").unwrap().kind,
+            AtCommandKind::Set
+        );
+        assert_eq!(
+            parse_line(b"AT+CWMODE?").unwrap().kind,
+            AtCommandKind::Query
+        );
+    }
+
+    /// `AT+LUAAPP=+<b64>` is the chunk-append form; the leading `+` must
+    /// survive as part of the token (it is outside URL-safe base64, so it is
+    /// unambiguous).
+    #[test]
+    fn parses_luaapp_append_chunk() {
+        let cmd = parse_line(b"AT+LUAAPP=+Zm9v").unwrap();
+        assert_eq!(cmd.op, AtOp::LuaApp);
+        assert_eq!(cmd.kind, AtCommandKind::Set);
+        assert_eq!(arg_token(cmd.arg(0).unwrap()), Some(&b"+Zm9v"[..]));
+    }
+
+    #[test]
+    fn parses_agentcfg_query_and_set() {
+        let q = parse_line(b"AT+AGENTCFG?").unwrap();
+        assert_eq!(q.op, AtOp::AgentCfg);
+        assert_eq!(q.kind, AtCommandKind::Query);
+
+        // Eight positional fields, matching `validate_agentcfg_set`.
+        let s = parse_line(b"AT+AGENTCFG=node-1,20,524288,10,30,1,10,0").unwrap();
+        assert_eq!(s.op, AtOp::AgentCfg);
+        assert_eq!(s.kind, AtCommandKind::Set);
+        assert_eq!(s.args.len(), 8);
     }
 
     #[test]
@@ -1739,9 +1868,12 @@ mod tests {
     fn classify_op_covers_every_atop_variant() {
         // Regression guard: every non-special `AtOp` variant must be
         // reachable from `classify_op`, with the correct command kind. If a
-        // new variant is added to the enum but not wired into the table, the
-        // distinct-op count drops below 34 and this test fails loudly instead
-        // of silently mis-parsing a command into an unrelated op.
+        // new variant is added to the enum but not wired into the table (or
+        // the table lags the enum, as it did for `OTA`, `FLIGHTCFG` and
+        // `LUAAPP` until 2026-11-08), the distinct-op count no longer matches
+        // the enum and this test fails loudly — a variant silently missing
+        // from the table used to slip through because the count was 32 + the
+        // two parser-special ops.
         let table: &[(&[u8], AtOp, AtCommandKind)] = &[
             (b"GMR", AtOp::GetVersion, AtCommandKind::Execute),
             (b"RST", AtOp::Reset, AtCommandKind::Execute),
@@ -1774,7 +1906,11 @@ mod tests {
                 AtCommandKind::Set,
             ),
             (b"HTTPGET", AtOp::HttpGet, AtCommandKind::Set),
+            (b"OTA", AtOp::Ota, AtCommandKind::Set),
             (b"LLMCFG", AtOp::LlmCfg, AtCommandKind::Set),
+            (b"AGENTCFG", AtOp::AgentCfg, AtCommandKind::Set),
+            (b"FLIGHTCFG", AtOp::FlightCfg, AtCommandKind::Set),
+            (b"LUAAPP", AtOp::LuaApp, AtCommandKind::Set),
             (b"TIME", AtOp::Time, AtCommandKind::Query),
             (b"NTPSYNC", AtOp::NtpSync, AtCommandKind::Execute),
             (b"TIMEZONE", AtOp::Timezone, AtCommandKind::Set),
@@ -1799,8 +1935,8 @@ mod tests {
         seen.dedup();
         assert_eq!(
             seen.len(),
-            34,
-            "all 34 AtOp variants must be distinct and reachable (got {})",
+            38,
+            "all 38 AtOp variants must be distinct and reachable (got {})",
             seen.len()
         );
     }
@@ -2048,5 +2184,66 @@ mod tests {
         for c in &cases {
             let _ = parse_line(c);
         }
+    }
+
+    /// Every op's audit name must be stable and unique: the `[at] op=...`
+    /// log line and `docs/AT_COMMAND_REFERENCE.md` both key off it. `Ping`
+    /// is the one deliberate empty name. This mirrors the integration test
+    /// but runs inside the lib suite so the `name()` match stays covered by
+    /// the `--lib` build.
+    #[test]
+    fn every_op_has_a_stable_audit_name() {
+        assert_eq!(AtOp::Ping.name(), "");
+        let named = [
+            (AtOp::SetEcho { on: true }, "E"),
+            (AtOp::GetVersion, "+GMR"),
+            (AtOp::Reset, "+RST"),
+            (AtOp::SysRam, "+SYSRAM"),
+            (AtOp::SysLog, "+SYSLOG"),
+            (AtOp::SysStore, "+SYSSTORE"),
+            (AtOp::CwMode, "+CWMODE"),
+            (AtOp::CwJap, "+CWJAP"),
+            (AtOp::CwQap, "+CWQAP"),
+            (AtOp::CwLap, "+CWLAP"),
+            (AtOp::CwHostname, "+CWHOSTNAME"),
+            (AtOp::CwAutoconn, "+CWAUTOCONN"),
+            (AtOp::CwReconnCfg, "+CWRECONNCFG"),
+            (AtOp::CwState, "+CWSTATE"),
+            (AtOp::CipStaMac, "+CIPSTAMAC"),
+            (AtOp::MacRand, "+MACRAND"),
+            (AtOp::Heap, "+HEAP"),
+            (AtOp::Uptime, "+UPTIME"),
+            (AtOp::Safemode, "+SAFEMODE"),
+            (AtOp::Ident, "+IDENT"),
+            (AtOp::IdentRot, "+IDENTROT"),
+            (AtOp::Sign, "+SIGN"),
+            (AtOp::Restore, "+RESTORE"),
+            (AtOp::Ifconfig, "+IFCONFIG"),
+            (AtOp::Ping6, "+PING"),
+            (AtOp::Agent, "+AGENT"),
+            (AtOp::WifiPassUpgrade, "+WIFIPASSUPGRADE"),
+            (AtOp::HttpGet, "+HTTPGET"),
+            (AtOp::Ota, "+OTA"),
+            (AtOp::LlmCfg, "+LLMCFG"),
+            (AtOp::AgentCfg, "+AGENTCFG"),
+            (AtOp::FlightCfg, "+FLIGHTCFG"),
+            (AtOp::Time, "+TIME"),
+            (AtOp::NtpSync, "+NTPSYNC"),
+            (AtOp::Timezone, "+TIMEZONE"),
+            (AtOp::Ble, "+BLE"),
+            (AtOp::LuaApp, "+LUAAPP"),
+        ];
+        for (op, expected) in named {
+            assert_eq!(op.name(), expected, "{op:?} name drifted");
+        }
+    }
+
+    #[test]
+    fn scratch_buffer_default_matches_new() {
+        // `Default` is a thin alias for `new()`; both must yield an empty,
+        // usable buffer so a `ScratchBuffer::default()` caller parses fine.
+        let mut s = ScratchBuffer::default();
+        let cmd = s.copy_and_parse(b"AT+GMR").unwrap();
+        assert_eq!(cmd.op, AtOp::GetVersion);
     }
 }

@@ -110,15 +110,23 @@ fn greenhouse_warm_die_drives_fan_from_agent() {
     for _ in 0..5 {
         last = app.tick().unwrap().result;
     }
-    // Mock returns "SET_COOLING_PULSE:60"; the script echoes it back.
+    // The script drives the fan itself and reports state with `COOLING:NN`.
+    // It must NOT also return a recognised action: that made `AppRuntime`
+    // actuate a second time (on the dispatcher's different pin).
     assert!(
-        last.starts_with("SET_COOLING_PULSE:"),
-        "expected SET_COOLING_PULSE:NN, got {last:?}"
+        last.starts_with("COOLING:") || last.is_empty(),
+        "expected a COOLING state report, got {last:?}"
     );
-    let fan = sim.lock().unwrap().pwm_duty(1);
+    let guard = sim.lock().unwrap();
+    let fan = guard.pwm_duty(1);
     assert!(
         fan > 0 && fan <= 80,
         "fan duty must be in (0, SAFE_PWM_MAX=80], got {fan}"
+    );
+    assert_eq!(
+        guard.pwm_duty(2),
+        0,
+        "the script must not also trigger the dispatcher's cooling pin"
     );
 }
 
@@ -426,6 +434,82 @@ fn alarm_normal_hr_stays_in_ok() {
     assert_eq!(t.result, "", "first tick in band must be silent");
     // State advanced to OK → LED on pin 4 is high.
     assert_eq!(sim.lock().unwrap().gpio_read(4).unwrap(), 1);
+}
+
+/// The device can boot while the vital sign is already out of band. The
+/// IDLE state had no else-arm, so it stayed IDLE forever with no alarm.
+#[test]
+fn alarm_boots_out_of_band_and_escalates() {
+    /// Delegates to `SimHardware` but reports a fixed heart rate.
+    struct FixedHr {
+        inner: SimHardware,
+        hr: f64,
+    }
+    impl HardwareBackend for FixedHr {
+        fn gpio_write(&mut self, p: u8, l: u8) -> Result<(), String> {
+            self.inner.gpio_write(p, l)
+        }
+        fn gpio_read(&mut self, p: u8) -> Result<u8, String> {
+            self.inner.gpio_read(p)
+        }
+        fn sensor_read(&mut self, name: &str) -> Result<f64, String> {
+            if name.contains("heart") {
+                Ok(self.hr)
+            } else {
+                self.inner.sensor_read(name)
+            }
+        }
+        fn flash_read(&mut self, a: u32, l: usize) -> Result<Vec<u8>, String> {
+            self.inner.flash_read(a, l)
+        }
+        fn flash_write(&mut self, a: u32, d: &[u8]) -> Result<(), String> {
+            self.inner.flash_write(a, d)
+        }
+        fn flash_erase_sector(&mut self, a: u32) -> Result<(), String> {
+            self.inner.flash_erase_sector(a)
+        }
+        fn i2c_write(&mut self, a: u8, r: u8, d: &[u8]) -> Result<(), String> {
+            self.inner.i2c_write(a, r, d)
+        }
+        fn i2c_read(&mut self, a: u8, r: u8, l: usize) -> Result<Vec<u8>, String> {
+            self.inner.i2c_read(a, r, l)
+        }
+        fn adc_read(&mut self, p: u8) -> Result<f64, String> {
+            self.inner.adc_read(p)
+        }
+        fn pwm_set(&mut self, p: u8, d: u8) -> Result<(), String> {
+            self.inner.pwm_set(p, d)
+        }
+        fn ble_send(&mut self, d: &[u8]) -> Result<(), String> {
+            self.inner.ble_send(d)
+        }
+        fn power_set(&mut self, p: u8) -> Result<(), String> {
+            self.inner.power_set(p)
+        }
+    }
+
+    let sim = Arc::new(Mutex::new(FixedHr {
+        inner: SimHardware::default(),
+        hr: 40.0, // below HR_REST_LOW (50)
+    }));
+    let hw: SharedHardware = sim.clone();
+    let agent = install_mock_agent("OK").expect("mock agent");
+    let vm = make_vm(hw.clone(), agent);
+    let mut app = AppRuntime::new(vm, hw);
+    app.boot(include_str!("../lua/apps/alarm.lua")).expect("boot");
+
+    // The first out-of-band tick must leave IDLE (previously silent forever).
+    let _ = app.tick().unwrap();
+    // Escalate across the INFO window; the LED/buzzer on pin 4 must be
+    // driven (WARN → 50 %, ALARM → 100 %).
+    for _ in 0..6 {
+        let _ = app.tick();
+    }
+    let duty = sim.lock().unwrap().inner.pwm_duty(4);
+    assert!(
+        duty > 0,
+        "an out-of-band boot must escalate to WARN/ALARM (pin 4 duty {duty})"
+    );
 }
 
 /// `on_event("MODE_ACTIVE")` retunes the thresholds; the script must accept

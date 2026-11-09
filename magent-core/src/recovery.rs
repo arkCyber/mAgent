@@ -124,7 +124,10 @@ impl RecoveryManager {
         }
 
         // Exponential backoff: base * 2^(retry_count - 1)
-        let delay = self.backoff_base_ms * (1 << (retry_count - 1));
+        // Use saturating arithmetic to prevent overflow at high retry counts.
+        let shift = (retry_count as u32).saturating_sub(1);
+        let power = 1u32.checked_shl(shift.min(31)).unwrap_or(u32::MAX);
+        let delay = self.backoff_base_ms.saturating_mul(power);
 
         // Cap at 5 seconds
         delay.min(5000)
@@ -645,6 +648,83 @@ mod tests {
             let (result, attempts) = futures::executor::block_on(drive_once(&r, err));
             assert_eq!(attempts, 1, "security timeout must Abort, not Retry");
             assert!(matches!(result, Err(E::OperationTimeout { .. })));
+        }
+
+        #[test]
+        fn crypto_error_is_abort() {
+            // A `CryptoError` (tag mismatch / tampering) is fatal: retrying it
+            // would replay a forged ciphertext against the AEAD.
+            let r = RecoveryManager::with_defaults();
+            let err = E::CryptoError {
+                reason: crate::error::EncryptionError::AuthenticationFailed,
+            };
+            let (result, attempts) = futures::executor::block_on(drive_once(&r, err));
+            assert_eq!(attempts, 1, "CryptoError must Abort, not Retry");
+            // The `clone_error` fallback arm reconstructs it as
+            // `Unknown { code: 0 }`, so assert on that shape.
+            assert!(matches!(result, Err(E::Unknown { code: 0 })));
+        }
+
+        #[test]
+        fn clone_error_fallback_arm_maps_unlisted_variants_to_unknown() {
+            // `clone_error` only reconstructs the handful of variants the
+            // strategy tests exercise; anything else falls through to
+            // `Unknown { code: 0 }`. Pin that so adding a new retryable
+            // variant without a clone arm is a visible test failure rather
+            // than a silent strategy mix-up.
+            let mapped = clone_error(&E::CryptoError {
+                reason: crate::error::EncryptionError::InvalidKey,
+            });
+            assert!(matches!(mapped, E::Unknown { code: 0 }));
+        }
+
+        #[test]
+        fn retryable_error_is_retried_then_gives_up_after_max_retries() {
+            // A `NetworkTimeout` is RetryWithBackoff. With a fresh closure
+            // that always fails, `execute_with_retry` must make exactly
+            // `max_retries + 1` attempts (the initial one plus the retries)
+            // and then return the last error — never loop forever.
+            let r = RecoveryManager::new(2, 10);
+            let attempts = Arc::new(AtomicU32::new(0));
+            let a = attempts.clone();
+            let result = futures::executor::block_on(r.execute_with_retry(move || {
+                let a = a.clone();
+                async move {
+                    a.fetch_add(1, Ordering::SeqCst);
+                    Err::<u8, E>(E::NetworkTimeout {
+                        operation: "test",
+                        duration_ms: 1,
+                    })
+                }
+            }));
+            assert!(result.is_err());
+            assert_eq!(attempts.load(Ordering::SeqCst), 3, "1 initial + 2 retries");
+        }
+
+        #[test]
+        fn retryable_error_that_recovers_on_the_last_attempt_succeeds() {
+            // Succeeds on attempt index 2 (the second retry) with
+            // `max_retries = 2`, exercising the `retry_count += 1` path
+            // twice before the `Ok` return.
+            let r = RecoveryManager::new(2, 10);
+            let attempts = Arc::new(AtomicU32::new(0));
+            let a = attempts.clone();
+            let result = futures::executor::block_on(r.execute_with_retry(move || {
+                let a = a.clone();
+                async move {
+                    let n = a.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        Err(E::NetworkTimeout {
+                            operation: "test",
+                            duration_ms: 1,
+                        })
+                    } else {
+                        Ok::<u8, E>(7)
+                    }
+                }
+            }));
+            assert_eq!(result.ok(), Some(7));
+            assert_eq!(attempts.load(Ordering::SeqCst), 3);
         }
     }
 }

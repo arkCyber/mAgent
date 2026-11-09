@@ -153,6 +153,13 @@ pub enum SealError {
     EmptyKey,
     /// Nonce was empty.
     EmptyNonce,
+    /// Nonce was not exactly [`NONCE_LEN`] bytes.
+    ///
+    /// Opening decodes exactly `2 * NONCE_LEN` nonce hex chars, so a
+    /// non-full-width nonce sealed here could never be opened
+    /// correctly. Reject it at the seal boundary instead of writing an
+    /// unrecoverable value.
+    BadNonceLength,
     /// Stored value's hex decode failed.
     BadHex,
     /// Stored value had wrong length for its declared prefix.
@@ -171,6 +178,7 @@ impl Clone for SealError {
             SealError::PlaintextTooLong => SealError::PlaintextTooLong,
             SealError::EmptyKey => SealError::EmptyKey,
             SealError::EmptyNonce => SealError::EmptyNonce,
+            SealError::BadNonceLength => SealError::BadNonceLength,
             SealError::BadHex => SealError::BadHex,
             SealError::BadLength => SealError::BadLength,
             SealError::BadMac => SealError::BadMac,
@@ -186,6 +194,7 @@ impl core::fmt::Display for SealError {
             SealError::PlaintextTooLong => "plaintext too long",
             SealError::EmptyKey => "empty device key",
             SealError::EmptyNonce => "empty nonce",
+            SealError::BadNonceLength => "nonce is not the required width",
             SealError::BadHex => "bad hex encoding",
             SealError::BadLength => "stored value length mismatch",
             SealError::BadMac => "mac mismatch (tampered or wrong key)",
@@ -300,6 +309,9 @@ pub fn seal_str(
     }
     if nonce.is_empty() {
         return Err(SealError::EmptyNonce);
+    }
+    if nonce.len() != NONCE_LEN {
+        return Err(SealError::BadNonceLength);
     }
     if plain.len() > MAX_PLAINTEXT {
         return Err(SealError::PlaintextTooLong);
@@ -455,6 +467,7 @@ pub fn open_sealed_v2<'a>(
                 wifi_pass_seal::SealError::PlaintextTooLong => SealError::PlaintextTooLong,
                 wifi_pass_seal::SealError::EmptyKey => SealError::EmptyKey,
                 wifi_pass_seal::SealError::EmptyNonce => SealError::EmptyNonce,
+                wifi_pass_seal::SealError::BadNonceLength => SealError::BadNonceLength,
                 wifi_pass_seal::SealError::BadFormat => SealError::BadHex,
                 wifi_pass_seal::SealError::UnknownVersion => SealError::BadPrefix,
                 wifi_pass_seal::SealError::CipherTooShort => SealError::BadLength,
@@ -521,6 +534,9 @@ pub fn seal_secret(
     }
     if nonce.is_empty() {
         return Err(SealError::EmptyNonce);
+    }
+    if nonce.len() != NONCE_LEN {
+        return Err(SealError::BadNonceLength);
     }
     if plain.len() > MAX_SECRET_PLAINTEXT {
         return Err(SealError::PlaintextTooLong);
@@ -918,6 +934,26 @@ mod tests {
         assert_eq!(r, Err(SealError::EmptyNonce));
     }
 
+    /// A non-full-width nonce used to be written into the blob, where
+    /// the opener's fixed `2 * NONCE_LEN` hex window could never read it
+    /// back. Reject it at the seal boundary.
+    #[test]
+    fn seal_rejects_non_full_width_nonce() {
+        let mut sealed: HeaplessString<MAX_ENCODED_LEN> = HeaplessString::new();
+        for len in [1usize, NONCE_LEN - 1, NONCE_LEN + 1] {
+            let nonce = vec![0xABu8; len];
+            assert_eq!(
+                seal_str("anything", TEST_KEY, &nonce, &mut sealed),
+                Err(SealError::BadNonceLength),
+                "len {len}"
+            );
+        }
+        assert_eq!(
+            seal_str("anything", TEST_KEY, &test_nonce(), &mut sealed),
+            Ok(())
+        );
+    }
+
     #[test]
     fn seal_rejects_oversized_plaintext() {
         const BIG: &str = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
@@ -1051,6 +1087,23 @@ mod tests {
         assert_eq!(
             seal_secret(b"x", TEST_KEY, &[], &mut blob),
             Err(SealError::EmptyNonce)
+        );
+    }
+
+    #[test]
+    fn secret_rejects_non_full_width_nonce() {
+        let mut blob: HeaplessString<MAX_SECRET_ENCODED_LEN> = HeaplessString::new();
+        for len in [1usize, NONCE_LEN - 1, NONCE_LEN + 1] {
+            let nonce = vec![0xABu8; len];
+            assert_eq!(
+                seal_secret(b"x", TEST_KEY, &nonce, &mut blob),
+                Err(SealError::BadNonceLength),
+                "len {len}"
+            );
+        }
+        assert_eq!(
+            seal_secret(b"x", TEST_KEY, &test_nonce(), &mut blob),
+            Ok(())
         );
     }
 

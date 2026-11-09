@@ -20,6 +20,12 @@ const MAX_SKILL_DESC: usize = 128;
 /// Maximum skill content length
 const MAX_SKILL_CONTENT: usize = 512;
 
+/// Capacity for the formatted injection string: the content plus the
+/// Markdown header (`# name\n## description\n`). Returning only
+/// `MAX_SKILL_CONTENT` silently truncated the tail of any skill whose
+/// content was near the limit.
+pub const MAX_INJECTION_LEN: usize = MAX_SKILL_CONTENT + MAX_SKILL_NAME + MAX_SKILL_DESC + 8;
+
 /// Skills manager
 pub struct SkillsManager {
     skills: Vec<Skill, MAX_SKILLS>,
@@ -352,7 +358,7 @@ impl Skill {
     }
 
     /// Get skill as formatted string for injection
-    pub fn to_injection_string(&self) -> String<MAX_SKILL_CONTENT> {
+    pub fn to_injection_string(&self) -> String<MAX_INJECTION_LEN> {
         let mut result = String::new();
 
         let _ = writeln!(result, "# {}", self.name);
@@ -592,5 +598,88 @@ mod extra_tests {
         assert!(out.as_str().contains("# read_sensor"));
         assert!(out.as_str().contains("## Read a sensor"));
         assert!(out.as_str().contains("returns temp"));
+    }
+
+    /// A max-length skill must inject its complete content; the header used
+    /// to consume part of a 512-byte return buffer, truncating the tail.
+    #[test]
+    fn to_injection_string_keeps_max_length_content_intact() {
+        let name = "n".repeat(MAX_SKILL_NAME);
+        let description = "d".repeat(MAX_SKILL_DESC);
+        let content = "c".repeat(MAX_SKILL_CONTENT);
+        let s = Skill::new(&name, &description, "device", &content).unwrap();
+        let out = s.to_injection_string();
+        assert!(
+            out.as_str().ends_with(&content),
+            "content tail was truncated (out len {})",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn best_k_handles_empty_registry_and_overlarge_k() {
+        // Empty registry: `k.min(0)` is 0 → an empty result, no panic.
+        let empty = SkillsManager::new(4);
+        assert!(empty.best_k(3).is_empty());
+
+        // k larger than the registry returns every skill (never indexes
+        // past the end).
+        let mut mgr = SkillsManager::new(4);
+        mgr.add(Skill::new("a", "d", "c", "x").unwrap()).unwrap();
+        mgr.add(Skill::new("b", "d", "c", "x").unwrap()).unwrap();
+        let all = mgr.best_k(99);
+        assert_eq!(all.len(), 2);
+        // best_k(0) returns nothing.
+        assert!(mgr.best_k(0).is_empty());
+    }
+
+    #[test]
+    fn best_k_is_stable_for_equal_scores() {
+        // Two skills with identical scores must keep their input order
+        // (the forward-scan partial sort is stable).
+        let mut mgr = SkillsManager::new(4);
+        let mut first = Skill::new("first", "d", "c", "x").unwrap();
+        first.usage_count = 5;
+        first.success_rate = 100; // score 500
+        let mut second = Skill::new("second", "d", "c", "x").unwrap();
+        second.usage_count = 5;
+        second.success_rate = 100; // score 500
+        mgr.add(first).unwrap();
+        mgr.add(second).unwrap();
+        let top = mgr.best_k(2);
+        assert_eq!(top[0].name.as_str(), "first");
+        assert_eq!(top[1].name.as_str(), "second");
+    }
+
+    #[test]
+    fn summary_separates_multiple_categories_with_a_comma() {
+        // With two distinct categories `summary` must emit the comma
+        // separator between the category tuples.
+        let mut mgr = SkillsManager::new(4);
+        mgr.add(Skill::new("a", "x", "device", "x").unwrap())
+            .unwrap();
+        mgr.add(Skill::new("b", "x", "voice", "x").unwrap())
+            .unwrap();
+        let s = mgr.summary();
+        assert!(s.as_str().starts_with("skills=2/"), "got {s}");
+        assert!(s.as_str().contains("device:1"), "got {s}");
+        assert!(s.as_str().contains("voice:1"), "got {s}");
+        assert!(s.as_str().contains(','), "expected a separator in {s}");
+    }
+
+    #[test]
+    fn search_results_are_capped_at_the_registry_capacity() {
+        // `search` pushes into a `Vec<&Skill, MAX_SKILLS>`. With a full
+        // registry every entry matches the empty keyword; the push of the
+        // last one must still succeed (cap == registry size), and the
+        // loop's capacity-failure branch is a safety net.
+        let mut mgr = SkillsManager::new(MAX_SKILLS);
+        for name in [
+            "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9",
+        ] {
+            mgr.add(Skill::new(name, "d", "c", "x").unwrap()).unwrap();
+        }
+        assert_eq!(mgr.count(), MAX_SKILLS);
+        assert_eq!(mgr.search("").len(), MAX_SKILLS);
     }
 }

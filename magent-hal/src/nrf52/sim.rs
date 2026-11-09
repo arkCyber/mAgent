@@ -326,8 +326,12 @@ pub mod simulation {
         /// tick rate this should be called once per millisecond;
         /// every 32 768 ticks roll `seconds` over by one.
         pub fn tick(&self) {
-            let ticks = self.ticks.fetch_add(1, Ordering::SeqCst);
-            if ticks >= 32768 {
+            // `fetch_add` yields the value *before* the increment, so the
+            // 32 768th tick is the one that sees a previous value of 32 767.
+            // The old body compared the pre-increment value against 32 768,
+            // which delayed every rollover by one tick.
+            let previous = self.ticks.fetch_add(1, Ordering::SeqCst);
+            if previous >= 32767 {
                 // 1 second at 32.768kHz
                 self.ticks.store(0, Ordering::SeqCst);
                 self.seconds.fetch_add(1, Ordering::SeqCst);
@@ -443,8 +447,14 @@ pub mod simulation {
 
     impl Trng {
         /// Create a new TRNG seeded with `seed`.
+        ///
+        /// Xorshift64 has a zero fixed point: a state of zero stays zero
+        /// forever, so a `Trng::new(0)` used to return 0 from every call.
+        /// Substitute the golden-ratio constant for that one seed.
         pub fn new(seed: u64) -> Self {
-            Self { state: seed }
+            Self {
+                state: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed },
+            }
         }
 
         /// Generate the next pseudo-random `u32`.
@@ -465,10 +475,18 @@ pub mod simulation {
             ((self.next_u32() as u64) << 32) | (self.next_u32() as u64)
         }
 
-        /// Generate a uniform pseudo-random integer in `min..=max`.
+        /// Generate a pseudo-random integer in `min..=max`.
+        ///
+        /// `min >= max` returns `min` (an empty/inverted range has no
+        /// values to choose from). The span is computed in `u64` so the
+        /// full `0..=u32::MAX` range no longer overflows `max - min + 1`
+        /// and the modulo cannot divide by zero.
         pub fn next_range(&mut self, min: u32, max: u32) -> u32 {
-            let range = max - min + 1;
-            min + (self.next_u32() % range)
+            if min >= max {
+                return min;
+            }
+            let span = u64::from(max - min) + 1;
+            min + (u64::from(self.next_u32()) % span) as u32
         }
     }
 
@@ -555,6 +573,7 @@ pub mod simulation {
             self.temperature_sensor.update();
             self.accelerometer.update();
             self.heart_rate_sensor.update();
+            self.spo2_sensor.update();
             self.step_counter.update(&self.accelerometer);
 
             // Update BLE
@@ -668,10 +687,16 @@ pub mod simulation {
         /// Returns [`HalError::StorageOutOfRange`] if the read would
         /// extend past the end of flash.
         pub fn read(&self, address: usize, buf: &mut [u8]) -> HalResult<()> {
-            if address + buf.len() > self.data.len() {
+            // `checked_add`: `address + buf.len()` wraps for an address near
+            // `usize::MAX`, and the wrapped sum passes the bound check, so the
+            // slice below panicked despite the `Result` return.
+            let Some(end) = address
+                .checked_add(buf.len())
+                .filter(|&end| end <= self.data.len())
+            else {
                 return Err(HalError::StorageOutOfRange);
-            }
-            buf.copy_from_slice(&self.data[address..address + buf.len()]);
+            };
+            buf.copy_from_slice(&self.data[address..end]);
             Ok(())
         }
 
@@ -682,7 +707,10 @@ pub mod simulation {
         /// already-cleared bits is a no-op. Increments the per-sector
         /// write counter used by [`Self::is_sector_worn`].
         pub fn write(&mut self, address: usize, data: &[u8]) -> HalResult<()> {
-            if address + data.len() > self.data.len() {
+            if address
+                .checked_add(data.len())
+                .is_none_or(|end| end > self.data.len())
+            {
                 return Err(HalError::StorageOutOfRange);
             }
 
@@ -703,12 +731,16 @@ pub mod simulation {
         /// Out-of-range sectors return [`HalError::StorageOutOfRange`].
         pub fn erase(&mut self, sector: usize) -> HalResult<()> {
             let sector_size = 4096;
-            let start = sector * sector_size;
+            // `sector * sector_size` wraps for a large `sector`, which would
+            // let an out-of-range sector slip past the bound check below.
+            let Some(start) = sector.checked_mul(sector_size) else {
+                return Err(HalError::StorageOutOfRange);
+            };
             if start >= self.data.len() {
                 return Err(HalError::StorageOutOfRange);
             }
 
-            let end = (start + sector_size).min(self.data.len());
+            let end = start.saturating_add(sector_size).min(self.data.len());
             for i in start..end {
                 self.data[i] = 0xFF;
             }
@@ -1020,7 +1052,10 @@ pub mod simulation {
             // pulse every ~10 ticks to simulate a walking pattern.
             // The pulse is a short-lived spike above 10.5 so the
             // step counter's peak detector can latch onto it.
-            let pulse = if t.fract() < 0.1 || (t as u64).is_multiple_of(10) {
+            // One pulse every 10 ticks. `t.fract()` was always 0 for the
+            // integer iteration counter, so the `fract() < 0.1` arm fired on
+            // every tick and the accelerometer never returned to rest.
+            let pulse = if (t as u64).is_multiple_of(10) {
                 0.95
             } else {
                 0.0
@@ -1180,7 +1215,10 @@ pub mod simulation {
             if z > 9.85 && !self.stride_detected {
                 self.stride_detected = true;
                 self.steps += 1;
-            } else if z < 9.75 {
+            } else if z < 9.9 {
+                // Release threshold must sit *above* the resting value
+                // (9.8 ± 0.01): 9.75 was never crossed, so `stride_detected`
+                // stayed latched and only the first pulse ever counted.
                 self.stride_detected = false;
             }
         }
@@ -1283,11 +1321,41 @@ pub use simulation::*;
 #[cfg(test)]
 mod tests {
     use super::simulation::*;
+    use crate::error::HalError;
 
     #[test]
     fn test_nrf52_simulator_creation() {
         let sim = Nrf52Simulator::new();
         assert_eq!(sim.get_power_mode(), PowerMode::Active);
+    }
+
+    /// Xorshift64 with a zero seed is stuck at zero forever; `Trng::new(0)`
+    /// must substitute a non-zero state.
+    #[test]
+    fn test_trng_zero_seed_is_not_stuck() {
+        let mut trng = Trng::new(0);
+        let a = trng.next_u32();
+        let b = trng.next_u32();
+        assert_ne!(a, 0);
+        assert_ne!(a, b);
+    }
+
+    /// An inverted range used to underflow `max - min + 1` (panic in debug,
+    /// `% 0` in release), and the full `0..=u32::MAX` range overflowed the
+    /// same expression.
+    #[test]
+    fn test_trng_next_range_handles_edge_ranges() {
+        let mut trng = Trng::new(1);
+        assert_eq!(trng.next_range(5, 4), 5, "inverted range returns min");
+        assert_eq!(trng.next_range(7, 7), 7, "single-value range returns it");
+        for _ in 0..1_000 {
+            let v = trng.next_range(0, u32::MAX);
+            let _ = v;
+        }
+        for _ in 0..1_000 {
+            let v = trng.next_range(10, 20);
+            assert!((10..=20).contains(&v));
+        }
     }
 
     #[test]
@@ -1316,6 +1384,19 @@ mod tests {
         assert!(z > 9.0 && z < 11.0);
     }
 
+    /// The synthesized pulse fires every 10 ticks and releases above the
+    /// resting value, so steps must keep accumulating (the old thresholds
+    /// latched after the first pulse, leaving `steps == 1` forever).
+    #[test]
+    fn test_steps_accumulate_over_time() {
+        let mut sim = Nrf52Simulator::new();
+        for _ in 0..1_000 {
+            sim.tick();
+        }
+        let steps = sim.step_counter.read().steps;
+        assert!(steps >= 50, "expected many steps, got {steps}");
+    }
+
     #[test]
     fn test_heart_rate_sensor() {
         let sim = Nrf52Simulator::new();
@@ -1342,6 +1423,34 @@ mod tests {
         sim.flash.read(0, &mut read_buf).unwrap();
 
         assert_eq!(read_buf, test_data);
+    }
+
+    #[test]
+    fn flash_rejects_an_overlarge_address_without_panicking() {
+        // `address + len` wraps for an address near `usize::MAX`, so the bound
+        // check passed on the wrapped sum and the slice that followed panicked
+        // even though the methods return `Result`. `erase` had the same shape
+        // in `sector * sector_size`.
+        let mut sim = Nrf52Simulator::new();
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            sim.flash.read(usize::MAX, &mut buf),
+            Err(HalError::StorageOutOfRange)
+        );
+        assert_eq!(
+            sim.flash.write(usize::MAX, b"hi"),
+            Err(HalError::StorageOutOfRange)
+        );
+        assert_eq!(
+            sim.flash.erase(usize::MAX),
+            Err(HalError::StorageOutOfRange)
+        );
+
+        // The last readable block still reads, so the guard did not become
+        // "reject everything".
+        let near_end = FLASH_SIZE - 4;
+        assert_eq!(sim.flash.read(near_end, &mut buf), Ok(()));
+        assert_eq!(sim.flash.write(near_end, b"ab"), Ok(()));
     }
 
     #[test]
@@ -1416,5 +1525,32 @@ mod tests {
         let val1 = trng.next_u32();
         let val2 = trng.next_u32();
         assert_ne!(val1, val2);
+    }
+
+    #[test]
+    fn rtc_rolls_seconds_over_on_the_32768th_tick() {
+        // A doc-commented "32 768 ticks = 1 second" RTC that rolls over one
+        // tick late reports every second of uptime as the previous one. The
+        // old body compared `fetch_add`'s pre-increment value against 32 768,
+        // so `seconds` only advanced on tick 32 769.
+        let rtc = RtcTime::new();
+
+        for _ in 0..32767 {
+            rtc.tick();
+        }
+        assert_eq!(rtc.get_seconds(), 0, "not yet a full second");
+
+        rtc.tick();
+        assert_eq!(rtc.get_seconds(), 1, "the 32 768th tick completes a second");
+        assert_eq!(
+            rtc.ticks.load(core::sync::atomic::Ordering::SeqCst),
+            0,
+            "sub-second counter reset"
+        );
+
+        for _ in 0..32768 {
+            rtc.tick();
+        }
+        assert_eq!(rtc.get_seconds(), 2);
     }
 }

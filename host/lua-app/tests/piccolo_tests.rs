@@ -116,6 +116,148 @@ fn piccolo_vm_full_hardware_surface() {
     );
 }
 
+/// `^`/`$` used to be consumed and ignored, so an anchored pattern matched
+/// anywhere. Validation scripts that rely on anchors could be bypassed.
+#[test]
+fn piccolo_string_match_honours_anchors() {
+    use magent_lua::hardware::SimHardware;
+    use magent_lua::{install_mock_agent, HardwareBackend, SharedHardware};
+    use std::sync::{Arc, Mutex};
+
+    let sim: Arc<Mutex<SimHardware>> = Arc::new(Mutex::new(SimHardware::default()));
+    let hw: SharedHardware = sim;
+    let agent = install_mock_agent("ok").unwrap();
+    let mut vm = magent_lua::piccolo_vm::PiccoloVm::new(hw, agent);
+
+    vm.run_script(
+        r#"
+        -- Anchored at start: 'abc' is present but not at offset 0.
+        assert(string.match('xabc', '^abc') == nil, '^ must anchor')
+        assert(string.match('abc', '^abc') == 'abc')
+        -- Anchored at end.
+        assert(string.match('abcx', 'abc$') == nil, '$ must anchor')
+        assert(string.match('abc', 'abc$') == 'abc')
+        -- Both, including a capture.
+        assert(string.match('ab', '^(a)b$') == 'a')
+        -- Unanchored matching still scans.
+        assert(string.match('xabc', 'abc') == 'abc')
+        "#,
+    )
+    .unwrap();
+}
+
+/// Integer arguments were truncated with `as u8`, so `gpio_write(256, 1)`
+/// silently drove pin 0 (and `i2c_write(0x148, …)` addressed 0x48) on this
+/// engine while the mlua engine rejected them. Same script must not reach
+/// different hardware depending on the engine.
+#[test]
+fn piccolo_hardware_arguments_are_range_checked() {
+    use magent_lua::hardware::SimHardware;
+    use magent_lua::{install_mock_agent, HardwareBackend, SharedHardware};
+    use std::sync::{Arc, Mutex};
+
+    let sim: Arc<Mutex<SimHardware>> = Arc::new(Mutex::new(SimHardware::default()));
+    let hw: SharedHardware = sim.clone();
+    let agent = install_mock_agent("ok").unwrap();
+    let mut vm = magent_lua::piccolo_vm::PiccoloVm::new(hw, agent);
+
+    for script in [
+        "hardware.gpio_write(256, 1)",
+        "hardware.gpio_write(1, 256)",
+        "hardware.i2c_write(0x148, 0, 'x')",
+        "hardware.flash_write(-1, 'x')",
+        "hardware.flash_read(4294967296, 1)",
+    ] {
+        let err = vm.run_script(script).unwrap_err();
+        assert!(
+            matches!(err, magent_lua::LuaHostError::Lua(_)),
+            "{script}: {err:?}"
+        );
+    }
+
+    // Pin 0 must not have been driven by the rejected first script.
+    assert_eq!(sim.lock().unwrap().gpio_read(0).unwrap(), 0);
+}
+
+/// `PiccoloVm::call` must convert nil/number/boolean like the mlua engine;
+/// demanding a String made `on_tick` (implicit nil) fail every tick.
+#[test]
+fn piccolo_call_converts_non_string_returns() {
+    use magent_lua::hardware::SimHardware;
+    use magent_lua::{install_mock_agent, HardwareBackend, SharedHardware};
+    use std::sync::{Arc, Mutex};
+
+    let sim: Arc<Mutex<SimHardware>> = Arc::new(Mutex::new(SimHardware::default()));
+    let hw: SharedHardware = sim;
+    let agent = install_mock_agent("ok").unwrap();
+    let mut vm = magent_lua::piccolo_vm::PiccoloVm::new(hw, agent);
+    vm.run_script(
+        "function n() end function i() return 42 end \
+         function b() return true end function s() return 'x' end",
+    )
+    .unwrap();
+    assert_eq!(vm.call("n", &[]).unwrap(), "");
+    assert_eq!(vm.call("i", &[]).unwrap(), "42");
+    assert_eq!(vm.call("b", &[]).unwrap(), "true");
+    assert_eq!(vm.call("s", &[]).unwrap(), "x");
+}
+
+/// Engine parity: `i2c_transfer` is now bound here too.
+#[test]
+fn piccolo_exposes_transfer_and_erase() {
+    use magent_lua::hardware::SimHardware;
+    use magent_lua::{install_mock_agent, HardwareBackend, SharedHardware};
+    use std::sync::{Arc, Mutex};
+
+    let sim: Arc<Mutex<SimHardware>> = Arc::new(Mutex::new(SimHardware::default()));
+    let hw: SharedHardware = sim;
+    let agent = install_mock_agent("ok").unwrap();
+    let mut vm = magent_lua::piccolo_vm::PiccoloVm::new(hw, agent);
+    vm.run_script(
+        "hardware.i2c_write(0x48, 0x02, 'CD') \
+         local o = hardware.i2c_transfer(0x48, 0x02, '', 2) \
+         assert(o == 'CD', tostring(o)) \
+         hardware.flash_write(0x200, 'AB') \
+         hardware.flash_erase_sector(0x200)",
+    )
+    .unwrap();
+}
+
+/// Whole-group captures, group quantifiers, escaped `$`, bounded `format`
+/// precision, and a bounded `match` comparison budget.
+#[test]
+fn piccolo_string_patterns_match_the_mlua_semantics() {
+    use magent_lua::hardware::SimHardware;
+    use magent_lua::{install_mock_agent, HardwareBackend, SharedHardware};
+    use std::sync::{Arc, Mutex};
+
+    let sim: Arc<Mutex<SimHardware>> = Arc::new(Mutex::new(SimHardware::default()));
+    let hw: SharedHardware = sim;
+    let agent = install_mock_agent("ok").unwrap();
+    let mut vm = magent_lua::piccolo_vm::PiccoloVm::new(hw, agent);
+    vm.run_script(
+        r#"
+        assert(string.match('ab', '(ab)') == 'ab', 'group span')
+        assert(string.match('abab', '(ab)+') == 'ab', 'group quantifier')
+        assert(string.match('a$b', 'a%$b') == 'a$b', 'escaped dollar')
+        assert(string.match('abcx', 'abc%$') == nil, 'escaped $ is not an anchor')
+        -- Precision is capped, so both render the same number of digits.
+        assert(#string.format('%.50f', 1) == #string.format('%.32f', 1))
+        "#,
+    )
+    .unwrap();
+
+    // Pathological O(n·m) matching is bounded: a 3000-byte literal that only
+    // fails at its final byte forces ~4.5M comparisons across start offsets,
+    // which exceeds the 1M budget and returns nil instead of running for
+    // minutes. (Building the string in Lua would trip the arena limit first.)
+    let big = "a".repeat(3000);
+    vm.run_script(&format!(
+        "assert(string.match('{big}', '{big}' .. 'b') == nil)"
+    ))
+    .unwrap();
+}
+
 /// Boot the exact `DEFAULT_MAIN_LUA` self-test the S3 firmware embeds (see
 /// `firmware/esp32-app/src/lua_task.rs`) through `AppRuntime<PiccoloVm>` +
 /// `SimHardware`. Every wired driver (`sensor_read`, `adc_read`, `pwm_set`,
@@ -316,8 +458,9 @@ fn piccolo_engine_enforces_memory_limit() {
     let agent = install_mock_agent("SET_COOLING").unwrap();
     let mut vm = magent_lua::piccolo_vm::PiccoloVm::new(hw, agent);
 
-    // Grows a table past the 8 MB cap; the memory limit must fire before the
-    // instruction budget (a handful of ops per iteration).
+    // Grows a table past the default 512 KiB arena cap; the memory limit must
+    // fire before the instruction budget (a handful of ops per iteration).
+    // (The N8R8 `s3-8mb-psram` profile raises the cap to 2 MiB.)
     let err = vm
         .run_script("local t={} while #t < 4000000 do t[#t+1]='x' end")
         .unwrap_err();
@@ -370,6 +513,103 @@ fn piccolo_vm_hardware_error_paths() {
         is_lua_err(vm.call("does_not_exist", &[]).unwrap_err()),
         "undefined callable must error"
     );
+}
+
+/// A script-supplied read length must be rejected, not handed to the backend's
+/// allocation. A negative Lua integer wraps to a huge `usize` through the
+/// `as usize` cast in the binding, and the old code passed it straight to
+/// `vec![0u8; len]` / `Vec::with_capacity(len)` — a capacity overflow that
+/// aborts the whole host process instead of returning the error the binding
+/// promises.
+#[test]
+fn piccolo_vm_rejects_an_out_of_range_read_length() {
+    use magent_lua::hardware::SimHardware;
+    use magent_lua::{install_mock_agent, LuaHostError, SharedHardware};
+    use std::sync::{Arc, Mutex};
+
+    let hw: SharedHardware = Arc::new(Mutex::new(SimHardware::default()));
+    let agent = install_mock_agent("SET_COOLING").unwrap();
+    let mut vm = magent_lua::piccolo_vm::PiccoloVm::new(hw, agent);
+
+    for script in [
+        // `-1` becomes `usize::MAX` under the binding's `as usize` cast.
+        "hardware.flash_read(0x100, -1)",
+        "hardware.i2c_read(0x48, 0x10, -1)",
+        // A large positive length would otherwise drive a giant allocation.
+        "hardware.flash_read(0x100, 1000000000)",
+        "hardware.i2c_read(0x48, 0x10, 1000000000)",
+    ] {
+        let err = vm
+            .run_script(script)
+            .expect_err("an out-of-range read length must be an error");
+        assert!(
+            matches!(err, LuaHostError::Lua(_) | LuaHostError::Hardware(_)),
+            "{script} should surface as a Lua/hardware error, got {err:?}"
+        );
+    }
+
+    // In-range reads still work (the bound must not break normal use).
+    vm.run_script(
+        "hardware.flash_write(0x100, 'HELLO') \
+         assert(hardware.flash_read(0x100, 5) == 'HELLO', 'flash roundtrip') \
+         hardware.i2c_write(0x48, 0x10, 'AB') \
+         assert(hardware.i2c_read(0x48, 0x10, 2) == 'AB', 'i2c roundtrip')",
+    )
+    .unwrap();
+}
+
+/// The I2C register file is addressed with an 8-bit offset, so the backend
+/// computes each register as `reg.wrapping_add(off as u8)`. A payload longer
+/// than 256 bytes therefore folds back onto registers it already wrote: the
+/// script is told the write succeeded while the simulator state is silently
+/// corrupted. The `mlua` engine rejects oversized payloads in its own binding;
+/// the `piccolo` engine (what the ESP32-S3 runs) had no bound at all.
+#[test]
+fn piccolo_vm_rejects_an_oversized_i2c_write() {
+    use magent_lua::hardware::SimHardware;
+    use magent_lua::{install_mock_agent, SharedHardware};
+    use std::sync::{Arc, Mutex};
+    let hw: SharedHardware = Arc::new(Mutex::new(SimHardware::default()));
+    let agent = install_mock_agent("SET_COOLING").unwrap();
+    let mut vm = magent_lua::piccolo_vm::PiccoloVm::new(hw, agent);
+
+    // 300 bytes: offsets 256.. wrap onto 0.. and clobber the first 44 bytes.
+    let big: String = std::iter::repeat_n('x', 300).collect();
+    vm.run_script(&format!("hardware.i2c_write(0x48, 0x10, '{big}')"))
+        .expect_err("an oversized i2c payload must be an error");
+
+    // A payload at the bound is still accepted.
+    let ok: String = std::iter::repeat_n('x', 256).collect();
+    vm.run_script(&format!(
+        "hardware.i2c_write(0x48, 0x10, '{ok}') \
+         assert(#hardware.i2c_read(0x48, 0x10, 256) == 256, 'i2c roundtrip')"
+    ))
+    .unwrap();
+}
+
+/// `string.match` is a hand-written shim whose docs promise `nil` for any
+/// pattern it does not support. A pattern that ends in an unterminated `(` is
+/// unsupported (real Lua raises "unfinished capture"), but the shim computed
+/// the capture body as `&pat[group_start..i - 1]` — for `(` at the end of the
+/// pattern `i - 1` lands *before* `group_start`, and the reversed slice panics
+/// the whole VM.
+#[test]
+fn piccolo_string_match_tolerates_an_unterminated_capture() {
+    use magent_lua::hardware::SimHardware;
+    use magent_lua::{install_mock_agent, SharedHardware};
+    use std::sync::{Arc, Mutex};
+
+    let hw: SharedHardware = Arc::new(Mutex::new(SimHardware::default()));
+    let agent = install_mock_agent("SET_COOLING").unwrap();
+    let mut vm = magent_lua::piccolo_vm::PiccoloVm::new(hw, agent);
+
+    vm.run_script(
+        "assert(string.match('abc', '(') == nil, 'trailing open paren') \
+         assert(string.match('abc', 'ab(') == nil, 'open paren after a prefix') \
+         assert(string.match('abc', '(a(b') == nil, 'unbalanced nested group') \
+         assert(string.match('abc', '(b)') == 'b', 'a closed capture still works')",
+    )
+    .unwrap();
 }
 
 /// A poisoned `SharedHardware` lock (e.g. a panic while a callback held the

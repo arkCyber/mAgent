@@ -168,6 +168,21 @@ impl MockExecutor {
         }
     }
 
+    /// Stub several tools at once. The multi-step planner routes call more
+    /// than one tool, so a runner whose executor only knows the first tool
+    /// fails partway through.
+    fn with_responses(pairs: &[(&str, &str)]) -> Self {
+        let r = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Self {
+            calls: Mutex::new(Vec::new()),
+            responses: Mutex::new(r),
+            errors: Mutex::new(HashMap::new()),
+        }
+    }
+
     fn with_error(tool: &str, err: &str) -> Self {
         let mut e = HashMap::new();
         e.insert(tool.to_string(), err.to_string());
@@ -515,7 +530,10 @@ fn sim_led_on_off() {
 
 #[test]
 fn sim_environmental_monitoring_runs_full_chain() {
-    let exec = MockExecutor::with_response("read_sensor", "20.0");
+    // The chain ends in a `ble_send`, so that tool must be stubbed too — an
+    // unstubbed step errors, and the runner now reports the failure rather
+    // than the completion text.
+    let exec = MockExecutor::with_responses(&[("read_sensor", "20.0"), ("ble_send", "sent")]);
     let mut runner = silent_runner(exec);
     let result = runner.run("Monitor the environment").unwrap();
     assert!(
@@ -524,6 +542,28 @@ fn sim_environmental_monitoring_runs_full_chain() {
         runner.tool_call_count()
     );
     assert!(result.contains("monitoring"));
+}
+
+#[test]
+fn sim_a_failing_step_in_a_chain_is_reported_not_glossed_over() {
+    // Same chain, but the BLE step genuinely fails. The old planner still
+    // answered "Environmental monitoring complete", which is the fabricated
+    // success this guards against.
+    let exec = MockExecutor::with_responses(&[("read_sensor", "20.0")]);
+    exec.errors
+        .lock()
+        .unwrap()
+        .insert("ble_send".to_string(), "no peer".to_string());
+    let mut runner = silent_runner(exec);
+    let result = runner.run("Monitor the environment").unwrap();
+    assert!(
+        result.contains("did not complete") && result.contains("no peer"),
+        "a failed step must be reported with its reason, got {result:?}"
+    );
+    assert!(
+        !result.contains("monitoring complete"),
+        "the failure must not be reworded into success, got {result:?}"
+    );
 }
 
 #[test]
@@ -539,7 +579,7 @@ fn sim_flash_log_includes_ble() {
 
 #[test]
 fn sim_temperature_with_fan_control() {
-    let exec = MockExecutor::with_response("read_sensor", "35.0");
+    let exec = MockExecutor::with_responses(&[("read_sensor", "35.0"), ("write_gpio", "gpio set")]);
     let mut runner = silent_runner(exec);
     let result = runner
         .run("Check temperature and turn on fan if above 25C")

@@ -24,6 +24,27 @@ pub const MAX_ALERT_HISTORY: usize = 50;
 /// Maximum emergency contacts
 pub const MAX_EMERGENCY_CONTACTS: usize = 5;
 
+/// Whether a cooldown that started at `last` has elapsed by `now`.
+///
+/// `last == None` means **nothing has been raised yet**, which always counts
+/// as elapsed. The three `last_*_ms` fields used to be plain `u32`s starting
+/// at `0`, so the cooldown test read "never raised" as "raised at t=0" and
+/// suppressed the first alert of a device's life: no glucose alert in the
+/// first 5 minutes of uptime, no ECG alert in the first minute, no emergency
+/// in the first 30 — the exact readings a freshly booted health monitor exists
+/// to report.
+///
+/// A `now` *before* `last` is a clock that stepped backwards (an NTP
+/// correction, a `u32` millisecond counter wrapping after ~49 days); the
+/// saturating subtraction reports no elapsed time, which suppresses a
+/// duplicate rather than firing one.
+fn cooldown_elapsed(last: Option<u32>, now: u32, cooldown_ms: u32) -> bool {
+    match last {
+        None => true,
+        Some(last) => now.saturating_sub(last) >= cooldown_ms,
+    }
+}
+
 /// Alert severity level
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AlertSeverity {
@@ -142,6 +163,31 @@ impl HealthAlert {
     pub fn mark_emergency_notified(&mut self) {
         self.emergency_contacted = true;
     }
+}
+
+/// A raised emergency notification, waiting for a host to deliver it.
+///
+/// `magent-core` has no radio and no SMS stack, so the emergency protocol
+/// cannot put this on the wire itself. What it *can* do — and previously did
+/// not — is decide what to send and to whom, and hand that to the layer that
+/// has the transport: the ESP32's AT surface, the host web admin, or an app
+/// through the Lua bridge. Before this existed, a Critical alert ran a
+/// cooldown check and returned, so the alert reached no one and the caller
+/// could not tell a handled emergency from an ignored one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmergencyNotification {
+    /// ID of the alert that raised this notification.
+    pub alert_id: u32,
+    /// Message body, ready to send (see
+    /// [`EarlyWarningSystem::generate_emergency_message`]).
+    pub message: String<512>,
+    /// Name of the highest-priority SMS-capable contact, if one is
+    /// configured.
+    pub contact_name: String<64>,
+    /// Phone number of that contact.
+    pub contact_phone: String<32>,
+    /// Timestamp the notification was raised at.
+    pub timestamp: u32,
 }
 
 /// Emergency contact
@@ -407,22 +453,26 @@ pub struct EarlyWarningSystem {
     next_alert_id: u32,
     /// Glucose reading count
     glucose_reading_count: u32,
-    /// Last glucose trend alert
-    last_glucose_alert_ms: u32,
+    /// Last glucose trend alert, or `None` if none has been raised. `None` is
+    /// *never raised*, not *raised at t=0* — see [`cooldown_elapsed`].
+    last_glucose_alert_ms: Option<u32>,
     /// Cooldown between glucose alerts (ms)
     glucose_alert_cooldown_ms: u32,
-    /// Last ECG alert
-    last_ecg_alert_ms: u32,
+    /// Last ECG alert, or `None` if none has been raised.
+    last_ecg_alert_ms: Option<u32>,
     /// Cooldown between ECG alerts (ms)
     ecg_alert_cooldown_ms: u32,
     /// Consecutive low glucose count
     consecutive_low_count: u8,
     /// Consecutive high glucose count
     consecutive_high_count: u8,
-    /// Last notification time for emergency
-    last_emergency_notification_ms: u32,
+    /// Last notification time for emergency, or `None` if none has been
+    /// raised.
+    last_emergency_notification_ms: Option<u32>,
     /// Cooldown for emergency notifications (ms) - 30 minutes
     emergency_cooldown_ms: u32,
+    /// Most recent emergency notification awaiting delivery by the host.
+    pending_emergency: Option<EmergencyNotification>,
 }
 
 impl EarlyWarningSystem {
@@ -434,14 +484,15 @@ impl EarlyWarningSystem {
             hospitals: Vec::new(),
             next_alert_id: 1,
             glucose_reading_count: 0,
-            last_glucose_alert_ms: 0,
+            last_glucose_alert_ms: None,
             glucose_alert_cooldown_ms: 300_000, // 5 minutes
-            last_ecg_alert_ms: 0,
+            last_ecg_alert_ms: None,
             ecg_alert_cooldown_ms: 60_000, // 1 minute
             consecutive_low_count: 0,
             consecutive_high_count: 0,
-            last_emergency_notification_ms: 0,
+            last_emergency_notification_ms: None,
             emergency_cooldown_ms: 1_800_000, // 30 minutes
+            pending_emergency: None,
         }
     }
 
@@ -524,11 +575,11 @@ impl EarlyWarningSystem {
         // Track consecutive readings
         match status {
             GlucoseStatus::Low => {
-                self.consecutive_low_count += 1;
+                self.consecutive_low_count = self.consecutive_low_count.saturating_add(1);
                 self.consecutive_high_count = 0;
             }
             GlucoseStatus::High | GlucoseStatus::Elevated => {
-                self.consecutive_high_count += 1;
+                self.consecutive_high_count = self.consecutive_high_count.saturating_add(1);
                 self.consecutive_low_count = 0;
             }
             GlucoseStatus::Normal => {
@@ -617,12 +668,16 @@ impl EarlyWarningSystem {
         };
 
         // Check cooldown
-        if current_time_ms - self.last_glucose_alert_ms < self.glucose_alert_cooldown_ms {
+        if !cooldown_elapsed(
+            self.last_glucose_alert_ms,
+            current_time_ms,
+            self.glucose_alert_cooldown_ms,
+        ) {
             return None;
         }
 
         // Create alert
-        let alert = HealthAlert::new(
+        let mut alert = HealthAlert::new(
             self.next_alert_id,
             alert_type,
             severity,
@@ -633,16 +688,19 @@ impl EarlyWarningSystem {
             current_time_ms,
         );
 
-        self.next_alert_id += 1;
-        self.last_glucose_alert_ms = current_time_ms;
+        self.next_alert_id = self.next_alert_id.wrapping_add(1);
+        self.last_glucose_alert_ms = Some(current_time_ms);
+
+        // Raise the emergency protocol *before* recording the alert, so the
+        // history copy carries the same `emergency_contacted` flag the caller
+        // receives. The cloned-then-triggered order left the recorded alert
+        // permanently false — the two views of the same alert disagreed.
+        if severity.requires_emergency() {
+            self.trigger_emergency_protocol(&mut alert, current_time_ms);
+        }
 
         // Add to history
         let _ = self.alert_history.push(alert.clone());
-
-        // Trigger emergency protocol for critical alerts
-        if severity.requires_emergency() {
-            self.trigger_emergency_protocol(&alert, current_time_ms);
-        }
 
         Some(alert)
     }
@@ -708,7 +766,11 @@ impl EarlyWarningSystem {
         }
 
         // Check cooldown
-        if current_time_ms - self.last_ecg_alert_ms < self.ecg_alert_cooldown_ms {
+        if !cooldown_elapsed(
+            self.last_ecg_alert_ms,
+            current_time_ms,
+            self.ecg_alert_cooldown_ms,
+        ) {
             return None;
         }
 
@@ -730,7 +792,7 @@ impl EarlyWarningSystem {
             ),
         };
 
-        let alert = HealthAlert::new(
+        let mut alert = HealthAlert::new(
             self.next_alert_id,
             alert_type,
             analysis.risk_level,
@@ -741,14 +803,14 @@ impl EarlyWarningSystem {
             current_time_ms,
         );
 
-        self.next_alert_id += 1;
-        self.last_ecg_alert_ms = current_time_ms;
-
-        let _ = self.alert_history.push(alert.clone());
+        self.next_alert_id = self.next_alert_id.wrapping_add(1);
+        self.last_ecg_alert_ms = Some(current_time_ms);
 
         if analysis.risk_level == AlertSeverity::Critical {
-            self.trigger_emergency_protocol(&alert, current_time_ms);
+            self.trigger_emergency_protocol(&mut alert, current_time_ms);
         }
+
+        let _ = self.alert_history.push(alert.clone());
 
         Some((alert, analysis))
     }
@@ -785,7 +847,7 @@ impl EarlyWarningSystem {
             return None;
         };
 
-        let alert = HealthAlert::new(
+        let mut alert = HealthAlert::new(
             self.next_alert_id,
             alert_type,
             severity,
@@ -796,13 +858,13 @@ impl EarlyWarningSystem {
             current_time_ms,
         );
 
-        self.next_alert_id += 1;
-
-        let _ = self.alert_history.push(alert.clone());
+        self.next_alert_id = self.next_alert_id.wrapping_add(1);
 
         if severity.requires_emergency() {
-            self.trigger_emergency_protocol(&alert, current_time_ms);
+            self.trigger_emergency_protocol(&mut alert, current_time_ms);
         }
+
+        let _ = self.alert_history.push(alert.clone());
 
         Some(alert)
     }
@@ -868,23 +930,107 @@ impl EarlyWarningSystem {
         })
     }
 
-    /// Trigger emergency protocol
-    fn trigger_emergency_protocol(&mut self, _alert: &HealthAlert, current_time_ms: u32) {
-        // Check cooldown
-        if current_time_ms - self.last_emergency_notification_ms < self.emergency_cooldown_ms {
-            return;
+    /// Raise the emergency protocol for a critical `alert`.
+    ///
+    /// Returns `true` when a notification was raised, `false` when the
+    /// cooldown suppressed it. On `true` the alert is marked
+    /// `emergency_contacted` and the notification is left in
+    /// [`Self::pending_emergency_notification`] for the host to deliver.
+    ///
+    /// The protocol's job here is *deciding*: which contact, and what message.
+    /// Delivery belongs to the layer that owns a transport — `magent-core`
+    /// under `no_std` has neither radio nor SMS, so pretending to send would
+    /// leave the caller unable to tell a handled emergency from an ignored
+    /// one. What it must not do is return silently, which is what it did
+    /// before: no message was built (`generate_emergency_message` was
+    /// unreachable from here), no state changed, and the alert went out with
+    /// `emergency_contacted: false`.
+    fn trigger_emergency_protocol(
+        &mut self,
+        alert: &mut HealthAlert,
+        current_time_ms: u32,
+    ) -> bool {
+        // Nothing has been raised yet → this is the first, and a cooldown that
+        // exists to rate-limit repeats must not suppress it. `cooldown_elapsed`
+        // also handles the backwards-timestamp case: the previous subtraction
+        // panicked in debug and wrapped in release, which would have read a
+        // wrapped value as "well past the cooldown" and fired.
+        if !cooldown_elapsed(
+            self.last_emergency_notification_ms,
+            current_time_ms,
+            self.emergency_cooldown_ms,
+        ) {
+            return false;
         }
+        self.last_emergency_notification_ms = Some(current_time_ms);
 
-        self.last_emergency_notification_ms = current_time_ms;
+        // Highest-priority contact that can actually receive an alert.
+        // `add_emergency_contact` keeps the list sorted by priority, so the
+        // first SMS-capable entry is the one to notify.
+        let primary = self.emergency_contacts.iter().find(|c| c.sms_enabled);
+        let contact_name = primary.map(|c| c.name.clone()).unwrap_or_default();
+        let contact_phone = primary.map(|c| c.phone.clone()).unwrap_or_default();
 
-        // In real implementation, this would:
-        // 1. Send SMS to emergency contacts
-        // 2. Call emergency services if needed
-        // 3. Provide location to emergency responders
-        // 4. Send alert to cloud monitoring service
+        let notification = EmergencyNotification {
+            alert_id: alert.id,
+            message: self.generate_emergency_message(alert),
+            contact_name,
+            contact_phone,
+            timestamp: current_time_ms,
+        };
 
-        // Mark alert as emergency contacted
-        // (In real implementation, this would be updated after actual contact)
+        alert.mark_emergency_notified();
+        self.pending_emergency = Some(notification);
+        true
+    }
+
+    /// Queue a notification the caller has already decided to send — a named
+    /// contact and a message that did **not** come from a threshold crossing.
+    ///
+    /// It shares the awaiting-delivery slot with the alert-driven protocol
+    /// ([`Self::trigger_emergency_protocol`]), because "a message that must
+    /// reach this contact" is the same thing to the layer that owns a
+    /// transport. Two differences are deliberate:
+    /// - **No cooldown.** The 30-minute window exists to rate-limit *repeated*
+    ///   alerts from a sensor that keeps reading badly. A user asking to reach
+    ///   their contact is a one-off decision, and suppressing it would be the
+    ///   device silently ignoring a request.
+    /// - **`alert_id` is 0**, meaning "not raised by an alert". Reusing
+    ///   `next_alert_id` would invent an alert that never happened.
+    ///
+    /// `magent-core` has no radio or SMS stack, so this is a decision, not a
+    /// send; the caller drains it with [`Self::take_emergency_notification`]
+    /// once it has put the message on the wire.
+    pub fn queue_notification(
+        &mut self,
+        contact: &EmergencyContact,
+        message: &str,
+        timestamp: u32,
+    ) -> EmergencyNotification {
+        let notification = EmergencyNotification {
+            alert_id: 0,
+            message: try_heapless::<512>(message),
+            contact_name: contact.name.clone(),
+            contact_phone: contact.phone.clone(),
+            timestamp,
+        };
+        self.pending_emergency = Some(notification.clone());
+        notification
+    }
+
+    /// The most recent emergency notification, if one is awaiting delivery.
+    ///
+    /// Paired with [`Self::take_emergency_notification`], which drains it.
+    pub fn pending_emergency_notification(&self) -> Option<&EmergencyNotification> {
+        self.pending_emergency.as_ref()
+    }
+
+    /// Take the pending emergency notification, clearing it.
+    ///
+    /// Call this once the host has put the notification on the wire, so the
+    /// next critical alert produces a fresh one.
+    pub fn take_emergency_notification(&mut self) -> Option<EmergencyNotification> {
+        self.pending_emergency.take()
     }
 
     /// Acknowledge alert
@@ -896,12 +1042,20 @@ impl EarlyWarningSystem {
         false
     }
 
-    /// Get unacknowledged alerts
+    /// Get unacknowledged alerts (at most the return buffer's 16).
+    ///
+    /// The history holds up to 50 alerts, so `collect()` into a `Vec<_, 16>`
+    /// panicked (`Vec::from_iter overflow`) once 17 unacknowledged alerts
+    /// existed — reachable with 17 abnormal heart-rate samples. Push
+    /// explicitly and stop at capacity instead.
     pub fn unacknowledged_alerts(&self) -> Vec<&HealthAlert, 16> {
-        self.alert_history
-            .iter()
-            .filter(|a| !a.acknowledged)
-            .collect()
+        let mut out = Vec::new();
+        for alert in self.alert_history.iter().filter(|a| !a.acknowledged) {
+            if out.push(alert).is_err() {
+                break;
+            }
+        }
+        out
     }
 
     /// Get alert history
@@ -909,12 +1063,22 @@ impl EarlyWarningSystem {
         &self.alert_history
     }
 
-    /// Get critical alerts
+    /// Get critical alerts (at most the return buffer's 8).
+    ///
+    /// Same overflow hazard as [`Self::unacknowledged_alerts`]: the history
+    /// can hold more than the return capacity.
     pub fn critical_alerts(&self) -> Vec<&HealthAlert, 8> {
-        self.alert_history
+        let mut out = Vec::new();
+        for alert in self
+            .alert_history
             .iter()
             .filter(|a| a.severity >= AlertSeverity::High && !a.acknowledged)
-            .collect()
+        {
+            if out.push(alert).is_err() {
+                break;
+            }
+        }
+        out
     }
 
     /// Generate emergency notification message
@@ -951,13 +1115,6 @@ impl EarlyWarningSystem {
 impl Default for EarlyWarningSystem {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// Implement Write for String
-impl core::fmt::Write for EarlyWarningSystem {
-    fn write_str(&mut self, _s: &str) -> core::fmt::Result {
-        Ok(())
     }
 }
 
@@ -1264,7 +1421,21 @@ mod tests {
 #[cfg(test)]
 mod extra_tests {
     use super::*;
-    use crate::health_sensors::{GlucoseData, UserProfile};
+    use crate::health_sensors::{EcgData, GlucoseData, HeartRateData, UserProfile};
+
+    fn mgr() -> EarlyWarningSystem {
+        EarlyWarningSystem::new()
+    }
+
+    fn ecg(hr: u16, rhythm: HeartRhythm, ts: u32) -> EcgData {
+        EcgData {
+            hr,
+            rhythm,
+            rr_interval: 800.0,
+            quality: 90,
+            timestamp: ts,
+        }
+    }
 
     #[test]
     fn alert_severity_names_and_emergency() {
@@ -1442,5 +1613,378 @@ mod extra_tests {
             .unwrap();
         let msg = s.generate_emergency_message(&alert);
         assert!(!msg.as_str().contains("最近医院"));
+    }
+
+    /// The emergency protocol was a no-op: it checked a cooldown, stored the
+    /// timestamp and returned. `generate_emergency_message` was never reached
+    /// from it, nothing was recorded, and the alert went out with
+    /// `emergency_contacted: false` — so a Critical reading reached nobody and
+    /// the caller could not tell a handled emergency from an ignored one.
+    #[test]
+    fn emergency_protocol_raises_a_notification_and_marks_the_alert() {
+        let mut m = EarlyWarningSystem::new();
+        m.add_emergency_contact(EmergencyContact::new("Son", "111", "family", 1))
+            .unwrap();
+        // Priority 0 outranks the above, so this is the one to notify.
+        m.add_emergency_contact(EmergencyContact::new("Doctor", "222", "physician", 0))
+            .unwrap();
+        m.add_hospital(Hospital::new("St Mary", "1 Road", "120"))
+            .unwrap();
+
+        // 50 mg/dL < 54 → Critical, and past the 30-minute emergency cooldown
+        // (which is measured from boot, so a small timestamp is suppressed).
+        let alert = m
+            .process_glucose(
+                &GlucoseData::new(50.0, -1, 1_800_000),
+                &UserProfile::default(),
+                1_800_000,
+            )
+            .expect("alert");
+
+        assert!(
+            alert.emergency_contacted,
+            "the caller's alert must record the emergency"
+        );
+        // The recorded copy has to agree with the returned one — the old
+        // clone-then-trigger order left the history entry permanently false.
+        let recorded = m.alert_history().last().expect("recorded");
+        assert_eq!(recorded.id, alert.id);
+        assert!(recorded.emergency_contacted, "history must agree");
+
+        let n = m.pending_emergency_notification().expect("a notification");
+        assert_eq!(n.alert_id, alert.id);
+        assert_eq!(n.timestamp, 1_800_000);
+        assert_eq!(n.contact_name.as_str(), "Doctor");
+        assert_eq!(n.contact_phone.as_str(), "222");
+        // The message the module already knew how to build, hospital included.
+        assert!(n.message.contains("低血糖警告"), "got {}", n.message);
+        assert!(n.message.contains("St Mary"), "got {}", n.message);
+    }
+
+    #[test]
+    fn a_second_critical_alert_inside_the_cooldown_is_not_re_raised() {
+        let mut m = EarlyWarningSystem::new();
+        m.add_emergency_contact(EmergencyContact::new("Son", "111", "family", 1))
+            .unwrap();
+        let first = m
+            .process_glucose(
+                &GlucoseData::new(50.0, -1, 1_800_000),
+                &UserProfile::default(),
+                1_800_000,
+            )
+            .unwrap();
+        assert!(first.emergency_contacted);
+        let (id0, ts0) = {
+            let n = m.pending_emergency_notification().unwrap();
+            (n.alert_id, n.timestamp)
+        };
+
+        // Ten minutes later: past the 5-minute *glucose* cooldown but well
+        // inside the 30-minute emergency one.
+        let second = m
+            .process_glucose(
+                &GlucoseData::new(45.0, -1, 2_400_000),
+                &UserProfile::default(),
+                2_400_000,
+            )
+            .unwrap();
+        assert!(
+            !second.emergency_contacted,
+            "inside the emergency cooldown, nobody was contacted"
+        );
+        let n = m.pending_emergency_notification().expect("still pending");
+        assert_eq!(n.alert_id, id0, "the cooldown must not re-raise");
+        assert_eq!(n.timestamp, ts0);
+    }
+
+    /// A clock that steps backwards (an NTP correction, a 32-bit `u32` ms
+    /// counter wrapping after ~49 days) used to underflow the cooldown
+    /// subtraction — a debug panic, and in release a wrapped value that read
+    /// as "well past the cooldown" and fired a duplicate alert. Either way the
+    /// reading is now suppressed, which is the safe outcome for a duplicate.
+    #[test]
+    fn a_backwards_timestamp_neither_panics_nor_re_raises() {
+        let mut m = EarlyWarningSystem::new();
+        m.add_emergency_contact(EmergencyContact::new("Son", "111", "family", 1))
+            .unwrap();
+        let first = m
+            .process_glucose(
+                &GlucoseData::new(50.0, -1, 1_800_000),
+                &UserProfile::default(),
+                1_800_000,
+            )
+            .unwrap();
+        assert!(first.emergency_contacted);
+        let (id0, ts0) = {
+            let n = m.pending_emergency_notification().unwrap();
+            (n.alert_id, n.timestamp)
+        };
+
+        // The clock jumps back to the start of the epoch. No panic, no second
+        // alert, and the notification already pending is left alone.
+        let second = m.process_glucose(
+            &GlucoseData::new(50.0, -1, 500),
+            &UserProfile::default(),
+            500,
+        );
+        assert!(second.is_none(), "a backwards clock must not re-alert");
+        let n = m.pending_emergency_notification().expect("unchanged");
+        assert_eq!(n.alert_id, id0);
+        assert_eq!(n.timestamp, ts0);
+    }
+
+    #[test]
+    fn a_non_critical_alert_raises_no_emergency() {
+        let mut m = EarlyWarningSystem::new();
+        // 65 mg/dL → Medium, not Critical.
+        let alert = m
+            .process_glucose(
+                &GlucoseData::new(65.0, 0, 1_800_000),
+                &UserProfile::default(),
+                1_800_000,
+            )
+            .expect("alert");
+        assert_eq!(alert.severity, AlertSeverity::Medium);
+        assert!(!alert.emergency_contacted);
+        assert!(m.pending_emergency_notification().is_none());
+    }
+
+    #[test]
+    fn taking_the_notification_drains_it() {
+        let mut m = EarlyWarningSystem::new();
+        let alert = m
+            .process_glucose(
+                &GlucoseData::new(50.0, -1, 1_800_000),
+                &UserProfile::default(),
+                1_800_000,
+            )
+            .unwrap();
+        let taken = m.take_emergency_notification().expect("one to take");
+        assert_eq!(taken.alert_id, alert.id);
+        assert!(m.pending_emergency_notification().is_none());
+        assert!(m.take_emergency_notification().is_none(), "only once");
+    }
+
+    /// With no contacts configured the protocol still records *what* happened
+    /// — the message and the hospital — rather than dropping the alert.
+    #[test]
+    fn an_emergency_with_no_contacts_still_records_the_message() {
+        let mut m = EarlyWarningSystem::new();
+        assert!(m.emergency_contacts().is_empty());
+        let alert = m
+            .process_glucose(
+                &GlucoseData::new(50.0, -1, 1_800_000),
+                &UserProfile::default(),
+                1_800_000,
+            )
+            .unwrap();
+        assert!(alert.emergency_contacted);
+        let n = m.pending_emergency_notification().expect("a notification");
+        assert!(n.contact_name.is_empty());
+        assert!(n.contact_phone.is_empty());
+        assert!(n.message.contains("低血糖警告"));
+    }
+
+    /// A device's **first** alert must not be suppressed by a cooldown that
+    /// exists to rate-limit the second one. The `last_*_ms` fields start at
+    /// `0`, and the cooldown test read that as "last raised at t=0" rather than
+    /// "never raised" — so on a freshly booted device no glucose alert could
+    /// fire in its first 5 minutes of uptime, no ECG alert in the first minute,
+    /// and no emergency in the first *30*. A health monitor that cannot report
+    /// the emergency at the moment it matters is the whole feature missing.
+    ///
+    /// The pre-existing tests all used timestamps past the cooldown
+    /// (`300_001`, `400_000`, `1_800_000`) — one comment even records the
+    /// workaround — so nothing ever exercised the boot window.
+    #[test]
+    fn the_first_glucose_alert_is_not_swallowed_by_the_cooldown() {
+        let mut m = EarlyWarningSystem::new();
+        // One second of uptime, and a critically low reading.
+        let alert = m.process_glucose(
+            &GlucoseData::new(50.0, -1, 1_000),
+            &UserProfile::default(),
+            1_000,
+        );
+        let alert = alert.expect("a critical-low reading 1 s after boot must alert");
+        assert_eq!(alert.alert_type, AlertType::GlucoseLow);
+        assert_eq!(alert.severity, AlertSeverity::Critical);
+    }
+
+    /// The same boot window, on the emergency path: the alert is Critical, so
+    /// the protocol has to run on the first reading rather than wait out a
+    /// 30-minute cooldown measured from power-on.
+    #[test]
+    fn the_first_emergency_is_raised_immediately_after_boot() {
+        let mut m = EarlyWarningSystem::new();
+        m.add_emergency_contact(EmergencyContact::new("Son", "111", "family", 1))
+            .unwrap();
+
+        let alert = m
+            .process_heart_rate(&HeartRateData::new(220, 20.0, None, 1_000), 1_000)
+            .expect("a 220 BPM reading 1 s after boot must alert");
+        assert_eq!(alert.severity, AlertSeverity::Critical);
+        assert!(
+            alert.emergency_contacted,
+            "the first emergency must reach a contact, not wait out a cooldown"
+        );
+        let n = m.pending_emergency_notification().expect("a notification");
+        assert_eq!(n.contact_name.as_str(), "Son");
+    }
+
+    /// The cooldown still does its job: a second alert inside the window is
+    /// suppressed. Without this the previous two tests would pass just as well
+    /// against a system that had no cooldown at all.
+    #[test]
+    fn a_second_alert_inside_the_cooldown_is_still_suppressed() {
+        let mut m = EarlyWarningSystem::new();
+        m.add_emergency_contact(EmergencyContact::new("Son", "111", "family", 1))
+            .unwrap();
+        assert!(m
+            .process_glucose(
+                &GlucoseData::new(50.0, -1, 1_000),
+                &UserProfile::default(),
+                1_000,
+            )
+            .is_some());
+        // 10 s later, inside the 5-minute glucose cooldown.
+        assert!(
+            m.process_glucose(
+                &GlucoseData::new(50.0, -1, 11_000),
+                &UserProfile::default(),
+                11_000,
+            )
+            .is_none(),
+            "the second reading inside the cooldown must be suppressed"
+        );
+        // Past it, the alert returns.
+        assert!(m
+            .process_glucose(
+                &GlucoseData::new(50.0, -1, 301_000),
+                &UserProfile::default(),
+                301_000,
+            )
+            .is_some());
+    }
+
+    #[test]
+    fn ecg_assess_risk_escalates_by_anomaly_count() {
+        // Two non-serious anomalies → High, *not* Critical (Critical is
+        // reserved for a serious anomaly or three-or-more).
+        let mut a = EcgAnalysis::new(80, HeartRhythm::Normal, 90);
+        let _ = a.anomalies.push(EcgAnomaly::new(
+            EcgAnomalyType::ProlongedQt,
+            AlertSeverity::Medium,
+            410.0,
+        ));
+        let _ = a.anomalies.push(EcgAnomaly::new(
+            EcgAnomalyType::TWaveInversion,
+            AlertSeverity::Medium,
+            0.0,
+        ));
+        a.assess_risk();
+        assert_eq!(a.risk_level, AlertSeverity::High);
+        assert!(a.recommendation.as_str().contains("cardiologist"));
+
+        // A single anomaly → Medium.
+        let mut b = EcgAnalysis::new(80, HeartRhythm::Normal, 90);
+        let _ = b.anomalies.push(EcgAnomaly::new(
+            EcgAnomalyType::ShortPr,
+            AlertSeverity::Medium,
+            100.0,
+        ));
+        b.assess_risk();
+        assert_eq!(b.risk_level, AlertSeverity::Medium);
+        assert!(b.recommendation.as_str().contains("Minor"));
+
+        // The default no-anomaly analysis stays Low.
+        let c = EcgAnalysis::new(70, HeartRhythm::Normal, 95);
+        assert_eq!(c.risk_level, AlertSeverity::Low);
+    }
+
+    #[test]
+    fn ecg_bradycardia_and_tachycardia_below_critical_are_medium() {
+        // Bradycardia with hr >= 40 → a single Medium anomaly → an overall
+        // Medium risk, which the alert path classifies as a plain heart-rate
+        // abnormality rather than an ECG anomaly.
+        let mut m = mgr();
+        let (alert, analysis) = m
+            .process_ecg(&ecg(45, HeartRhythm::Bradycardia, 120_000), 120_000)
+            .expect("alert");
+        assert_eq!(analysis.risk_level, AlertSeverity::Medium);
+        assert_eq!(analysis.rhythm, HeartRhythm::Bradycardia);
+        assert_eq!(alert.alert_type, AlertType::HeartRateAbnormal);
+
+        // Tachycardia with hr <= 180 → Medium as well.
+        let mut m2 = mgr();
+        let (alert2, analysis2) = m2
+            .process_ecg(&ecg(150, HeartRhythm::Tachycardia, 120_000), 120_000)
+            .expect("alert");
+        assert_eq!(analysis2.risk_level, AlertSeverity::Medium);
+        assert_eq!(alert2.alert_type, AlertType::HeartRateAbnormal);
+    }
+
+    #[test]
+    fn ecg_anomaly_descriptions_cover_the_remaining_variants() {
+        assert!(EcgAnomalyType::ShortPr.description().contains("PR"));
+        assert!(EcgAnomalyType::StSegmentChange.description().contains("ST"));
+        assert!(EcgAnomalyType::MissedBeats.description().contains("beat"));
+        assert!(EcgAnomalyType::Tachycardia.description().contains("fast"));
+    }
+
+    #[test]
+    fn predict_glucose_trend_selects_every_risk_band() {
+        let m = mgr();
+        // Mild sustained rise: predicted_60min ≈ 212 → in (200, 250] → 50.
+        let moderate = vec![
+            GlucoseData::new(150.0, 0, 0),
+            GlucoseData::new(151.0, 0, 60_000),
+            GlucoseData::new(152.0, 0, 120_000),
+        ];
+        let p = m.predict_glucose_trend(&moderate).expect("prediction");
+        assert_eq!(p.risk_level, 50);
+        assert_eq!(p.trend, 1);
+
+        // Gentle rise kept well inside range → 20, and a flat series → trend 0.
+        let calm = vec![
+            GlucoseData::new(120.0, 0, 0),
+            GlucoseData::new(121.0, 0, 60_000),
+            GlucoseData::new(122.0, 0, 120_000),
+        ];
+        assert_eq!(m.predict_glucose_trend(&calm).expect("prediction").risk_level, 20);
+
+        let flat = vec![
+            GlucoseData::new(110.0, 0, 0),
+            GlucoseData::new(110.0, 0, 60_000),
+            GlucoseData::new(110.0, 0, 120_000),
+        ];
+        assert_eq!(m.predict_glucose_trend(&flat).expect("prediction").trend, 0);
+    }
+
+    #[test]
+    fn emergency_message_labels_a_generic_alert() {
+        let m = EarlyWarningSystem::new();
+        // An alert type the message formatter has no dedicated label for falls
+        // back to the generic "健康警告" heading.
+        let alert = HealthAlert::new(
+            1,
+            AlertType::BloodPressureAbnormal,
+            AlertSeverity::High,
+            150.0,
+            130.0,
+            "bp high",
+            "rest",
+            0,
+        );
+        let msg = m.generate_emergency_message(&alert);
+        assert!(msg.as_str().contains("健康警告"), "got {}", msg);
+        assert!(msg.as_str().contains("150.0"));
+    }
+
+    #[test]
+    fn default_early_warning_system_matches_new() {
+        let a = EarlyWarningSystem::default();
+        assert!(a.alert_history().is_empty());
+        assert!(a.emergency_contacts().is_empty());
+        assert!(a.hospitals().is_empty());
     }
 }

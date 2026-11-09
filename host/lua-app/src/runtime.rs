@@ -118,7 +118,23 @@ impl<T: LuaEngine> AppRuntime<T> {
         self.last_error = None;
         self.booted_at = Instant::now();
         self.last_tick_at = Instant::now();
-        self.vm.run_script(script)
+        match self.vm.run_script(script) {
+            Ok(()) => {
+                // A reload is an explicit restart: clear a previous stop so
+                // the new app can run.
+                self.stop.store(false, Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                // The new script failed to boot. Record it rather than
+                // leaving `Health` looking pristine — a supervisor that keeps
+                // the runtime would otherwise see a healthy VM with no
+                // `on_tick` and an empty tick result forever.
+                self.error_count = self.error_count.saturating_add(1);
+                self.last_error = Some(e.to_string());
+                Err(e)
+            }
+        }
     }
 
     /// Advance one event-loop tick.

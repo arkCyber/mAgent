@@ -33,6 +33,9 @@ pub enum NrfError {
     NotConnected,
     /// A catch-all for simulator / driver failures.
     Backend,
+    /// A write would have to set a bit: NOR flash can only clear bits, so the
+    /// target must be erased (0xFF) first.
+    NotErased,
 }
 
 impl core::fmt::Display for NrfError {
@@ -42,6 +45,7 @@ impl core::fmt::Display for NrfError {
             NrfError::OutOfRange => f.write_str("address out of range"),
             NrfError::NotConnected => f.write_str("BLE link is not connected"),
             NrfError::Backend => f.write_str("nRF52 backend error"),
+            NrfError::NotErased => f.write_str("flash target is not erased"),
         }
     }
 }
@@ -89,11 +93,21 @@ impl Gpio for NrfGpio {
     type Error = NrfError;
 
     fn configure(&mut self, mode: PinMode) -> Result<(), Self::Error> {
+        // nRF52840 exposes P0.00–P0.31 and P1.00–P1.15 = 48 pins (0..=47).
+        // Without this check the host simulator accepted pin 200 while the
+        // device's GPIO driver rejected it — a script that passed on the host
+        // failed on hardware.
+        if self.pin >= 48 {
+            return Err(NrfError::OutOfRange);
+        }
         self.mode = mode;
         Ok(())
     }
 
     fn set_level(&mut self, level: PinLevel) -> Result<(), Self::Error> {
+        if self.pin >= 48 {
+            return Err(NrfError::OutOfRange);
+        }
         if matches!(
             self.mode,
             PinMode::Input | PinMode::InputPullUp | PinMode::InputPullDown
@@ -105,6 +119,9 @@ impl Gpio for NrfGpio {
     }
 
     fn read_level(&self) -> Result<PinLevel, Self::Error> {
+        if self.pin >= 48 {
+            return Err(NrfError::OutOfRange);
+        }
         Ok(self.level)
     }
 }
@@ -156,21 +173,32 @@ impl Flash for NrfFlash {
 
     fn read(&self, address: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
         let start = address as usize;
-        let end = start + buf.len();
-        if end > self.data.len() {
-            return Err(NrfError::OutOfRange);
-        }
+        let end = start
+            .checked_add(buf.len())
+            .filter(|&end| end <= self.data.len())
+            .ok_or(NrfError::OutOfRange)?;
         buf.copy_from_slice(&self.data[start..end]);
         Ok(())
     }
 
     fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
         let start = address as usize;
-        let end = start + data.len();
-        if end > self.data.len() {
+        // `checked_add`: on a 32-bit target `address as usize + len` can wrap,
+        // passing the bound check and panicking on the slice below.
+        if start
+            .checked_add(data.len())
+            .is_none_or(|end| end > self.data.len())
+        {
             return Err(NrfError::OutOfRange);
         }
-        // Flash can only clear bits, not set them.
+        // NOR flash can only clear bits. A write that would need to set one
+        // (i.e. the target was never erased) is reported, not silently
+        // AND-ed: the old code returned Ok and left corrupted bytes behind.
+        for (i, byte) in data.iter().enumerate() {
+            if self.data[start + i] & *byte != *byte {
+                return Err(NrfError::NotErased);
+            }
+        }
         for (i, byte) in data.iter().enumerate() {
             self.data[start + i] &= *byte;
         }
@@ -380,6 +408,10 @@ mod tests {
             "BLE link is not connected"
         );
         assert_eq!(format!("{}", NrfError::Backend), "nRF52 backend error");
+        assert_eq!(
+            format!("{}", NrfError::NotErased),
+            "flash target is not erased"
+        );
     }
 
     #[test]
@@ -393,6 +425,14 @@ mod tests {
         // Input mode rejects writes.
         g.configure(PinMode::Input).unwrap();
         assert_eq!(g.set_level(PinLevel::High), Err(NrfError::InvalidMode));
+    }
+
+    #[test]
+    fn gpio_rejects_a_pin_the_chip_does_not_have() {
+        let mut g = NrfGpio::new(200);
+        assert_eq!(g.configure(PinMode::Output), Err(NrfError::OutOfRange));
+        assert_eq!(g.set_level(PinLevel::High), Err(NrfError::OutOfRange));
+        assert_eq!(g.read_level(), Err(NrfError::OutOfRange));
     }
 
     #[test]
@@ -417,13 +457,16 @@ mod tests {
     }
 
     #[test]
-    fn flash_write_is_and_only() {
+    fn flash_write_rejects_setting_bits_unless_erased() {
         let mut f = NrfFlash::new(1024);
         f.write(0, &[0xF0]).unwrap();
-        f.write(0, &[0x0F]).unwrap();
+        // 0x0F needs bits 0..=3 set, which flash cannot do.
+        assert_eq!(f.write(0, &[0x0F]), Err(NrfError::NotErased));
+        // Clearing additional bits is a legal second write (0xF0 & 0xE0).
+        f.write(0, &[0xE0]).unwrap();
         let mut b = [0u8; 1];
         f.read(0, &mut b).unwrap();
-        assert_eq!(b[0], 0x00); // 0xF0 & 0x0F = 0x00 (flash can only clear bits)
+        assert_eq!(b[0], 0xE0);
     }
 
     #[test]

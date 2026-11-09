@@ -15,6 +15,36 @@ use magent_hal::nrf52::adapter::{NrfBle, NrfFlash, NrfGpio, NrfPower, NrfTempera
 #[cfg(not(target_os = "espidf"))]
 use magent_hal::{Ble, Flash, Gpio, PinLevel, PinMode, Power, PowerProfile, Sensor};
 
+/// Maximum bytes a single `hardware.flash_read` may request.
+///
+/// The length comes from the script, so the Lua bindings clamp it to this
+/// before calling the backend: a negative Lua integer would otherwise arrive
+/// as `usize::MAX` (through the binding's `as usize` cast) and the backend's
+/// `vec![0u8; len]` would abort the process with a capacity overflow. One
+/// flash sector — the largest granularity the region is addressed in.
+pub const MAX_FLASH_READ_LEN: usize = 4096;
+
+/// Maximum bytes a single `hardware.i2c_read` may request. Matches the
+/// `MAX_I2C_LEN` bound the write paths already enforce.
+pub const MAX_I2C_READ_LEN: usize = 256;
+
+/// Maximum bytes a single `hardware.i2c_write` may send.
+///
+/// The payload comes from the script and is written to a register file
+/// addressed by an 8-bit offset, so `reg.wrapping_add(off as u8)` folds any
+/// offset past 255 back onto earlier registers: a longer payload silently
+/// overwrites the bytes it just wrote and the caller is told the write
+/// succeeded. The `mlua` binding already rejects oversized payloads with a
+/// clearer message; this is the shared backstop so the `piccolo` binding
+/// (which the ESP32-S3 runs on-device) cannot corrupt state either.
+pub const MAX_I2C_WRITE_LEN: usize = 256;
+
+/// Maximum bytes a single `hardware.ble_send` may hand to the link.
+pub const MAX_PAYLOAD_LEN: usize = 4096;
+
+/// Maximum combined `agent.reason(context, prompt)` text, in bytes.
+pub const MAX_REASON_LEN: usize = 2048;
+
 /// Shared handle to a [`HardwareBackend`] (interior-mutability, engine-agnostic).
 ///
 /// A [`Mutex`] gives interior mutability; a poisoned lock is surfaced as an
@@ -86,6 +116,9 @@ pub struct SimHardware {
     ble: NrfBle,
     temp: NrfTemperature,
     power: NrfPower,
+    /// Highest flash address ever written (mirrors the ESP32 NVS backend,
+    /// which truncates a read to the stored blob length).
+    flash_written_end: u32,
 }
 
 #[cfg(not(target_os = "espidf"))]
@@ -104,6 +137,7 @@ impl Default for SimHardware {
             ble,
             temp: NrfTemperature::default(),
             power: NrfPower::default(),
+            flash_written_end: 0,
         }
     }
 }
@@ -155,41 +189,80 @@ impl HardwareBackend for SimHardware {
     }
 
     fn sensor_read(&mut self, name: &str) -> std::result::Result<f64, String> {
-        // A realistic simulated sensor surface matching the `magent-core`
-        // tool names (`read_sensor sensor=...`), so Lua scripts exercise the
-        // same names a real chip will.
-        match name {
-            "temp" | "temperature" | "die" => {
-                Ok(self.temp.read().map_err(|e| format!("temp read: {e}"))? as f64)
-            }
-            "heart_rate" | "hr" | "pulse" => Ok(72.0),
-            "hrv" => Ok(55.0),
-            "stress" => Ok(0.3),
-            "glucose" => Ok(95.0),
-            "battery" => Ok(3.70), // nominal cell voltage, volts
-            "memory" | "free_heap" => Ok(128_000.0), // bytes of free heap
-            _ => Err(format!("unknown sensor: {name}")),
+        // A realistic simulated sensor surface matching both the
+        // `magent-core` tool names and the firmware's substring aliases
+        // (`lua_task.rs` matches "temp"/"die", "mem"/"heap"/"sram"). A
+        // script built for the chip must therefore also run here.
+        let n = name.to_ascii_lowercase();
+        if n.contains("temp") || n.contains("die") {
+            Ok(self.temp.read().map_err(|e| format!("temp read: {e}"))? as f64)
+        } else if n.contains("mem") || n.contains("heap") || n.contains("sram") {
+            Ok(128_000.0) // bytes of free heap
+        } else if n.contains("heart") || n == "hr" || n.contains("pulse") {
+            Ok(72.0)
+        } else if n.contains("hrv") {
+            Ok(55.0)
+        } else if n.contains("stress") {
+            Ok(0.3)
+        } else if n.contains("glucose") {
+            Ok(95.0)
+        } else if n.contains("battery") {
+            Ok(3.70) // nominal cell voltage, volts
+        } else if n.contains("step") {
+            Ok(1200.0)
+        } else {
+            Err(format!("unknown sensor: {name}"))
         }
     }
 
     fn flash_read(&mut self, address: u32, len: usize) -> std::result::Result<Vec<u8>, String> {
-        let mut buf = vec![0u8; len];
-        self.flash
-            .read(address, &mut buf)
-            .map_err(|e| format!("flash read: {e}"))?;
+        // Mirror the device backend: a read past the written data returns
+        // only the stored prefix, not `0xFF` filler. Scripts that compare a
+        // read-back against the bytes they wrote (e.g. `selftest.lua`) rely
+        // on this. The host simulator tracks the highest written address;
+        // reads beyond it are trimmed exactly like the ESP32 NVS-backed
+        // backend trims to the stored blob.
+        let start = address as u64;
+        // Out-of-region reads are hardware errors, as on the chip.
+        if start >= self.flash.capacity() as u64 {
+            return Err("flash read: out of range".to_string());
+        }
+        let requested_end = start + len as u64;
+        let written_end = u64::from(self.flash_written_end);
+        let end = requested_end
+            .min(written_end.max(start))
+            .min(self.flash.capacity() as u64);
+        let n = (end.saturating_sub(start)) as usize;
+        let mut buf = vec![0u8; n];
+        if n > 0 {
+            self.flash
+                .read(address, &mut buf)
+                .map_err(|e| format!("flash read: {e}"))?;
+        }
         Ok(buf)
     }
 
     fn flash_write(&mut self, address: u32, data: &[u8]) -> std::result::Result<(), String> {
         self.flash
             .write(address, data)
-            .map_err(|e| format!("flash write: {e}"))
+            .map_err(|e| format!("flash write: {e}"))?;
+        let end = address.saturating_add(data.len() as u32);
+        self.flash_written_end = self.flash_written_end.max(end);
+        Ok(())
     }
 
     fn flash_erase_sector(&mut self, address: u32) -> std::result::Result<(), String> {
         self.flash
             .erase_sector(address)
-            .map_err(|e| format!("flash erase: {e}"))
+            .map_err(|e| format!("flash erase: {e}"))?;
+        // Erasing a sector resets the written extent to that sector's start
+        // so a later read does not resurrect stale data.
+        const SECTOR: u32 = 4096;
+        let sector_start = (address / SECTOR) * SECTOR;
+        if self.flash_written_end >= sector_start {
+            self.flash_written_end = sector_start;
+        }
+        Ok(())
     }
 
     fn i2c_read(&mut self, addr: u8, reg: u8, len: usize) -> std::result::Result<Vec<u8>, String> {
@@ -210,6 +283,12 @@ impl HardwareBackend for SimHardware {
     }
 
     fn i2c_write(&mut self, addr: u8, reg: u8, data: &[u8]) -> std::result::Result<(), String> {
+        if data.len() > MAX_I2C_WRITE_LEN {
+            return Err(format!(
+                "i2c write: payload {} exceeds maximum {MAX_I2C_WRITE_LEN}",
+                data.len()
+            ));
+        }
         for (off, &byte) in data.iter().enumerate() {
             let key = (addr, reg.wrapping_add(off as u8));
             self.i2c.insert(key, byte);
