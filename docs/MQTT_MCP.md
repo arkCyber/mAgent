@@ -54,11 +54,22 @@ Example session:
                           "payload_json":{"heart_rate":72}}}}
 ← {"id":3,"jsonrpc":"2.0","result":{
     "content":[{"type":"text","text":
-      "{\"result\":{\"bytes\":16,\"published\":true,\"qos\":1,
-                    \"retain\":false,\"topic\":\"magent/events\"},
+      "{\"result\":{\"queued\":true,\"delivered\":false,\"expected_ack\":true,
+                    \"bytes\":16,\"qos\":1,\"retain\":false,
+                    \"topic\":\"magent/events\",
+                    \"note\":\"queued for the MQTT event loop; broker acknowledgement is not observed by this tool\"},
                  \"broker\":\"localhost:1883\"}"}],
     "isError":false}}
 ```
+
+> **`queued` is not `delivered`.** `rumqttc`'s publish only enqueues the
+> packet for the background event loop; the broker's PUBACK (QoS 1/2) arrives
+> afterwards and this tool does not wait for it. The result therefore says
+> `queued` / `delivered: false` rather than claiming a delivery nobody
+> observed. `expected_ack` is `true` for QoS 1 and 2. `subscribe_topic`
+> answers the same way (`requested` / `confirmed: false`), because SUBACK —
+> including a broker refusal, 0x80 — is likewise not awaited, and the
+> subscription is not restored after a reconnect (`clean_session`).
 
 ## Running
 

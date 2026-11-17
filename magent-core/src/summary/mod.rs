@@ -755,8 +755,25 @@ mod tests {
     use super::*;
     use crate::agent_runner::Message;
     use crate::conversation::{compress_messages, CompressionPolicy, CompressionStats};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+
+    /// Serialises every test that reads or writes the environment.
+    ///
+    /// `summaries_dir()` reads `$MAGENT_SUMMARIES_DIR` / `$XDG_DATA_HOME` /
+    /// `$HOME`, and `summaries_dir_falls_back_to_home_and_relative` rewrites
+    /// them mid-test to exercise each branch. Under `cargo test`'s default
+    /// parallelism another test calling `open_default()` could observe the
+    /// temporary values and assert against a directory that is not its own —
+    /// an intermittent failure that has nothing to do with the code under
+    /// test. The guard is a no-op for the many tests that never touch env.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the environment lock, recovering from a poisoned mutex so one
+    /// unrelated failure cannot cascade into every other env-dependent test.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// Each test gets its own scratch directory under
     /// `std::env::temp_dir()` so they can run in parallel without
@@ -1251,6 +1268,7 @@ mod tests {
 
     #[test]
     fn summaries_dir_honours_env_override() {
+        let _guard = lock_env();
         let prev = std::env::var(SUMMARIES_DIR_ENV).ok();
         let custom = scratch("env-override");
         // SAFETY: env mutation is process-global. We pick a unique
@@ -1310,6 +1328,7 @@ mod tests {
 
     #[test]
     fn open_default_uses_the_summaries_dir() {
+        let _guard = lock_env();
         let store = FileSummaryStore::open_default();
         // The store is rooted at whatever `summaries_dir()` resolves to;
         // saving under it must produce a path beneath it. Use a topic unique
@@ -1328,6 +1347,7 @@ mod tests {
 
     #[test]
     fn ensure_summaries_dir_creates_the_directory() {
+        let _guard = lock_env();
         let prev = std::env::var(SUMMARIES_DIR_ENV).ok();
         let custom = scratch("ensure-dir");
         // Scratch() already created the dir; remove it so we can observe
@@ -1352,6 +1372,7 @@ mod tests {
 
     #[test]
     fn summaries_dir_falls_back_to_home_and_relative() {
+        let _guard = lock_env();
         let prev = std::env::var(SUMMARIES_DIR_ENV).ok();
         let prev_xdg = std::env::var("XDG_DATA_HOME").ok();
         let prev_home = std::env::var("HOME").ok();

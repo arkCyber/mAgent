@@ -12,7 +12,6 @@ use core::fmt;
 // message, …). The crate's `lib.rs` brings `alloc` in via
 // `#[macro_use] extern crate alloc;` but macros aren't types, so
 // we re-import `String` here.
-#[cfg(feature = "web3")]
 use alloc::string::String;
 
 /// Result type for mAgent operations
@@ -184,6 +183,22 @@ pub enum AgentError {
         /// (FFI / C) source. Lossy by definition — only useful when
         /// matched against the foreign library's header.
         code: u32,
+    },
+    /// A tool failed with a diagnostic that does not fit the typed
+    /// taxonomy above — a refused URL, a rejected argument, a parse
+    /// failure inside a tool.
+    ///
+    /// This exists so a tool failure cannot be reported as a *success*.
+    /// Callers used to work around the missing variant by returning
+    /// `Ok("error: …")`, which the runner recorded as a successful call.
+    /// [`message`](Self::ToolFailed::message) is the only owned-text
+    /// variant; it is populated only on host builds that have something to
+    /// say.
+    ToolFailed {
+        /// Tool that failed, for the log line.
+        tool: &'static str,
+        /// Human-readable reason.
+        message: String,
     },
     /// Local crypto / AEAD failure (key derivation, GCM authentication
     /// mismatch, …). Distinct from the network-layer `EncryptionFailed`
@@ -579,6 +594,8 @@ impl AgentError {
             }
 
             AgentError::CryptoError { .. } => ErrorCategory::Security,
+
+            AgentError::ToolFailed { .. } => ErrorCategory::Validation,
         }
     }
 
@@ -614,6 +631,13 @@ impl AgentError {
             | AgentError::InvalidStateTransition { .. }
             | AgentError::Unknown { .. }
             | AgentError::CryptoError { .. } => RecoveryStrategy::Fatal,
+
+            // A tool that failed is the *caller's* to recover from: the
+            // runner feeds the message back to the model, which decides what
+            // to do next. Retrying the same call with the same arguments here
+            // would just fail again, so this layer skips it — matching
+            // `recovery::get_strategy`, which must not disagree.
+            AgentError::ToolFailed { .. } => RecoveryStrategy::Skip,
         }
     }
 
@@ -728,6 +752,9 @@ impl fmt::Display for AgentError {
             AgentError::CryptoError { reason } => {
                 write!(f, "Crypto error: {:?}", reason)
             }
+            AgentError::ToolFailed { tool, message } => {
+                write!(f, "{} failed: {}", tool, message)
+            }
             AgentError::Unknown { code } => {
                 write!(f, "Unknown error with code: {}", code)
             }
@@ -827,6 +854,11 @@ impl defmt::Format for AgentError {
             }
             AgentError::CryptoError { reason } => {
                 defmt::write!(f, "Crypto error: reason={}", reason)
+            }
+            AgentError::ToolFailed { tool, .. } => {
+                // `defmt` cannot format an owned `String`; the tool name is
+                // the part that belongs on a device console.
+                defmt::write!(f, "tool failed: {}", tool)
             }
             AgentError::Unknown { code } => {
                 defmt::write!(f, "Unknown error: code={}", code)

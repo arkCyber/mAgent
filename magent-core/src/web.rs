@@ -144,21 +144,32 @@ fn tag_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"<[^>]+>").expect("hardcoded tag regex"))
 }
 
-/// Compiled regex for finding DDG result blocks. We accept both
-/// the legacy `class="result__a"` markup and the modern
-/// `data-testid="result-title-a"` form, since DDG has been slowly
-/// migrating. Each branch maps cleanly to its own capture groups so
-/// that title and snippet are never cross-contaminated:
+/// Compiled regex matching a single DDG result *anchor* (the title link).
+/// Legacy markup: `class="result__a"`; modern: `data-testid="result-title-a"`.
 ///
-/// Branch 1 (legacy): `(1)` href, `(2)` title, `(3)` snippet
-/// Branch 2 (modern): `(4)` href, `(5)` title, `(6)` snippet
-fn ddg_block_regex() -> &'static Regex {
+/// Captures: `(1)` href (legacy), `(2)` title (legacy), `(3)` href (modern),
+/// `(4)` title (modern).
+///
+/// Deliberately *not* one regex spanning title → snippet. That form used
+/// `(?s).*?` between the two, which crosses result boundaries: a result
+/// without a snippet matched the *next* result's snippet, so A was reported
+/// with B's text and B disappeared entirely.
+const DDG_ANCHOR_PATTERN: &str = r#"(?s)(?:class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>|data-testid="result-title-a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>)"#;
+
+fn ddg_anchor_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(DDG_ANCHOR_PATTERN).expect("hardcoded DDG anchor regex"))
+}
+
+/// Compiled regex matching one snippet element's body.
+/// Legacy: `class="result__snippet"`; modern: `data-testid="result-snippet"`.
+fn ddg_snippet_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?s)(?:class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</a>|data-testid="result-title-a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?data-testid="result-snippet"[^>]*>(.*?)</[^>]+>)"#,
+            r#"(?s)(?:class="result__snippet"[^>]*>(.*?)</a>|data-testid="result-snippet"[^>]*>(.*?)</[^>]+>)"#,
         )
-        .expect("hardcoded DDG regex")
+        .expect("hardcoded DDG snippet regex")
     })
 }
 
@@ -203,17 +214,35 @@ fn decode_html_entities(s: &str) -> String {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '&' {
+            // Collect the candidate entity name, but only treat it as an
+            // entity when a `;` actually terminates it.
             let mut buf = String::new();
             while let Some(&next) = chars.peek() {
-                if next == ';' || buf.len() > 8 {
+                if next == ';' {
+                    break;
+                }
+                // A raw `&` starts a new candidate; anything else that can
+                // never appear in an entity name (whitespace, `=`, `/`, …)
+                // means this `&` was ordinary text.
+                if next == '&' || !next.is_ascii_alphanumeric() && next != '#' {
+                    break;
+                }
+                if buf.len() > 8 {
                     break;
                 }
                 buf.push(next);
                 chars.next();
             }
-            if matches!(chars.peek(), Some(';')) {
-                chars.next();
+            // Without the terminator this was a bare ampersand in prose
+            // ("AT&T", "Tom & Jerry"). Emitting `&T;` inserted a semicolon
+            // into the middle of a word — the page text the model sees must
+            // be what the page actually said.
+            if !matches!(chars.peek(), Some(';')) {
+                out.push('&');
+                out.push_str(&buf);
+                continue;
             }
+            chars.next(); // consume the `;`
             let replaced = match buf.as_str() {
                 "amp" => Some('&'),
                 "lt" => Some('<'),
@@ -246,8 +275,8 @@ fn decode_html_entities(s: &str) -> String {
                             }
                         }
                     }
-                    // Unknown — pass through literally (HTML entity found but
-                    // not recognised; preserving `&...;` is safer than dropping it).
+                    // Unknown but *terminated* entity (`&foo;`): preserve it
+                    // literally rather than dropping bytes.
                     out.push('&');
                     out.push_str(&buf);
                     out.push(';');
@@ -398,15 +427,29 @@ fn validate_resolved_fetch_target(url: &str) -> Result<(), String> {
     let host = parsed
         .host_str()
         .ok_or_else(|| format!("URL has no host: {url}"))?;
-    // An IP literal is its own resolution; the lexical check above sufficed.
-    if host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<std::net::IpAddr>()
-        .is_ok()
+
+    // Classify the *normalised* host, not only the raw input.
+    //
+    // `Url::parse` rewrites numeric and alternate-radix host spellings into
+    // canonical IP literals: `http://2130706433/` and `http://0x7f000001/`
+    // both become `127.0.0.1`, and `http://2852039166/` becomes
+    // `169.254.169.254` (cloud metadata). The lexical pass above sees none of
+    // those as an IP, so it let them through; this function then re-checked
+    // the *parsed* host, found it was an IP literal, concluded "already
+    // vetted" and returned Ok — sending the request inward. That early
+    // return is the bypass; the check has to run on this value.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let is_literal = bare.parse::<std::net::IpAddr>().is_ok();
+    if let Some(reason) =
+        crate::at_validate::public_fetch_target_refusal(bare, ALLOW_PRIVATE_NETWORKS)
     {
+        return Err(format!("{reason}: {host}"));
+    }
+    if is_literal {
+        // A literal is its own resolution; it has just been classified.
         return Ok(());
     }
+
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| format!("URL has no port: {url}"))?;
@@ -473,20 +516,40 @@ pub fn web_search(args: &str) -> std::result::Result<String, String> {
 /// the legacy and modern layouts, the empty-hit skip, and the result
 /// cap — is testable without a live network round-trip.
 fn parse_search_results(body: &str) -> Vec<SearchHit> {
+    // Split the document into per-result segments first: each result owns
+    // the markup from its title anchor up to (but not including) the next
+    // anchor. A snippet is only ever taken from *its own* segment, which is
+    // what keeps result A from being reported with result B's summary.
+    let anchors: Vec<_> = ddg_anchor_regex().captures_iter(body).collect();
     let mut hits: Vec<SearchHit> = Vec::new();
-    for cap in ddg_block_regex().captures_iter(body) {
-        // Branch 1 (legacy): groups 1-3; Branch 2 (modern): groups 4-6.
-        // We try branch 1 first, then branch 2. Each branch has a
-        // self-contained href/title/snippet set, so they never bleed
-        // into each other.
-        let (href, title_raw, snippet_raw) =
-            if let (Some(h), Some(t), Some(s)) = (cap.get(1), cap.get(2), cap.get(3)) {
-                (h.as_str(), t.as_str(), s.as_str())
-            } else if let (Some(h), Some(t), Some(s)) = (cap.get(4), cap.get(5), cap.get(6)) {
-                (h.as_str(), t.as_str(), s.as_str())
-            } else {
-                continue;
-            };
+    for (i, cap) in anchors.iter().enumerate() {
+        let (href, title_raw) = if let (Some(h), Some(t)) = (cap.get(1), cap.get(2)) {
+            (h.as_str(), t.as_str())
+        } else if let (Some(h), Some(t)) = (cap.get(3), cap.get(4)) {
+            (h.as_str(), t.as_str())
+        } else {
+            continue;
+        };
+
+        // Segment = from this anchor's end to the next anchor's start.
+        // `captures_iter` yields non-overlapping, ordered matches and regex
+        // boundaries are character boundaries, so this range always exists.
+        // If that ever stopped being true, falling back to an empty segment
+        // would silently drop the snippet — which is the bug this function
+        // exists to fix — so the range is taken directly instead.
+        let Some(whole) = cap.get(0) else {
+            continue;
+        };
+        let seg_start = whole.end();
+        let seg_end = anchors
+            .get(i + 1)
+            .and_then(|n| n.get(0))
+            .map_or(body.len(), |m| m.start());
+        let segment = &body[seg_start..seg_end];
+        let snippet_raw = ddg_snippet_regex()
+            .captures(segment)
+            .and_then(|c| c.get(1).or_else(|| c.get(2)))
+            .map_or("", |m| m.as_str());
 
         let title = normalise_whitespace(&strip_and_decode(title_raw));
         let snippet = normalise_whitespace(&strip_and_decode(snippet_raw));
@@ -762,6 +825,13 @@ fn extract_query(args: &str, key: &str) -> Option<String> {
     if let Some(v) = extract_json_value(args, key) {
         return Some(v);
     }
+    // A JSON object that did not yield the key is malformed for this tool.
+    // Falling through to the bare-token rule would return a fragment of the
+    // JSON (e.g. `{"timeout":5`) as the query, so the tool would search for
+    // garbage and report "no results" instead of "bad arguments".
+    if args.trim_start().starts_with('{') {
+        return None;
+    }
     let mut bare: Option<String> = None;
     for part in args.split(',') {
         let trimmed = part.trim();
@@ -779,86 +849,115 @@ fn extract_query(args: &str, key: &str) -> Option<String> {
     bare
 }
 
-/// Tiny JSON-value extractor for the single-string case we see from
-/// the LLM (`{"url":"https://…"}`). We deliberately do NOT pull in
-/// `serde_json::Value` here — the `web` module's only purpose is to
-/// be an `std`-only leaf and the JSON we receive is short and
-/// well-formed by construction (`agent_runner::execute_tool`
-/// serialises a `HashMap<String, serde_json::Value>` with `to_string`).
+/// Extract a string value for `key` from a JSON-object argument payload.
 ///
-/// Returns `None` if the input isn't a JSON object or the key is
-/// absent — the caller falls back to the `key=value` parser.
+/// Returns `None` when the input is not a JSON object or the key is absent
+/// (the caller then falls back to the `key=value` parser).
+///
+/// This used to be a hand-rolled scanner that `return None`'d the moment it
+/// met a value that was not a string literal — so `{"timeout":5,"url":…}`
+/// gave up *before* reaching `url`, and the caller's `key=value` fallback
+/// then treated the first bare token (`{"timeout":5`) as the value. The
+/// tools really do receive objects with non-string members (`max_results`,
+/// `latitude`, `timeout`), so the scanner is now `serde_json`, which this
+/// crate already depends on.
 fn extract_json_value(args: &str, key: &str) -> Option<String> {
     let trimmed = args.trim();
-    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+    if !trimmed.starts_with('{') {
         return None;
     }
-    // Hand-parse `"key":"value"` pairs. We accept whitespace around
-    // `:` and `,`, and we do NOT unescape JSON escapes (\u, \n, \").
-    // The LLM emits URLs as ASCII so escaping is rare in practice;
-    // a malformed hit just falls through to the key=value parser.
-    let body = &trimmed[1..trimmed.len() - 1];
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Skip whitespace and commas.
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        // Expect `"key"`.
-        if bytes[i] != b'"' {
-            return None;
-        }
-        i += 1;
-        let key_start = i;
-        while i < bytes.len() && bytes[i] != b'"' {
-            // Honour backslash escapes inside the key just enough to
-            // skip over `\"` so we don't terminate on the escaped quote.
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
-        if i >= bytes.len() {
-            return None;
-        }
-        let k = &body[key_start..i];
-        i += 1;
-        // Skip whitespace + `:`.
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b':') {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            return None;
-        }
-        // Value must be a string for us to care; numeric / bool / object
-        // values are ignored so the key=value parser gets a shot.
-        if bytes[i] != b'"' {
-            return None;
-        }
-        i += 1;
-        let value_start = i;
-        while i < bytes.len() && bytes[i] != b'"' {
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-            } else {
-                i += 1;
-            }
-        }
-        if i >= bytes.len() {
-            return None;
-        }
-        let v = &body[value_start..i];
-        if k == key {
-            return Some(v.to_string());
-        }
-        i += 1;
+    let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        // Models routinely emit a trailing comma before a closing brace.
+        // Stripping just those two-character sequences is a bounded repair
+        // (it cannot change a valid document) and keeps an otherwise
+        // well-formed call working.
+        Err(_) => serde_json::from_str(&strip_trailing_commas(trimmed)).ok()?,
+    };
+    let object = parsed.as_object()?;
+    // Exact key first, then a case-insensitive match: the model emits `URL`
+    // and `City` as often as the lower-case spelling, and the `key=value`
+    // branch already compares case-insensitively.
+    if let Some(v) = object.get(key).and_then(|v| v.as_str()) {
+        return Some(v.to_string());
     }
-    None
+    object
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .and_then(|(_, v)| v.as_str())
+        .map(str::to_string)
+}
+
+/// Remove a *trailing* comma — one followed only by whitespace before the
+/// closing `}` or `]` — ignoring commas inside string literals.
+///
+/// Used only as a retry after strict parsing failed. It must not alter an
+/// already-valid document: an earlier version dropped every comma before a
+/// closer, turning `["a","b"]` into `["a""b"]`.
+///
+/// Works on **bytes** throughout and only ever removes ASCII `,`/whitespace
+/// ranges, so the surviving byte ranges are valid UTF-8 by construction. (A
+/// previous version rebuilt the string with `byte as char`, which mapped
+/// every non-ASCII byte to a different code point — `"北京"` came back as
+/// `"å\u{8c}—å\u{8c}—"`.)
+fn strip_trailing_commas(input: &str) -> String {
+    let bytes = input.as_bytes();
+    // Byte ranges to delete, in order.
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    // Start of the last top-level comma and whether only whitespace has
+    // followed it.
+    let mut comma_start: Option<usize> = None;
+    let mut only_whitespace_since = false;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => {
+                in_string = true;
+                only_whitespace_since = false;
+            }
+            b',' => {
+                comma_start = Some(i);
+                only_whitespace_since = true;
+            }
+            b'}' | b']' => {
+                if only_whitespace_since {
+                    if let Some(start) = comma_start.take() {
+                        cuts.push((start, i));
+                    }
+                }
+                comma_start = None;
+                only_whitespace_since = false;
+            }
+            _ if b.is_ascii_whitespace() => {}
+            _ => only_whitespace_since = false,
+        }
+    }
+
+    if cuts.is_empty() {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut last = 0usize;
+    for (start, end) in cuts {
+        // Drop the comma but keep the whitespace between it and the closer.
+        out.push_str(&input[last..start]);
+        out.push_str(&input[start + 1..end]);
+        last = end;
+    }
+    out.push_str(&input[last..]);
+    out
 }
 
 /// Percent-encode for safe inclusion in a URL query string.
@@ -1301,17 +1400,105 @@ mod tests {
     }
 
     #[test]
-    fn extract_json_value_handles_escaped_quotes_in_key_and_value() {
-        // A backslash escape inside key or value must not terminate the
-        // scan early (i += 2 skip). The parser does not unescape, so the
-        // extracted substring keeps the literal backslash.
+    fn extract_json_value_decodes_json_escapes() {
+        // Keys and values carry JSON escapes. The previous hand-rolled
+        // scanner skipped over `\\"` but did NOT unescape, so a URL or query
+        // containing a quote or a backslash came back with the escape
+        // sequence still in it. `serde_json` decodes it, which is what the
+        // tool actually needs.
+        let args = "{\"a\\\"b\":\"v\"}";
+        assert_eq!(extract_json_value(args, "a\"b").unwrap(), "v");
+        let args = "{\"url\":\"v\\\"w\"}";
+        assert_eq!(extract_json_value(args, "url").unwrap(), "v\"w");
+        // A unicode escape decodes too.
         assert_eq!(
-            extract_json_value(r#"{"a\"b":"v"}"#, r#"a\"b"#).unwrap(),
-            "v"
+            extract_json_value(r#"{"query":"caf\u00e9"}"#, "query").unwrap(),
+            "café"
+        );
+    }
+
+    /// A trailing comma is only the *last* comma before a closer. Stripping
+    /// every comma that precedes `}`/`]` would silently merge array
+    /// elements (`["a","b"]` → `["a""b"]`) and break a document that parsed
+    /// fine without repair.
+    #[test]
+    fn strip_trailing_commas_leaves_valid_arrays_alone() {
+        for valid in [
+            r#"["a","b"]"#,
+            r#"{"a":["x","y"],"b":2}"#,
+            r#"{"a":[1],"b":3}"#,
+            r#"{"k":"v,"}"#,
+        ] {
+            assert_eq!(
+                strip_trailing_commas(valid),
+                valid,
+                "valid JSON must not be rewritten"
+            );
+        }
+        assert_eq!(strip_trailing_commas(r#"["a","b",]"#), r#"["a","b"]"#);
+        assert_eq!(strip_trailing_commas(r#"{"k":"v",}"#), r#"{"k":"v"}"#);
+    }
+
+    /// Multiple and nested trailing commas are all removed, and a comma
+    /// inside a string is never touched.
+    #[test]
+    fn strip_trailing_commas_handles_nesting_and_repetition() {
+        for (input, want) in [
+            (r#"{"a":[1,],"b":2,}"#, r#"{"a":[1],"b":2}"#),
+            (r#"[1,2,3,]"#, r#"[1,2,3]"#),
+            (r#"{"a":1,"b":[2,3,],}"#, r#"{"a":1,"b":[2,3]}"#),
+            (r#"{"nested":{"x":1,},}"#, r#"{"nested":{"x":1}}"#),
+            (r#"[[1,],[2,]]"#, r#"[[1],[2]]"#),
+            (r#"{"s":"a,]","t":1,}"#, r#"{"s":"a,]","t":1}"#),
+        ] {
+            assert_eq!(strip_trailing_commas(input), want, "input: {input}");
+        }
+    }
+
+    /// Non-ASCII must survive verbatim.
+    ///
+    /// The repair pass used to rebuild the string by pushing each *byte* as
+    /// a `char`, which mangled every multi-byte code point: `"北京"` came
+    /// back as `"å\u{8c}—å\u{8c}—"`. Skipping the surgical edit entirely is
+    /// not enough — the pass has to be byte-exact even when it *does* edit.
+    #[test]
+    fn strip_trailing_commas_preserves_utf8() {
+        let with_trailing = r#"{"city":"北京","note":"café",}"#;
+        assert_eq!(
+            strip_trailing_commas(with_trailing),
+            r#"{"city":"北京","note":"café"}"#
+        );
+        // No edit needed: must be byte-identical.
+        let clean = r#"{"city":"北京","note":"café,"}"#;
+        assert_eq!(strip_trailing_commas(clean), clean);
+        // A comma *inside* a string is not a trailing comma.
+        let inner = r#"{"a":"x,","b":"y,]"}"#;
+        assert_eq!(strip_trailing_commas(inner), inner);
+    }
+
+    /// A non-string member must not stop the scan — the tools really receive
+    /// objects like `{"timeout":5,"url":…}` and `{"max_results":10,"query":…}`.
+    /// The old scanner bailed at the numeric value and the `key=value`
+    /// fallback then returned the raw fragment `{"timeout":5` as the query.
+    #[test]
+    fn extract_json_value_skips_non_string_members() {
+        assert_eq!(
+            extract_json_value(r#"{"timeout":5,"url":"https://x"}"#, "url").unwrap(),
+            "https://x"
         );
         assert_eq!(
-            extract_json_value(r#"{"url":"v\"w"}"#, "url").unwrap(),
-            r#"v\"w"#
+            extract_json_value(r#"{"max_results":10,"query":"rust async"}"#, "query").unwrap(),
+            "rust async"
+        );
+        // Nested objects / arrays before the target key.
+        assert_eq!(
+            extract_json_value(r#"{"opts":{"a":1},"list":[1,2],"city":"Paris"}"#, "city").unwrap(),
+            "Paris"
+        );
+        // Case-insensitive fallback, matching the key=value branch.
+        assert_eq!(
+            extract_json_value(r#"{"URL":"https://x"}"#, "url").unwrap(),
+            "https://x"
         );
     }
 
@@ -1351,12 +1538,40 @@ mod tests {
             body.push_str(&format!(
                 r#"<a class="result__a" href="https://example.com/{i}">Title {i}</a>"#
             ));
-            body.push_str(&format!(
-                r#"<a class="result__snippet">Snippet {i}</a>"#
-            ));
+            body.push_str(&format!(r#"<a class="result__snippet">Snippet {i}</a>"#));
         }
         let hits = parse_search_results(&body);
         assert_eq!(hits.len(), MAX_SEARCH_RESULTS);
+    }
+
+    /// A result with no snippet must not steal the *next* result's snippet.
+    ///
+    /// The legacy branch of the block regex is
+    /// `href="…">title</a>.*?class="result__snippet"…`, and `(?s)` lets that
+    /// `.*?` cross result boundaries. So when result A has no snippet, the
+    /// match runs on and returns A's url/title with B's snippet — and B is
+    /// consumed, never reported. The model then reads B's text as A's.
+    #[test]
+    fn parse_search_results_does_not_attach_a_neighbours_snippet() {
+        let body = r#"<a class="result__a" href="https://a.example/">Title A</a>
+            <a class="result__a" href="https://b.example/">Title B</a>
+            <a class="result__snippet">Snippet of B</a>"#;
+        let hits = parse_search_results(body);
+        for hit in &hits {
+            assert!(
+                !(hit.url.contains("a.example") && hit.snippet.contains("Snippet of B")),
+                "result A must not carry B's snippet: {:?}",
+                hits.iter()
+                    .map(|h| (&h.url, &h.snippet))
+                    .collect::<Vec<_>>()
+            );
+        }
+        // B (which does own the snippet) should still be reported.
+        assert!(
+            hits.iter().any(|h| h.url.contains("b.example")),
+            "the result that owns the snippet must be reported: {:?}",
+            hits.iter().map(|h| &h.url).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1370,6 +1585,43 @@ mod tests {
     fn decode_html_entities_unknown_entity_preserved() {
         // Unknown entities should be passed through literally, not dropped.
         assert_eq!(decode_html_entities("&unknown;"), "&unknown;");
+    }
+
+    /// A bare `&` in prose is not an entity. The decoder used to append a
+    /// `;` to it unconditionally, so page text came out as `AT&T;` and, for
+    /// `R&D department`, the semicolon landed *inside* the following word
+    /// (`R&D departm;ent`). That is the page content handed to the model.
+    #[test]
+    fn decode_html_entities_leaves_bare_ampersands_alone() {
+        assert_eq!(decode_html_entities("AT&T"), "AT&T");
+        assert_eq!(decode_html_entities("Tom & Jerry"), "Tom & Jerry");
+        assert_eq!(decode_html_entities("R&D department"), "R&D department");
+        // An entity that *is* terminated still decodes.
+        assert_eq!(decode_html_entities("AT&amp;T"), "AT&T");
+        assert_eq!(decode_html_entities("R&amp;D"), "R&D");
+    }
+
+    /// Numeric entities outside Unicode's scalar range (and the lone
+    /// surrogates D800–DFFF) cannot become a `char`. They are left as text
+    /// rather than dropped, so the page content is never silently shortened.
+    #[test]
+    fn decode_html_entities_rejects_out_of_range_code_points() {
+        assert_eq!(decode_html_entities("&#xD800;"), "&#xD800;");
+        assert_eq!(decode_html_entities("&#1114112;"), "&#1114112;");
+        // In-range ones still decode, including above the BMP.
+        assert_eq!(decode_html_entities("&#x1F600;"), "😀");
+        assert_eq!(decode_html_entities("&#8364;"), "€");
+    }
+
+    /// A `&` followed by too many characters, or by punctuation, is text.
+    #[test]
+    fn decode_html_entities_stops_at_non_entity_characters() {
+        assert_eq!(
+            decode_html_entities("& very long prose"),
+            "& very long prose"
+        );
+        assert_eq!(decode_html_entities("x & y"), "x & y");
+        assert_eq!(decode_html_entities("&&"), "&&");
     }
 
     #[test]
@@ -1649,6 +1901,45 @@ mod tests {
         );
         let err2 = fetch_url("url=http://169.254.169.254/latest/meta-data").unwrap_err();
         assert!(err2.contains("non-public"), "got: {err2}");
+    }
+
+    /// Numeric and alternate-radix host spellings pass the lexical check
+    /// (`2130706433` is not an IP literal *as written*) but `Url::parse`
+    /// canonicalises them into `127.0.0.1` / `169.254.169.254`. The guard
+    /// used to see the canonical form, recognise it as an IP literal and
+    /// conclude "already vetted", sending the request inward.
+    ///
+    /// These are checked at the validation layer directly, so the test
+    /// needs no network: every spelling below must be refused *before* a
+    /// socket is opened.
+    #[test]
+    fn fetch_url_rejects_alternate_ip_spellings_before_network() {
+        for url in [
+            // 127.0.0.1 as a decimal integer and in hex / octal.
+            "http://2130706433:8080/",
+            "http://0x7f000001:8080/",
+            "http://017700000001:8080/",
+            // 169.254.169.254 (cloud metadata) in integer / dotted-octal /
+            // hex forms.
+            "http://2852039166/",
+            "http://0251.0376.0251.0376/",
+            "http://0xa9fea9fe/",
+        ] {
+            let err = validate_resolved_fetch_target(url)
+                .expect_err(&format!("{url} must be refused as a non-public target"));
+            assert!(
+                err.contains("non-public"),
+                "{url} must be refused for being non-public, got: {err}"
+            );
+        }
+    }
+
+    /// A public IP literal still works: the classifier runs on it and
+    /// accepts it, so the fix did not turn the SSRF guard into a blanket
+    /// "all literals refused".
+    #[test]
+    fn fetch_target_validation_accepts_a_public_literal() {
+        assert!(validate_resolved_fetch_target("http://93.184.216.34/").is_ok());
     }
 
     #[test]

@@ -114,6 +114,12 @@ impl RecoveryManager {
             AgentError::Web3Error { .. } => RecoveryStrategy::Abort,
             AgentError::Unknown { .. } => RecoveryStrategy::Abort,
             AgentError::CryptoError { .. } => RecoveryStrategy::Abort,
+
+            // A tool failure is not a fault of *this* layer: retrying the
+            // same tool with the same arguments would fail again. The agent
+            // loop feeds the message back to the model instead. This mirrors
+            // `AgentError::recovery_strategy` — the two must not disagree.
+            AgentError::ToolFailed { .. } => RecoveryStrategy::Skip,
         }
     }
 
@@ -212,6 +218,57 @@ impl Default for RecoveryManager {
 #[allow(clippy::items_after_test_module)] // FallbackProvider/etc. live below the test module on purpose.
 mod tests {
     use super::*;
+
+    /// The crate has **two** recovery-strategy enums:
+    /// `error::RecoveryStrategy` (a coarse classification on the error) and
+    /// `recovery::RecoveryStrategy` (what the manager does). They are
+    /// different types with different vocabularies, so they cannot be
+    /// compared directly — but they must not give contradictory *advice*.
+    ///
+    /// They disagreed once: `ToolFailed` was `RetryBackoff` in one and
+    /// `Abort` in the other, i.e. "retry it" versus "give up". This pins the
+    /// pairing for the variants where the intent is unambiguous.
+    #[test]
+    fn the_two_recovery_mappings_do_not_contradict() {
+        use crate::error::AgentError as E;
+        use alloc::string::ToString;
+        let r = RecoveryManager::with_defaults();
+
+        // A failed tool is skipped at this layer in both mappings: the
+        // agent loop hands the message to the model rather than retrying the
+        // identical call.
+        let tool_failed = E::ToolFailed {
+            tool: "fetch_url",
+            message: "refused".to_string(),
+        };
+        // Exactly `Skip`: the daemon/loop does not retry the identical call.
+        // This must be `matches!`, not a range — accepting `Abort` here is
+        // what let the two mappings drift apart in the first place.
+        assert_eq!(
+            r.get_strategy(&tool_failed),
+            RecoveryStrategy::Skip,
+            "a tool failure must be skipped at this layer, not abandoned"
+        );
+        assert!(matches!(
+            tool_failed.recovery_strategy(),
+            crate::error::RecoveryStrategy::Skip
+        ));
+
+        // Neither mapping may call a retryable network fault fatal.
+        let net = E::NetworkTimeout {
+            operation: "llm",
+            duration_ms: 1,
+        };
+        assert!(matches!(
+            r.get_strategy(&net),
+            RecoveryStrategy::Retry | RecoveryStrategy::RetryWithBackoff
+        ));
+        assert!(matches!(
+            net.recovery_strategy(),
+            crate::error::RecoveryStrategy::RetryBackoff
+                | crate::error::RecoveryStrategy::RetryImmediate
+        ));
+    }
 
     #[test]
     fn backoff_is_exponential_and_capped() {

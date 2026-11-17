@@ -620,7 +620,10 @@ impl<'de> Deserialize<'de> for Wei {
                 f.write_str("a hex quantity string or an unsigned integer")
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Wei, E> {
-                let raw = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v);
+                let raw = v
+                    .strip_prefix("0x")
+                    .or_else(|| v.strip_prefix("0X"))
+                    .unwrap_or(v);
                 if raw.is_empty() {
                     return Ok(Wei(0));
                 }
@@ -744,10 +747,7 @@ impl<'de> Deserialize<'de> for Hash {
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Hash, E> {
                 Hash::from_hex(v).map_err(E::custom)
             }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Hash, A::Error> {
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Hash, A::Error> {
                 let mut bytes = [0u8; 32];
                 for (i, slot) in bytes.iter_mut().enumerate() {
                     *slot = seq
@@ -911,7 +911,10 @@ pub(crate) mod serde_helpers {
                     f.write_str("a hex quantity string or an unsigned integer")
                 }
                 fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<u64, E> {
-                    let raw = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")).unwrap_or(v);
+                    let raw = v
+                        .strip_prefix("0x")
+                        .or_else(|| v.strip_prefix("0X"))
+                        .unwrap_or(v);
                     if raw.is_empty() {
                         return Ok(0);
                     }

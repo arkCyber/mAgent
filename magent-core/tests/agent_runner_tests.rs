@@ -401,7 +401,11 @@ fn parse_result_handles_string_number_object() {
     let r = silent_runner(MockExecutor::default());
     assert_eq!(r.parse_result(r#"{"result": "ok"}"#).unwrap(), "ok");
     assert_eq!(r.parse_result(r#"{"result": 42}"#).unwrap(), "42");
-    assert_eq!(r.parse_result(r#"{"result": 3.14}"#).unwrap(), "3.1");
+    // A fractional result keeps the value the model produced. This used to
+    // assert "3.1" because the extractor formatted every float as `{:.1}`,
+    // which silently rounded measurements (36.65 °C → "36.6").
+    assert_eq!(r.parse_result(r#"{"result": 3.14}"#).unwrap(), "3.14");
+    assert_eq!(r.parse_result(r#"{"result": 0.25}"#).unwrap(), "0.25");
     assert_eq!(
         r.parse_result(r#"{"result": {"a": 1}}"#).unwrap(),
         "{\"a\":1}"

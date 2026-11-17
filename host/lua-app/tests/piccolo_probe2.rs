@@ -190,3 +190,35 @@ fn match_init_inside_codepoint_does_not_panic() {
         "温度",
     );
 }
+
+/// Deeply nested capture groups must not blow the stack.
+///
+/// The pattern parser recursed once per `(` (and the matcher again per
+/// nested capture), with no bound. A script could exceed the device's Lua
+/// thread stack with a few thousand levels — an abort, not an `Err` — while
+/// staying well inside the 512 KiB script budget. The depth cap makes this a
+/// plain "no match".
+#[test]
+fn deeply_nested_captures_do_not_overflow_the_stack() {
+    let mut vm = fresh_vm();
+    // 60 000 opening parens — comfortably inside the 512 KiB script budget,
+    // and far enough past the 32-level cap that an unbounded parser would
+    // overflow the test thread's stack (observed at this depth before the
+    // cap was added).
+    let depth = 60000;
+    let mut pattern = "(".repeat(depth);
+    pattern.push('a');
+    pattern.push_str(&")".repeat(depth));
+    // The pattern is passed as a runtime string via a quoted literal.
+    let script = format!(
+        "function on_script() return string.match(\"a\", \"{}\") or \"no-match\" end",
+        pattern
+    );
+    let out = run_and_call(&mut vm, &script);
+    // Either a match or an explicit "no-match" is acceptable; what matters
+    // is that the VM answered instead of crashing the process.
+    assert!(
+        out == "no-match" || out == "a",
+        "unexpected result from a deeply nested pattern: {out:?}"
+    );
+}

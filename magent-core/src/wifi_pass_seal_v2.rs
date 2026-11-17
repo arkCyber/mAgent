@@ -386,6 +386,25 @@ pub fn open_sealed_v2<'a>(
     out: &mut Vec<u8, MAX_PLAINTEXT>,
 ) -> Result<OpenOutcome<'a>, SealError> {
     if let Some(payload) = stored.strip_prefix(DBO2_PREFIX) {
+        // `DBO2:` is also a legal start for a plaintext WPA2 passphrase
+        // (`DBO2:mywifi` is 12 characters, well inside WPA2's 8..=63), so the
+        // prefix alone cannot decide. Two shapes are distinguishable:
+        //
+        //   * a **sealed blob** is hex only and at least
+        //     `2*(NONCE_LEN + MAC_LEN)` characters long;
+        //   * a **password** that merely starts `DBO2:` is anything else —
+        //     typically short and not pure hex.
+        //
+        // A short *hex* body (`DBO2:zz` — not hex at all; `DBO2:0011` — hex
+        // but too short) is a truncated blob: report it rather than hand
+        // unauthenticated bytes back as a credential. A short non-hex body is
+        // the password it looks like, and locking the user out of their own
+        // network over a passphrase that begins `DBO2:` would be worse.
+        let looks_like_blob = payload.len() >= 2 * (NONCE_LEN + MAC_LEN)
+            || payload.bytes().all(|b| b.is_ascii_hexdigit());
+        if !looks_like_blob {
+            return Ok(OpenOutcome::LegacyPlaintext(stored));
+        }
         // DBO2 path: payload = hex(nonce) + hex(cipher) + hex(mac)
         let expected = 2 * (NONCE_LEN + MAX_PLAINTEXT + MAC_LEN);
         if payload.len() != expected {
@@ -457,6 +476,16 @@ pub fn open_sealed_v2<'a>(
         }
         Ok(OpenOutcome::Dbo2Decoded)
     } else {
+        // Only `DBO2:` and `DBO1:` are sealed formats. Anything else that is
+        // still *shaped* like a version tag (`DBO7:`, a truncated `DBO2`, a
+        // case-flipped `dbo2:`) is a corrupt or unsupported write, not a
+        // plaintext password. Falling through to `LegacyPlaintext` would hand
+        // that string back to the caller as the Wi-Fi password verbatim, so a
+        // single flipped byte in NVS turns a MAC-checked entry into an
+        // unauthenticated one. Refuse instead of downgrading.
+        if !stored.starts_with(wifi_pass_seal::PREFIX) && looks_like_seal_tag(stored) {
+            return Err(SealError::BadPrefix);
+        }
         // Fall back to DBO1 / legacy.
         match wifi_pass_seal::open_sealed_bytes(stored, device_key, out) {
             Ok(wifi_pass_seal::OpenOutcome::DecodedBytes) => Ok(OpenOutcome::Dbo1Decoded),
@@ -474,6 +503,67 @@ pub fn open_sealed_v2<'a>(
             }),
         }
     }
+}
+
+/// True when `stored` looks like a sealed blob whose version tag we cannot
+/// use — corrupt, truncated, or from a newer build.
+///
+/// The decision has to separate two strings that share a prefix:
+///
+/// * a **corrupt sealed entry** (`DBO2:` with a flipped byte in the tag or the
+///   separator), and
+/// * a **legitimate plaintext password** that happens to begin `DBO2:`.
+///
+/// Tag shape alone cannot do it: `"DBO2:mywifi"` is a legal WPA2 passphrase,
+/// while `"DBO2;abcd…"` is a flipped separator on a real blob. The
+/// discriminator that actually holds is the *body*: every sealed format is
+/// `DBO<digits><separator>` followed by **hex only**, and at least
+/// [`MIN_SEALED_HEX_LEN`] characters of it. No plausible password is a
+/// 56-character hex string.
+///
+/// Refusing a corrupt blob matters because the alternative is handing that
+/// string back as the Wi-Fi password: the device quietly leaves the
+/// integrity-checked path and uses unauthenticated bytes as a credential.
+pub fn looks_like_seal_tag(stored: &str) -> bool {
+    /// Shortest sealed body: DBO2's `2*(NONCE_LEN + MAC_LEN)`. Well past any
+    /// password-shaped string.
+    const MIN_SEALED_HEX_LEN: usize = 56;
+    /// Longest plausible tag+separator region (`DBO99:` is six bytes).
+    const MAX_TAG_LEN: usize = 6;
+
+    let bytes = stored.as_bytes();
+
+    // The discriminator is the **body**, not the tag. A single-bit flip
+    // anywhere in `DBO2:` used to defeat this test, so `open_sealed_v2` fell
+    // through to its plaintext branch and handed the whole ciphertext back as
+    // the Wi-Fi password / API key. Measured cases that all returned
+    // `LegacyPlaintext` before this: `XBO2:` (`D`→`X`), `DQO2:` (`O`→`Q`),
+    // `DBC2:` (`B`→`C`), and the separator flips `DBO28…` / `DBO2;…`. Any one
+    // of them turns a MAC-checked entry into an unauthenticated one.
+    //
+    // So find where a long hex body begins and require only that the bytes
+    // before it look like a version tag: at most `MAX_TAG_LEN` bytes,
+    // alphanumeric (or one corrupted separator), containing a digit. No real
+    // password is a tag-shaped prefix followed by 56+ hex characters —
+    // crediting that shape is what makes a corrupted blob a refusal instead
+    // of a credential.
+    //
+    // Every split point is tried, not just the first: with a digit separator
+    // (`DBO28<hex>`) the earliest hex-only suffix starts at byte 3, whose
+    // prefix `DBO` has no digit. The correct split is byte 4 (`DBO2`), and
+    // stopping at the first candidate would reject a legitimate flipped
+    // separator.
+    (3..=MAX_TAG_LEN).any(|k| {
+        if bytes.len() < k || bytes.len() - k < MIN_SEALED_HEX_LEN {
+            return false;
+        }
+        let (tag, body) = bytes.split_at(k);
+        tag.iter().any(u8::is_ascii_digit)
+            && tag
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b';' | b'>' | b'*'))
+            && body.iter().all(u8::is_ascii_hexdigit)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -600,8 +690,25 @@ pub fn open_secret(
     out: &mut Vec<u8, MAX_SECRET_PLAINTEXT>,
 ) -> Result<SecretOpenOutcome, SealError> {
     let Some(payload) = stored.strip_prefix(DBO2_PREFIX) else {
+        // A value that is *shaped* like a sealed blob but whose tag we do not
+        // support is corrupt or from a newer build. Returning
+        // `LegacyPlaintext` made the caller use those bytes as the credential
+        // verbatim — the same unauthenticated-downgrade hole the Wi-Fi path
+        // closed in round 20. A genuine legacy plaintext secret (an API key,
+        // a token) cannot be a long hex string, so the shape test separates
+        // them without guessing.
+        if looks_like_seal_tag(stored) {
+            return Err(SealError::BadPrefix);
+        }
         return Ok(SecretOpenOutcome::LegacyPlaintext);
     };
+    // Same rule as `open_sealed_v2`: a short non-hex body under a `DBO2:`
+    // prefix is a plaintext credential that happens to start with the tag,
+    // not a truncated blob.
+    if payload.len() < 2 * (NONCE_LEN + MAC_LEN) && !payload.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Ok(SecretOpenOutcome::LegacyPlaintext);
+    }
 
     // Must at least hold nonce + MAC; cipher length must be even (hex).
     if payload.len() < 2 * (NONCE_LEN + MAC_LEN) || !(payload.len() - 2 * MAC_LEN).is_multiple_of(2)
@@ -859,6 +966,164 @@ mod tests {
         }
     }
 
+    /// A corrupt or unknown version tag must be refused, not downgraded to
+    /// plaintext.
+    ///
+    /// Only `DBO2:` and `DBO1:` are sealed formats. Before the guard, any
+    /// other prefix fell into DBO1's `LegacyPlaintext` branch and
+    /// `open_stored_wifi_pass` returned that string verbatim as the Wi-Fi
+    /// password. So one flipped byte in NVS (`DBO2:` → `DBO7:`, or the `2`
+    /// erased to `0xFF`) turned an integrity-checked entry into an
+    /// unauthenticated one, silently, and the device would then try to join a
+    /// network with the tag string as the key.
+    #[test]
+    fn an_unknown_version_tag_is_refused_not_treated_as_plaintext() {
+        let mut out: Vec<u8, MAX_PLAINTEXT> = Vec::new();
+        // A corrupt or unsupported sealed blob: tag-shaped *and* a long hex
+        // body, which no password is.
+        let hex_body = "ab".repeat(64);
+        for stored in [
+            format!("DBO7:{hex_body}"),
+            format!("DBO2;{hex_body}"), // separator byte flipped
+            format!("DBO10:{hex_body}"),
+            format!("dbo2:{hex_body}"),
+        ] {
+            let r = open_sealed_v2(&stored, TEST_KEY, &mut out);
+            assert!(
+                r.is_err(),
+                "{stored:?} is a sealed blob with a bad tag and must not open \
+                 as plaintext"
+            );
+        }
+
+        // A short, *non-hex* tag-like string is a plausible password and must
+        // still migrate. (`DBO2:deadbeef` is deliberately absent: valid hex
+        // but too short to be a blob, so it is reported as truncated.)
+        for password in ["DBO2:mywifi", "DBO9:changeme", "DBO2:p@ssw0rd"] {
+            let r = open_sealed_v2(password, TEST_KEY, &mut out)
+                .unwrap_or_else(|e| panic!("{password:?} is a password, got {e:?}"));
+            assert_eq!(r, OpenOutcome::LegacyPlaintext(password));
+        }
+
+        // A genuine legacy password still migrates.
+        let r = open_sealed_v2("hunter2", TEST_KEY, &mut out).unwrap();
+        assert_eq!(r, OpenOutcome::LegacyPlaintext("hunter2"));
+    }
+
+    /// A single flipped separator byte must still be recognised as a blob.
+    ///
+    /// The separator used to have to be *non-alphanumeric*. Flipping ':'
+    /// (0x3A) to '8' (0x38), '2' (0x32) or 'z' (0x7A) is a one-bit change that
+    /// produces an alphanumeric byte, which made the tag scan absorb the digit
+    /// and the whole 300-character blob fall through to the plaintext branch —
+    /// handed back as the Wi-Fi password / API key. Roughly 3 of the 8
+    /// single-bit flips of the separator were enough.
+    #[test]
+    fn a_flipped_separator_still_reads_as_a_sealed_blob() {
+        let hex = "0123456789abcdef".repeat(8); // 128 hex chars
+                                                // ':' is 0x3A; these are all one bit different and all alphanumeric.
+        for sep in ["8", "2", "z", ":", ";", ">", "*"] {
+            let stored = format!("DBO2{sep}{hex}");
+            assert!(
+                looks_like_seal_tag(&stored),
+                "separator {sep:?} must still be recognised: {stored}"
+            );
+            let mut out: Vec<u8, MAX_PLAINTEXT> = Vec::new();
+            assert!(
+                open_sealed_v2(&stored, TEST_KEY, &mut out).is_err(),
+                "a corrupt blob must not open as plaintext: {stored}"
+            );
+        }
+    }
+
+    /// A single-bit flip in the *tag letters* must also read as a blob.
+    ///
+    /// The separator fix above still keyed on the literal `DBO` prefix, so
+    /// corrupting any of its three letters made the shape test return `false`:
+    /// `open_sealed_v2` then took its plaintext branch and returned the whole
+    /// ciphertext as the Wi-Fi password / API key. Measured before the fix,
+    /// every one of `XBO2:…` (D→X), `EBO2:…` (D→E), `DQO2:…` (O→Q) and
+    /// `DBC2:…` (B→C) came back as `LegacyPlaintext(<the blob>)`.
+    #[test]
+    fn a_flipped_tag_letter_still_reads_as_a_sealed_blob() {
+        let hex = "0123456789abcdef".repeat(8); // 128 hex chars
+        let sealed = format!("DBO2:{hex}");
+        let mut bytes = sealed.clone().into_bytes();
+        // Flip one bit in each tag letter in turn.
+        for index in 0..3usize {
+            let original = bytes[index];
+            // 0x20 lowercases an ASCII letter, which is still a tag byte the
+            // shape test must not be fooled by.
+            bytes[index] ^= 0x20;
+            let mutated = alloc::string::String::from_utf8(bytes.clone()).expect("still ASCII");
+            assert!(
+                looks_like_seal_tag(&mutated),
+                "flipping byte {index} ({}) must still read as a blob: {mutated}",
+                original as char
+            );
+            let mut out: Vec<u8, MAX_PLAINTEXT> = Vec::new();
+            assert!(
+                open_sealed_v2(&mutated, TEST_KEY, &mut out).is_err(),
+                "a corrupt tag must not open as plaintext: {mutated}"
+            );
+            bytes[index] = original;
+        }
+    }
+
+    #[test]
+    fn seal_tag_shape_is_recognised_without_matching_plaintext() {
+        let hex_body = "ab".repeat(64);
+
+        // Tag-shaped with a hex body → a sealed blob we cannot use.
+        assert!(looks_like_seal_tag(&format!("DBO2:{hex_body}")));
+        assert!(looks_like_seal_tag(&format!("dbo1:{hex_body}")));
+        assert!(looks_like_seal_tag(&format!("DBO99:{hex_body}")));
+        // A corrupted separator still reads as a seal attempt.
+        assert!(looks_like_seal_tag(&format!("DBO2;{hex_body}")));
+
+        // Short tag-like strings are passwords, not blobs.
+        assert!(!looks_like_seal_tag("DBO2:x"));
+        assert!(!looks_like_seal_tag("DBO2:mywifi"));
+        assert!(!looks_like_seal_tag("DBO9:changeme"));
+
+        // Not tag-shaped at all.
+        assert!(!looks_like_seal_tag("DBO:"));
+        assert!(!looks_like_seal_tag("DBOx:"));
+        assert!(!looks_like_seal_tag("DBO2"));
+        assert!(!looks_like_seal_tag("myDBO2:pass"));
+        assert!(!looks_like_seal_tag("hunter2"));
+        // A long body that is not hex is not a seal either.
+        assert!(!looks_like_seal_tag(&format!("DBO2:{}", "zz".repeat(64))));
+    }
+
+    /// The generic-secret path refuses a corrupt seal tag too.
+    ///
+    /// It used to treat *any* non-`DBO2:` value as legacy plaintext, so a
+    /// credential blob with a damaged tag was handed back verbatim as the API
+    /// key. The shape test separates that from a real legacy secret.
+    #[test]
+    fn open_secret_refuses_a_corrupt_tag() {
+        let mut out: Vec<u8, MAX_SECRET_PLAINTEXT> = Vec::new();
+        let hex_body = "ab".repeat(80);
+        for stored in [format!("DBO7:{hex_body}"), format!("DBO2;{hex_body}")] {
+            let err = open_secret(&stored, TEST_KEY, &mut out)
+                .expect_err("a corrupt seal tag must not open as plaintext");
+            assert_eq!(err, SealError::BadPrefix, "for {stored}");
+        }
+
+        // A real legacy secret still opens.
+        assert_eq!(
+            open_secret("sk-live-abcdef", TEST_KEY, &mut out).unwrap(),
+            SecretOpenOutcome::LegacyPlaintext
+        );
+        // A secret that happens to start `DBO2:` but cannot be a blob is also
+        // legacy plaintext.
+        assert_eq!(
+            open_secret("DBO2:sk-live", TEST_KEY, &mut out).unwrap(),
+            SecretOpenOutcome::LegacyPlaintext
+        );
+    }
+
     /// Full DBO1 → DBO2 migration round-trip:
     ///
     /// 1. Seal under DBO1 (legacy path).
@@ -964,11 +1229,24 @@ mod tests {
         assert_eq!(r, Err(SealError::PlaintextTooLong));
     }
 
+    /// A short **non-hex** `DBO2:`-prefixed value is a password, not a blob.
+    ///
+    /// `DBO2:` is a legal start for a WPA2 passphrase, and refusing it locked
+    /// the user out of their own network. The discriminator is the body: a
+    /// sealed blob is hex only, so `DBO2:zz` cannot be one. (Owner decision
+    /// 2026-11-15: prefer treating such a value as the password.)
     #[test]
-    fn seal_rejects_short_prefix_payload() {
-        // "DBO2:zz" — too short to contain nonce + MAC.
+    fn a_short_non_hex_prefix_payload_is_a_password() {
         let mut out: Vec<u8, MAX_PLAINTEXT> = Vec::new();
-        let err = open_sealed_v2("DBO2:zz", TEST_KEY, &mut out).unwrap_err();
+        let r = open_sealed_v2("DBO2:zz", TEST_KEY, &mut out).expect("a password, not an error");
+        assert_eq!(r, OpenOutcome::LegacyPlaintext("DBO2:zz"));
+    }
+
+    /// A short **hex** `DBO2:` body is a truncated blob and is reported.
+    #[test]
+    fn a_short_hex_prefix_payload_is_reported_as_truncated() {
+        let mut out: Vec<u8, MAX_PLAINTEXT> = Vec::new();
+        let err = open_sealed_v2("DBO2:deadbeef", TEST_KEY, &mut out).unwrap_err();
         assert_eq!(err, SealError::BadLength);
     }
 
@@ -998,6 +1276,37 @@ mod tests {
     // ------------------------------------------------------------------
     // Generic secret seal / open (seal_secret / open_secret)
     // ------------------------------------------------------------------
+
+    /// A sealed secret must never exceed the firmware's NVS read buffer.
+    ///
+    /// The firmware reads NVS strings through a fixed buffer
+    /// (`nvs_load_string`). A sealed LLM API key at the validation cap
+    /// (128 bytes) produces `5 + 2*(12 + 128 + 16) = 317` characters, and the
+    /// module constant allows up to 573 — so the buffer has to be sized from
+    /// `MAX_SECRET_ENCODED_LEN`, not guessed. This pins the worst case so a
+    /// later widening of the plaintext cap cannot outgrow it silently.
+    #[test]
+    fn the_worst_case_sealed_secret_fits_the_firmware_nvs_buffer() {
+        let plain = [0x5Au8; MAX_SECRET_PLAINTEXT];
+        let nonce = test_nonce();
+        let mut blob: HeaplessString<MAX_SECRET_ENCODED_LEN> = HeaplessString::new();
+        seal_secret(&plain, TEST_KEY, &nonce, &mut blob).expect("seal");
+
+        // The firmware's `nvs_load_string` buffer. Keep the two in step: a
+        // larger constant here means the firmware buffer must grow too.
+        const FIRMWARE_NVS_BUF: usize = 640;
+        assert!(
+            blob.len() <= FIRMWARE_NVS_BUF,
+            "a sealed secret is {} chars, past the firmware's {FIRMWARE_NVS_BUF}-byte \
+             NVS read buffer — it would be truncated and fail its MAC on every boot",
+            blob.len()
+        );
+        assert_eq!(blob.len(), MAX_SECRET_ENCODED_LEN);
+        assert_eq!(
+            MAX_SECRET_ENCODED_LEN, 573,
+            "if this changes, re-check FIRMWARE_NVS_BUF in firmware/esp32-app/src/main.rs"
+        );
+    }
 
     #[test]
     fn secret_round_trips_with_long_plaintext() {

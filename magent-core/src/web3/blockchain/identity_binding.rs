@@ -905,13 +905,7 @@ mod tests {
 
         // Replacing the public `did` field while keeping the (valid)
         // signature must fail: the DID is inside the signed claim.
-        let swapped = BindingProof::new(
-            "did:key:z6MkAttacker",
-            addr,
-            1,
-            sig.to_hex(),
-            message,
-        );
+        let swapped = BindingProof::new("did:key:z6MkAttacker", addr, 1, sig.to_hex(), message);
         assert!(!swapped.verify_crypto().unwrap());
     }
 }

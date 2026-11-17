@@ -17,7 +17,7 @@ use crate::error::{AgentError, Result};
 use crate::health_sensors::HeartRateData;
 use crate::sleep_manager::{SleepManager, SleepQuality, SleepRecord};
 use crate::sports_coach::{ExerciseGoal, ExerciseType, SportsCoach};
-use crate::voice_notification::{VoiceCategory, VoiceNotificationManager};
+use crate::voice_notification::{QueueOutcome, VoiceCategory, VoiceNotificationManager};
 use std::format;
 use std::string::{String, ToString};
 use std::vec::Vec;
@@ -409,6 +409,11 @@ pub struct AgentSimulator {
     pub early_warning: EarlyWarningSystem,
 }
 
+/// The stress level a fresh simulator starts at (30 %).
+///
+/// Named so the initial `last_hrv` and the reported level cannot drift apart.
+pub const DEFAULT_STRESS_LEVEL: u8 = 30;
+
 /// Health simulation state
 pub struct HealthSimState {
     /// Current exercise state
@@ -419,8 +424,15 @@ pub struct HealthSimState {
     pub stress_level: u8,
     /// Last heart rate reading
     pub last_hr: u16,
-    /// Last HRV reading
+    /// Last HRV reading.
+    ///
+    /// Starts at the value `simulate_hrv`'s formula gives for the default
+    /// stress level, so a fresh simulator's two readings of "same moment"
+    /// agree; `hrv_sampled` distinguishes the placeholder from a measurement.
     pub last_hrv: f32,
+    /// Whether `last_hrv` came from a sample (or an explicit set) rather than
+    /// the initial placeholder.
+    pub hrv_sampled: bool,
     /// Last glucose reading
     pub last_glucose: f32,
     /// Hours since meal (for glucose simulation)
@@ -429,15 +441,21 @@ pub struct HealthSimState {
 
 impl HealthSimState {
     /// Default-construct a state with no in-progress exercise, 30 %
-    /// baseline stress, a 72 BPM resting heart rate, HRV of 55 ms,
+    /// baseline stress, a 72 BPM resting heart rate, HRV consistent with that
+    /// stress level (65 ms),
     /// fasting-glucose 100 mg/dL, and "2 h since last meal".
     pub fn new() -> Self {
         Self {
             is_exercising: false,
             minutes_elapsed: 0,
-            stress_level: 30,
+            stress_level: DEFAULT_STRESS_LEVEL,
             last_hr: 72,
-            last_hrv: 55.0,
+            // `simulate_hrv`'s formula at the default stress level: HRV
+            // decreases with stress. The old literal 55.0 matched no
+            // formula and disagreed with the `hrv` sensor on a fresh
+            // simulator.
+            last_hrv: 80.0 - (DEFAULT_STRESS_LEVEL as f32 * 0.5),
+            hrv_sampled: false,
             last_glucose: 100.0,
             hours_since_meal: 2.0,
         }
@@ -722,24 +740,39 @@ impl AgentSimulator {
                     None => 5,
                 };
                 let ts = self.uptime_ms();
-                let before = self.voice.voice_queue_size();
-                self.voice
+                // Ask the manager what it did. The old code compared queue
+                // depth before/after, which cannot tell "dropped because the
+                // queue is full of equally-urgent cues" from "queued" — both
+                // leave the depth unchanged — so a lost message was reported
+                // as queued and the model moved on believing the user had
+                // been told.
+                let outcome = self
+                    .voice
                     .queue_voice(&text, priority, VoiceCategory::System, ts)?;
                 let depth = self.voice.voice_queue_size();
-                // The queue not growing means one of two things: the manager
-                // routed the cue elsewhere (do-not-disturb at priority < 8), or
-                // a full queue replaced an equal-priority entry. Only the first
-                // is a suppression, so check both rather than blaming DND for a
-                // queue that simply stayed the same size.
-                if depth == before && self.voice.is_in_dnd_period(self.current_hour()) {
-                    Ok(format!(
-                        "Voice message not queued — do-not-disturb is active (queue depth {depth})"
-                    ))
-                } else {
-                    Ok(format!(
-                        "Queued voice message (priority {priority}, queue depth {depth})"
-                    ))
-                }
+                Ok(match outcome {
+                    QueueOutcome::Queued => {
+                        format!("Queued voice message (priority {priority}, queue depth {depth})")
+                    }
+                    QueueOutcome::EvictedLowerPriority => format!(
+                        "Queued voice message (priority {priority}), replacing a \
+                         lower-priority one (queue depth {depth})"
+                    ),
+                    QueueOutcome::RoutedToNotification => "Voice message not spoken — \
+                         do-not-disturb is active; sent as a screen notification instead"
+                        .to_string(),
+                    QueueOutcome::DroppedInDnd => "Voice message NOT delivered — \
+                         do-not-disturb is active and this cue is below the threshold \
+                         that reaches the screen either; it was discarded"
+                        .to_string(),
+                    QueueOutcome::Dropped => format!(
+                        "Voice message NOT queued — the queue is full of cues at least as \
+                         urgent (depth {depth}); nothing was lost from it"
+                    ),
+                    QueueOutcome::VoiceDisabled => {
+                        "Voice output is disabled on this device; nothing was queued".to_string()
+                    }
+                })
             }
             "send_health_alert" => {
                 let Some(alert_type) = extract_str_arg(args, "type") else {
@@ -757,26 +790,26 @@ impl AgentSimulator {
                 let ts = self.uptime_ms();
                 // An alert's channels are not all-or-nothing: the manager
                 // routes the cue and the notification independently, and under
-                // do-not-disturb it can drop either (priority < 7). Reporting
-                // "delivered" unconditionally would be the old fabricated-success
-                // bug in a new place, so capture both channels before and after
-                // and report what the pipeline actually did.
-                let voice_before = self.voice.voice_queue_size();
-                let notes_before = self.voice.notification_history().len();
+                // do-not-disturb it can drop either. The manager now reports
+                // each channel's outcome directly — the old before/after
+                // counter comparison this dispatch used could not see a drop
+                // that evicted an entry (the length stayed the same), so a
+                // suppressed alert could read as raised.
                 // The prompt carries no `recommendation` argument; the module's
                 // alert body is "{message}。{recommendation}", so an empty
                 // recommendation yields a plain sentence rather than invented
                 // advice the model never gave.
-                self.voice
-                    .send_health_alert(&alert_type, severity as u8, &message, "", ts)?;
+                let outcome =
+                    self.voice
+                        .send_health_alert(&alert_type, severity as u8, &message, "", ts)?;
                 Ok(format!(
                     "Health alert {alert_type} (severity {severity}): voice {}, notification {}",
-                    if self.voice.voice_queue_size() > voice_before {
+                    if outcome.voice {
                         "queued"
                     } else {
                         "not queued"
                     },
-                    if self.voice.notification_history().len() > notes_before {
+                    if outcome.notification {
                         "raised"
                     } else {
                         "not raised"
@@ -788,11 +821,36 @@ impl AgentSimulator {
                     return Err(missing_field("script"));
                 };
                 let ts = self.uptime_ms();
-                self.voice.send_meditation(&script, ts)?;
-                Ok(format!(
-                    "Meditation script queued (queue depth {})",
-                    self.voice.voice_queue_size()
-                ))
+                // `send_meditation` queues at priority 7, which do-not-disturb
+                // routes to a screen notification. Reporting "queued" there
+                // was self-contradictory — the same message said
+                // "(queue depth 0)". Go through `queue_voice` so the outcome
+                // is known.
+                let outcome = self
+                    .voice
+                    .queue_voice(&script, 7, VoiceCategory::Meditation, ts)?;
+                let depth = self.voice.voice_queue_size();
+                Ok(match outcome {
+                    QueueOutcome::Queued | QueueOutcome::EvictedLowerPriority => {
+                        format!("Meditation script queued (queue depth {depth})")
+                    }
+                    QueueOutcome::RoutedToNotification => {
+                        "Meditation script not spoken — do-not-disturb is active; \
+                         sent as a screen notification instead"
+                            .to_string()
+                    }
+                    QueueOutcome::DroppedInDnd => {
+                        "Meditation script NOT delivered — do-not-disturb is active and \
+                         it was below the threshold for a screen notification too"
+                            .to_string()
+                    }
+                    QueueOutcome::Dropped => format!(
+                        "Meditation script NOT queued — the voice queue is full (depth {depth})"
+                    ),
+                    QueueOutcome::VoiceDisabled => {
+                        "Voice output is disabled on this device; nothing was queued".to_string()
+                    }
+                })
             }
             "set_dnd" => {
                 // Absent and present-but-not-a-boolean are different mistakes:
@@ -998,7 +1056,13 @@ impl AgentSimulator {
                 // described that fabricated string rather than its data. Both
                 // the embedded executor (`tools.rs`) and the host simulator
                 // already persist the `data` value; this now matches them.
-                let data = extract_str_arg(args, "data").unwrap_or_default();
+                // An absent `data` key is a missing field, not an empty
+                // write. Every other argument on this dispatch (`address`,
+                // `pin`, `severity`, …) already reports `missing_field`;
+                // `unwrap_or_default()` made a typo'd key ("data_") look
+                // like a successful write of zero bytes, and bumped the
+                // "Flash writes" counter with nothing persisted.
+                let data = extract_str_arg(args, "data").ok_or_else(|| missing_field("data"))?;
                 self.flash.write(address, data.as_bytes())?;
                 Ok(format!(
                     "Wrote {} bytes to flash at 0x{:04X}",
@@ -1012,33 +1076,36 @@ impl AgentSimulator {
                 // `{"data":"System health OK"}` went over the wire as
                 // 27 bytes of JSON — braces, quotes and key name included —
                 // for a 16-character message.
-                let data = extract_str_arg(args, "data").unwrap_or_default();
+                // Same rule as `flash_write`: no payload is a missing field,
+                // not a successful transmission of nothing.
+                let data = extract_str_arg(args, "data").ok_or_else(|| missing_field("data"))?;
                 self.ble.send(&data)?;
                 Ok(format!("Sent {} bytes via BLE", data.len()))
             }
-            "web_search" => {
-                // Delegate to the dedicated web module so the heavy
-                // lifting (regex, reqwest, HTML stripping) lives in
-                // one place. Tool failures are surfaced as `Ok` with
-                // a leading "error:" prefix so the LLM sees the
-                // failure (the agent loop matches on the prefix).
-                match crate::web::web_search(args) {
-                    Ok(s) => Ok(s),
-                    Err(e) => Ok(format!("error: web_search failed: {e}")),
-                }
+            // Delegate to the dedicated web module so the heavy lifting
+            // (regex, reqwest, HTML stripping) lives in one place.
+            //
+            // A failure is returned as `Err`, not `Ok("error: …")`. The old
+            // wrapping assumed the agent loop matched on the prefix, but
+            // nothing does: the runner treats `Ok` as success, so a refused
+            // URL or an unreachable host was reported to the user as a
+            // *successful* tool call (a green ✓ in the CLI trace) whose
+            // "result" began with the word `error:`. `ToolExecutor` already
+            // has an error channel — the runner turns `Err` into
+            // `Error: {e}`, feeds it back to the model, and marks the call
+            // failed.
+            // The web module reports a message-shaped error (`String`), while
+            // this dispatch returns `AgentError`. `AgentError` is `no_std` and
+            // deliberately carries no owned text, so the reason is
+            // classified into the network taxonomy; the detailed message is
+            // logged. What must *not* happen is the old `Ok("error: …")`:
+            // that made a refused URL look like a successful call.
+            "web_search" => web_tool_result("web_search", crate::web::web_search(args)),
+            "fetch_url" => web_tool_result("fetch_url", crate::web::fetch_url(args)),
+            "webpage_summary" => {
+                web_tool_result("webpage_summary", crate::web::webpage_summary(args))
             }
-            "fetch_url" => match crate::web::fetch_url(args) {
-                Ok(s) => Ok(s),
-                Err(e) => Ok(format!("error: fetch_url failed: {e}")),
-            },
-            "webpage_summary" => match crate::web::webpage_summary(args) {
-                Ok(s) => Ok(s),
-                Err(e) => Ok(format!("error: webpage_summary failed: {e}")),
-            },
-            "get_weather" => match crate::web::get_weather(args) {
-                Ok(s) => Ok(s),
-                Err(e) => Ok(format!("error: get_weather failed: {e}")),
-            },
+            "get_weather" => web_tool_result("get_weather", crate::web::get_weather(args)),
             _ => Err(AgentError::ConfigurationError {
                 field: "tool",
                 reason: crate::error::ConfigError::MissingField,
@@ -1128,26 +1195,49 @@ impl AgentSimulator {
         let variation = ((self.health_state.minutes_elapsed as f32 * 0.1).sin() * 10.0) as i16;
         let hr = (base_hr as i16 + variation).clamp(50, 200) as u16;
 
-        let base_hrv = if self.health_state.is_exercising {
-            20.0
-        } else {
-            55.0
-        };
-        let hrv = base_hrv + ((self.health_state.minutes_elapsed as f32 * 0.2).sin() * 5.0);
-
+        let hrv = self.instant_hrv();
         self.health_state.last_hr = hr;
         self.health_state.last_hrv = hrv;
+        self.health_state.hrv_sampled = true;
 
         (hr, hrv)
     }
 
     /// Simulate HRV based on stress level
     fn simulate_hrv(&mut self) -> (f32, u8) {
-        // HRV decreases with stress
-        let base_hrv = 80.0 - (self.health_state.stress_level as f32 * 0.5);
-        let hrv = base_hrv + ((self.health_state.minutes_elapsed as f32 * 0.15).sin() * 5.0);
+        let hrv = self.instant_hrv();
         self.health_state.last_hrv = hrv;
+        self.health_state.hrv_sampled = true;
         (hrv, self.health_state.stress_level)
+    }
+
+    /// The HRV for this instant. **One** formula, used by every reading.
+    ///
+    /// HRV has two drivers and they *multiply*: parasympathetic tone falls
+    /// with psychological stress (`80 − stress·0.5`) and falls again under
+    /// exertion. The simulator used to have two competing formulas — the heart
+    /// rate read derived HRV from a fixed 55/20 base that ignored stress, the
+    /// HRV/stress reads used the stress formula that ignored exercise — and
+    /// both wrote `last_hrv`. Whichever sensor was read last therefore decided
+    /// what the next `check_stress_level` and `get_status` reported, so a
+    /// single moment had up to three different HRVs (measured: 56.0 ms from
+    /// `check_stress_level`, 65.7 ms from the `hrv` sensor, 65.0 ms from a
+    /// fresh state). A health reading with more than one answer is unusable.
+    ///
+    /// The stress formula is the one the rest of the tree is calibrated
+    /// against: `SleepManager::calculate_stress_score` normalises against
+    /// `(80 − hrv)/80`, and `HealthSimState::new` documents 65 ms at the
+    /// default stress of 30. Exertion is applied as a scale (0.3), which
+    /// reproduces the old exercising base (~20 ms) at that same stress level.
+    fn instant_hrv(&self) -> f32 {
+        let stress_base = 80.0 - f32::from(self.health_state.stress_level) * 0.5;
+        let activity_scale = if self.health_state.is_exercising {
+            0.3
+        } else {
+            1.0
+        };
+        let wobble = (self.health_state.minutes_elapsed as f32 * 0.15).sin() * 5.0;
+        (stress_base * activity_scale + wobble).clamp(5.0, 120.0)
     }
 
     /// Simulate blood glucose
@@ -1181,17 +1271,45 @@ impl AgentSimulator {
         (hr, rhythm, 95)
     }
 
-    /// Calculate stress from HRV
-    fn calculate_stress(&self) -> (u8, &'static str, f32) {
-        let hrv = self.health_state.last_hrv;
-        let (level, desc) = if hrv >= 80.0 {
-            (20u8, "Low")
-        } else if hrv >= 50.0 {
-            (50u8, "Moderate")
-        } else if hrv >= 25.0 {
-            (75u8, "High")
-        } else {
-            (95u8, "Very High")
+    /// The stress reading shown by `check_stress_level` / `read_sensor
+    /// sensor=stress`.
+    ///
+    /// The level comes from the health state — the same field `simulate_hrv`
+    /// reports as "Stress Level" and that `set_stress_level` writes. It used
+    /// to be *derived* from `last_hrv` alone, so the two sensors disagreed
+    /// about the same moment: a fresh simulator is documented as starting at
+    /// 30 % stress, yet reported `50 (Moderate)` here and `30` from the `hrv`
+    /// sensor; after `set_stress_level(90)` one said 90 and the other said
+    /// 75. A single reading with two answers is worse than either number.
+    ///
+    /// HRV is still reported alongside, as the measurement the figure is
+    /// based on (refreshed if it has never been read).
+    fn calculate_stress(&mut self) -> (u8, &'static str, f32) {
+        // The guard used to test `last_hrv <= 0.0`, but the field starts at
+        // 55.0 and `simulate_hrv` never returns a non-positive value, so the
+        // branch was dead: the reading paired the *stored* level (30 by
+        // default) with an HRV derived from a different formula (`55.0`)
+        // than the `hrv` sensor uses (`80 - 30*0.5 = 65.0`). Two columns of
+        // one reading, computed two ways.
+        //
+        // Report the HRV for *this* moment, from the same function every other
+        // sensor uses. The previous code refreshed `last_hrv` only when it had
+        // never been sampled, so after any heart-rate read it reported that
+        // sensor's (different) figure — two answers for one moment. With a
+        // single formula the value no longer depends on which sensor ran
+        // first, so recomputing is both cheap and the only way to stay
+        // truthful when `set_stress_level` / `set_exercising` change the state
+        // between reads.
+        let hrv = self.instant_hrv();
+        self.health_state.last_hrv = hrv;
+        self.health_state.hrv_sampled = true;
+
+        let level = self.health_state.stress_level;
+        let desc = match level {
+            0..=25 => "Low",
+            26..=55 => "Moderate",
+            56..=80 => "High",
+            _ => "Very High",
         };
         (level, desc, hrv)
     }
@@ -1256,15 +1374,48 @@ fn extract_int_arg(s: &str, key: &str) -> Option<i32> {
         }
         return None;
     }
-    let prefix = format!("{}=", key);
-    s.find(&prefix).and_then(|pos| {
-        let start = pos + prefix.len();
-        let end = s[start..]
-            .find(|c: char| !c.is_ascii_digit())
-            .map(|i| start + i)
-            .unwrap_or(s.len());
-        s[start..end].parse().ok()
-    })
+    let start = kv_value_start(s, key)?;
+    let end = s[start..]
+        .find(|c: char| !c.is_ascii_digit())
+        .map(|i| start + i)
+        .unwrap_or(s.len());
+    s[start..end].parse().ok()
+}
+
+/// Byte offset of `key`'s value in a `key=value,key=value` payload.
+///
+/// The key must be a **whole** field name, not a substring. The old
+/// `s.find("text=")` matched inside `context=`, so a payload such as
+/// `context=5,text=hello` returned `5` for `text=` — the model's argument was
+/// replaced by an unrelated field's value, and `flash_write address=…` could
+/// read the low bits of `base_address=…`. Fields are delimited by `,`/`;`
+/// and the run-up to a field may carry only whitespace.
+fn kv_value_start(s: &str, key: &str) -> Option<usize> {
+    let mut search_from = 0usize;
+    while let Some(rel) = s[search_from..].find(key) {
+        let pos = search_from + rel;
+        let after = pos + key.len();
+        let at_field_start = s[..pos].trim_end().is_empty()
+            || s[..pos].trim_end().ends_with(',')
+            || s[..pos].trim_end().ends_with(';');
+        // `key` must be followed directly by `=` (or ` =`).
+        let rest = s[after..].trim_start();
+        if at_field_start && rest.starts_with('=') {
+            let eq = s.len() - rest.len();
+            // Skip whitespace between `=` and the value: `text = third` is
+            // the same field as `text=third`, and leaving the space in made
+            // the caller's whitespace-boundary scan return an empty value.
+            let value_start = eq + 1;
+            let value = s[value_start..].trim_start();
+            return Some(s.len() - value.len());
+        }
+        // Keep looking from the next byte.
+        search_from = after;
+        if search_from >= s.len() {
+            break;
+        }
+    }
+    None
 }
 
 /// Read a string tool argument, in either shape [`extract_int_arg`] accepts —
@@ -1336,9 +1487,10 @@ fn extract_str_arg(s: &str, key: &str) -> Option<String> {
             _ => None,
         };
     }
-    let prefix = format!("{}=", key);
-    let pos = s.find(&prefix)?;
-    let rest = &s[pos + prefix.len()..];
+    // Whole-field match only (see `kv_value_start`): a substring lookup let
+    // `text=` match inside `context=`.
+    let start = kv_value_start(s, key)?;
+    let rest = &s[start..];
     let end = rest
         .find(|c: char| c == ',' || c == ';' || c.is_whitespace())
         .unwrap_or(rest.len());
@@ -1443,6 +1595,24 @@ fn parse_bool(v: &str) -> Option<bool> {
 }
 
 /// A required argument the call omitted.
+/// Turn a web tool's `String` error into a typed [`AgentError`].
+///
+/// The tool's own message is what the model needs to recover ("refusing
+/// non-http(s) URL: …", "missing 'url'"), so it is carried through
+/// [`AgentError::ToolFailed`] rather than flattened into a generic network
+/// reason. What matters for the runner is the *variant*: an `Err` marks the
+/// call failed and feeds the text back to the model. The old code returned
+/// `Ok("error: …")`, which the runner recorded as a successful tool call.
+fn web_tool_result(
+    tool: &'static str,
+    result: core::result::Result<String, String>,
+) -> Result<String> {
+    match result {
+        Ok(body) => Ok(body),
+        Err(message) => Err(AgentError::ToolFailed { tool, message }),
+    }
+}
+
 fn missing_field(field: &'static str) -> AgentError {
     AgentError::ConfigurationError {
         field,
@@ -1528,6 +1698,12 @@ fn resolve_sensor_as(implied: &str, args: &str) -> Result<SimSensorType> {
 mod tests {
     use super::*;
 
+    /// Capacity of the voice queue, read from the module that owns it so the
+    /// test does not hard-code a number that can drift.
+    fn magent_core_voice_queue_capacity() -> usize {
+        crate::voice_notification::MAX_VOICE_QUEUE
+    }
+
     /// The LLM-shaped payload that `agent_runner::execute_tool`
     /// serialises via `serde_json::to_string`. We assert that the
     /// web tools reach the HTTP layer instead of bouncing back
@@ -1546,14 +1722,23 @@ mod tests {
         // (no network in unit tests), but the failure surface
         // proves the routing worked.
         let result = sim.execute_tool("web_search", "query=rust");
-        assert!(result.is_ok());
-        let body = result.unwrap();
-        // Either an answer (network is reachable) or a placeholder
-        // error string — both prove we reached `web::web_search`.
-        assert!(
-            body.starts_with('[') || body.starts_with("error: web_search failed"),
-            "expected JSON hits or error, got {body}"
-        );
+        // Either outcome is fine here — a live search returns JSON hits, an
+        // offline one returns a *tool failure*. What the test pins is that
+        // the dispatch reached `web::web_search` rather than bouncing back
+        // as an unknown tool (whose message is `ConfigurationError`).
+        match result {
+            Ok(body) => assert!(
+                body.starts_with('['),
+                "expected JSON hits from a live search, got {body}"
+            ),
+            Err(e) => {
+                let text = e.to_string();
+                assert!(
+                    text.contains("web_search"),
+                    "the failure must come from web_search, got {text}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1565,16 +1750,23 @@ mod tests {
         // reaches the URL validator (which rejects non-http(s)).
         let mut sim = AgentSimulator::new();
         let result = sim.execute_tool("fetch_url", r#"{"url":""}"#);
-        assert!(result.is_ok());
-        let body = result.unwrap();
+        // A refused URL is a *failed* tool call, not a successful one whose
+        // text happens to start with "error:". The runner keys its success
+        // bit, the ✓/✗ trace and the `Error:` message it feeds back to the
+        // model off this `Result`.
+        let err = match result {
+            Err(e) => e,
+            Ok(body) => panic!("a refused URL must be a tool failure, got Ok({body:?})"),
+        };
+        let text = err.to_string();
         assert!(
-            body.starts_with("error: fetch_url failed"),
-            "expected fetch_url to be called, got {body}"
+            text.contains("fetch_url"),
+            "the error must name the tool, got {text}"
         );
         // The error message should reference the URL scheme check.
         assert!(
-            body.contains("refusing non-http"),
-            "expected URL scheme rejection, got {body}"
+            text.contains("refusing"),
+            "expected URL rejection, got {text}"
         );
     }
 
@@ -1584,9 +1776,11 @@ mod tests {
         // This path also has to keep working.
         let mut sim = AgentSimulator::new();
         let result = sim.execute_tool("fetch_url", "url=");
-        assert!(result.is_ok());
-        let body = result.unwrap();
-        assert!(body.contains("error: fetch_url failed"));
+        let err = match result {
+            Err(e) => e,
+            Ok(body) => panic!("an empty URL must be a tool failure, got Ok({body:?})"),
+        };
+        assert!(err.to_string().contains("fetch_url"));
     }
 
     #[test]
@@ -1596,14 +1790,16 @@ mod tests {
             "webpage_summary",
             r#"{"url":"https://example.com","query":"test"}"#,
         );
-        // Network may or may not be available in tests; either way
-        // we should NOT see "missing url" because the JSON parser
-        // finds the URL.
-        assert!(result.is_ok());
-        let body = result.unwrap();
+        // Network may or may not be available in tests, so either outcome
+        // is acceptable — but the *argument parser* must have found the URL.
+        // A "missing 'url'" failure means the JSON dispatch is broken.
+        let text = match result {
+            Ok(body) => body,
+            Err(e) => e.to_string(),
+        };
         assert!(
-            !body.contains("missing 'url'"),
-            "webpage_summary should have parsed the JSON url, got {body}"
+            !text.contains("missing 'url'"),
+            "webpage_summary should have parsed the JSON url, got {text}"
         );
     }
 
@@ -1613,16 +1809,19 @@ mod tests {
         // Empty city is a cheap, network-independent failure that still
         // proves the dispatch reached `web::get_weather` (and parsed the
         // JSON `city` arg) rather than bouncing back as an unknown tool.
-        let result = sim.execute_tool("get_weather", r#"{"city":""}"#);
-        assert!(result.is_ok());
-        let body = result.unwrap();
+        // It must surface as a tool failure.
+        let err = match sim.execute_tool("get_weather", r#"{"city":""}"#) {
+            Err(e) => e,
+            Ok(body) => panic!("an empty city must be a tool failure, got Ok({body:?})"),
+        };
+        let text = err.to_string();
         assert!(
-            body.starts_with("error: get_weather failed"),
-            "expected get_weather to be called, got {body}"
+            text.contains("get_weather"),
+            "expected get_weather to be called, got {text}"
         );
         assert!(
-            body.contains("empty city"),
-            "expected the empty-city guard, got {body}"
+            text.contains("empty city"),
+            "expected the empty-city guard, got {text}"
         );
     }
 
@@ -1630,10 +1829,11 @@ mod tests {
     fn execute_tool_routes_get_weather_with_kv_args() {
         let mut sim = AgentSimulator::new();
         // The embedded planner (no JSON support) emits `city=...`.
-        let result = sim.execute_tool("get_weather", "city=");
-        assert!(result.is_ok());
-        let body = result.unwrap();
-        assert!(body.contains("error: get_weather failed"));
+        let err = match sim.execute_tool("get_weather", "city=") {
+            Err(e) => e,
+            Ok(body) => panic!("an empty city must be a tool failure, got Ok({body:?})"),
+        };
+        assert!(err.to_string().contains("get_weather"));
     }
 
     /// `read_sensor` routed on `args.contains(...)` over the *whole* payload
@@ -1925,6 +2125,40 @@ mod tests {
         assert_eq!(extract_int_arg(r#"{"state":"high"}"#, "pin"), None);
         assert_eq!(extract_int_arg("state=high", "pin"), None);
         assert_eq!(extract_int_arg("", "pin"), None);
+    }
+
+    /// The `key=value` fallback must match a whole field name, not a
+    /// substring. `s.find("text=")` matched inside `context=`, returning the
+    /// neighbouring field's value as this argument.
+    #[test]
+    fn key_value_lookup_matches_whole_field_names_only() {
+        // `text` must not be read out of `context`.
+        assert_eq!(
+            extract_str_arg("context=hello,text=world", "text").as_deref(),
+            Some("world")
+        );
+        assert_eq!(
+            extract_int_arg("base_address=4096,pin=7", "pin"),
+            Some(7),
+            "the pin must not be read from base_address's digits"
+        );
+        // Absent as a whole field → None, not a neighbour's value.
+        assert_eq!(extract_str_arg("context=hello", "text"), None);
+        assert_eq!(extract_int_arg("base_address=4096", "address"), None);
+        // Field boundaries: start of string, comma, semicolon, surrounding
+        // whitespace.
+        assert_eq!(
+            extract_str_arg("text=first", "text").as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            extract_str_arg("a=1; text=second", "text").as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            extract_str_arg("a=1,  text = third", "text").as_deref(),
+            Some("third")
+        );
     }
 
     #[test]
@@ -2833,6 +3067,241 @@ mod tests {
         assert!(out.contains("6C6F67"), "got {out:?}");
     }
 
+    /// No payload is a caller mistake, not a successful write of nothing.
+    /// `unwrap_or_default()` used to turn a missing `data` into an empty
+    /// slice: the write "succeeded", the counter advanced, and the model was
+    /// told its (absent) data had been persisted.
+    #[test]
+    fn a_missing_data_argument_is_an_error_not_a_zero_byte_write() {
+        let mut sim = AgentSimulator::new();
+        let err = sim
+            .execute_tool("flash_write", r#"{"address":1024}"#)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("data"),
+            "the error must name the missing field: {err}"
+        );
+        // A typo'd key is the same mistake.
+        assert!(sim
+            .execute_tool("flash_write", r#"{"address":1024,"data_":"x"}"#)
+            .is_err());
+
+        sim.ble.connect().unwrap();
+        assert!(
+            sim.execute_tool("ble_send", r#"{}"#).is_err(),
+            "an empty BLE send must not report success"
+        );
+        // A present-but-empty payload is the caller's explicit choice and
+        // still works.
+        assert!(sim
+            .execute_tool("flash_write", r#"{"address":1024,"data":""}"#)
+            .is_ok());
+    }
+
+    /// A full queue of equally-urgent cues must not be reported as "queued".
+    /// The old before/after depth comparison could not see the drop.
+    #[test]
+    fn a_dropped_voice_message_is_not_reported_as_queued() {
+        let mut sim = AgentSimulator::new();
+        // Fill the queue at priority 9 (the maximum).
+        for i in 0..magent_core_voice_queue_capacity() {
+            sim.execute_tool(
+                "queue_voice",
+                &format!(r#"{{"text":"filler {i}","priority":9}}"#),
+            )
+            .expect("filling the queue must succeed");
+        }
+        // A lower-priority cue cannot displace anything.
+        let out = sim
+            .execute_tool("queue_voice", r#"{"text":"important","priority":2}"#)
+            .expect("the call itself succeeds");
+        assert!(
+            out.contains("NOT queued"),
+            "a dropped message must say so, got {out:?}"
+        );
+    }
+
+    /// Under do-not-disturb a low-priority cue is routed to a notification.
+    /// That is not "queued" either.
+    #[test]
+    fn a_dnd_routed_voice_message_is_not_reported_as_queued() {
+        let mut sim = AgentSimulator::new();
+        sim.execute_tool(
+            "set_dnd",
+            r#"{"enabled":true,"start_hour":0,"end_hour":23}"#,
+        )
+        .unwrap();
+        let out = sim
+            .execute_tool("queue_voice", r#"{"text":"hi","priority":3}"#)
+            .unwrap();
+        assert!(out.contains("do-not-disturb"), "got {out:?}");
+        assert!(!out.contains("Queued voice message"), "got {out:?}");
+    }
+
+    /// `check_stress_level` and the `hrv` sensor describe the same state.
+    /// They used to disagree: the first derived a level from HRV, the second
+    /// reported `stress_level`, so a fresh simulator (documented as 30 %
+    /// stress) reported 50 and 30 in the same breath.
+    #[test]
+    fn stress_sensors_agree_with_the_stored_stress_level() {
+        let mut sim = AgentSimulator::new();
+        let stress = sim.execute_tool("check_stress_level", "{}").unwrap();
+        let hrv = sim
+            .execute_tool("read_sensor", r#"{"sensor":"hrv"}"#)
+            .unwrap();
+        // 30 is the documented baseline.
+        assert!(stress.contains("Stress Level: 30"), "got {stress:?}");
+        assert!(hrv.contains("Stress Level: 30"), "got {hrv:?}");
+
+        sim.set_stress_level(90);
+        let stress = sim.execute_tool("check_stress_level", "{}").unwrap();
+        let hrv = sim
+            .execute_tool("read_sensor", r#"{"sensor":"hrv"}"#)
+            .unwrap();
+        assert!(stress.contains("Stress Level: 90"), "got {stress:?}");
+        assert!(hrv.contains("Stress Level: 90"), "got {hrv:?}");
+        assert!(stress.contains("Very High"), "got {stress:?}");
+    }
+
+    /// The two stress readings must report the *same* HRV for the same
+    /// moment, not merely the same level.
+    ///
+    /// `calculate_stress` refreshed HRV only when `last_hrv <= 0.0`, but the
+    /// field was initialised to a literal 55.0 and `simulate_hrv` is always
+    /// positive — so the branch was dead. A fresh simulator therefore paired
+    /// its level with 55.0 while the `hrv` sensor, using
+    /// `80 - level * 0.5`, said 65.0. Both figures describe one instant.
+    #[test]
+    fn both_stress_readings_report_the_same_hrv() {
+        let mut sim = AgentSimulator::new();
+        let stress = sim.execute_tool("check_stress_level", "{}").unwrap();
+        let hrv = sim
+            .execute_tool("read_sensor", r#"{"sensor":"hrv"}"#)
+            .unwrap();
+
+        // Pull the number that directly follows `HRV:`, wherever it sits in
+        // the line (the two tools order the fields differently).
+        let hrv_in = |text: &str| -> f32 {
+            let after = text
+                .split_once("HRV:")
+                .unwrap_or_else(|| panic!("no HRV field in {text:?}"))
+                .1;
+            after
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or_else(|| panic!("no HRV number in {text:?}"))
+        };
+        let a = hrv_in(&stress);
+        let b = hrv_in(&hrv);
+        assert!(
+            (a - b).abs() < 0.05,
+            "both readings describe one moment but report HRV {a} vs {b}: \
+             {stress:?} / {hrv:?}"
+        );
+    }
+
+    /// Every HRV reading for one instant must agree, in **any** read order.
+    ///
+    /// The test above only covers stress-then-HRV, which is now the easy case:
+    /// `check_stress_level` refreshes the value it reports. The real defect was
+    /// that `simulate_heart_rate` and `simulate_hrv` used *different formulas*
+    /// and both wrote `last_hrv`, so a heart-rate read (which happens first in
+    /// most conversations — "how am I doing?" → HR, then stress) left the state
+    /// holding an HRV that ignored the stress level. Whichever sensor ran last
+    /// decided what `check_stress_level` and `get_status` called the truth.
+    ///
+    /// Measured before the fix: `check_stress_level` 56.0 ms, `hrv` 65.7 ms,
+    /// `get_status` 56.0 ms — three figures for one moment, all labelled HRV.
+    #[test]
+    fn every_hrv_reading_for_one_moment_agrees_in_any_read_order() {
+        /// `get_status` writes `HRV=66.5 ms`, the sensor replies `HRV: 66.5 ms`.
+        /// Accept either spelling rather than forcing one surface to change.
+        fn hrv_after_hr(text: &str) -> f32 {
+            let after = text
+                .split_once("HRV")
+                .unwrap_or_else(|| panic!("no HRV field in {text:?}"))
+                .1
+                .trim_start_matches([':', '='])
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or_else(|| panic!("no HRV number in {text:?}"));
+            after
+        }
+
+        // The order a real conversation takes: heart rate first.
+        let mut sim = AgentSimulator::new();
+        let _ = sim
+            .execute_tool("read_sensor", r#"{"sensor":"heart_rate"}"#)
+            .unwrap();
+        let from_hr = {
+            let s = sim
+                .execute_tool("read_sensor", r#"{"sensor":"heart_rate"}"#)
+                .unwrap();
+            hrv_after_hr(&s)
+        };
+        let from_stress = hrv_after_hr(&sim.execute_tool("check_stress_level", "{}").unwrap());
+        let from_hrv = hrv_after_hr(
+            &sim.execute_tool("read_sensor", r#"{"sensor":"hrv"}"#)
+                .unwrap(),
+        );
+        let from_status = hrv_after_hr(&sim.get_status());
+
+        for (name, value) in [
+            ("check_stress_level", from_stress),
+            ("hrv sensor", from_hrv),
+            ("get_status", from_status),
+        ] {
+            assert!(
+                (from_hr - value).abs() < 0.05,
+                "{name} reports HRV {value} for the same moment the heart-rate \
+                 read calls {from_hr}"
+            );
+        }
+    }
+
+    /// HRV must still respond to both of its drivers after the unification.
+    ///
+    /// A single formula is only an improvement if it keeps the two effects the
+    /// old split was trying to express: stress lowers HRV, and exertion lowers
+    /// it further. A "fix" that made every reading constant would pass the
+    /// agreement test above.
+    #[test]
+    fn hrv_still_falls_with_stress_and_with_exertion() {
+        fn hrv(text: &str) -> f32 {
+            text.split_once("HRV:")
+                .unwrap_or_else(|| panic!("no HRV field in {text:?}"))
+                .1
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or_else(|| panic!("no HRV number in {text:?}"))
+        }
+
+        let mut rested = AgentSimulator::new();
+        rested.set_stress_level(10);
+        let low_stress = hrv(&rested.execute_tool("check_stress_level", "{}").unwrap());
+
+        let mut stressed = AgentSimulator::new();
+        stressed.set_stress_level(90);
+        let high_stress = hrv(&stressed.execute_tool("check_stress_level", "{}").unwrap());
+        assert!(
+            high_stress < low_stress,
+            "stress must lower HRV: {low_stress} at 10 % vs {high_stress} at 90 %"
+        );
+
+        let mut active = AgentSimulator::new();
+        active.set_stress_level(10);
+        active.set_exercising(true);
+        let exercising = hrv(&active.execute_tool("check_stress_level", "{}").unwrap());
+        assert!(
+            exercising < low_stress,
+            "exertion must lower HRV further: {low_stress} at rest vs {exercising} \
+             while exercising"
+        );
+    }
+
     /// `ble_send` forwarded the raw args envelope, so
     /// `{"data":"System health OK"}` went over the air as 27 bytes of JSON
     /// — braces, quotes and key name included — for a 16-character message.
@@ -2921,14 +3390,19 @@ mod tests {
     #[test]
     fn simulator_components_default_matches_new() {
         assert_eq!(SimFlashStorage::default().write_count(), 0);
-        assert_eq!(SimGpioController::default().get_pin(0).unwrap(), GpioPinState::Low);
+        assert_eq!(
+            SimGpioController::default().get_pin(0).unwrap(),
+            GpioPinState::Low
+        );
         assert!(!SimBleInterface::default().is_connected());
         // A fresh sensor manager reads without panicking.
         let _ = SimSensorManager::default().read_temperature();
         let _ = HealthSimState::default();
         // The whole simulator defaults to the same working state.
         let mut sim = AgentSimulator::default();
-        assert!(sim.execute_tool("read_sensor", r#"{"sensor":"temperature"}"#).is_ok());
+        assert!(sim
+            .execute_tool("read_sensor", r#"{"sensor":"temperature"}"#)
+            .is_ok());
     }
 
     #[test]
@@ -2951,17 +3425,23 @@ mod tests {
         // each probe 0.5 below its band boundary.
         let mut sim = AgentSimulator::new();
         sim.set_hours_since_meal(1.0);
-        let rising = sim.execute_tool("read_sensor", r#"{"sensor":"glucose"}"#).unwrap();
+        let rising = sim
+            .execute_tool("read_sensor", r#"{"sensor":"glucose"}"#)
+            .unwrap();
         assert!(rising.contains("Rising"), "got {rising:?}");
 
         let mut sim = AgentSimulator::new();
         sim.set_hours_since_meal(1.9);
-        let stable = sim.execute_tool("read_sensor", r#"{"sensor":"glucose"}"#).unwrap();
+        let stable = sim
+            .execute_tool("read_sensor", r#"{"sensor":"glucose"}"#)
+            .unwrap();
         assert!(stable.contains("Stable"), "got {stable:?}");
 
         let mut sim = AgentSimulator::new();
         sim.set_hours_since_meal(3.9);
-        let falling = sim.execute_tool("read_sensor", r#"{"sensor":"glucose"}"#).unwrap();
+        let falling = sim
+            .execute_tool("read_sensor", r#"{"sensor":"glucose"}"#)
+            .unwrap();
         assert!(falling.contains("Falling"), "got {falling:?}");
     }
 
@@ -2971,15 +3451,21 @@ mod tests {
     fn ecg_and_hrv_readings_reflect_the_stress_state() {
         let mut sim = AgentSimulator::new();
         sim.set_stress_level(20);
-        let normal = sim.execute_tool("read_sensor", r#"{"sensor":"ecg"}"#).unwrap();
+        let normal = sim
+            .execute_tool("read_sensor", r#"{"sensor":"ecg"}"#)
+            .unwrap();
         assert!(normal.contains("Rhythm=Normal"), "got {normal:?}");
 
         let mut sim = AgentSimulator::new();
         sim.set_stress_level(90);
-        let irregular = sim.execute_tool("read_sensor", r#"{"sensor":"ecg"}"#).unwrap();
+        let irregular = sim
+            .execute_tool("read_sensor", r#"{"sensor":"ecg"}"#)
+            .unwrap();
         assert!(irregular.contains("Rhythm=Irregular"), "got {irregular:?}");
 
-        let hrv = sim.execute_tool("read_sensor", r#"{"sensor":"hrv"}"#).unwrap();
+        let hrv = sim
+            .execute_tool("read_sensor", r#"{"sensor":"hrv"}"#)
+            .unwrap();
         assert!(hrv.contains("HRV:"), "got {hrv:?}");
         assert!(hrv.contains("Stress Level: 90"), "got {hrv:?}");
     }
@@ -3120,9 +3606,7 @@ mod tests {
 
         let mut sim = AgentSimulator::new();
         sim.early_warning = EarlyWarningSystem::new();
-        let err = sim
-            .execute_tool("find_nearest_hospital", "{}")
-            .unwrap_err();
+        let err = sim.execute_tool("find_nearest_hospital", "{}").unwrap_err();
         assert!(
             matches!(
                 err,
@@ -3141,7 +3625,10 @@ mod tests {
     fn set_dnd_with_a_non_boolean_enabled_is_an_invalid_value() {
         let mut sim = AgentSimulator::new();
         let err = sim
-            .execute_tool("set_dnd", r#"{"enabled":"maybe","start_hour":22,"end_hour":7}"#)
+            .execute_tool(
+                "set_dnd",
+                r#"{"enabled":"maybe","start_hour":22,"end_hour":7}"#,
+            )
             .unwrap_err();
         assert!(
             matches!(

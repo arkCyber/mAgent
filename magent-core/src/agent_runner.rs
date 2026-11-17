@@ -2093,15 +2093,24 @@ fn write_message_into(buf: &mut Vec<u8>, m: &Message) -> std::result::Result<(),
 /// when the model wraps them in ```` ```json ```` / ```` ```xml ```` blocks.
 fn strip_code_fence(s: &str) -> String {
     let t = s.trim();
-    if let Some(body) = t.strip_prefix("```") {
-        // Drop the trailing fence, then any leading language-tag line.
-        let body = body.strip_suffix("```").unwrap_or(body);
-        match body.find('\n') {
-            Some(i) => body[i + 1..].trim().to_string(),
-            None => body.trim().to_string(),
-        }
-    } else {
-        t.to_string()
+    // Models routinely precede a fenced block with a sentence
+    // (`Sure:\n```json …```), so the block has to be located, not just
+    // assumed to be at the start. Requiring the response to *begin* with the
+    // fence meant a tool call written that way was returned as the final
+    // answer, braces and fence included, with exit 0.
+    let Some(start) = t.find("```") else {
+        return t.to_string();
+    };
+    let body = &t[start..];
+    let body = body.strip_prefix("```").unwrap_or(body);
+    // Drop the trailing fence, then any leading language-tag line.
+    let body = match body.rfind("```") {
+        Some(end) => &body[..end],
+        None => body,
+    };
+    match body.find('\n') {
+        Some(i) => body[i + 1..].trim().to_string(),
+        None => body.trim().to_string(),
     }
 }
 
@@ -2146,7 +2155,12 @@ fn parse_anthropic_tool_call(
     }
 
     let close_off = find_sub(&s[invoke_tag_end..], "</invoke>")? + invoke_tag_end;
-    let inner = &s[invoke_tag_end..close_off];
+    // `invoke_tag_end` points *at* the tag's closing `>`; the body starts
+    // after it. Slicing from `invoke_tag_end` put a stray `>` at the head of
+    // the body, which was invisible while the parser required at least one
+    // `<parameter>` — but a zero-argument `<invoke …></invoke>` then had the
+    // body `">"`, which is not whitespace, so it was rejected as prose.
+    let inner = &s[invoke_tag_end + 1..close_off];
 
     let mut args: HashMap<String, serde_json::Value> = HashMap::new();
     let mut pos = 0;
@@ -2168,7 +2182,21 @@ fn parse_anthropic_tool_call(
         break;
     }
 
-    if args.is_empty() {
+    // An empty parameter list is a legitimate zero-argument call:
+    // `get_sleep_quality`, `check_stress_level`, `read_heart_rate`,
+    // `end_exercise`, `get_exercise_goal` all take none. Returning `None`
+    // here made them unrecognisable, so the whole XML block fell through to
+    // `parse_result`'s prose branch and the *markup itself* was reported as
+    // the agent's final answer.
+    //
+    // But an `<invoke>` with *body text* and no `<parameter>` is a model
+    // writing an answer in invoke-shaped markup, not a call — treating it as
+    // a zero-argument call would invoke a tool on the strength of prose.
+    // Only an empty body is a zero-argument call.
+    // Only the *body text* matters: `<invoke …></invoke>` and
+    // `<invoke …>\n  </invoke>` are both empty and therefore valid
+    // zero-argument calls; `<invoke …>some answer</invoke>` is prose.
+    if args.is_empty() && !inner.trim().is_empty() {
         return None;
     }
     Some((name, args))
@@ -2190,12 +2218,53 @@ fn result_value_to_string(result: &serde_json::Value) -> String {
         return n.to_string();
     }
     if let Some(n) = result.as_f64() {
-        return format!("{:.1}", n);
+        // Preserve the value the model produced. `{:.1}` rounded every
+        // fractional result to one decimal place, so `{"result": 0.25}`
+        // became "0.2" and a reading like 36.65 °C became "36.6" — a
+        // silently falsified measurement presented as the final answer.
+        // `serde_json`'s own formatter keeps the shortest round-trip
+        // representation.
+        match serde_json::Number::from_f64(n) {
+            Some(number) => return serde_json::Value::Number(number).to_string(),
+            // Unreachable in practice: `as_f64` reads a `serde_json::Number`,
+            // and a `Number` only ever holds a finite value (`from_f64` and
+            // the parser both refuse NaN/±∞ — a `Value::from(NaN)` is stored
+            // as `Null`). It used to fall back to `Number::from(0)` anyway,
+            // which would have reported an undefined result as the
+            // measurement "0" if that invariant ever stopped holding. Spell
+            // the float honestly instead.
+            None => return n.to_string(),
+        }
     }
     if let Some(s) = result.as_str() {
         return s.to_string();
     }
     result.to_string()
+}
+
+/// Is `text` a tool-call object rather than an answer?
+///
+/// Mirrors the shapes [`RunnerConfig`]-aware callers feed to
+/// `parse_tool_calls`: the `{"tool":…}` envelope, the OpenAI
+/// `{"name":…,"arguments":…}` form, and a `tool_calls` array. Used by
+/// `parse_result` so an unparsed tool call is never returned as the answer.
+fn is_tool_call_object(text: &str) -> bool {
+    let t = text.trim();
+    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(t) {
+        return obj.contains_key("tool")
+            || obj.contains_key("tool_calls")
+            || (obj.contains_key("name") && obj.contains_key("arguments"));
+    }
+    // The interesting case is precisely a tool call whose JSON did *not*
+    // parse (that is why `parse_tool_calls` found nothing). A model's
+    // near-miss is still clearly a call, so fall back to a structural
+    // check: a JSON-looking body carrying one of the call keys.
+    if !t.starts_with('{') {
+        return false;
+    }
+    ["\"tool\"", "\"tool_calls\"", "\"arguments\""]
+        .iter()
+        .any(|key| t.contains(key))
 }
 
 /// Heuristic guard: does this trimmed string read like mid-plan chatter
@@ -2362,12 +2431,10 @@ fn parse_tool_calls_from_json(
     //      carry an explicit `"args"` object. Arbitrary data keys are not
     //      tool names.
     if let Some(obj) = json.as_object() {
-        if obj.keys().any(|k| {
-            matches!(
-                k.as_str(),
-                "result" | "error" | "reasoning" | "thought"
-            )
-        }) {
+        if obj
+            .keys()
+            .any(|k| matches!(k.as_str(), "result" | "error" | "reasoning" | "thought"))
+        {
             return Vec::new();
         }
         for (key, tool_obj) in obj {
@@ -2869,11 +2936,7 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
         self.run_inner(task, true)
     }
 
-    fn run_inner(
-        &mut self,
-        task: &str,
-        keep_history: bool,
-    ) -> std::result::Result<String, String> {
+    fn run_inner(&mut self, task: &str, keep_history: bool) -> std::result::Result<String, String> {
         if keep_history {
             self.reset_run_state();
         } else {
@@ -3705,22 +3768,50 @@ impl<E: ToolExecutor> RealAgentRunner<E> {
             }
         }
 
-        // 2. A fenced block (code or JSON): the inner content IS the answer.
-        //    This is how a model that's asked to write code (but forgets the
-        //    {"result":...} envelope) usually responds.
+        // 2. Any {"result": ...} object embedded in prose or markdown.
+        //
+        //    This runs *before* the fenced-block branch. It used to run
+        //    after, so a response like
+        //    ```json {"result":"42"} ``` followed by "Hope that helps."
+        //    returned the raw fenced text — the correct value `42` was
+        //    never extracted.
         if response.contains("```") {
-            let cleaned = strip_code_fence(response);
-            if !cleaned.is_empty() {
-                return Some(cleaned);
+            if let Some(obj) = find_json_object(response) {
+                if !is_tool_call_object(obj) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(obj) {
+                        if let Some(result) = v.get("result") {
+                            return Some(result_value_to_string(result));
+                        }
+                    }
+                }
             }
-        }
-
-        // 3. A {"result": ...} object embedded anywhere in prose/markdown.
-        if let Some(obj) = find_json_object(response) {
+        } else if let Some(obj) = find_json_object(response) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(obj) {
                 if let Some(result) = v.get("result") {
                     return Some(result_value_to_string(result));
                 }
+            }
+        }
+
+        // 3. A fenced block (code or JSON): the inner content IS the answer.
+        //    This is how a model that's asked to write code (but forgets the
+        //    {"result":...} envelope) usually responds.
+        //
+        //    But a fenced *tool call* is not an answer. `parse_tool_calls`
+        //    already ran and found nothing (typically the model emitted
+        //    slightly invalid JSON, e.g. a trailing comma), so returning the
+        //    block here reported the unparsed call — braces and all — as the
+        //    agent's final result and exited 0.
+        if response.contains("```") {
+            let cleaned = strip_code_fence(response);
+            if is_tool_call_object(&cleaned) {
+                // Deliberately not an answer. Fall through to *no* result:
+                // the prose branch below would otherwise return the whole
+                // response — fence markers included — as the final answer.
+                return None;
+            }
+            if !cleaned.is_empty() {
+                return Some(cleaned);
             }
         }
 
@@ -4871,7 +4962,8 @@ mod deepseek_client_tests {
     /// inherent getters.
     #[test]
     fn llm_backend_delegations_forward_to_the_inherent_methods() {
-        let mut c = DeepSeekClient::with_endpoint("https://api.example/v1", "deepseek-chat", "sk-x");
+        let mut c =
+            DeepSeekClient::with_endpoint("https://api.example/v1", "deepseek-chat", "sk-x");
         c.client = Err("could not build the HTTP client: no TLS backend".to_string());
         let backend: &mut dyn LlmBackend = &mut c;
 
@@ -5689,9 +5781,8 @@ mod parse_tolerance_tests {
     #[test]
     fn parse_tool_call_single_openai_object() {
         let r = runner();
-        let calls = r.parse_tool_calls(
-            r#"{"name":"read_sensor","arguments":{"sensor":"temperature"}}"#,
-        );
+        let calls =
+            r.parse_tool_calls(r#"{"name":"read_sensor","arguments":{"sensor":"temperature"}}"#);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "read_sensor");
         assert_eq!(
@@ -5716,6 +5807,158 @@ mod parse_tolerance_tests {
         let r = runner();
         let out = r.parse_result("```\nlet x = 1;\n```").unwrap();
         assert!(out.contains("let x = 1;"));
+    }
+
+    /// A model that wraps its answer in a fence *and* appends prose used to
+    /// get the whole fenced blob back instead of the `result` value.
+    #[test]
+    fn parse_result_prefers_the_envelope_inside_a_fence() {
+        let r = runner();
+        let out = r
+            .parse_result("```json\n{\"result\": \"42\"}\n```\nHope that helps.")
+            .unwrap();
+        assert_eq!(out, "42", "the embedded result value must win");
+    }
+
+    /// A fenced *tool call* is not an answer. When `parse_tool_calls` could
+    /// not parse it (here: a trailing comma), the fenced-block shortcut used
+    /// to return the raw JSON and the run exited 0 reporting a tool call as
+    /// the agent's result.
+    #[test]
+    fn parse_result_does_not_return_a_fenced_tool_call() {
+        let r = runner();
+        let fenced = "```json\n{\"tool\": \"read_sensor\", \"args\": {\"sensor\": \"temp\",}}\n```";
+        assert!(
+            is_tool_call_object("{\"tool\":\"x\",\"args\":{}}"),
+            "the helper must recognise the tool envelope"
+        );
+        // The content is a tool call, so this must not be reported as an answer.
+        assert_eq!(
+            r.parse_result(fenced),
+            None,
+            "got a tool call as the result"
+        );
+    }
+
+    /// A fenced tool call preceded by prose must still not be the answer.
+    ///
+    /// `strip_code_fence` required the response to *begin* with the fence, so
+    /// `Sure:\n```json {tool call with a trailing comma} ``` ` kept the
+    /// leading sentence after stripping, failed `is_tool_call_object`, and the
+    /// whole response — fence markers and unparsed call included — was
+    /// returned as the final answer with exit 0. The existing test only used a
+    /// bare fence, so it never exercised this shape.
+    #[test]
+    fn parse_result_does_not_return_a_fenced_tool_call_after_prose() {
+        let r = runner();
+        let response = "Sure, let me check that.\n```json
+{\"tool\": \"read_sensor\", \"args\": {\"sensor\": \"temp\",}}
+```";
+        assert_eq!(
+            r.parse_result(response),
+            None,
+            "a tool call behind a sentence must not become the answer"
+        );
+
+        // Prose that merely *mentions* a fence is unaffected.
+        let prose = "The example below is illustrative.\n```
+fn main() {}\n```\nThat is all.";
+        assert!(
+            r.parse_result(prose).is_some(),
+            "a code answer must survive"
+        );
+    }
+
+    /// `strip_code_fence` extracts the block wherever it starts.
+    #[test]
+    fn strip_code_fence_finds_a_block_after_prose() {
+        assert_eq!(strip_code_fence("Intro\n```\nbody\n```"), "body");
+        assert_eq!(strip_code_fence("```\nbody\n```\ntrailing"), "body");
+        assert_eq!(strip_code_fence("```rust\nfn f() {}\n```"), "fn f() {}");
+        // No fence at all is returned unchanged.
+        assert_eq!(strip_code_fence("plain text"), "plain text");
+    }
+
+    /// An `<invoke>` carrying body text but no `<parameter>` is prose in
+    /// invoke-shaped markup, not a call.
+    #[test]
+    fn parse_anthropic_tool_call_ignores_prose_in_an_invoke() {
+        assert!(
+            parse_anthropic_tool_call(r#"<invoke name="answer">The sensor reads 25.5 C.</invoke>"#)
+                .is_none(),
+            "prose inside an invoke is not a tool call"
+        );
+    }
+
+    /// Zero-argument Anthropic tool calls must parse. They used to be
+    /// dropped (`args.is_empty() -> None`), after which the XML itself was
+    /// returned as the final answer.
+    #[test]
+    fn parse_anthropic_tool_call_accepts_zero_arguments() {
+        let (name, args) =
+            parse_anthropic_tool_call(r#"<invoke name="get_sleep_quality"></invoke>"#)
+                .expect("a zero-argument invoke must parse");
+        assert_eq!(name, "get_sleep_quality");
+        assert!(args.is_empty());
+    }
+
+    /// The invoke body must start *after* the tag's `>`, not at it.
+    ///
+    /// Slicing from the `>` byte put a stray `>` at the head of every body.
+    /// With ≥1 `<parameter>` the parser skipped it as incidental text; with
+    /// none it made an empty invoke look like prose.
+    #[test]
+    fn parse_anthropic_tool_call_body_excludes_the_tag_delimiter() {
+        let (_, args) = parse_anthropic_tool_call(
+            r#"<invoke name="fetch_url"><parameter name="url">https://x</parameter></invoke>"#,
+        )
+        .expect("parameterised invoke must parse");
+        assert_eq!(
+            args.get("url").and_then(|v| v.as_str()),
+            Some("https://x"),
+            "the value must not carry tag punctuation: {args:?}"
+        );
+    }
+
+    /// A fractional `result` must keep the value the model produced.
+    /// `{:.1}` turned 0.25 into "0.2" and 36.65 into "36.6".
+    #[test]
+    fn parse_result_preserves_fractional_precision() {
+        let r = runner();
+        assert_eq!(
+            r.parse_result(r#"{"result":0.25}"#).as_deref(),
+            Some("0.25")
+        );
+        assert_eq!(
+            r.parse_result(r#"{"result":36.65}"#).as_deref(),
+            Some("36.65")
+        );
+        assert_eq!(
+            r.parse_result(r#"{"result":1.2345}"#).as_deref(),
+            Some("1.2345")
+        );
+    }
+
+    /// A non-finite `result` must never be reported as the measurement `0`.
+    ///
+    /// `serde_json` cannot represent NaN/±∞ at all: `Value::from(f64::NAN)`
+    /// stores `Null`, and `Number::from_f64` returns `None`. That is exactly
+    /// why the old `unwrap_or_else(|| Number::from(0))` was dangerous in
+    /// principle — if a `Number` ever did yield a non-finite `f64`, the
+    /// fallback would have published "0" as the answer. Pin the *observable*
+    /// contract: a non-finite input becomes `null` (not `0`), and the finite
+    /// path keeps full precision.
+    #[test]
+    fn a_non_finite_result_is_not_fabricated_as_zero() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let v = serde_json::Value::from(value);
+            let out = result_value_to_string(&v);
+            assert_ne!(out, "0", "{value} must not become a fabricated reading");
+            assert_eq!(out, "null", "{value} has no JSON form; it is null");
+        }
+        // The finite path is untouched: no forced decimal place, no rounding.
+        assert_eq!(result_value_to_string(&serde_json::json!(0.25)), "0.25");
+        assert_eq!(result_value_to_string(&serde_json::json!(42)), "42");
     }
 
     #[test]
@@ -7129,15 +7372,15 @@ mod surface_tests {
             "{\"response\":\"generated text\"}",
         )]);
         let c = OllamaClient::new(&mock.base_url, "llama3.2");
-        assert_eq!(c.generate("hi").expect("200 with a response"), "generated text");
+        assert_eq!(
+            c.generate("hi").expect("200 with a response"),
+            "generated text"
+        );
     }
 
     #[test]
     fn ollama_generate_reports_a_non_success_status() {
-        let mock = super::http_mock::Mock::start(vec![super::http_mock::Reply::new(
-            500,
-            "boom",
-        )]);
+        let mock = super::http_mock::Mock::start(vec![super::http_mock::Reply::new(500, "boom")]);
         let c = OllamaClient::new(&mock.base_url, "llama3.2");
         let err = c.generate("hi").expect_err("500 is an error");
         assert!(err.contains("HTTP error"), "got {err}");
@@ -7145,10 +7388,8 @@ mod surface_tests {
 
     #[test]
     fn ollama_generate_reports_a_missing_response_field() {
-        let mock = super::http_mock::Mock::start(vec![super::http_mock::Reply::new(
-            200,
-            "{\"other\":1}",
-        )]);
+        let mock =
+            super::http_mock::Mock::start(vec![super::http_mock::Reply::new(200, "{\"other\":1}")]);
         let c = OllamaClient::new(&mock.base_url, "llama3.2");
         let err = c.generate("hi").expect_err("no `response` field");
         assert!(err.contains("No content in response"), "got {err}");
@@ -7158,10 +7399,7 @@ mod surface_tests {
     fn ollama_chat_surfaces_a_non_success_status() {
         // The status branch of `chat_with_messages` is separate from the retry
         // machinery: a permanent 400 must come back as "HTTP error".
-        let mock = super::http_mock::Mock::start(vec![super::http_mock::Reply::new(
-            400,
-            "bad",
-        )]);
+        let mock = super::http_mock::Mock::start(vec![super::http_mock::Reply::new(400, "bad")]);
         let mut c = OllamaClient::new(&mock.base_url, "llama3.2");
         let err = c
             .chat_with_messages(&[Message::user("hi")], SamplingParams::default())
@@ -7235,6 +7473,9 @@ mod surface_tests {
         let mut buf = Vec::new();
         write_json_string(&mut buf, "x\r\t\u{0001}\"\\\n温度").expect("writes");
         let as_str = String::from_utf8(buf).expect("utf8");
-        assert_eq!(as_str, format!("\"{}\"", escape_json("x\r\t\u{0001}\"\\\n温度")));
+        assert_eq!(
+            as_str,
+            format!("\"{}\"", escape_json("x\r\t\u{0001}\"\\\n温度"))
+        );
     }
 }

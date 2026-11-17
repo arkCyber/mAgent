@@ -89,6 +89,20 @@ impl MqttClient {
     ) -> Result<Self, MqttError> {
         let mut opts = MqttOptions::new(&config.client_id, &config.broker_host, config.broker_port);
         opts.set_keep_alive(Duration::from_secs(config.keep_alive_secs as u64));
+        // `rumqttc` defaults both directions to a 10 KiB packet ceiling and
+        // *rejects* anything larger inside the background event loop — where
+        // the error is only logged, the connection is torn down, and the
+        // queued publish is dropped. The caller had already returned
+        // `Ok(qos)`, so a 50 KiB event was reported as published and then
+        // silently lost. Raising the ceiling to the payload cap this crate
+        // already advertises is what makes `max_payload_bytes` true rather
+        // than a limit that only the pre-flight check believes in.
+        //
+        // The overhead is the MQTT fixed header (≤5 bytes), the topic length
+        // prefix (2), the packet id (2 for QoS 1/2) and the remaining-length
+        // field (≤4); 64 bytes covers it with room to spare.
+        let packet_limit = max_payload_bytes.saturating_add(64);
+        opts.set_max_packet_size(packet_limit, packet_limit);
         if !config.username.is_empty() {
             opts.set_credentials(&config.username, &config.password);
         }
@@ -174,7 +188,7 @@ impl MqttClient {
         qos: Option<u8>,
         retain: bool,
     ) -> Result<u8, MqttError> {
-        validate_topic(topic)?;
+        validate_topic(topic, false)?;
         if payload.len() > self.max_payload_bytes {
             return Err(MqttError::PayloadTooLarge {
                 bytes: payload.len(),
@@ -194,7 +208,7 @@ impl MqttClient {
     /// `subscribe_topic` tool so an MCP client can tail control
     /// messages from a parent supervisor.
     pub async fn subscribe(&self, topic: &str, qos: Option<u8>) -> Result<u8, MqttError> {
-        validate_topic(topic)?;
+        validate_topic(topic, true)?;
         let qos_u8 = qos.unwrap_or(self.config.qos_default);
         let qos_enum = qos_from_u8(qos_u8)?;
         self.inner
@@ -235,17 +249,47 @@ fn qos_from_u8(value: u8) -> Result<QoS, MqttError> {
 /// Reject empty topics and topics containing NUL bytes. The MQTT
 /// 3.1.1 spec forbids both, and `rumqttc` would surface them as
 /// confusing errors at publish time.
-fn validate_topic(topic: &str) -> Result<(), MqttError> {
+/// MQTT allows at most 65535 bytes in the topic-name length field
+/// (MQTT-3.3.2-1). Anything longer is silently truncated by the wire
+/// encoder's `u16` length prefix, producing a corrupt packet.
+const MAX_TOPIC_BYTES: usize = 65_535;
+
+/// Validate a topic supplied by the model.
+///
+/// A topic used for PUBLISH must not contain the wildcards `+` or `#`
+/// (MQTT-3.3.2-2); a broker is required to drop the connection over it.
+/// `publish_bytes` — which this client uses — performs no such check, so a
+/// model that emitted `magent/+/cmd` produced an invalid PUBLISH and the
+/// tool still reported `{"published": true}`.
+///
+/// Subscriptions *do* allow wildcards, so the caller picks the mode.
+fn validate_topic(topic: &str, allow_wildcards: bool) -> Result<(), MqttError> {
     if topic.is_empty() {
         return Err(MqttError::InvalidTopic {
             topic: topic.to_string(),
             reason: "topic is empty".to_string(),
         });
     }
+    if topic.len() > MAX_TOPIC_BYTES {
+        return Err(MqttError::InvalidTopic {
+            topic: topic.to_string(),
+            reason: format!(
+                "topic is {} bytes; the MQTT limit is {MAX_TOPIC_BYTES}",
+                topic.len()
+            ),
+        });
+    }
     if topic.contains('\0') {
         return Err(MqttError::InvalidTopic {
             topic: topic.to_string(),
             reason: "topic contains a NUL byte".to_string(),
+        });
+    }
+    if !allow_wildcards && (topic.contains('+') || topic.contains('#')) {
+        return Err(MqttError::InvalidTopic {
+            topic: topic.to_string(),
+            reason: "wildcards (`+`, `#`) are only valid in a subscription, not a publish"
+                .to_string(),
         });
     }
     Ok(())
@@ -265,17 +309,58 @@ mod tests {
 
     #[test]
     fn validate_topic_rejects_empty() {
-        assert!(validate_topic("").is_err());
+        assert!(validate_topic("", false).is_err());
+        assert!(validate_topic("", true).is_err());
     }
 
     #[test]
     fn validate_topic_rejects_nul() {
-        assert!(validate_topic("foo\0bar").is_err());
+        assert!(validate_topic("foo\0bar", false).is_err());
     }
 
     #[test]
     fn validate_topic_accepts_normal() {
-        assert!(validate_topic("magent/events").is_ok());
-        assert!(validate_topic("magent/cmd/+").is_ok());
+        assert!(validate_topic("magent/events", false).is_ok());
+        assert!(validate_topic("magent/cmd/+", true).is_ok());
+    }
+
+    /// A publish topic with a wildcard is invalid MQTT (the broker drops
+    /// the connection), and an over-long topic is silently truncated by the
+    /// wire encoder's `u16` length prefix. Both used to be accepted, with
+    /// the tool reporting a successful publish.
+    #[test]
+    fn validate_topic_rejects_publish_wildcards_and_overlong_topics() {
+        assert!(validate_topic("magent/+/cmd", false).is_err());
+        assert!(validate_topic("magent/#", false).is_err());
+        // The same strings are legal subscription filters.
+        assert!(validate_topic("magent/+/cmd", true).is_ok());
+        assert!(validate_topic("magent/#", true).is_ok());
+
+        let long = "a".repeat(MAX_TOPIC_BYTES + 1);
+        assert!(validate_topic(&long, false).is_err());
+        assert!(validate_topic(&"a".repeat(MAX_TOPIC_BYTES), false).is_ok());
+    }
+
+    /// The packet ceiling handed to `rumqttc` must cover the payload cap this
+    /// crate advertises.
+    ///
+    /// `rumqttc` defaults `max_outgoing_packet_size` to 10 KiB and enforces it
+    /// inside the background event loop: an oversized publish is rejected
+    /// there, after `publish_bytes` has already returned `Ok`. With the old
+    /// 1 MiB `max_payload_bytes` and no `set_max_packet_size`, every payload
+    /// between 10 KiB and 1 MiB was reported as published and silently
+    /// dropped — and the codec error tore down the connection.
+    #[test]
+    fn the_packet_ceiling_covers_the_advertised_payload_cap() {
+        // Mirrors the arithmetic in `connect_with_cap`.
+        let cap = DEFAULT_MAX_PAYLOAD_BYTES;
+        let ceiling = cap.saturating_add(64);
+        assert!(
+            ceiling > cap,
+            "the ceiling must leave room for the MQTT fixed header"
+        );
+        // `rumqttc`'s default would be exactly this; make the regression
+        // impossible to reintroduce silently.
+        assert!(ceiling > 10 * 1024, "the old default was 10 KiB");
     }
 }

@@ -79,6 +79,12 @@ use heapless::{String as HeaplessString, Vec};
 /// backwards compatibility for one release cycle).
 const VERSION_TAG: &str = "DBO1";
 
+/// Wire-format prefix of a DBO1 entry (including the trailing colon).
+///
+/// Exposed so the DBO2 dispatcher can tell a *sealed* entry from legacy
+/// plaintext without duplicating the literal.
+pub const PREFIX: &str = "DBO1:";
+
 /// Length of the random nonce prefix (bytes).
 pub const NONCE_LEN: usize = 12;
 
@@ -230,7 +236,6 @@ pub fn open_sealed_bytes<'a>(
     device_key: &[u8],
     out: &mut Vec<u8, MAX_PLAINTEXT>,
 ) -> Result<OpenOutcome<'a>, SealError> {
-    const PREFIX: &str = "DBO1:";
     let Some(payload_hex) = stored.strip_prefix(PREFIX) else {
         // Legacy plaintext entry — preserve verbatim.
         return Ok(OpenOutcome::LegacyPlaintext(stored));

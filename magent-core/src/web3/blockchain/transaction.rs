@@ -852,7 +852,11 @@ mod tests {
         assert_eq!(encoded[0], 0x02, "EIP-1559 type byte");
         // The access list is the final field of the typed payload; an empty
         // RLP list is the single byte 0xc0 (0x80 would be an empty string).
-        assert_eq!(encoded.last(), Some(&0xc0), "empty access list must be 0xc0");
+        assert_eq!(
+            encoded.last(),
+            Some(&0xc0),
+            "empty access list must be 0xc0"
+        );
     }
 
     #[test]

@@ -82,6 +82,19 @@ pub enum BlockchainAction {
     VcVerify(PathBuf),
     /// `magent web3 vc present <FILE>`
     VcPresent(VcPresentOptions),
+    /// `magent web3 vc verify-presentation <FILE> [--challenge <STR>]`
+    ///
+    /// `vc present` could sign a presentation but nothing could check one, so
+    /// a tampered or unsigned presentation looked the same as a valid one.
+    /// `--challenge` supplies the verifier's nonce: when given, the
+    /// presentation must carry exactly that challenge, which is what makes a
+    /// signature non-replayable to another verifier.
+    VcVerifyPresentation {
+        /// Presentation file to verify.
+        path: PathBuf,
+        /// The challenge this verifier issued, if it issued one.
+        challenge: Option<String>,
+    },
 }
 
 /// Where a signing key comes from.
@@ -135,7 +148,8 @@ pub struct VcIssueOptions {
     pub claims: Vec<(String, serde_json::Value)>,
     pub issuer: KeySource,
     /// `--valid-until <ISO8601>` — passed through verbatim; the credential's
-    /// own `is_expired` compares the string against the current timestamp.
+    /// own `is_expired` parses it to an instant (a timezone offset is applied,
+    /// and an unparseable bound counts as expired).
     pub valid_until: Option<String>,
     pub output: Option<PathBuf>,
 }
@@ -220,9 +234,9 @@ pub struct PresentationDisplay {
 }
 
 /// Render chain list output.
-pub fn render_chain_list(chains: Vec<ChainDisplay>, out: &mut Output) {
+pub fn render_chain_list(chains: Vec<ChainDisplay>, out: &mut Output) -> Result<(), Web3CliError> {
     if out.kind() == OutputKind::Json {
-        out.write_json_str(serde_json::to_string(&chains).unwrap_or_default());
+        render_json(&chains, out)?;
     } else {
         let _ = out.info("Supported chains:");
         for chain in &chains {
@@ -234,12 +248,13 @@ pub fn render_chain_list(chains: Vec<ChainDisplay>, out: &mut Output) {
             ));
         }
     }
+    Ok(())
 }
 
 /// Render chain info output.
-pub fn render_chain_info(chain: &ChainDisplay, out: &mut Output) {
+pub fn render_chain_info(chain: &ChainDisplay, out: &mut Output) -> Result<(), Web3CliError> {
     if out.kind() == OutputKind::Json {
-        out.write_json_str(serde_json::to_string(chain).unwrap_or_default());
+        render_json(chain, out)?;
     } else {
         let _ = out.info(&format!("Chain: {}", chain.name));
         let _ = out.info(&format!("  ID: {}", chain.id));
@@ -257,24 +272,26 @@ pub fn render_chain_info(chain: &ChainDisplay, out: &mut Output) {
             chain.explorer.as_deref().unwrap_or("-")
         ));
     }
+    Ok(())
 }
 
 /// Render balance output.
-pub fn render_balance(balance: &BalanceDisplay, out: &mut Output) {
+pub fn render_balance(balance: &BalanceDisplay, out: &mut Output) -> Result<(), Web3CliError> {
     if out.kind() == OutputKind::Json {
-        out.write_json_str(serde_json::to_string(balance).unwrap_or_default());
+        render_json(balance, out)?;
     } else {
         let _ = out.info(&format!("Address: {}", balance.address));
         let _ = out.info(&format!("Chain: {}", balance.chain));
         let _ = out.info(&format!("Balance: {} ETH", balance.balance_ether));
         let _ = out.info(&format!("         {} wei", balance.balance_wei));
     }
+    Ok(())
 }
 
 /// Render transaction output.
-pub fn render_tx(tx: &TxDisplay, out: &mut Output) {
+pub fn render_tx(tx: &TxDisplay, out: &mut Output) -> Result<(), Web3CliError> {
     if out.kind() == OutputKind::Json {
-        out.write_json_str(serde_json::to_string(tx).unwrap_or_default());
+        render_json(tx, out)?;
     } else {
         let _ = out.info("Transaction request:");
         let _ = out.info(&format!("  To: {}", tx.to));
@@ -284,12 +301,13 @@ pub fn render_tx(tx: &TxDisplay, out: &mut Output) {
         let _ = out.info("");
         let _ = out.info("Note: This is an unsigned transaction. Sign and broadcast separately.");
     }
+    Ok(())
 }
 
 /// Render binding output.
-pub fn render_binding(binding: &BindingDisplay, out: &mut Output) {
+pub fn render_binding(binding: &BindingDisplay, out: &mut Output) -> Result<(), Web3CliError> {
     if out.kind() == OutputKind::Json {
-        out.write_json_str(serde_json::to_string(binding).unwrap_or_default());
+        render_json(binding, out)?;
     } else {
         let _ = out.info("Identity Binding:");
         let _ = out.info(&format!("  DID: {}", binding.did));
@@ -301,16 +319,21 @@ pub fn render_binding(binding: &BindingDisplay, out: &mut Output) {
             let _ = out.info(&format!("  Expires: {} (unix)", expires));
         }
     }
+    Ok(())
 }
 
 /// Render binding verification result.
-pub fn render_binding_verify(is_valid: bool, binding: Option<&BindingDisplay>, out: &mut Output) {
+pub fn render_binding_verify(
+    is_valid: bool,
+    binding: Option<&BindingDisplay>,
+    out: &mut Output,
+) -> Result<(), Web3CliError> {
     if out.kind() == OutputKind::Json {
         let json = serde_json::json!({
             "is_valid": is_valid,
             "binding": binding
         });
-        out.write_json_str(serde_json::to_string(&json).unwrap_or_default());
+        render_json(&json, out)?;
     } else {
         if is_valid {
             let _ = out.info("✓ Binding is valid");
@@ -326,12 +349,13 @@ pub fn render_binding_verify(is_valid: bool, binding: Option<&BindingDisplay>, o
             let _ = out.info("✗ Binding is invalid or not found");
         }
     }
+    Ok(())
 }
 
 /// Render VC output.
-pub fn render_vc(vc: &VcDisplay, out: &mut Output) {
+pub fn render_vc(vc: &VcDisplay, out: &mut Output) -> Result<(), Web3CliError> {
     if out.kind() == OutputKind::Json {
-        out.write_json_str(serde_json::to_string(vc).unwrap_or_default());
+        render_json(vc, out)?;
     } else {
         let _ = out.info("Verifiable Credential:");
         let _ = out.info(&format!("  ID: {}", vc.id));
@@ -345,16 +369,21 @@ pub fn render_vc(vc: &VcDisplay, out: &mut Output) {
         let proof_status = if vc.has_proof { "signed" } else { "unsigned" };
         let _ = out.info(&format!("  Proof: {}", proof_status));
     }
+    Ok(())
 }
 
 /// Render VC verification result.
-pub fn render_vc_verify(is_valid: bool, vc: Option<&VcDisplay>, out: &mut Output) {
+pub fn render_vc_verify(
+    is_valid: bool,
+    vc: Option<&VcDisplay>,
+    out: &mut Output,
+) -> Result<(), Web3CliError> {
     if out.kind() == OutputKind::Json {
         let json = serde_json::json!({
             "is_valid": is_valid,
             "credential": vc
         });
-        out.write_json_str(serde_json::to_string(&json).unwrap_or_default());
+        render_json(&json, out)?;
     } else {
         if is_valid {
             let _ = out.info("✓ Credential is valid");
@@ -367,12 +396,13 @@ pub fn render_vc_verify(is_valid: bool, vc: Option<&VcDisplay>, out: &mut Output
             let _ = out.info("✗ Credential is invalid or expired");
         }
     }
+    Ok(())
 }
 
 /// Render presentation output.
-pub fn render_presentation(vp: &PresentationDisplay, out: &mut Output) {
+pub fn render_presentation(vp: &PresentationDisplay, out: &mut Output) -> Result<(), Web3CliError> {
     if out.kind() == OutputKind::Json {
-        out.write_json_str(serde_json::to_string(vp).unwrap_or_default());
+        render_json(vp, out)?;
     } else {
         let _ = out.info("Verifiable Presentation:");
         let _ = out.info(&format!("  ID: {}", vp.id));
@@ -381,6 +411,25 @@ pub fn render_presentation(vp: &PresentationDisplay, out: &mut Output) {
         let _ = out.info(&format!("  Created: {}", vp.created));
         let proof_status = if vp.has_proof { "signed" } else { "unsigned" };
         let _ = out.info(&format!("  Proof: {}", proof_status));
+    }
+    Ok(())
+}
+
+/// Serialise a display record for the JSON path.
+///
+/// A display record is built from already-validated data (hex strings,
+/// decimal numbers, unit-tagged integers), so serialisation cannot
+/// fail in practice. If it somehow does, the fallback is a *reported*
+/// error rather than an empty payload: the previous
+/// `unwrap_or_default()` made the command print a bare newline and
+/// still exit 0, which a `| jq` consumer read as "no result".
+fn render_json<T: Serialize>(value: &T, out: &mut Output) -> Result<(), Web3CliError> {
+    match serde_json::to_string(value) {
+        Ok(json) => {
+            out.write_json_str(json);
+            Ok(())
+        }
+        Err(e) => Err(Web3CliError::Serialise(e.to_string())),
     }
 }
 
@@ -398,12 +447,12 @@ pub fn execute(
         BlockchainAction::ChainList => {
             let chains: Vec<ChainDisplay> =
                 KnownChain::ALL.iter().copied().map(chain_display).collect();
-            render_chain_list(chains, out);
+            render_chain_list(chains, out)?;
             Ok(())
         }
         BlockchainAction::ChainInfo(name) => {
             let chain = resolve_chain(name)?;
-            render_chain_info(&chain_display(chain), out);
+            render_chain_info(&chain_display(chain), out)?;
             Ok(())
         }
         BlockchainAction::Balance(opts) => run_balance(opts, out),
@@ -413,6 +462,9 @@ pub fn execute(
         BlockchainAction::VcIssue(opts) => run_vc_issue(opts, passphrase, out),
         BlockchainAction::VcVerify(path) => run_vc_verify(path, out),
         BlockchainAction::VcPresent(opts) => run_vc_present(opts, passphrase, out),
+        BlockchainAction::VcVerifyPresentation { path, challenge } => {
+            run_vc_verify_presentation(path, challenge.as_deref(), out)
+        }
     }
 }
 
@@ -441,7 +493,7 @@ fn run_balance(opts: &BalanceOptions, out: &mut Output) -> Result<(), Web3CliErr
         balance_wei: wei.as_wei().to_string(),
         balance_ether: format!("{:.6}", wei.as_ether()),
     };
-    render_balance(&display, out);
+    render_balance(&display, out)?;
     Ok(())
 }
 
@@ -464,7 +516,7 @@ fn run_tx_build(opts: &TxBuildOptions, out: &mut Output) -> Result<(), Web3CliEr
         data_length: data.len(),
         encoded_length: request.encode_for_signing().len(),
     };
-    render_tx(&display, out);
+    render_tx(&display, out)?;
     Ok(())
 }
 
@@ -507,7 +559,11 @@ fn run_bind_create(opts: &BindCreateOptions, out: &mut Output) -> Result<(), Web
     let binding = IdentityBinding::new(opts.did.clone(), address, chain.chain_id(), 0, now)
         .with_expiry(claim.expires_at);
     let document = serde_json::json!({ "binding": binding, "proof": proof });
-    let text = serde_json::to_string_pretty(&document).unwrap_or_default();
+    // A serialisation failure must be reported, not turned into an empty
+    // document: `unwrap_or_default()` would write a zero-byte "binding proof"
+    // and still exit 0.
+    let text = serde_json::to_string_pretty(&document)
+        .map_err(|e| Web3CliError::Serialise(e.to_string()))?;
     let echoed = emit(&text, opts.output.as_deref(), out, "binding proof")?;
 
     let display = BindingDisplay {
@@ -521,7 +577,7 @@ fn run_bind_create(opts: &BindCreateOptions, out: &mut Output) -> Result<(), Web
         expires_at: Some(claim.expires_at),
     };
     if !echoed {
-        render_binding(&display, out);
+        render_binding(&display, out)?;
     }
     Ok(())
 }
@@ -544,6 +600,11 @@ fn run_bind_verify(path: &Path, out: &mut Output) -> Result<(), Web3CliError> {
     // metadata against the claim inside the signed message too.
     let signature_ok = proof.verify().map_err(Web3CliError::Core)?;
     let metadata_ok = message_binds_metadata(&proof);
+    // A binding carries an expiry. `bind create` signs `expiresAt` into the
+    // message, so the signature still verifies long after that instant —
+    // without this check `bind verify` reported a one-day binding as valid a
+    // year later, and a CI gate that relies on it could not fail.
+    let not_expired = !claim_expired(&proof.message, now_unix());
     // When the file is the full envelope, the `binding` record has to agree
     // with the proof for the same reason.
     let envelope_ok = match value.get("binding") {
@@ -560,16 +621,22 @@ fn run_bind_verify(path: &Path, out: &mut Output) -> Result<(), Web3CliError> {
     // A failed verification must be a failed *command*: rendering `✗` and
     // returning Ok made `bind verify` exit 0 on a tampered proof, the opposite
     // of `web3 verify` and unusable as a CI gate.
-    if !(signature_ok && metadata_ok && envelope_ok) {
-        return Err(Web3CliError::VerificationFailed {
-            reason: format!(
+    if !(signature_ok && metadata_ok && not_expired && envelope_ok) {
+        let reason = if !not_expired {
+            format!(
+                "{}: binding proof has expired (its signed expiresAt is in the past)",
+                path.display()
+            )
+        } else {
+            format!(
                 "{}: binding proof is invalid or its metadata is not bound to \
                  the signed message",
                 path.display()
-            ),
-        });
+            )
+        };
+        return Err(Web3CliError::VerificationFailed { reason });
     }
-    render_binding_verify(true, None, out);
+    render_binding_verify(true, None, out)?;
     Ok(())
 }
 
@@ -598,6 +665,22 @@ fn message_binds_metadata(proof: &BindingProof) -> bool {
             .is_some_and(|v| *v == chain_id.as_str())
 }
 
+/// Whether the signed `expiresAt:` field of a binding message is in the past.
+///
+/// `BindingClaim::encode` writes `expiresAt:{unix_secs}` as the last line, so
+/// the value is part of the signed bytes and cannot be edited — but the
+/// signature says "the holder signed this claim", not "this claim is still
+/// current". A missing or unparseable field means the claim cannot be shown
+/// to be in force, so it is treated as expired (fail closed), matching
+/// `VerifiableCredential::is_expired`.
+fn claim_expired(message: &str, now: u64) -> bool {
+    message
+        .lines()
+        .find_map(|line| line.strip_prefix("expiresAt:"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .is_none_or(|expires_at| now > expires_at)
+}
+
 fn run_vc_issue(
     opts: &VcIssueOptions,
     passphrase: &mut PassphraseResolver,
@@ -606,31 +689,54 @@ fn run_vc_issue(
     let issuer = identity_from_key_source(&opts.issuer, passphrase)?;
     let issuer_did = issuer.did_key().as_str().to_string();
 
-    let subject = opts.claims.iter().fold(
-        CredentialSubject::new(opts.subject_did.clone()),
-        |subject, (key, value)| subject.with_claim(key.clone(), value),
-    );
+    // `try_with_claim` so a claim name that collides with a
+    // `credentialSubject` field is an error here rather than a silently
+    // missing claim (or, worse, a duplicate JSON key that no reader in this
+    // repo can parse back — see `is_reserved_claim_key`).
+    let mut subject = CredentialSubject::new(opts.subject_did.clone());
+    for (key, value) in &opts.claims {
+        subject = subject
+            .try_with_claim(key.clone(), value)
+            .map_err(Web3CliError::Core)?;
+    }
     let types = vec![
         "VerifiableCredential".to_string(),
         opts.credential_type.clone(),
     ];
     let mut credential = VerifiableCredential::new(new_id(), issuer_did.clone(), types, subject);
     if let Some(until) = &opts.valid_until {
+        // A bound the verifier cannot evaluate makes `is_expired` answer
+        // "expired", so a typo (`2027-13-01`, a missing `T`, a stray word)
+        // would sign and write a credential that `vc verify` rejects forever
+        // — while this command printed success. Refuse it at the issuer.
+        if !magent_core::web3::is_valid_instant_bound(until) {
+            return Err(Web3CliError::Usage(format!(
+                "--valid-until {until:?} is not a valid ISO-8601 instant \
+                 (expected e.g. 2027-01-01T00:00:00Z); a credential issued \
+                 with it could never verify"
+            )));
+        }
         credential = credential.with_expiry(until.clone());
     }
 
-    let signature = sign_ed25519(&issuer, &credential.encode_for_signing())?;
-    credential.sign(CredentialProof::new(
+    // Build the proof first, hash the body with its options, then attach the
+    // signature — the options are part of the signed bytes.
+    let mut proof = CredentialProof::new(
         ProofType::Ed25519Signature2020,
         verification_method(&issuer_did),
-        signature,
-    ));
+        core::Signature::from_bytes(&[0u8; 64])?,
+    );
+    let bytes = credential
+        .signing_input(&proof)
+        .map_err(Web3CliError::Core)?;
+    proof.proof_value = sign_ed25519(&issuer, &bytes)?.to_hex();
+    credential.sign(proof);
     credential.validate().map_err(Web3CliError::Core)?;
 
     let text = String::from_utf8_lossy(&credential.encode_canonical()).into_owned();
     let echoed = emit(&text, opts.output.as_deref(), out, "credential")?;
     if !echoed {
-        render_vc(&vc_display(&credential), out);
+        render_vc(&vc_display(&credential), out)?;
     }
     Ok(())
 }
@@ -647,18 +753,89 @@ fn run_vc_verify(path: &Path, out: &mut Output) -> Result<(), Web3CliError> {
     // `did:key`, so the public key is embedded in the proof's verification
     // method — the old note claiming it was unavailable was wrong, and
     // skipping the check let a tampered subject pass as valid.
+    //
+    // `is_not_yet_valid` is part of the same check the core `verify()` makes
+    // for a credential inside a presentation. This path assembled the checks
+    // by hand and omitted it, so a credential stamped `validFrom: 2999-…`
+    // passed `vc verify` (exit 0, "valid") while the same credential inside a
+    // presentation was rejected — two entry points, opposite verdicts.
+    if credential.is_not_yet_valid() {
+        return Err(Web3CliError::VerificationFailed {
+            reason: format!(
+                "{}: credential is not yet valid (validFrom is in the future \
+                 or unparseable)",
+                path.display()
+            ),
+        });
+    }
     if credential.is_expired() {
         return Err(Web3CliError::VerificationFailed {
             reason: format!("{}: credential has expired", path.display()),
         });
     }
     credential.validate().map_err(Web3CliError::Core)?;
-    credential.verify_proof().map_err(|e| {
-        Web3CliError::VerificationFailed {
+    credential
+        .verify_proof()
+        .map_err(|e| Web3CliError::VerificationFailed {
             reason: format!("{}: {e}", path.display()),
-        }
+        })?;
+    render_vc_verify(true, Some(&vc_display(&credential)), out)?;
+    Ok(())
+}
+
+fn run_vc_verify_presentation(
+    path: &Path,
+    expected_challenge: Option<&str>,
+    out: &mut Output,
+) -> Result<(), Web3CliError> {
+    let text = read_file(path)?;
+    let presentation: VerifiablePresentation = serde_json::from_str(&text).map_err(|e| {
+        Web3CliError::Usage(format!(
+            "{} is not a verifiable presentation: {e}",
+            path.display()
+        ))
     })?;
-    render_vc_verify(true, Some(&vc_display(&credential)), out);
+
+    // `verify()` — not `validate()` + `verify_proof()`. The outer proof only
+    // attests that this holder assembled the document; it says nothing about
+    // the credentials inside, which a holder can choose freely. Verifying the
+    // outer proof alone accepted a presentation whose only credential named a
+    // fake issuer and carried no signature.
+    //
+    // With `--challenge`, also require that this presentation carries the
+    // nonce *this* verifier issued — a presentation signed for somebody else
+    // is a valid document that must not be accepted here.
+    let outcome = match expected_challenge {
+        Some(expected) => presentation.verify_with_challenge(expected),
+        None => presentation.verify(),
+    };
+    outcome.map_err(|e| Web3CliError::VerificationFailed {
+        reason: format!("{}: {e}", path.display()),
+    })?;
+
+    if out.kind() == OutputKind::Json {
+        let json = serde_json::json!({
+            "is_valid": true,
+            "presentation": {
+                "id": presentation.id,
+                "holder": presentation.holder,
+                "credential_count": presentation.verifiable_credential.len(),
+                "has_proof": presentation.proof.is_some(),
+                "challenge_checked": expected_challenge.is_some(),
+            }
+        });
+        render_json(&json, out)?;
+    } else {
+        let _ = out.info("✓ Presentation is valid");
+        let _ = out.info(&format!("  Holder: {}", presentation.holder));
+        let _ = out.info(&format!(
+            "  Credentials: {}",
+            presentation.verifiable_credential.len()
+        ));
+        if expected_challenge.is_some() {
+            let _ = out.info("  Challenge: matches the expected value");
+        }
+    }
     Ok(())
 }
 
@@ -678,24 +855,29 @@ fn run_vc_present(
     let holder_did = holder.did_key().as_str().to_string();
     let mut presentation = VerifiablePresentation::new(holder_did.clone(), vec![credential]);
 
-    // Sign the proof-less form, mirroring the credential's own rule that the
-    // signed bytes must not depend on whether a proof is attached.
-    let mut unsigned = presentation.clone();
-    unsigned.proof = None;
-    let bytes = serde_json::to_vec(&unsigned).unwrap_or_default();
-    let signature = sign_ed25519(&holder, &bytes)?;
+    // Build the proof first, hash the body together with its options through
+    // the core helper, then attach the signature. The options (challenge,
+    // domain, verification method) must be in the signed bytes — signing a
+    // proof-less clone left them unprotected, so a rewritten challenge still
+    // verified.
     let mut proof = PresentationProof::new(
         ProofType::Ed25519Signature2020,
         verification_method(&holder_did),
         opts.challenge.clone(),
-        signature,
+        // Placeholder, replaced once the options are fixed.
+        core::Signature::from_bytes(&[0u8; 64])?,
     );
     if let Some(domain) = &opts.domain {
         proof = proof.with_domain(domain.clone());
     }
+    let bytes = presentation
+        .signing_input(&proof)
+        .map_err(Web3CliError::Core)?;
+    proof.proof_value = sign_ed25519(&holder, &bytes)?.to_hex();
     presentation.sign(proof);
 
-    let text = serde_json::to_string_pretty(&presentation).unwrap_or_default();
+    let text = serde_json::to_string_pretty(&presentation)
+        .map_err(|e| Web3CliError::Serialise(e.to_string()))?;
     let echoed = emit(&text, opts.output.as_deref(), out, "presentation")?;
     let display = PresentationDisplay {
         id: presentation.id.clone(),
@@ -705,7 +887,7 @@ fn run_vc_present(
         has_proof: presentation.proof.is_some(),
     };
     if !echoed {
-        render_presentation(&display, out);
+        render_presentation(&display, out)?;
     }
     Ok(())
 }
@@ -949,6 +1131,27 @@ mod tests {
     /// harness).
     fn json_string<T: serde::Serialize>(value: &T) -> String {
         serde_json::to_string(value).unwrap_or_default()
+    }
+
+    /// `bind verify` must refuse a binding whose signed `expiresAt` has passed.
+    ///
+    /// `bind create --expiry-days 1` signs `expiresAt` into the message, but
+    /// the signature verifying says only that the holder signed the claim — a
+    /// one-day binding reported "valid" a year later, so it could not gate
+    /// anything. `claim_expired` reads the field out of the signed bytes.
+    #[test]
+    fn a_binding_past_its_signed_expiry_is_reported_as_expired() {
+        let message = "DIDBindingClaim\ndid:did:key:z6Mk\naddress:ab\nchainId:1\n\
+                       issuedAt:1700000000\nexpiresAt:1700086400";
+        // 1700086400 is the instant itself; > is the rule, so it is still
+        // valid at exactly that second and expired one second later.
+        assert!(!claim_expired(message, 1_700_086_400));
+        assert!(claim_expired(message, 1_700_086_401));
+
+        // A message with no parseable `expiresAt` cannot be shown to be in
+        // force, so it fails closed rather than passing as a fresh binding.
+        assert!(claim_expired("DIDBindingClaim\ndid:did:key:z6Mk", 0));
+        assert!(claim_expired("DIDBindingClaim\nexpiresAt:not-a-number", 0));
     }
 
     #[test]
@@ -1347,7 +1550,11 @@ mod tests {
         // while exiting 0.
         let mut out = Output::new(OutputKind::Human, true);
         assert!(matches!(
-            execute(&BlockchainAction::BindVerify(tampered_path.clone()), &mut passphrase, &mut out),
+            execute(
+                &BlockchainAction::BindVerify(tampered_path.clone()),
+                &mut passphrase,
+                &mut out
+            ),
             Err(Web3CliError::VerificationFailed { .. })
         ));
 

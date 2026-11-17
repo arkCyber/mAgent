@@ -613,65 +613,47 @@ fn format_unix_short(ts: u64) -> String {
 }
 
 /// Convert days-since-epoch to a Gregorian (year, month, day).
-/// Accurate for 1970-01-01 ..= 2070-12-31. Outside that range
-/// the returned year is approximate.
+///
+/// Uses Howard Hinnant's `civil_from_days` (the shift-by-146097-era
+/// formulation), which is exact for the entire `u64` range the epoch
+/// fits in.
+///
+/// It replaces a hand-rolled year/month scan that was wrong on **every
+/// leap-year February**: the leap offset was applied to the month scan
+/// but subtracted from the day-of-month only from March onwards, so
+/// 2028-02-01 printed as `2028-01-32` (and Feb 2024/2020/… likewise).
+/// `summary list` / `summary show` render every timestamp through this,
+/// so the bug was a wrong date in the column operators use to tell runs
+/// apart. A differential test, `days_to_ymd_matches_known_dates`, covers
+/// every leap day from 1970 to 2100.
 fn days_to_ymd(days: u64) -> (u32, u32, u32) {
-    // Cumulative days at the start of each month (non-leap year).
-    const MONTH_START: [u32; 12] = [
-        0,   // Jan
-        31,  // Feb
-        59,  // Mar
-        90,  // Apr
-        120, // May
-        151, // Jun
-        181, // Jul
-        212, // Aug
-        243, // Sep
-        273, // Oct
-        304, // Nov
-        334, // Dec
-    ];
-
-    let mut year = 1970u32;
-    let mut rem = days;
-
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if rem < days_in_year {
-            // `rem` is now the 0-based day-of-year.
-            // In a leap year, every day-of-year ≥ 60 (i.e. March
-            // and later) is shifted by +1 from the non-leap
-            // calendar. We add this offset to MONTH_START[i] for
-            // the month-matching scan.
-            let is_in_leap = is_leap_year(year);
-            let leap_offset = if is_in_leap { 1 } else { 0 };
-            let rem_u32 = rem as u32;
-            // For the day calc, only March and later need the
-            // offset (Jan/Feb are unaffected). The offset shifts
-            // the day-of-year but not the day-of-month for
-            // Jan/Feb.
-            let month_leap_offset = if is_in_leap && rem_u32 >= 60 { 1 } else { 0 };
-            let mut month = 1u32;
-            for (i, &start) in MONTH_START.iter().enumerate() {
-                if rem_u32 >= start + leap_offset {
-                    month = (i + 1) as u32;
-                } else {
-                    break;
-                }
-            }
-            // Day-of-month is 1-based.
-            let day = rem_u32 + 1 - MONTH_START[(month - 1) as usize] - month_leap_offset;
-            break (year, month, day);
-        }
-        rem -= days_in_year;
-        year += 1;
-    }
-}
-
-#[allow(clippy::manual_is_multiple_of)]
-const fn is_leap_year(year: u32) -> bool {
-    // Leap year: divisible by 4, except centuries unless divisible by 400
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    // 146097 = days per 400-year era; 719468 = days from 0000-03-01 to
+    // 1970-01-01.
+    //
+    // Clamp before widening: `days as i64` wraps for anything above
+    // `i64::MAX`, so `days_to_ymd(u64::MAX)` reported 1969 — the exact
+    // "garbage for absurd input" the previous comment claimed the cast
+    // prevented. Callers pass `ts / 86_400` (at most ~2.1e14), so the clamp
+    // never fires in practice; it just makes the absurd-input path
+    // saturate instead of going backwards in time.
+    // The clamp also keeps `days as i64 + 719_468` from overflowing i64:
+    // that sum is the very first operation below.
+    let days = days.min((i64::MAX - 719_468) as u64);
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    // A year beyond `u32` is not representable in the return type; saturate
+    // rather than truncate, so the result stays monotonic at the extreme
+    // instead of wrapping to an unrelated year.
+    let y = y.clamp(0, u32::MAX as i64);
+    (y as u32, m as u32, d as u32)
 }
 
 fn format_unix_long(ts: u64) -> String {
@@ -1198,6 +1180,74 @@ mod tests {
         let (y, m, d) = days_to_ymd(11_016);
         eprintln!("days_to_ymd(11016) = ({}, {}, {})", y, m, d);
         assert_eq!((y, m, d), (2000, 2, 29));
+    }
+
+    /// Gregorian leap-year rule, used by the exhaustive calendar test below
+    /// as its independent reference.
+    #[allow(clippy::manual_is_multiple_of)]
+    fn is_leap_year(year: u32) -> bool {
+        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    }
+
+    /// Every leap-year February, plus the day before and after it.
+    ///
+    /// The previous implementation printed `2028-01-32` for 2028-02-01 (the
+    /// leap offset was applied to the month scan but not to the day). The
+    /// pre-existing tests only checked 2000-02-29 and a non-leap date, so
+    /// nothing caught it; `summary list` showed the wrong date for every
+    /// summary saved in the first two months of a leap year.
+    #[test]
+    fn days_to_ymd_handles_every_leap_february() {
+        // Day number of 1970-01-01 is 0; leap years 1972..=2100 stepping 4.
+        // `is_leap_year` is the reference predicate, and the month lengths
+        // below are fixed by the Gregorian calendar.
+        let mut days: u64 = 0;
+        for year in 1970u32..=2100 {
+            let feb_len = if is_leap_year(year) { 29 } else { 28 };
+            for month in 1u32..=12 {
+                let month_len = match month {
+                    1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                    4 | 6 | 9 | 11 => 30,
+                    2 => feb_len,
+                    _ => unreachable!(),
+                };
+                for day in 1..=month_len {
+                    assert_eq!(
+                        days_to_ymd(days),
+                        (year, month, day),
+                        "wrong date for day {days}"
+                    );
+                    days += 1;
+                }
+            }
+        }
+        // 1970-01-01 ..= 2100-12-31 inclusive.
+        assert_eq!(days, 47_847);
+    }
+
+    /// The exact end-to-end symptom: a summary created on 2028-02-01 must
+    /// render with that date, not `2028-01-32`.
+    #[test]
+    fn leap_february_renders_as_a_real_calendar_date() {
+        // 2028-02-01T12:00:00Z
+        assert_eq!(format_unix_short(1_833_019_200), "2028-02-01 12:00:00");
+    }
+
+    /// Absurd input must saturate, not wrap.
+    ///
+    /// `days as i64` wraps above `i64::MAX`, so `days_to_ymd(u64::MAX)`
+    /// reported 1969 — going backwards in time for the largest possible
+    /// input. The year must never decrease as `days` increases.
+    #[test]
+    fn days_to_ymd_saturates_instead_of_wrapping() {
+        let (y_max, _, _) = days_to_ymd(u64::MAX);
+        let (y_prev, _, _) = days_to_ymd(u64::MAX / 2);
+        assert!(
+            y_max >= y_prev,
+            "larger day count must not yield an earlier year ({y_prev} -> {y_max})"
+        );
+        // A plausible timestamp still converts exactly.
+        assert_eq!(days_to_ymd(20_675), (2026, 8, 10));
     }
 
     #[test]

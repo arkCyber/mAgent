@@ -118,9 +118,9 @@ pub struct SleepQuality {
     /// Sleep efficiency (percentage of time in bed actually sleeping).
     ///
     /// **Convention:** this is a 0.0–100.0 percentage (e.g. `95.0` for 95%),
-    /// **not** a 0–1 fraction. The score formula is `efficiency * 0.25`, so a
-    /// fractional value like `0.95` would silently contribute almost nothing
-    /// to the overall score.
+    /// **not** a 0–1 fraction. The score formula weights it
+    /// `efficiency * 0.30` (clamped to 30 points), so a fractional value like
+    /// `0.95` would silently contribute almost nothing to the overall score.
     pub efficiency: f32,
     /// Deep sleep minutes (estimated)
     pub deep_sleep_min: u16,
@@ -144,14 +144,19 @@ impl SleepQuality {
         wake_count: u8,
         onset_latency_min: u8,
     ) -> Self {
-        // Calculate overall score
+        // Weighted score, 0–100. The four positive components must sum to
+        // 100 so a perfect night (8 h, 100 % efficiency, full deep+REM
+        // structure, instant onset, no wakes) reports 100 — the UI renders
+        // "score N/100". They used to sum to 90 (30+25+25+10), so the best
+        // possible night could never read above 90.
         let duration_score = (duration_min as f32 / 480.0 * 30.0).min(30.0);
-        let efficiency_score = efficiency * 0.25;
-        let structure_score = ((deep_sleep_min as u32 + rem_sleep_min as u32) as f32 / 180.0 * 25.0).min(25.0);
+        let efficiency_score = (efficiency * 0.30).clamp(0.0, 30.0);
+        let structure_score =
+            ((deep_sleep_min as u32 + rem_sleep_min as u32) as f32 / 180.0 * 30.0).min(30.0);
         let latency_score = if onset_latency_min < 15 {
             10.0
         } else {
-            10.0 - onset_latency_min as f32 / 3.0
+            (10.0 - onset_latency_min as f32 / 3.0).max(0.0)
         };
         let wake_penalty = (wake_count as f32 * 2.0).min(10.0);
 
@@ -201,12 +206,29 @@ pub struct SleepRecord {
 }
 
 impl SleepRecord {
-    /// Get sleep duration in minutes
+    /// Get sleep duration in minutes.
+    ///
+    /// Both time-of-day fields are plain `u16` with no invariant enforced at
+    /// construction, so they must be handled defensively:
+    ///
+    /// * Equal start and wake times mean **zero** minutes. The old `else`
+    ///   branch reported `1440 - start + start` = 24 h, so a zero-length
+    ///   record inflated the weekly average, sleep debt and the score.
+    /// * A value outside a day (`>= 1440`) would underflow `1440 - start` in
+    ///   debug (panic) and wrap in release (a ~4000-minute night). Such a
+    ///   record is reported as zero rather than as a fabricated 24 h+ night.
     pub fn duration_minutes(&self) -> u32 {
-        if self.wake_time_min > self.sleep_start_min {
-            self.wake_time_min as u32 - self.sleep_start_min as u32
+        let start = self.sleep_start_min;
+        let wake = self.wake_time_min;
+        if start >= 1440 || wake >= 1440 {
+            return 0;
+        }
+        if wake > start {
+            u32::from(wake - start)
+        } else if wake == start {
+            0
         } else {
-            (1440 - self.sleep_start_min as u32) + self.wake_time_min as u32
+            u32::from(1440 - start) + u32::from(wake)
         }
     }
 }
@@ -355,8 +377,11 @@ pub struct SleepManager {
     meditation_goal_min: u8,
     /// Today's meditation minutes
     today_meditation_min: u8,
-    /// Last meditation offer time
-    last_meditation_offer: u32,
+    /// Last meditation offer time, or `None` if none has been offered.
+    ///
+    /// `None` is *never offered*, not *offered at t=0* — see
+    /// `check_stress_intervention`.
+    last_meditation_offer: Option<u32>,
     /// Cooldown between offers (ms)
     meditation_cooldown_ms: u32,
 }
@@ -372,7 +397,7 @@ impl SleepManager {
             stress_threshold: 70,
             meditation_goal_min: 10,
             today_meditation_min: 0,
-            last_meditation_offer: 0,
+            last_meditation_offer: None,
             meditation_cooldown_ms: 900_000, // 15 minutes
         }
     }
@@ -481,14 +506,19 @@ impl SleepManager {
         self.last_stress_check = current_time_ms;
 
         // Check if intervention needed
-        // Saturating: a clock that goes backwards (reboot, time sync, or a
-        // u32 millisecond wrap at ~49 days) used to panic in debug and wrap
-        // to a huge value in release — bypassing the cooldown entirely.
-        if stress_score >= self.stress_threshold
-            && current_time_ms.saturating_sub(self.last_meditation_offer)
-                > self.meditation_cooldown_ms
-        {
-            self.last_meditation_offer = current_time_ms;
+        //
+        // `last_meditation_offer` is an `Option`: `None` means *never offered*,
+        // which always passes. As a plain `u32` initialised to 0 it read
+        // "offered at boot", so the first intervention of a device's life was
+        // suppressed for its first 15 minutes — the window right after power-on
+        // where a stress reading matters most. The subtraction saturates so a
+        // clock that steps backwards (NTP, a `u32` wrap at ~49 days) reads as
+        // "no time passed" and holds the cooldown rather than bypassing it.
+        let cooldown_elapsed = self
+            .last_meditation_offer
+            .is_none_or(|last| current_time_ms.saturating_sub(last) > self.meditation_cooldown_ms);
+        if stress_score >= self.stress_threshold && cooldown_elapsed {
+            self.last_meditation_offer = Some(current_time_ms);
             event.meditation_offered = true;
 
             let recommended_session = MeditationType::recommended_for_stress(stress);
@@ -558,10 +588,22 @@ impl SleepManager {
 
     /// Record meditation completion
     pub fn record_meditation(&mut self, session: MeditationSession) -> Result<()> {
-        self.today_meditation_min = self.today_meditation_min.saturating_add(session.duration_min);
+        self.today_meditation_min = self
+            .today_meditation_min
+            .saturating_add(session.duration_min);
 
-        // Update the most recent stress event with meditation info
-        if let Some(event) = self.stress_log.last_mut() {
+        // Attribute the completion to the stress event that actually offered a
+        // session. The old body always marked `stress_log.last_mut()`, which
+        // is merely the newest *sample*: an offer at t=1 s followed by a
+        // low-stress sample at t=2 s marked the low-stress event as "accepted",
+        // so the log claimed the user accepted an intervention that was never
+        // offered to them.
+        if let Some(event) = self
+            .stress_log
+            .iter_mut()
+            .rev()
+            .find(|e| e.meditation_offered && !e.meditation_accepted)
+        {
             event.meditation_accepted = true;
             event.session_completed = Some(session);
         }
@@ -757,6 +799,25 @@ mod tests {
         }
     }
 
+    /// A perfect night must score 100, because the score is displayed as
+    /// "N/100".
+    ///
+    /// The four positive weights summed to 90 (duration 30 + efficiency 25 +
+    /// structure 25 + latency 10), so the best possible night read as 90 and
+    /// nothing could reach the stated maximum.
+    #[test]
+    fn a_perfect_night_scores_one_hundred() {
+        let perfect = SleepQuality::new(480, 100.0, 90, 90, 0, 10);
+        assert_eq!(
+            perfect.score, 100,
+            "8 h, 100% efficiency, full structure, instant onset, no wakes"
+        );
+
+        // A night 20 % short of the duration target loses ~6 points.
+        let slightly_short = SleepQuality::new(384, 100.0, 90, 90, 0, 10);
+        assert_eq!(slightly_short.score, 94);
+    }
+
     #[test]
     fn sleep_quality_scores_and_rates() {
         // A good night (8h, 95% efficiency, plenty of deep+REM, fast onset,
@@ -792,6 +853,93 @@ mod tests {
         // Overnight: 23:00 → 06:30 crosses midnight → (1440-1380)+390 = 450.
         let overnight = record(80, 450);
         assert_eq!(overnight.duration_minutes(), 450);
+    }
+
+    /// Zero-length and out-of-range windows must not fabricate a duration.
+    ///
+    /// Equal start/wake times fell into the `else` branch and returned
+    /// `1440 - start + start` = 24 h, so a zero-minute record inflated the
+    /// weekly average and sleep debt. A value outside a day (`>= 1440`)
+    /// underflowed in debug and wrapped in release.
+    #[test]
+    fn degenerate_sleep_windows_report_zero_not_a_full_day() {
+        let mut zero = record(80, 0);
+        zero.sleep_start_min = 22 * 60;
+        zero.wake_time_min = 22 * 60;
+        assert_eq!(
+            zero.duration_minutes(),
+            0,
+            "equal start and wake is a zero-length night, not 24 hours"
+        );
+
+        let mut out_of_range = record(80, 0);
+        out_of_range.sleep_start_min = 2000; // not a time of day
+        out_of_range.wake_time_min = 400;
+        assert_eq!(
+            out_of_range.duration_minutes(),
+            0,
+            "an impossible time-of-day field is not a real duration"
+        );
+        out_of_range.sleep_start_min = 1380;
+        out_of_range.wake_time_min = 1500;
+        assert_eq!(out_of_range.duration_minutes(), 0);
+    }
+
+    /// The first stress intervention must fire right after boot.
+    ///
+    /// `last_meditation_offer` was a plain `u32` initialised to 0, so the
+    /// cooldown test `now - 0 > 900_000` suppressed every offer for the first
+    /// 15 minutes of uptime — the window where a high stress reading is most
+    /// significant.
+    #[test]
+    fn the_first_stress_intervention_is_not_suppressed_at_boot() {
+        let mut m = SleepManager::new();
+        // 60 s after boot, high stress (low HRV, fast HR).
+        let rec = m.check_stress_intervention(10.0, 160, 60_000);
+        assert!(
+            rec.is_some(),
+            "the first high-stress reading after boot must offer an intervention"
+        );
+
+        // A second reading inside the cooldown is suppressed.
+        assert!(m.check_stress_intervention(10.0, 160, 120_000).is_none());
+        // After the 15-minute cooldown it fires again.
+        assert!(m
+            .check_stress_intervention(10.0, 160, 60_000 + 900_001)
+            .is_some());
+    }
+
+    /// A completion is attributed to the event that offered it, not to
+    /// whichever stress sample happened to be newest.
+    #[test]
+    fn a_meditation_completion_is_attributed_to_the_offering_event() {
+        let mut m = SleepManager::new();
+        // High stress at t=1 s → offer.
+        assert!(m.check_stress_intervention(10.0, 160, 1_000).is_some());
+        // Low stress at t=2 s → a new sample, no offer.
+        assert!(m.check_stress_intervention(90.0, 65, 2_000).is_none());
+
+        m.record_meditation(MeditationSession::new(MeditationType::EmergencyCalm, 3, 80))
+            .unwrap();
+
+        let log = m.stress_log();
+        let offered = log
+            .iter()
+            .find(|e| e.meditation_offered)
+            .expect("an offer exists");
+        assert!(
+            offered.meditation_accepted,
+            "the offering event is the one that was accepted"
+        );
+        let newest = log.last().expect("non-empty");
+        assert!(
+            !newest.meditation_offered,
+            "the low-stress sample was not an offer"
+        );
+        assert!(
+            !newest.meditation_accepted,
+            "a sample that was never offered must not be marked accepted"
+        );
     }
 
     #[test]
@@ -1029,9 +1177,7 @@ mod tests {
     fn record_meditation_updates_the_most_recent_stress_event() {
         let mut m = SleepManager::new();
         // Push a stress event into the log first, then record a completion.
-        assert!(m
-            .check_stress_intervention(10.0, 160, 1_000_000)
-            .is_some());
+        assert!(m.check_stress_intervention(10.0, 160, 1_000_000).is_some());
         let session = MeditationSession::new(MeditationType::EmergencyCalm, 3, 80);
         m.record_meditation(session).unwrap();
         let event = m.stress_log().last().unwrap();

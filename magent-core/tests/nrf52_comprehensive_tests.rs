@@ -655,10 +655,23 @@ mod wear_leveling_tests {
         let mut wl = WearLeveler::new(4, 100);
         wl.set_strategy(WearLevelingStrategy::Static);
 
+        // Documented call order: ask which sector the *next* write goes to,
+        // write there, then credit the write. The previous revision of this
+        // test incremented first and then asked, which is the reverse of the
+        // contract `static_wear_leveling` and `increment_write_count` share —
+        // it only ever passed against the old `(count - 1) % N` formula.
         for i in 0..8 {
-            wl.increment_write_count();
             let sector = wl.get_next_sector().unwrap();
             assert_eq!(sector, i % 4);
+            wl.increment_write_count();
+        }
+
+        // Clearing the rotation counter must not blind the wear accounting:
+        // every write it credited has to be visible in the distribution.
+        let stats = wl.calculate_wear_distribution();
+        assert_eq!(stats.total_writes, 8);
+        for (i, s) in stats.sectors.iter().enumerate() {
+            assert_eq!(s.write_count, 2, "sector {i} should hold 2 writes");
         }
     }
 

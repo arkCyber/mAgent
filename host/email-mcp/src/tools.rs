@@ -230,24 +230,20 @@ impl ToolRegistry {
 
     async fn tool_list_inbox(&self, args: Value) -> Result<String, anyhow::Error> {
         let limit = limit_arg(&args)?;
-        self.state.ensure_imap().await?;
-        let mut guard = self.state.imap.lock().await;
-        let session = guard
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
-        let summaries = session.list_inbox(limit).await?;
+        let summaries = self
+            .state
+            .with_imap(|session| Box::pin(async move { session.list_inbox(limit).await }))
+            .await?;
         let json = ImapSession::summaries_to_json(&summaries);
         Ok(serde_json::to_string_pretty(&json)?)
     }
 
     async fn tool_get_email(&self, args: Value) -> Result<String, anyhow::Error> {
         let uid = uid_arg(&args)?;
-        self.state.ensure_imap().await?;
-        let mut guard = self.state.imap.lock().await;
-        let session = guard
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
-        let msg = session.get_email(uid).await?;
+        let msg = self
+            .state
+            .with_imap(|session| Box::pin(async move { session.get_email(uid).await }))
+            .await?;
         let json = ImapSession::full_to_json(&msg);
         Ok(serde_json::to_string_pretty(&json)?)
     }
@@ -272,12 +268,17 @@ impl ToolRegistry {
             anyhow::bail!("`query` must not be empty");
         }
         let limit = limit_arg(&args)?;
-        self.state.ensure_imap().await?;
-        let mut guard = self.state.imap.lock().await;
-        let session = guard
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
-        let summaries = session.search_emails(query, limit).await?;
+        // Own the query (detached from `args`) and clone per attempt: the
+        // reconnect helper may call the closure twice, so it cannot move a
+        // single owned value into the future.
+        let query = query.to_string();
+        let summaries = self
+            .state
+            .with_imap(move |session| {
+                let query = query.clone();
+                Box::pin(async move { session.search_emails(&query, limit).await })
+            })
+            .await?;
         let json = ImapSession::summaries_to_json(&summaries);
         Ok(serde_json::to_string_pretty(&json)?)
     }
@@ -295,23 +296,23 @@ impl ToolRegistry {
             .get("body")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("missing `body`"))?;
-        self.state.ensure_smtp().await?;
-        let guard = self.state.smtp.lock().await;
-        let session = guard
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("smtp not connected"))?;
-        let response = session.send(to, subject, body).await?;
+        let response = self
+            .state
+            .with_smtp(|session| {
+                let (to, subject, body) = (to.to_string(), subject.to_string(), body.to_string());
+                Box::pin(async move { session.send(&to, &subject, &body).await })
+            })
+            .await?;
         Ok(json!({ "status": "sent", "server_response": response }).to_string())
     }
 
     async fn tool_mark_read(&self, args: Value) -> Result<String, anyhow::Error> {
         let uid = uid_arg(&args)?;
-        self.state.ensure_imap().await?;
-        let mut guard = self.state.imap.lock().await;
-        let session = guard
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("imap not connected"))?;
-        if !session.mark_read(uid).await? {
+        let marked = self
+            .state
+            .with_imap(|session| Box::pin(async move { session.mark_read(uid).await }))
+            .await?;
+        if !marked {
             anyhow::bail!("no message with uid {uid} in INBOX");
         }
         Ok(json!({ "status": "marked_read", "uid": uid }).to_string())

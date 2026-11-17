@@ -839,6 +839,15 @@ fn v_to_owned_string(v: piccolo::Value<'_>) -> String {
 /// pathological pattern would otherwise run for minutes.
 const MAX_MATCH_STEPS: usize = 1_000_000;
 
+/// Maximum `(` nesting the pattern engine will parse or match.
+///
+/// Each level costs one Rust stack frame in `parse_group_at` and again in
+/// `match_sub_at`. The script budget (512 KiB) allows tens of thousands of
+/// nested parens, which overflowed the Lua thread's stack on device — an
+/// abort rather than an error. 32 is far beyond any real pattern
+/// (`(((%d+)))` is 3) and keeps the recursion trivially bounded.
+const MAX_PATTERN_DEPTH: usize = 32;
+
 fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
     // `init` is a Lua 1-based index into a *byte* string. This shim holds a
     // `&str`, so a script passing an index that lands inside a multi-byte
@@ -940,6 +949,21 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
     /// consumed the trailing quantifier, so `(ab)` captured just `"a"` and
     /// `(ab)+` failed (the `+` became a literal).
     fn parse_group(pb: &[u8]) -> Option<Vec<Inst>> {
+        parse_group_at(pb, 0)
+    }
+
+    /// [`parse_group`] with an explicit nesting depth.
+    ///
+    /// `parse_group` recurses once per `(` and had no bound: a script
+    /// pattern like `((((…a…))))` (a few thousand levels fits easily in the
+    /// 512 KiB script budget) recursed thousands of frames deep at *match*
+    /// time and blew the device's Lua thread stack — an abort, not an
+    /// `Err`, which the sandbox contract forbids. The depth cap turns that
+    /// into "no match".
+    fn parse_group_at(pb: &[u8], depth: usize) -> Option<Vec<Inst>> {
+        if depth > MAX_PATTERN_DEPTH {
+            return None;
+        }
         let mut out: Vec<Inst> = Vec::new();
         let mut i = 0;
         while i < pb.len() {
@@ -957,6 +981,12 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
             }
             if c == b'(' {
                 i += 1;
+                // `depth` below counts parens while scanning for this
+                // group's `)`; keep the *recursion* depth separate. They used
+                // to share one name, so the recursive call passed the local
+                // paren counter (always 1 here) and the nesting cap could
+                // never trigger.
+                let outer_depth = depth;
                 let mut depth = 1usize;
                 let group_start = i;
                 while i < pb.len() && depth > 0 {
@@ -976,7 +1006,7 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
                     return None; // unterminated capture
                 }
                 let body = &pb[group_start..i - 1];
-                let inner = parse_group(body)?;
+                let inner = parse_group_at(body, outer_depth + 1)?;
                 let mut quant = Quant::Once;
                 if i < pb.len() {
                     match pb[i] {
@@ -1062,6 +1092,24 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
         pos: usize,
         steps: &mut usize,
     ) -> Option<(usize, Option<(usize, usize)>)> {
+        match_sub_at(code, s, pos, steps, 0)
+    }
+
+    /// [`match_sub`] with an explicit nesting depth.
+    ///
+    /// The parser caps nesting at [`MAX_PATTERN_DEPTH`], so this second cap
+    /// is defence in depth: a program that somehow exceeded it reports "no
+    /// match" instead of overflowing the stack.
+    fn match_sub_at(
+        code: &[Inst],
+        s: &[u8],
+        pos: usize,
+        steps: &mut usize,
+        depth: usize,
+    ) -> Option<(usize, Option<(usize, usize)>)> {
+        if depth > MAX_PATTERN_DEPTH {
+            return None;
+        }
         let mut p = pos;
         let mut capture: Option<(usize, usize)> = None;
         for inst in code {
@@ -1080,7 +1128,7 @@ fn do_string_match(s: &str, pat: &str, init: i64) -> Option<String> {
                         break;
                     }
                     let before = p;
-                    match match_sub(&inst.inner, s, p, steps) {
+                    match match_sub_at(&inst.inner, s, p, steps, depth + 1) {
                         Some((end, _)) => {
                             if reps == 0 {
                                 first_end = Some(end);

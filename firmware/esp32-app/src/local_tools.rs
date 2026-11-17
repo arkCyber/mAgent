@@ -75,6 +75,20 @@ fn required_kv<'a>(pairs: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
         .map(|(_, v)| *v)
 }
 
+/// Like [`required_kv`], but an explicitly empty value counts as *present*.
+///
+/// For arguments where emptiness is a meaningful value rather than a typo:
+/// `flash_write`'s `data=` is a request to write zero bytes, and the Lua
+/// `hardware.flash_write` binding allows it. `required_kv` treated `data=`
+/// the same as a missing `data`, so "set this key to empty" was refused with
+/// "missing required argument". A *missing* key is still `None`.
+fn kv_allowing_empty<'a>(pairs: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| *v)
+}
+
 /// Why `pin` must not be driven as a user GPIO on this board, or `None`.
 ///
 /// The tool/Lua APIs take a **pin number chosen by the model or the script**.
@@ -116,13 +130,61 @@ pub(crate) fn reserved_pin_reason(pin: i32) -> Option<&'static str> {
     }
 }
 
-/// The ESP32-C61's reserved-pin map is not encoded yet, so nothing is refused
-/// there. The C61 is single-core with its own flash/PSRAM pin assignment;
-/// guessing it would be worse than not having it. Recorded in
-/// `docs/BACKLOG.md` as follow-up.
+/// Ask the GPIO matrix whether this pin is already owned by a peripheral.
+///
+/// The C61 board's pin map is not recorded in this repo, and copying the S3
+/// table would be actively wrong (different flash/PSRAM assignment). But the
+/// question this function has to answer — "has the system already claimed
+/// this pin?" — is one ESP-IDF can answer at runtime, and more accurately
+/// than any table: `gpio_get_io_config` reports the current IOMUX function
+/// selection, and `FUNC_GPIO` (= 1 on every ESP32-family part) is the plain
+/// "this is a GPIO" setting. Anything else means a peripheral owns the pad —
+/// SPI flash, PSRAM, UART0, USB-JTAG — and reconfiguring it detaches that
+/// peripheral, which on the flash pins is an immediate `StoreProhibited`.
+///
+/// This also covers pins the S3 table cannot know about, and it stays correct
+/// if the board's pin map changes.
 #[cfg(not(feature = "board-s3"))]
-pub(crate) fn reserved_pin_reason(_pin: i32) -> Option<&'static str> {
-    None
+pub(crate) fn reserved_pin_reason(pin: i32) -> Option<&'static str> {
+    /// IOMUX function selector for "plain GPIO".
+    const FUNC_GPIO: u32 = 1;
+
+    let Ok(pin) = u32::try_from(pin) else {
+        return Some("negative pin number");
+    };
+    let mut config = core::mem::MaybeUninit::<esp_idf_sys::gpio_io_config_t>::uninit();
+    // SAFETY: `gpio_get_io_config` writes the struct and returns an error
+    // code; the struct is only read when the call reported `ESP_OK`.
+    let rc = unsafe {
+        esp_idf_sys::gpio_get_io_config(pin as esp_idf_sys::gpio_num_t, config.as_mut_ptr())
+    };
+    if rc != esp_idf_sys::ESP_OK {
+        return Some("pin number is out of range for this chip");
+    }
+    // SAFETY: initialised by the successful call above.
+    let config = unsafe { config.assume_init() };
+    if config.fun_sel != FUNC_GPIO || config.oe_ctrl_by_periph {
+        return Some(
+            "pin is owned by a system peripheral (flash/PSRAM/UART/USB) — \
+             driving it detaches that peripheral",
+        );
+    }
+    // Defence in depth: a pin can read as plain-GPIO while the peripheral
+    // that owns it is between initialisation steps, and driving a flash pin
+    // is an immediate crash rather than an error.
+    //
+    // Taken from ESP-IDF's own definition for this part
+    // (`components/soc/esp32c61/include/soc/spi_pins.h`), not from memory:
+    // MSPI CS1=14, CS0=15, MISO=16, WP=17, HD=19, CLK=20, MOSI=21. Note that
+    // 18 is *not* in the set — a "16..=21" range would have wrongly refused it.
+    match pin {
+        14..=17 | 19..=21 => {
+            Some("SPI flash pin (GPIO14-17,19-21) — driving it detaches the flash")
+        }
+        // UART0, claimed by the ingress adapter.
+        10 | 11 => Some("UART0 RX/TX — owned by the UART ingress"),
+        _ => None,
+    }
 }
 
 /// `write_gpio pin=N,state=high|low` — drive a real GPIO on the C61.
@@ -305,7 +367,23 @@ fn flash_write(args: &str) -> ToolResult {
             false,
         );
     };
-    let data = kv(&pairs, "data", "");
+    // An omitted `data` is a missing field, not a successful write of zero
+    // bytes: `kv(.., "data", "")` made a typo'd key ("data_") look like a
+    // persisted value, and the model was told the write had happened.
+    //
+    // An *explicitly empty* `data=`, on the other hand, is a real request to
+    // write nothing, and the Lua binding (`hardware.flash_write`) accepts it.
+    // Conflating the two refused a legitimate "set this key to empty".
+    let data = match kv_allowing_empty(&pairs, "data") {
+        Some(d) => d,
+        None => {
+            return tool_result(
+                "flash_write",
+                "missing required argument: data".to_string(),
+                false,
+            )
+        }
+    };
     match crate::nvs_flash::write(addr, data.as_bytes()) {
         Ok(()) => tool_result(
             "flash_write",

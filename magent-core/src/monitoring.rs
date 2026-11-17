@@ -121,13 +121,20 @@ impl MonitoringManager {
     }
 
     /// Record operation start
+    ///
+    /// The counters saturate rather than overflow. `+= 1` panics under debug
+    /// overflow checks and wraps to a small number in release, and this type
+    /// lives on a wearable that stays up for months: at a few operations per
+    /// second `u32` reaches its limit in well under two years. A restarted
+    /// count is indistinguishable from "no operations yet"; a pinned
+    /// `u32::MAX` at least says "lost count, saturated" truthfully.
     pub fn operation_start(&mut self) {
-        self.metrics.total_operations += 1;
+        self.metrics.total_operations = self.metrics.total_operations.saturating_add(1);
     }
 
     /// Record operation success
     pub fn operation_success(&mut self, execution_time_us: u32) {
-        self.metrics.successful_operations += 1;
+        self.metrics.successful_operations = self.metrics.successful_operations.saturating_add(1);
 
         // Update average execution time. Compute the running sum in `u64`:
         // `avg * (n - 1)` overflows `u32` well before the counters do, which
@@ -142,7 +149,7 @@ impl MonitoringManager {
 
     /// Record operation failure
     pub fn operation_failure(&mut self) {
-        self.metrics.failed_operations += 1;
+        self.metrics.failed_operations = self.metrics.failed_operations.saturating_add(1);
     }
 
     /// Get performance metrics
@@ -150,7 +157,16 @@ impl MonitoringManager {
         &self.metrics
     }
 
-    /// Add health check
+    /// Add (or replace) a health check for `component`.
+    ///
+    /// The latest verdict for a component *replaces* its earlier one. The old
+    /// body always appended, so a periodic monitor re-reporting the same
+    /// component filled the 16 slots inside a minute; the oldest entries were
+    /// then evicted, and `get_health_status` — which aggregates every stored
+    /// entry — kept reporting a component's *stale* `Unhealthy` verdict long
+    /// after it had recovered, because the recovering report was one of
+    /// several duplicates rather than an update. One slot per component makes
+    /// the aggregate describe the current state.
     pub fn add_health_check(
         &mut self,
         component: &str,
@@ -171,10 +187,25 @@ impl MonitoringManager {
             })?,
         };
 
-        if self.health_checks.push(check.clone()).is_err() {
-            // Health check buffer full, remove oldest
-            let _ = self.health_checks.remove(0);
-            let _ = self.health_checks.push(check);
+        match self
+            .health_checks
+            .iter_mut()
+            .find(|existing| existing.component == check.component)
+        {
+            Some(existing) => {
+                // Same component, new verdict: overwrite in place so it keeps
+                // its position (the eviction order stays oldest-registered).
+                existing.status = check.status;
+                existing.message = check.message;
+            }
+            None => {
+                if self.health_checks.push(check.clone()).is_err() {
+                    // Buffer full and no slot for a *new* component: evict
+                    // the oldest registration.
+                    let _ = self.health_checks.remove(0);
+                    let _ = self.health_checks.push(check);
+                }
+            }
         }
 
         Ok(())
@@ -439,14 +470,71 @@ mod tests {
     #[test]
     fn health_status_degrades_then_recovers() {
         let mut m = MonitoringManager::new();
-        m.add_health_check("sensor", HealthStatus::Degraded, "noisy").unwrap();
-        assert_eq!(m.get_health_status(), HealthStatus::Degraded);
-        // Overwrite by adding a healthy check for the same component
-        m.add_health_check("sensor", HealthStatus::Healthy, "").unwrap();
-        // Now we have Healthy + Degraded → overall Degraded
+        m.add_health_check("sensor", HealthStatus::Degraded, "noisy")
+            .unwrap();
         assert_eq!(m.get_health_status(), HealthStatus::Degraded);
 
+        // A fresh verdict for the *same* component replaces the old one.
+        // The previous behaviour appended a second entry, so the recovered
+        // sensor's stale `Degraded` verdict kept the whole device Degraded
+        // forever — and a monitor that re-reports every second filled the
+        // table in seconds, evicting the checks that were still current.
+        m.add_health_check("sensor", HealthStatus::Healthy, "")
+            .unwrap();
+        assert_eq!(
+            m.get_health_status(),
+            HealthStatus::Healthy,
+            "a component that recovered must stop degrading the device"
+        );
+        assert_eq!(m.get_health_checks().len(), 1, "one slot per component");
+
+        // An unrelated healthy component does not change that.
+        m.add_health_check("ble", HealthStatus::Healthy, "")
+            .unwrap();
+        assert_eq!(m.get_health_status(), HealthStatus::Healthy);
+
+        // A different component going unhealthy still dominates.
+        m.add_health_check("wifi", HealthStatus::Unhealthy, "link down")
+            .unwrap();
+        assert_eq!(m.get_health_status(), HealthStatus::Unhealthy);
+    }
+
+    /// Re-reporting one component must not consume table slots. The old
+    /// append-only body evicted genuinely different components within
+    /// seconds on a periodic monitor.
+    #[test]
+    fn repeated_reports_for_one_component_do_not_evict_others() {
+        let mut m = MonitoringManager::new();
         m.add_health_check("ble", HealthStatus::Healthy, "").unwrap();
-        assert_eq!(m.get_health_status(), HealthStatus::Degraded);
+        m.add_health_check("wifi", HealthStatus::Unhealthy, "down")
+            .unwrap();
+        for _ in 0..40 {
+            m.add_health_check("sensor", HealthStatus::Healthy, "")
+                .unwrap();
+        }
+        assert_eq!(m.get_health_checks().len(), 3, "one slot per component");
+        assert_eq!(
+            m.get_health_status(),
+            HealthStatus::Unhealthy,
+            "the wifi verdict must survive a chatty sensor"
+        );
+    }
+
+    /// Counter arithmetic saturates instead of overflowing.
+    #[test]
+    fn operation_counters_saturate_instead_of_wrapping() {
+        let mut m = MonitoringManager::new();
+        m.metrics.total_operations = u32::MAX - 1;
+        m.metrics.successful_operations = u32::MAX - 1;
+        m.metrics.failed_operations = u32::MAX - 1;
+        m.operation_start();
+        m.operation_start();
+        m.operation_success(1);
+        m.operation_success(1);
+        m.operation_failure();
+        m.operation_failure();
+        assert_eq!(m.get_metrics().total_operations, u32::MAX);
+        assert_eq!(m.get_metrics().successful_operations, u32::MAX);
+        assert_eq!(m.get_metrics().failed_operations, u32::MAX);
     }
 }

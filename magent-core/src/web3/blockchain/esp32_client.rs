@@ -906,8 +906,8 @@ mod tests {
         use crate::web3::blockchain::esp32_http::TransactionReceiptResponse;
 
         let wire = TransactionReceiptResponse {
-            transaction_hash:
-                "0x742d35cc6634c0532925a3b844bc9e7595f8be21000000000000000000000000".to_string(),
+            transaction_hash: "0x742d35cc6634c0532925a3b844bc9e7595f8be21000000000000000000000000"
+                .to_string(),
             block_number: "0x10".to_string(),
             block_hash: "0x742d35cc6634c0532925a3b844bc9e7595f8be21000000000000000000000001"
                 .to_string(),

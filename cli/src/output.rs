@@ -46,6 +46,27 @@ pub struct Output {
     /// returns `TasksFailed`, so without this latch stdout carried two
     /// JSON objects and `jq` choked on the second.
     envelope_written: bool,
+    /// The first error seen while writing the command's *payload* to
+    /// stdout, if any.
+    ///
+    /// Most payload writers here are infallible by signature (they are
+    /// called as statements all over the CLI) and used to discard the
+    /// `io::Result` outright. That made a full disk or a closed stream
+    /// look like success: `magent config export > /full/disk` exited 0
+    /// with the record never delivered. Keeping the first error lets
+    /// [`Self::finish`] turn it into a non-zero exit code and one clear
+    /// diagnostic at the single point where every command ends.
+    ///
+    /// Stderr failures are tracked separately and only suppress that
+    /// diagnostic (there is nowhere left to print it).
+    stdout_error: Option<io::Error>,
+    /// Whether any stderr write has failed.
+    stderr_broken: bool,
+    /// Whether the "payload not delivered" diagnostic has already been
+    /// written. `finish` is called by both the command (doctor gates its
+    /// verdict on it) and `main` (which sets the exit code), so without this
+    /// latch the operator saw the same error line twice.
+    diagnostic_printed: bool,
 }
 
 impl Output {
@@ -69,11 +90,95 @@ impl Output {
             color,
             pending_answer: None,
             envelope_written: false,
+            stdout_error: None,
+            stderr_broken: false,
+            diagnostic_printed: false,
         }
     }
 
     pub fn kind(&self) -> OutputKind {
         self.kind
+    }
+
+    /// Record a stdout write failure, keeping the first one (the first
+    /// error is the cause; later ones are usually the same broken pipe).
+    fn note_stdout(&mut self, result: &io::Result<()>) {
+        if let Err(e) = result {
+            if self.stdout_error.is_none() {
+                // Clone the payload: `io::Error` is not `Copy` and the
+                // caller still owns the result it wants to return.
+                self.stdout_error = Some(io::Error::new(e.kind(), e.to_string()));
+            }
+        }
+    }
+
+    /// Record a stderr write failure. Used by the trace/warn channels so
+    /// a closed stderr doesn't produce a second, useless error line.
+    fn note_stderr(&mut self, result: io::Result<()>) -> io::Result<()> {
+        if result.is_err() {
+            self.stderr_broken = true;
+        }
+        result
+    }
+
+    /// Flush both streams and report the command's overall output
+    /// status.
+    ///
+    /// Call this once at the end of a command, after its return value
+    /// (success or failure) is known. It returns:
+    ///
+    /// * `Ok(())` — everything reached the terminal.
+    /// * `Err(first)` — the payload never fully reached stdout. A diagnostic
+    ///   is written to stderr when that stream still works, but the error is
+    ///   returned either way: the exit status is the signal, and it must not
+    ///   depend on whether the explanation could be printed.
+    ///
+    /// The caller turns that into a non-zero exit. Exit 0 while the
+    /// requested data silently went nowhere is the failure mode this
+    /// exists to remove: a script that redirects to a full disk or
+    /// through a closed pipe must be able to tell.
+    ///
+    /// (Shells still see `SIGPIPE` for the `| head` case, which is why that
+    /// path is handled by the default signal disposition rather than here.)
+    pub fn finish(&mut self) -> io::Result<()> {
+        let stdout_res = self.stdout.flush();
+        let stderr_res = self.stderr.flush();
+        self.note_stdout(&stdout_res);
+        let _ = self.note_stderr(stderr_res);
+
+        // The error is *borrowed*, not taken: `finish` is called by both the
+        // command (doctor gates its verdict on it) and `main` (which turns it
+        // into the exit code). Taking it made the first call consume the
+        // failure, so the second saw `None` and the process could exit 0 after
+        // the payload was lost.
+        let Some(e) = self.stdout_error.as_ref() else {
+            return Ok(());
+        };
+        if self.stderr_broken {
+            // Nowhere left to report it — but the *exit status* is still the
+            // signal, and it does not depend on being able to print. Returning
+            // `Ok` here made a lost payload exit 0 whenever anything earlier
+            // in the command had already failed to write to stderr: a stderr
+            // warning (e.g. an unfilled prompt placeholder) followed by a
+            // failed payload write was reported as full success by a caller
+            // that had delivered nothing at all.
+            return Err(io::Error::new(e.kind(), e.to_string()));
+        }
+        // The error is returned on every call (idempotent), but the *line* is
+        // printed once: `finish` runs for both the command and `main`.
+        if !self.diagnostic_printed {
+            self.diagnostic_printed = true;
+            // Best effort: if this write fails too, there is nothing else to
+            // try.
+            let _ = writeln!(
+                self.stderr,
+                "error: could not write the command's output to stdout: {} — \
+                 the data was not delivered (disk full? stream closed?)",
+                e
+            );
+            let _ = self.stderr.flush();
+        }
+        Err(io::Error::new(e.kind(), e.to_string()))
     }
 
     /// Emit a step-by-step trace line. Silently dropped in JSON mode.
@@ -83,7 +188,8 @@ impl Output {
         }
         let prefix = if self.color { "\x1b[2m" } else { "" };
         let suffix = if self.color { "\x1b[0m" } else { "" };
-        writeln!(self.stderr, "{}[agent] {}{}", prefix, line, suffix)
+        let res = writeln!(self.stderr, "{}[agent] {}{}", prefix, line, suffix);
+        self.note_stderr(res)
     }
 
     /// Emit a labelled trace line — useful for the runner to print
@@ -95,14 +201,16 @@ impl Output {
         }
         let prefix = if self.color { "\x1b[36m" } else { "" }; // cyan
         let reset = if self.color { "\x1b[0m" } else { "" };
-        writeln!(self.stderr, "{}[{}] {}{}", prefix, label, body, reset)
+        let res = writeln!(self.stderr, "{}[{}] {}{}", prefix, label, body, reset);
+        self.note_stderr(res)
     }
 
     /// Print a warning. Always shown, even in JSON mode (goes to stderr).
     pub fn warn(&mut self, msg: &str) -> io::Result<()> {
         let prefix = if self.color { "\x1b[33m" } else { "" }; // yellow
         let reset = if self.color { "\x1b[0m" } else { "" };
-        writeln!(self.stderr, "{}warning: {}{}", prefix, msg, reset)
+        let res = writeln!(self.stderr, "{}warning: {}{}", prefix, msg, reset);
+        self.note_stderr(res)
     }
 
     /// Report a command failure.
@@ -136,7 +244,8 @@ impl Output {
     pub fn fail(&mut self, code: &str, exit: u8, msg: &str) {
         let prefix = if self.color { "\x1b[31m" } else { "" }; // red
         let reset = if self.color { "\x1b[0m" } else { "" };
-        let _ = writeln!(self.stderr, "{}error: {}{}", prefix, msg, reset);
+        let res = writeln!(self.stderr, "{}error: {}{}", prefix, msg, reset);
+        let _ = self.note_stderr(res);
 
         if self.kind == OutputKind::Json && !self.envelope_written {
             let envelope = serde_json::json!({
@@ -147,7 +256,8 @@ impl Output {
             });
             let json = serde_json::to_string_pretty(&envelope)
                 .unwrap_or_else(|_| "{\"ok\":false}".to_string());
-            let _ = writeln!(self.stdout, "{}", json);
+            let res = writeln!(self.stdout, "{}", json);
+            self.note_stdout(&res);
         }
     }
 
@@ -159,14 +269,15 @@ impl Output {
     /// the diagnostic. The line is prefixed with `info:` so
     /// downstream log scrapers can route it.
     pub fn info(&mut self, msg: &str) -> io::Result<()> {
-        if self.kind == OutputKind::Human {
+        let res = if self.kind == OutputKind::Human {
             writeln!(self.stderr, "{}", msg)
         } else {
             // JSON mode → stderr with explicit prefix so the line
             // is identifiable as a diagnostic and can't be confused
             // with the JSON envelope on stdout.
             writeln!(self.stderr, "info: {}", msg)
-        }
+        };
+        self.note_stderr(res)
     }
 
     /// Borrow the stdout writer. Used by subcommands that need to
@@ -174,6 +285,11 @@ impl Output {
     /// going through the JSON envelope. Returns `None` if the
     /// underlying writer can't be borrowed (e.g. a panic earlier in
     /// the process already holds the lock).
+    ///
+    /// Write failures on the returned writer are the caller's to
+    /// report — [`Self::finish`] cannot see them — so prefer
+    /// [`Self::write_stdout_bytes`] where the payload is already a
+    /// byte slice in hand.
     pub fn stdout_writer(&mut self) -> &mut io::StdoutLock<'static> {
         &mut self.stdout
     }
@@ -185,16 +301,30 @@ impl Output {
         &mut self.stderr
     }
 
+    /// Write raw payload bytes to stdout in **both** modes, recording a
+    /// failure for [`Self::finish`].
+    ///
+    /// This is the tracked counterpart of [`Self::stdout_writer`]: the
+    /// payload commands (`config export`, `set-prompt export`, …) hand
+    /// their record straight through, and a failed write must not be
+    /// mistaken for a delivered one.
+    pub fn write_stdout_bytes(&mut self, payload: &[u8]) {
+        let res = self.stdout.write_all(payload);
+        self.note_stdout(&res);
+        self.envelope_written = true;
+    }
+
     /// Write a raw human-mode payload (string) to stdout. Used by
     /// the summary subcommand's `export` and `load` actions whose
     /// job is to feed another process, and by `save` for its
     /// "saved N bytes to <path>" confirmation. In JSON mode this
     /// is a no-op so the JSON envelope on stdout stays clean.
     ///
-    /// Returns `Err` only when the underlying IO write fails.
+    /// Write failures are recorded for [`Self::finish`].
     pub fn write_human(&mut self, payload: &str) {
         if self.kind == OutputKind::Human {
-            let _ = self.stdout.write_all(payload.as_bytes());
+            let res = self.stdout.write_all(payload.as_bytes());
+            self.note_stdout(&res);
         }
     }
 
@@ -208,8 +338,11 @@ impl Output {
     /// Unlike [`Self::write_human`] this appends a trailing newline
     /// so the redirected stream stays line-oriented.
     pub fn write_stdout_line(&mut self, payload: &str) {
-        let _ = self.stdout.write_all(payload.as_bytes());
-        let _ = self.stdout.write_all(b"\n");
+        let res = self
+            .stdout
+            .write_all(payload.as_bytes())
+            .and_then(|()| self.stdout.write_all(b"\n"));
+        self.note_stdout(&res);
         self.envelope_written = true;
     }
 
@@ -223,8 +356,11 @@ impl Output {
     /// the only place that knows the wire shape.
     pub fn write_json_str(&mut self, payload: String) {
         if self.kind == OutputKind::Json {
-            let _ = self.stdout.write_all(payload.as_bytes());
-            let _ = self.stdout.write_all(b"\n");
+            let res = self
+                .stdout
+                .write_all(payload.as_bytes())
+                .and_then(|()| self.stdout.write_all(b"\n"));
+            self.note_stdout(&res);
             self.envelope_written = true;
         }
     }
@@ -246,10 +382,10 @@ impl Output {
         // then drain to the IO stream so we don't have to depend on
         // `StderrLock: fmt::Write` (it doesn't, on stable).
         let mut buf = String::new();
-        std::fmt::Write::write_fmt(&mut buf, args)
-            .map_err(io::Error::other)?;
+        std::fmt::Write::write_fmt(&mut buf, args).map_err(io::Error::other)?;
         buf.push('\n');
-        self.stderr.write_all(buf.as_bytes())
+        let res = self.stderr.write_all(buf.as_bytes());
+        self.note_stderr(res)
     }
 
     /// [`Self::stderr_fmt_line`]'s opposite number: the same formatting
@@ -262,6 +398,11 @@ impl Output {
     /// every redirect an empty file while `--json` worked. Still a
     /// no-op in JSON mode, where the envelope is the only stdout
     /// output.
+    ///
+    /// A write failure is recorded for [`Self::finish`], which reports it
+    /// once at the end of the command; the returned `Ok(())` is therefore
+    /// deliberate, not a swallowed error. Callers use `?` to propagate
+    /// *formatting* errors and let `finish` handle the stream.
     pub fn stdout_fmt_line(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
         if self.kind == OutputKind::Json {
             return Ok(());
@@ -269,7 +410,9 @@ impl Output {
         let mut buf = String::new();
         std::fmt::Write::write_fmt(&mut buf, args).map_err(io::Error::other)?;
         buf.push('\n');
-        self.stdout.write_all(buf.as_bytes())
+        let res = self.stdout.write_all(buf.as_bytes());
+        self.note_stdout(&res);
+        Ok(())
     }
 
     /// Emit the final answer on stdout. In Human mode this is the only
@@ -284,12 +427,13 @@ impl Output {
         }
 
         let bar = "=".repeat(60);
-        writeln!(self.stdout)?;
-        writeln!(self.stdout, "{}", bar)?;
-        writeln!(self.stdout, "RESULT")?;
-        writeln!(self.stdout, "{}", bar)?;
-        writeln!(self.stdout, "{}", answer)?;
-        Ok(())
+        let res = writeln!(self.stdout)
+            .and_then(|()| writeln!(self.stdout, "{}", bar))
+            .and_then(|()| writeln!(self.stdout, "RESULT"))
+            .and_then(|()| writeln!(self.stdout, "{}", bar))
+            .and_then(|()| writeln!(self.stdout, "{}", answer));
+        self.note_stdout(&res);
+        res
     }
 
     /// JSON-mode final write. `extra` is any additional top-level JSON
@@ -311,21 +455,88 @@ impl Output {
         }
         let json = serde_json::to_string_pretty(&serde_json::Value::Object(envelope))
             .unwrap_or_else(|_| "{}".to_string());
-        writeln!(self.stdout, "{}", json)?;
+        let res = writeln!(self.stdout, "{}", json);
+        self.note_stdout(&res);
         self.envelope_written = true;
-        Ok(())
+        res
     }
 
     /// Flush both streams.
+    ///
+    /// A *stderr* flush failure must not be recorded as a stdout failure:
+    /// [`Self::finish`] turns a recorded stdout error into a non-zero exit
+    /// plus "could not write the command's output to stdout", which would
+    /// then be wrong about both the stream and the consequence (the payload
+    /// did reach stdout).
     pub fn flush(&mut self) -> io::Result<()> {
-        self.stdout.flush()?;
-        self.stderr.flush()
+        let stdout_res = self.stdout.flush();
+        let stderr_res = self.stderr.flush();
+        self.note_stdout(&stdout_res);
+        let stderr_res = self.note_stderr(stderr_res);
+        stdout_res.and(stderr_res)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `finish` must report the same failure every time it is called.
+    ///
+    /// It is called twice on the doctor path (once by the command to gate its
+    /// verdict, once by `main` to set the exit code). Taking the stored error
+    /// made the first call consume it, so the second returned `Ok` and the
+    /// process could exit 0 after the payload was lost.
+    #[test]
+    fn finish_reports_a_stdout_failure_on_every_call() {
+        let mut out = Output::new(OutputKind::Human, true);
+        // Inject a recorded stdout failure the way a real failed write would.
+        out.note_stdout(&Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "disk full",
+        )));
+
+        assert!(
+            out.finish().is_err(),
+            "the first call must report the failure"
+        );
+        assert!(
+            out.finish().is_err(),
+            "a later call must not report success for the same failure"
+        );
+    }
+
+    /// A lost payload must exit non-zero even when stderr is broken too.
+    ///
+    /// The exit status is the signal; whether the *explanation* can be
+    /// printed is a separate question. Returning `Ok` in that case made this
+    /// sequence — a stderr warning that already failed (`stderr_broken`),
+    /// then a failed payload write — report complete success while delivering
+    /// nothing.
+    #[test]
+    fn finish_reports_a_stdout_failure_even_when_stderr_is_broken() {
+        let mut out = Output::new(OutputKind::Human, true);
+        out.note_stdout(&Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "disk full",
+        )));
+        // Simulate a prior failed stderr write.
+        let _ = out.note_stderr(Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed")));
+        assert!(
+            out.finish().is_err(),
+            "a lost payload must not report success just because the              diagnostic cannot be printed"
+        );
+        // And it stays idempotent.
+        assert!(out.finish().is_err());
+    }
+
+    /// A clean stream reports success on every call.
+    #[test]
+    fn finish_is_ok_when_nothing_failed() {
+        let mut out = Output::new(OutputKind::Human, true);
+        assert!(out.finish().is_ok());
+        assert!(out.finish().is_ok());
+    }
 
     #[test]
     fn trace_is_silent_in_json_mode() {
@@ -349,7 +560,8 @@ mod tests {
     fn write_json_in_human_mode_is_a_noop() {
         let mut out = Output::new(OutputKind::Human, true);
         out.final_answer("done").unwrap();
-        out.write_json(serde_json::json!({"iterations": 3})).unwrap();
+        out.write_json(serde_json::json!({"iterations": 3}))
+            .unwrap();
     }
 
     #[test]

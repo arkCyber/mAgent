@@ -65,7 +65,7 @@ use core::fmt;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use ed25519_dalek::{Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 
 use crate::error::Web3ErrorKind;
@@ -409,8 +409,12 @@ pub fn verify_signature_detailed(
             actual_len: public.as_bytes().len(),
         }
     })?;
+    // `verify_strict`, not `verify`: the lenient verifier accepts small-order
+    // public keys, so a `did:key` holding the identity point plus a
+    // `R = identity, S = 0` signature verified for *every* payload — an
+    // attacker could forge any signed envelope without a private key.
     verifying_key
-        .verify(
+        .verify_strict(
             payload,
             &ed25519_dalek::Signature::from_bytes(sig.to_bytes()),
         )

@@ -46,7 +46,7 @@ mod tools;
 
 use std::sync::Arc;
 
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{self, AsyncWriteExt, BufReader};
 
 use crate::config::Config;
 use crate::mqtt_client::MqttClient;
@@ -114,21 +114,143 @@ async fn main() -> anyhow::Result<()> {
     run_stdio_loop(registry).await
 }
 
-/// Drive the JSON-RPC request loop until EOF on stdin.
+/// Largest JSON-RPC request line accepted from the MCP client (see the
+/// email server for the rationale: the transport is newline-delimited and a
+/// whole line is buffered before validation). Enforced *while* reading —
+/// measuring a finished line means the allocation has already happened.
+const MAX_REQUEST_LINE_BYTES: usize = 1_048_576;
+
+/// Bytes of an over-long line we will discard while resynchronising on the
+/// next newline before giving up on the peer.
+const MAX_OVERLONG_LINE_DRAIN_BYTES: usize = 16 * 1_048_576;
+
+/// One bounded line read from stdin.
+enum LineRead {
+    Eof,
+    Line(String),
+    TooLong { bytes: usize },
+}
+
+/// Read one newline-terminated line, buffering at most `max` bytes.
+///
+/// `read_line` has no ceiling: it grows the buffer until the newline
+/// arrives, so an over-long line is only detectable after it is already in
+/// memory. This stores at most `max` bytes and drains the rest without
+/// keeping it.
+async fn read_line_bounded<R>(reader: &mut R, max: usize) -> std::io::Result<LineRead>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut total: usize = 0;
+    let mut overflow = false;
+
+    loop {
+        let (consumed, has_newline) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                if total == 0 && !overflow {
+                    return Ok(LineRead::Eof);
+                }
+                break;
+            }
+            let consumed = match available.iter().position(|&b| b == b'\n') {
+                Some(pos) => pos + 1,
+                None => available.len(),
+            };
+            let has_newline = available.get(consumed - 1) == Some(&b'\n');
+            if !overflow {
+                if buf.len() + consumed > max {
+                    overflow = true;
+                    buf = Vec::new();
+                } else {
+                    buf.extend_from_slice(&available[..consumed]);
+                }
+            }
+            total = total.saturating_add(consumed);
+            (consumed, has_newline)
+        };
+        reader.consume(consumed);
+        if has_newline {
+            break;
+        }
+        if overflow && total > max.saturating_add(MAX_OVERLONG_LINE_DRAIN_BYTES) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request line has no newline within the discard budget",
+            ));
+        }
+    }
+
+    if overflow {
+        return Ok(LineRead::TooLong { bytes: total });
+    }
+    String::from_utf8(buf).map(LineRead::Line).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "request line is not UTF-8")
+    })
+}
+
 async fn run_stdio_loop(registry: Arc<ToolRegistry>) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut reader = BufReader::new(stdin);
-    let mut line = String::new();
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            // EOF — the parent process closed stdin. Exit cleanly.
-            log::info!("mqtt-mcp: stdin EOF, shutting down");
-            break;
-        }
+        let line = match read_line_bounded(&mut reader, MAX_REQUEST_LINE_BYTES).await {
+            // A line the reader could not interpret (not UTF-8, or an
+            // over-long line past the discard budget) is a bad request. `?`
+            // terminated the whole server on one stray byte without
+            // answering; the stream is line-aligned, so reply -32700 and
+            // keep serving.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                log::error!("mqtt-mcp: unreadable request line: {e}");
+                let envelope = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": -32700,
+                        "message": format!("request line is not valid UTF-8 or is unreadable: {e}"),
+                    }
+                });
+                let mut buf = serde_json::to_vec(&envelope)?;
+                buf.push(b'\n');
+                stdout.write_all(&buf).await?;
+                stdout.flush().await?;
+                continue;
+            }
+            // Any other transport failure is fatal.
+            Err(e) => return Err(e.into()),
+            Ok(LineRead::Eof) => {
+                // EOF — the parent process closed stdin. Exit cleanly.
+                log::info!("mqtt-mcp: stdin EOF, shutting down");
+                break;
+            }
+            Ok(LineRead::Line(line)) => line,
+            Ok(LineRead::TooLong { bytes }) => {
+                log::error!(
+                    "mqtt-mcp: request line is {bytes} bytes (limit {}); rejecting",
+                    MAX_REQUEST_LINE_BYTES
+                );
+                let envelope = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": {
+                        "code": -32700,
+                        "message": format!(
+                            "request exceeds the {} byte limit",
+                            MAX_REQUEST_LINE_BYTES
+                        ),
+                    }
+                });
+                let mut buf = serde_json::to_vec(&envelope)?;
+                buf.push(b'\n');
+                stdout.write_all(&buf).await?;
+                stdout.flush().await?;
+                continue;
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;

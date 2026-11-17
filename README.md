@@ -31,6 +31,11 @@ tools, and a bidirectional UART command interface.
 - **Memory Safety**: Stack depth analysis, heapless data structures, bounded buffers
 - **Resource Limits**: Strict memory, time, and iteration budgets
 - **Input Validation**: All inputs validated with bounds checking
+- **Honest Reporting**: A tool says what it observed, not what it hoped. An
+  MQTT publish reports `queued` (not `delivered`) because PUBACK is never
+  awaited; a tool result with an undefined value is never rendered as `0`; a
+  health reading has exactly one value per instant, whichever sensor is asked
+  first; an alert names the threshold its reading actually crossed.
 - **Fault Tolerance**: Graceful degradation, watchdog integration
 - **Secure Communication**: certificate-validated HTTPS on the ESP32 path
   (mbedTLS + the compiled-in CA bundle, `CONFIG_ESP_TLS_INSECURE=n` by
@@ -229,6 +234,17 @@ MicroAgent/
   `WIFI_PASS` and `LLM_API_KEY` behind an encrypted (bonded) link.
 - **Wi-Fi passphrase at rest**: sealed with a device-bound key (DBO2) before
   being written to NVS — a raw flash dump does not reveal the passphrase.
+  The same sealing covers the LLM API key. An entry whose tag is corrupt
+  (`XBO2:`, `DQO2:`, a flipped separator) is **refused**, never handed back
+  as a plaintext credential: a sealed blob and a password are told apart by
+  body shape, not by the prefix alone.
+- **Verifiable credentials / signed messages**: Ed25519 proofs verified with
+  `verify_strict`, which rejects small-order public keys. The lenient
+  verifier accepts the eight small-order points, and with them a
+  `did:key` of the identity point plus `R = identity, S = 0` verified for
+  *any* document — a universal forgery with no private key. That was fixed
+  in the 2026-11-17 round; see `docs/BACKLOG.md` for the remaining
+  wire-format items that need an owner decision.
 - **Message authentication**: HMAC-SHA-256 tags via `SecurityManager` on
   `web3` builds. On builds without `web3` this now **fails closed** rather
   than returning a fake tag.
@@ -426,6 +442,9 @@ verbatim.
 | [LLM Backends](docs/LLM_BACKENDS.md) | DeepSeek / Ollama provider wiring |
 | [Summary Store](docs/SUMMARY_STORE.md) | Run-summary schema & CLI |
 | [Aerospace Code Audit](docs/AUDIT_AEROSPACE_2026.md) | Panic-freedom / bounded-memory audit (internal self-audit — see [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) for scope & limitations) |
+| [Known Gaps / Backlog](docs/BACKLOG.md) | Open findings by priority, including the wire-format items awaiting an owner decision |
+| [Changelog](CHANGELOG.md) | Every audit round, defect and fix |
+| [MQTT MCP Server](docs/MQTT_MCP.md) | `magent-mqtt-mcp` protocol surface and result semantics |
 | [Security Policy](SECURITY.md) | Vulnerability disclosure & coordinated disclosure timeline |
 | [Security Audit Baseline](SECURITY_AUDIT.md) | Internal AI-assisted self-audit (NOT a third-party audit) |
 | [Contributing](CONTRIBUTING.md) | How to file issues, open PRs, run the local toolchain |
@@ -525,13 +544,16 @@ unattended / low-trust environments:
 - **Panic-cascade safety** — the trace-sink and boot-key paths never `panic!`
   inside a `Result`; `#![deny(clippy::panic_in_result_fn)]` is enforced under
   CI to keep it that way.
-- **Test coverage** — `magent-core` ships **1200+ tests** (931 unit lib tests plus
-  integration targets: AT parser, web3/blockchain, ingress gateway, time-sync,
-  property tests, nRF52 sim, security, power, mock-HTTP e2e) across all feature
-  flags, all green with 0 failures. The host crates (`magent` CLI, MCP executors,
-  simulators, `magent-tools`) add another ~460. All firmware targets (nRF52840,
-  nRF52840 integration-test, ESP32-C61, ESP32-S3) compile cleanly; the S3 is
-  verified stable on hardware (WiFi + agent + HTTP dashboard, long-run soak).
+- **Test coverage** — the workspace runs **2753 tests, 0 failures**
+  (`cargo test`, default members). `magent-core` alone contributes 1457
+  across its feature sets: 1202 unit lib tests with `--features std`, 1521
+  with the opt-in `std,web3,verifiable_credentials,boot-key` set, plus
+  integration targets (AT parser, web3/blockchain, ingress gateway, time-sync,
+  property tests, nRF52 sim, security, power, mock-HTTP e2e). The host crates
+  (`magent` CLI, MCP executors, simulators, `magent-tools`) account for the
+  rest. All firmware targets (nRF52840, nRF52840 integration-test,
+  ESP32-C61, ESP32-S3) compile cleanly; the S3 is verified stable on hardware
+  (WiFi + agent + HTTP dashboard, long-run soak).
 
 ## 🤝 Contributing
 

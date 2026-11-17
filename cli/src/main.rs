@@ -7,6 +7,10 @@
 use std::io::Write as _;
 use std::process::ExitCode;
 
+#[cfg(feature = "web3")]
+use magent::cli::web3_help_text;
+#[cfg(feature = "web3")]
+use magent::web3::{Web3Action, Web3Cmd};
 use magent::{
     cli::{
         config_help_text, doctor_help_text, help_text, run_help_text, scheduler_help_text,
@@ -20,10 +24,6 @@ use magent::{
     scheduler::SchedulerCmd,
     summary::SummaryCmd,
 };
-#[cfg(feature = "web3")]
-use magent::cli::web3_help_text;
-#[cfg(feature = "web3")]
-use magent::web3::{Web3Action, Web3Cmd};
 
 /// Version string baked into the binary. Kept in lockstep with the
 /// workspace `Cargo.toml` package version; bump both together.
@@ -186,11 +186,7 @@ fn main() -> ExitCode {
         Ok(argv) => argv,
         Err(raw) => {
             let mut stderr = std::io::stderr().lock();
-            let _ = writeln!(
-                stderr,
-                "error: argument is not valid UTF-8: {:?}",
-                raw
-            );
+            let _ = writeln!(stderr, "error: argument is not valid UTF-8: {:?}", raw);
             let _ = writeln!(stderr);
             let _ = writeln!(stderr, "{}", help_text(VERSION));
             return ExitCode::from(2);
@@ -220,19 +216,33 @@ fn main() -> ExitCode {
     // The config's `io.no_color` and `io.json_default` only kick in
     // when the user didn't pass the corresponding flag.
     //
-    // We deliberately load the config here rather than later in
-    // `RunnerCmd::execute` because the resulting `Output` is used
-    // by the *dispatch* path too (e.g. `magent config show` reads
-    // its data through the same `out` writer). Loading the config
-    // twice is fine — `with_defaults()` is free and the file is
-    // tiny.
-    let config_for_io = magent::config::load()
-        .unwrap_or_else(|_| magent::config::ConfigRecord::with_defaults());
+    // A load failure must not be silent. A *missing* file and a *missing
+    // location* (no `$MAGENT_CONFIG_FILE`, no `$HOME`) both mean "built-in
+    // defaults" — `config::load` resolves them itself, so neither reaches
+    // here. A corrupt file, a too-new schema, or an unreadable path is
+    // reported here, once, to stderr — and the fact that it failed is carried
+    // into `doctor`, which must not print a green verdict for a config `run`
+    // refuses to use.
+    let mut config_for_io = magent::config::ConfigRecord::with_defaults();
+    let config_load_error: Option<String> = match magent::config::load() {
+        Ok(c) => {
+            config_for_io = c;
+            None
+        }
+        Err(e) => {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "warning: {e} — using built-in defaults"
+            );
+            Some(e.to_string())
+        }
+    };
     let io_config = &config_for_io.io;
     // `--json` CLI flag and `io.json_default = true` both yield JSON.
-// Collapsing the two identical arms is intentional: any future
-// divergence (e.g. "CLI wins over config, but config enables a
-// richer JSON variant") would surface as a semantic change here.
+    // Collapsing the two identical arms is intentional: any future
+    // divergence (e.g. "CLI wins over config, but config enables a
+    // richer JSON variant") would surface as a semantic change here.
     let output_kind = if args.global.json || io_config.json_default {
         OutputKind::Json
     } else {
@@ -252,19 +262,50 @@ fn main() -> ExitCode {
     }
     let mut out = Output::new(output_kind, no_color);
 
-    match args.command {
+    let code = dispatch(
+        args.command,
+        &mut out,
+        &config_for_io,
+        config_load_error.as_deref(),
+    );
+
+    // Flush and check that the payload actually reached stdout. Every
+    // writer above is either infallible by signature or has its error
+    // recorded inside `Output`, so this is the single point where a
+    // failed write (`magent config export > /full/disk`, a closed
+    // stream) becomes a non-zero exit instead of a silent success. A
+    // failure here is an I/O failure, not rejected input, so it exits 1
+    // — and it never masks an earlier non-zero status (the command had
+    // already failed for its own reason).
+    if out.finish().is_err() && code == ExitCode::SUCCESS {
+        return ExitCode::FAILURE;
+    }
+    code
+}
+
+/// Run the parsed subcommand and return the exit code it maps to.
+///
+/// Split out of [`main`] so the output-status check in `main` covers
+/// every dispatch arm without repeating it in each one.
+fn dispatch(
+    command: Command,
+    out: &mut Output,
+    config_for_io: &magent::config::ConfigRecord,
+    config_load_error: Option<&str>,
+) -> ExitCode {
+    match command {
         Command::Help => {
-            print!("{}", help_text(VERSION));
+            out.write_stdout_bytes(help_text(VERSION).as_bytes());
             ExitCode::SUCCESS
         }
         Command::RunHelp => {
             // `magent run --help` or `magent help run`.
-            print!("{}", run_help_text());
+            out.write_stdout_bytes(run_help_text().as_bytes());
             ExitCode::SUCCESS
         }
         Command::DoctorHelp => {
             // `magent doctor --help` or `magent help doctor`.
-            print!("{}", doctor_help_text());
+            out.write_stdout_bytes(doctor_help_text().as_bytes());
             ExitCode::SUCCESS
         }
         Command::Version => {
@@ -281,13 +322,14 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Command::Run(mut opts) => match RunCmd::new(&mut opts).execute(&mut out) {
+        Command::Run(mut opts) => match RunCmd::new(&mut opts).execute(out) {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
-                // A missing/unreadable `--prompt` file is rejected input, not
-                // a failed run: `--help` documents exit 2 for that class.
+                // A missing/unreadable `--prompt` file or an unusable config
+                // file is rejected input, not a failed run: `--help` documents
+                // exit 2 for that class.
                 let code = match &e {
-                    RunError::PromptLoad(_) => 2,
+                    RunError::PromptLoad(_) | RunError::ConfigLoad(_) => 2,
                     _ => 1,
                 };
                 out.fail("run_error", code, &e.to_string());
@@ -295,28 +337,87 @@ fn main() -> ExitCode {
             }
         },
         Command::Doctor => {
-            // Doctor mirrors the same defaults `run` uses. Provider-
-            // specific URLs come from the same env vars so users can
-            // switch providers without re-typing the URL.
-            let provider = std::env::var("MAGENT_PROVIDER")
-                .unwrap_or_else(|_| "ollama".to_string());
-            let url = std::env::var("OLLAMA_HOST")
-                .unwrap_or_else(|_| "http://localhost:11434".to_string());
-            let model = std::env::var("OLLAMA_MODEL")
-                .unwrap_or_else(|_| "llama3.2".to_string());
-            let deepseek_url = std::env::var("DEEPSEEK_HOST")
-                .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string());
+            // Doctor mirrors `run`'s resolution order: built-in defaults →
+            // config file → environment variables. It used to read only the
+            // environment, so a config that pinned a broken URL still got a
+            // green "PASS" while `run` failed against that same URL.
+            let cfg = &config_for_io;
+            let cfg_provider = cfg.provider.default.trim();
+            let provider = std::env::var("MAGENT_PROVIDER").unwrap_or_else(|_| {
+                if cfg_provider.is_empty() {
+                    "ollama".to_string()
+                } else {
+                    cfg_provider.to_string()
+                }
+            });
+            let cfg_ollama_url = cfg.provider.ollama.url.trim();
+            let cfg_ollama_model = cfg.provider.ollama.model.trim();
+            let cfg_deepseek_url = cfg.provider.deepseek.url.trim();
+            let cfg_deepseek_model = cfg.provider.deepseek.model.trim();
+            let url = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| {
+                if cfg_ollama_url.is_empty() {
+                    "http://localhost:11434".to_string()
+                } else {
+                    cfg_ollama_url.to_string()
+                }
+            });
+            // `DEEPSEEK_MODEL` mirrors `OLLAMA_MODEL`; the two are
+            // separate so a `provider.default = deepseek` config can be
+            // checked without the check leaping to the Ollama model (it
+            // used to read `OLLAMA_MODEL` unconditionally, which also
+            // let an unrelated `OLLAMA_MODEL=llama3.2` in the
+            // environment override the configured DeepSeek model).
+            let (model_env, cfg_model, default_model) = if provider == "deepseek" {
+                ("DEEPSEEK_MODEL", cfg_deepseek_model, "deepseek-chat")
+            } else {
+                ("OLLAMA_MODEL", cfg_ollama_model, "llama3.2")
+            };
+            let model = std::env::var(model_env)
+                .ok()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if cfg_model.is_empty() {
+                        default_model.to_string()
+                    } else {
+                        cfg_model.to_string()
+                    }
+                });
+            let deepseek_url = std::env::var("DEEPSEEK_HOST").unwrap_or_else(|_| {
+                if cfg_deepseek_url.is_empty() {
+                    "https://api.deepseek.com/v1".to_string()
+                } else {
+                    cfg_deepseek_url.to_string()
+                }
+            });
+            // The API key still comes from the environment only: the config
+            // stores an env *var name*, never the secret itself.
+            let api_key_env = cfg
+                .provider
+                .deepseek
+                .api_key_env
+                .as_deref()
+                .unwrap_or("DEEPSEEK_API_KEY");
             let api_key = std::env::var("DEEPSEEK_API_KEY")
                 .ok()
+                .or_else(|| std::env::var(api_key_env).ok())
                 .or_else(|| std::env::var("OLLAMA_API_KEY").ok());
-            let cmd = DoctorCmd::new(
-                &provider,
-                &url,
-                &model,
-                &deepseek_url,
-                api_key.as_deref(),
-            );
-            if cmd.execute(&mut out) {
+            // A config file `run` refuses to use must not get a green
+            // doctor verdict. Without this, a corrupt `magent.json` made
+            // `doctor` report `ok: true` (exit 0) from built-in defaults
+            // while `run` exited 2 on the same file — the two subcommands
+            // disagreeing about the configuration, which is the exact
+            // defect this round set out to remove. Checked before the
+            // network probes so a broken config fails fast.
+            if let Some(err) = config_load_error {
+                out.fail(
+                    "config_error",
+                    2,
+                    &format!("the config file is unusable: {err}"),
+                );
+                return ExitCode::from(2);
+            }
+            let cmd = DoctorCmd::new(&provider, &url, &model, &deepseek_url, api_key.as_deref());
+            if cmd.execute(out) {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
@@ -324,10 +425,10 @@ fn main() -> ExitCode {
         }
         Command::SetPromptHelp => {
             // `magent set-prompt --help` or `magent help set-prompt`.
-            print!("{}", set_prompt_help_text());
+            out.write_stdout_bytes(set_prompt_help_text().as_bytes());
             ExitCode::SUCCESS
         }
-        Command::SetPrompt(action) => match SetPromptCmd::new(&action).execute(&mut out) {
+        Command::SetPrompt(action) => match SetPromptCmd::new(&action).execute(out) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 // All prompt-store errors are user errors (bad name,
@@ -339,10 +440,10 @@ fn main() -> ExitCode {
         },
         Command::SummaryHelp => {
             // `magent summary --help` or `magent help summary`.
-            print!("{}", summary_help_text());
+            out.write_stdout_bytes(summary_help_text().as_bytes());
             ExitCode::SUCCESS
         }
-        Command::Summary(action) => match SummaryCmd::new(&action).execute(&mut out) {
+        Command::Summary(action) => match SummaryCmd::new(&action).execute(out) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 // Same error reporting pattern as `SetPromptCmd` —
@@ -355,10 +456,10 @@ fn main() -> ExitCode {
         },
         Command::ConfigHelp => {
             // `magent config --help` or `magent help config`.
-            print!("{}", config_help_text());
+            out.write_stdout_bytes(config_help_text().as_bytes());
             ExitCode::SUCCESS
         }
-        Command::Config(action) => match ConfigCmd::new(&action).execute(&mut out) {
+        Command::Config(action) => match ConfigCmd::new(&action).execute(out) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 // Same error reporting pattern as `SetPromptCmd` —
@@ -371,10 +472,10 @@ fn main() -> ExitCode {
         },
         Command::SchedulerHelp => {
             // `magent scheduler --help` or `magent help scheduler`.
-            print!("{}", scheduler_help_text());
+            out.write_stdout_bytes(scheduler_help_text().as_bytes());
             ExitCode::SUCCESS
         }
-        Command::Scheduler(action) => match SchedulerCmd::new(action).execute(&mut out) {
+        Command::Scheduler(action) => match SchedulerCmd::new(action).execute(out) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 // `SchedulerError::Interrupted` is the clean
@@ -390,13 +491,22 @@ fn main() -> ExitCode {
                 // command line or config was rejected".
                 let code = match &e {
                     magent::scheduler::SchedulerError::Interrupted => 130,
-                    magent::scheduler::SchedulerError::TasksFailed { .. } => 1,
+                    // A daemon that could not persist its counters exits
+                    // 1 like a failed task: the work may have run, but the
+                    // record of it was lost. Only bad *input* gets 2.
+                    magent::scheduler::SchedulerError::TasksFailed { .. }
+                    | magent::scheduler::SchedulerError::State { .. }
+                    | magent::scheduler::SchedulerError::StateJson { .. } => 1,
                     _ => 2,
                 };
                 let tag = match &e {
                     magent::scheduler::SchedulerError::Interrupted => "scheduler_interrupted",
                     magent::scheduler::SchedulerError::TasksFailed { .. } => {
                         "scheduler_tasks_failed"
+                    }
+                    magent::scheduler::SchedulerError::State { .. }
+                    | magent::scheduler::SchedulerError::StateJson { .. } => {
+                        "scheduler_state_error"
                     }
                     _ => "scheduler_error",
                 };
@@ -430,16 +540,23 @@ fn main() -> ExitCode {
                     .unwrap_or_else(|| "MAGENT_WEB3_PASSPHRASE".to_string()),
                 _ => "MAGENT_WEB3_PASSPHRASE".to_string(),
             };
-            let mut cmd = Web3Cmd::new(&action, Box::new(move |var| {
-                let key = if var.is_empty() { env_var.as_str() } else { var };
-                std::env::var(key).map_err(|_| {
+            let mut cmd = Web3Cmd::new(
+                &action,
+                Box::new(move |var| {
+                    let key = if var.is_empty() {
+                        env_var.as_str()
+                    } else {
+                        var
+                    };
+                    std::env::var(key).map_err(|_| {
                     magent::web3::Web3CliError::Aead(format!(
                         "passphrase env var ${} is not set (use --passphrase-env or export the variable)",
                         key
                     ))
                 })
-            }));
-            match cmd.execute(&mut out) {
+                }),
+            );
+            match cmd.execute(out) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     out.fail("web3_error", 2, &e.to_string());
@@ -449,7 +566,7 @@ fn main() -> ExitCode {
         }
         #[cfg(feature = "web3")]
         Command::Web3Help => {
-            print!("{}", web3_help_text());
+            out.write_stdout_bytes(web3_help_text().as_bytes());
             ExitCode::SUCCESS
         }
     }

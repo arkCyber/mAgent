@@ -16,8 +16,12 @@ use serde::{Deserialize, Serialize};
 /// Maximum history entries for trend analysis
 pub const MAX_HEALTH_HISTORY: usize = 144; // 24 hours at 10-minute intervals
 
-/// Heart rate zones for exercise guidance
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Heart rate zones for exercise guidance.
+///
+/// Ordered from rest to danger so callers can test "this band or higher"
+/// (`zone() >= Cardio`) rather than an equality against one band — the
+/// equality form silently excluded Peak and Danger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum HeartRateZone {
     /// Below 50 % of max HR — sitting / standing still.
     Rest = 0,
@@ -51,7 +55,17 @@ impl HeartRateZone {
         // Saturating subtraction: when age > 220 the max heart rate
         // formula is undefined — clamp to 0 so the percentage is
         // always 100 % of 0 → Danger zone (safest default).
-        let max_hr = 220u16.saturating_sub(age as u16);
+        Self::from_hr_and_max(hr, 220u16.saturating_sub(age as u16))
+    }
+
+    /// Calculate the zone from a heart rate and a maximum heart rate.
+    ///
+    /// The single place the band boundaries live; [`Self::from_hr_and_age`]
+    /// and [`HeartRateData::zone_for_profile`] both route through it, so a
+    /// profile's measured `max_hr` and the age formula cannot drift apart.
+    ///
+    /// A non-zero `max_hr` is required: see [`Self::from_hr_and_age`].
+    pub fn from_hr_and_max(hr: u16, max_hr: u16) -> Self {
         if max_hr == 0 {
             return HeartRateZone::Danger;
         }
@@ -73,8 +87,11 @@ impl HeartRateZone {
     }
 }
 
-/// Stress level derived from HRV
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Stress level derived from HRV.
+///
+/// The variants are ordered low → high so `current_stress` can take the
+/// worse of the HRV and heart-rate readings with a plain `max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum StressLevel {
     /// Relaxed state; HRV ≥ 80 ms.
     Low = 0,
@@ -207,9 +224,32 @@ impl HeartRateData {
         self.hr >= 40 && self.hr <= 180
     }
 
-    /// Get heart rate zone (assuming age 30 as default)
+    /// Get the heart-rate zone for the default adult profile.
+    ///
+    /// **This assumes a 30-year-old** (max HR 190) and is only a convenience
+    /// for callers with no user profile. Anything that acts on the zone —
+    /// `sports_coach`'s danger warning, the breathing pattern, the coaching
+    /// messages — must use [`Self::zone_for_profile`] instead: a 70-year-old
+    /// at 145 BPM is at 97 % of a 150 max and in the danger band, but this
+    /// function reports `Cardio` and no warning would be raised.
     pub fn zone(&self) -> HeartRateZone {
         HeartRateZone::from_hr_and_age(self.hr, 30)
+    }
+
+    /// Get the heart-rate zone for a specific user profile.
+    ///
+    /// Uses the profile's stored maximum heart rate when it has one, falling
+    /// back to the age formula (`220 - age`) otherwise. Preferring `max_hr`
+    /// matters because it is the field a clinician or the user can set
+    /// directly, and the age formula is wrong for athletes and for anyone
+    /// with a measured maximum.
+    pub fn zone_for_profile(&self, profile: &UserProfile) -> HeartRateZone {
+        let max_hr = if profile.max_hr > 0 {
+            profile.max_hr
+        } else {
+            220u16.saturating_sub(profile.age as u16)
+        };
+        HeartRateZone::from_hr_and_max(self.hr, max_hr)
     }
 
     /// Get stress level from HRV
@@ -289,32 +329,103 @@ impl EcgData {
     }
 }
 
-/// Body temperature data
+/// Where a temperature reading was taken.
+///
+/// The two sites have **incompatible** normal ranges — core body temperature
+/// is 36.0–37.5 °C while skin is several degrees cooler — so a single
+/// threshold cannot judge both. The type used to assume core, which made a
+/// healthy 34 °C skin reading "not normal, no fever" (neither state) and an
+/// exercised 38 °C skin reading a "体温偏高" warning about a fever that the
+/// sensor could not have measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TemperatureSite {
+    /// Core body temperature (rectal / oral / oesophageal).
+    #[default]
+    ///
+    /// Normal 36.0–37.5 °C; above 37.5 °C is a fever.
+    Core,
+    /// Skin temperature (wrist, forehead, chest).
+    ///
+    /// Normal 32.0–36.0 °C. Skin runs cooler than core and rises with
+    /// exertion and ambient heat, so it cannot establish a fever — see
+    /// [`TemperatureData::has_fever`].
+    Skin,
+}
+
+impl TemperatureSite {
+    /// The inclusive normal range for this site, in °C.
+    pub fn normal_range(self) -> (f32, f32) {
+        match self {
+            TemperatureSite::Core => (36.0, 37.5),
+            TemperatureSite::Skin => (32.0, 36.0),
+        }
+    }
+}
+
+/// Temperature data
+///
+/// Carries the measurement [`TemperatureSite`] because the normal range and
+/// the meaning of "fever" depend on it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemperatureData {
-    /// Skin temperature in Celsius
+    /// Temperature in Celsius
     pub temperature: f32,
+    /// Where it was measured.
+    ///
+    /// Defaults to [`TemperatureSite::Core`] when absent so a record written
+    /// before this field existed still deserialises — the old type implicitly
+    /// meant core, which is exactly what `Default` encodes.
+    #[serde(default)]
+    pub site: TemperatureSite,
     /// Timestamp (ms since boot)
     pub timestamp: u32,
 }
 
 impl TemperatureData {
-    /// Create new temperature data
+    /// Create new **core** temperature data.
+    ///
+    /// Kept for compatibility; it assumes the core site, which is what this
+    /// constructor always meant. Use [`Self::at_site`] for a skin reading.
     pub fn new(temperature: f32, timestamp: u32) -> Self {
+        Self::at_site(temperature, TemperatureSite::Core, timestamp)
+    }
+
+    /// Create temperature data for a specific measurement site.
+    pub fn at_site(temperature: f32, site: TemperatureSite, timestamp: u32) -> Self {
         Self {
             temperature,
+            site,
             timestamp,
         }
     }
 
-    /// Check if temperature is normal (36.0 - 37.5°C)
+    /// Check if the temperature is within its site's normal range.
     pub fn is_normal(&self) -> bool {
-        self.temperature >= 36.0 && self.temperature <= 37.5
+        let (low, high) = self.site.normal_range();
+        self.temperature >= low && self.temperature <= high
     }
 
-    /// Get fever status
+    /// Whether this reading indicates a fever.
+    ///
+    /// Only meaningful for [`TemperatureSite::Core`]. A skin sensor cannot
+    /// establish a core temperature, so a skin reading **never** reports a
+    /// fever — the honest answer — and `false` is returned rather than
+    /// comparing a 38 °C skin reading against a core threshold.
     pub fn has_fever(&self) -> bool {
-        self.temperature > 37.5
+        match self.site {
+            TemperatureSite::Core => self.temperature > 37.5,
+            TemperatureSite::Skin => false,
+        }
+    }
+
+    /// Whether the reading is above its site's normal band, without claiming
+    /// a diagnosis.
+    ///
+    /// This is the signal a skin sensor *can* provide: "warmer than usual",
+    /// which is what `sports_coach` should warn about.
+    pub fn is_elevated(&self) -> bool {
+        let (_, high) = self.site.normal_range();
+        self.temperature > high
     }
 }
 
@@ -558,13 +669,37 @@ impl HealthSensorManager {
         }
     }
 
-    /// Get overall stress level combining HRV and HR
+    /// Overall stress level, combining HRV and heart rate.
+    ///
+    /// The doc comment always said "combining HRV and HR", but the body only
+    /// looked at HRV: a user at 190 BPM with HRV 85 read as `Low("Relaxed")`.
+    /// Severe tachycardia is not relaxation, and this value feeds the
+    /// intervention and notification paths, so HR now raises the verdict.
+    ///
+    /// HR contributes when it is clearly above the resting rate (the same
+    /// `+30 BPM` band `is_exercising` uses) and scales with how far above it
+    /// sits, so ordinary exercise — where high HR is expected, not stress —
+    /// does not by itself report maximum stress.
     pub fn current_stress(&self) -> StressLevel {
-        if let Some(hr) = self.latest_heart_rate() {
-            hr.stress_level()
+        let Some(hr) = self.latest_heart_rate() else {
+            return StressLevel::Low;
+        };
+        let from_hrv = hr.stress_level();
+
+        // Heart-rate bands relative to the user's resting rate.
+        let elevated = self.profile.resting_hr.saturating_add(30);
+        let high = self.profile.resting_hr.saturating_add(60);
+        let from_hr = if hr.hr >= high {
+            StressLevel::VeryHigh
+        } else if hr.hr >= elevated {
+            StressLevel::High
         } else {
             StressLevel::Low
-        }
+        };
+
+        // The worse of the two readings wins: stress is only ever raised by
+        // the HR channel, never masked by a reassuring HRV value.
+        core::cmp::max(from_hrv, from_hr)
     }
 
     /// Clear all history
@@ -596,7 +731,10 @@ mod std_impl {
             let base_hrv = if is_exercising { 20.0 } else { 60.0 };
             let hrv = base_hrv + ((minutes_elapsed as f32 * 0.2).sin() * 5.0);
 
-            HeartRateData::new(hr, hrv, Some(98), minutes_elapsed * 60000)
+            // `minutes_elapsed * 60000` overflows `u32` past 71 582 minutes
+            // (~50 days of simulated uptime): panic under overflow checks,
+            // a wrapped (wrong) timestamp in release. Saturate instead.
+            HeartRateData::new(hr, hrv, Some(98), minutes_elapsed.saturating_mul(60_000))
         }
 
         /// Simulate glucose data (for testing)
@@ -744,6 +882,61 @@ mod tests {
         assert!(TemperatureData::new(38.0, 1).has_fever());
         assert!(!TemperatureData::new(35.0, 1).is_normal());
         assert!(!TemperatureData::new(35.0, 1).has_fever());
+    }
+
+    /// A record written before `site` existed must still deserialise.
+    ///
+    /// The old type had only `temperature` and `timestamp`, and implicitly
+    /// meant core. Without `#[serde(default)]` every stored reading would
+    /// fail to parse, which on a device means losing the temperature history.
+    #[test]
+    fn a_temperature_record_without_a_site_is_read_as_core() {
+        let legacy = r#"{"temperature":38.2,"timestamp":1234}"#;
+        let parsed: TemperatureData = serde_json::from_str(legacy).expect("legacy JSON");
+        assert_eq!(parsed.site, TemperatureSite::Core);
+        assert_eq!(parsed.temperature, 38.2);
+        assert!(parsed.has_fever(), "a legacy 38.2 reading is a core fever");
+
+        // A new record round-trips with its site.
+        let skin = TemperatureData::at_site(34.0, TemperatureSite::Skin, 1);
+        let json = serde_json::to_string(&skin).expect("serialise");
+        let back: TemperatureData = serde_json::from_str(&json).expect("round trip");
+        assert_eq!(back.site, TemperatureSite::Skin);
+    }
+
+    /// Each site is judged on its own band, and only core can report a fever.
+    #[test]
+    fn temperature_sites_have_their_own_normal_bands() {
+        // Healthy skin (34 °C) is normal on the skin scale, and is neither
+        // normal nor a fever on the core scale — the defect this fixes.
+        let skin = TemperatureData::at_site(34.0, TemperatureSite::Skin, 0);
+        assert!(skin.is_normal());
+        assert!(!skin.has_fever());
+        assert!(!skin.is_elevated());
+
+        // The same value as a *core* reading is hypothermic, not normal.
+        let core = TemperatureData::at_site(34.0, TemperatureSite::Core, 0);
+        assert!(!core.is_normal());
+        assert!(!core.has_fever());
+
+        // Exercised skin is elevated for its site but is not a fever: a skin
+        // sensor cannot establish a core temperature.
+        let warm = TemperatureData::at_site(38.0, TemperatureSite::Skin, 0);
+        assert!(!warm.is_normal());
+        assert!(warm.is_elevated());
+        assert!(
+            !warm.has_fever(),
+            "a skin reading must not claim a fever"
+        );
+
+        // Core thresholds still work.
+        let fever = TemperatureData::at_site(38.0, TemperatureSite::Core, 0);
+        assert!(fever.has_fever());
+        assert!(fever.is_elevated());
+        assert!(!fever.is_normal());
+
+        // `new` is the core constructor, as it always documented.
+        assert_eq!(TemperatureData::new(37.0, 0).site, TemperatureSite::Core);
     }
 
     #[test]
@@ -903,5 +1096,41 @@ mod std_sim_tests {
             .unwrap();
         assert_eq!(m.glucose_history().len(), 1);
         assert_eq!(m.ecg_history().len(), 1);
+    }
+
+    /// `current_stress` must combine HRV *and* HR, as its contract says.
+    ///
+    /// It only looked at HRV, so 190 BPM with a reassuring HRV of 85 ms read
+    /// as `Low("Relaxed")` — and this value drives intervention prompts and
+    /// notifications.
+    #[test]
+    fn current_stress_is_raised_by_heart_rate_not_only_hrv() {
+        let mut m = HealthSensorManager::new();
+        // Default profile: resting 60 BPM.
+        m.add_heart_rate(HeartRateData::new(190, 85.0, Some(98), 0))
+            .unwrap();
+        assert_eq!(
+            m.current_stress(),
+            StressLevel::VeryHigh,
+            "severe tachycardia must not read as relaxed"
+        );
+
+        // Elevated but below the `resting + 60` band.
+        let mut m2 = HealthSensorManager::new();
+        m2.add_heart_rate(HeartRateData::new(110, 85.0, Some(98), 0))
+            .unwrap();
+        assert_eq!(m2.current_stress(), StressLevel::High);
+
+        // Normal HR and good HRV stays relaxed.
+        let mut m3 = HealthSensorManager::new();
+        m3.add_heart_rate(HeartRateData::new(65, 85.0, Some(98), 0))
+            .unwrap();
+        assert_eq!(m3.current_stress(), StressLevel::Low);
+
+        // Low HRV still drives the verdict when HR is unremarkable.
+        let mut m4 = HealthSensorManager::new();
+        m4.add_heart_rate(HeartRateData::new(70, 10.0, Some(98), 0))
+            .unwrap();
+        assert_eq!(m4.current_stress(), StressLevel::VeryHigh);
     }
 }

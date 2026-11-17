@@ -1,13 +1,618 @@
 # mAgent Backlog — Known Gaps (Post-Audit)
 
-> Status as of the **2026-11-09 audit round 3**. This file tracks the
+> Status as of the **2026-11-17 audit round 24**. This file tracks the
 > feature/security gaps surfaced by the code audit that are **not yet resolved**,
 > prioritised P0 → P2. Newly resolved entries are marked `[x]` with the date and
 > keep their original finding for the record; see `CHANGELOG.md` for the round
-> summary. The 2026-11-09 round closed the DBO1 identity-seed migration, the
-> seal/open nonce-width invariant, the empty `search_emails` query, the
-> email-MCP tool-error contract and `mark_read` verification, plus the CLI /
-> agent-loop / Lua-sandbox / firmware findings recorded below.
+> summary. Round 24 audited the *verifier* instead of the signing input and
+> found a total break (a small-order Ed25519 key forged any credential or
+> signed envelope), plus a seal-tag corruption that returned ciphertext as the
+> credential; it also unified two divergent HRV formulas, closed the MQTT
+> "reported delivery it never saw" gap, and fixed JSON-RPC error codes. The
+> remaining round-24 findings change the signed wire format and are recorded
+> as P1 owner decisions below. Round 14 found that round 13's option encoding was still malleable
+> (absent vs empty `domain`) and that credentials carried the same unsigned-
+> challenge hole round 13 fixed in presentations. Round 13 found that the
+> presentation `challenge`/`domain` were
+> outside the signed bytes — the anti-replay feature added in round 11 did
+> nothing — and bound them, added `verify_with_challenge` and a CLI
+> `--challenge`. Round 12 audited round 11's own code and closed a
+> forged-credential hole in presentation verification, a CLI path that
+> bypassed the same check, and a `finish()` that consumed its error — see
+> below. Round 11 closed a
+> verifiable-presentation gap (`vc present` signed presentations nothing could
+> verify — `vc verify-presentation` and `VerifiablePresentation::verify` now
+> exist), the emergency-hospital eviction
+> policy, the boot-time stress-intervention cooldown, the sleep score's 90-point
+> ceiling, `current_stress` ignoring heart rate, and several alert
+> thresholds/rate limits — see below. Round 10 audited `magent-core`'s storage,
+> wear-levelling, time and health modules: cooldowns that swallowed emergencies,
+> a low-quality ECG raising a cardiac alert, compaction laundering corrupted
+> values and deleting entries past a damaged header, static wear-levelling one
+> sector behind its ledger, `i32::MIN` drift panics, and missing fsync in the
+> CLI stores — see below. Round 9 audited rounds 4–8's own code and closed six
+> defects those fixes introduced (SMTP retry duplicating a send, DND swallowing
+> a cue and reporting delivery, claimed alert channels, after-the-fact line
+> caps, lost request ids, `--repl -p -` no-op, `doctor` passing a broken config,
+> corrupt mail reported as absent) — see below. Two 2026-11-10 rounds closed the
+> CLI's *silent-success* error paths
+> (a failed stdout write, unlistable prompt files, `--prompt -`, the `doctor`
+> provider/model mismatch, padded config endpoints, daemon state-file
+> failures) and the agent-side fabrications (an SSRF guard bypass, web tool
+> failures recorded as successes, a leaked search snippet, a fenced tool call
+> returned as the answer, rounded measurements, contradictory stress sensors,
+> and impossible dates in `summary list`) — see below. The 2026-11-09 round
+> closed the DBO1 identity-seed
+> migration, the seal/open nonce-width invariant, the empty `search_emails`
+> query, the email-MCP tool-error contract and `mark_read` verification, plus
+> the CLI / agent-loop / Lua-sandbox / firmware findings recorded below.
+
+## ✅ Done (2026-11-17) — round 24: the verifier itself, and readings that disagreed
+- [x] **A small-order Ed25519 key forged any credential or envelope.** The
+      lenient `VerifyingKey::verify` accepts the eight small-order points, so
+      a `did:key` of the identity point plus `R = identity, S = 0` verified
+      for an arbitrary issuer/subject/claims with no private key (reproduced:
+      `verify()` → `Ok`). All three verifiers use `verify_strict` now.
+- [x] **A corrupted `DBO` tag returned the ciphertext as the credential.** A
+      one-bit flip in `D`, `O` or `B` defeated the round-23 shape test, so
+      `XBO2:`/`DQO2:`/`DBC2:` blobs were handed back as the Wi-Fi password /
+      API key. The test now discriminates on the long hex body.
+- [x] **One moment had up to three different HRVs** (56.0 / 65.7 / 65.0 ms,
+      measured) because two formulas both wrote `last_hrv`. Unified into
+      `instant_hrv()`.
+- [x] **Heart-rate alerts reported `threshold: 0.0`** for every band.
+- [x] **A 126–180 mg/dL reading counted toward the "> 180 sustained"
+      escalation**, so one genuinely high sample read as sustained
+      hyperglycaemia.
+- [x] **MQTT reported delivery it never observed** (10 KiB–1 MiB publishes
+      dropped by the codec; PUBACK/SUBACK never awaited).
+- [x] **The tool executor dropped buffered stdout between `rpc()` calls**,
+      desynchronising the stream.
+- [x] **JSON-RPC codes**: unknown tool → -32602, valid non-object JSON →
+      -32600, rejected `initialize` → handshake failure.
+- [x] **CLI web3**: `bind verify` ignored the signed expiry; `vc verify`
+      skipped `validFrom`; `vc issue` accepted an unparseable `--valid-until`.
+
+## 🟡 P1 — open, from round 24 (need an owner decision)
+
+These are real defects that cannot be fixed mechanically: each changes the
+signed wire format, which invalidates credentials and bindings already issued
+by the committed build. They are ranked by severity.
+
+- [ ] **`proof.type` is not covered by the signature.** `encode_proof_options`
+      hashes `created`, `verificationMethod`, `purpose`, `challenge` and
+      `domain` — but not the algorithm identifier. Flipping
+      `Ed25519Signature2020` ↔ `2018` in the JSON still verifies, so one
+      signature is valid for two documents that claim different algorithms.
+      Note the existing `every_credential_proof_field_is_covered_by_the_signature`
+      only catches the `DataIntegrityProof` mutation, and only because that
+      type is unsupported — false assurance. Fixing it means adding `proofType`
+      to the options encoding, which invalidates every credential issued so
+      far; that is a migration decision (bump a scheme version and accept both
+      on read, or accept revoking existing credentials).
+- [ ] **`credentialSubject` accepts a duplicate claim key.** `RESERVED_CLAIM_KEYS`
+      covers only `id`; inserting `"role":"user"` before the signed
+      `"role":"admin"` parses last-wins, verifies, and re-serialises to the
+      original signed text. A first-wins consumer reading the raw document sees
+      a claim the issuer never signed. A `deny_unknown_fields`-style guard or a
+      duplicate-key scan at parse time would close it; the latter needs
+      `serde_json`'s raw-value path.
+- [ ] **Unknown / W3C fields are silently dropped, and the W3C standard field
+      names are not accepted.** No `#[serde(deny_unknown_fields)]`, and the
+      structs have no `expirationDate`, `evidence`, `termsOfUse` or
+      `proofValue`; a W3C-shaped document fails to deserialise
+      (`missing field 'proof_value'`). Verification re-serialises the *parsed*
+      struct, so an added `expirationDate` vanishes before hashing and a
+      credential a W3C consumer calls expired is accepted here. This is a
+      compatibility decision: interoperate with the W3C data model, or
+      document explicitly that this is a private profile.
+- [ ] **`credentialStatus` is parsed but never consulted**, so revocation is
+      ignored and a revoked credential verifies forever (the module docs
+      advertise revocation support). Enforcing it needs a status-list fetch,
+      which is a transport/session question for the CLI.
+- [ ] **`purpose` is not checked on the `options-v1` path.** It is inside the
+      signed bytes, so it cannot be *changed* after signing — but a credential
+      whose proof declares `Authentication` is accepted as an assertion.
+      Adding the check would reject documents already signed this way
+      (including any issued with the default `AssertionMethod`? no — those
+      pass; only deliberately mis-purposed ones fail), so it is closer to
+      safe, but it still needs a decision on which purposes are acceptable per
+      operation.
+- [ ] **Fractional-second truncation is asymmetric across the two bounds.**
+      `parse_iso8601_instant` truncates fractions *down*, so `validUntil:
+      …:04.999Z` expires up to 999 ms early (fail-closed, fine) while
+      `validFrom: …:04.999Z` becomes valid up to 999 ms early (fail-open).
+      Truncating the upper bound up instead is a two-line change but alters
+      which credentials are accepted at the boundary.
+- [ ] **`body-only` remains an accepted scheme for credentials.** Presentations
+      refuse it outright; credentials accept it for legacy compatibility, which
+      is a standing downgrade surface. Retiring it requires knowing whether any
+      deployed build signed body-only credentials.
+
+## ✅ Done (2026-11-16) — round 23: defects in round 22's own fixes
+- [x] **A flipped separator byte bypassed the seal-tag guard** (`:`→`8`/`2`/`z`
+      are one-bit alphanumeric changes; ~3 of 8 flips worked, handing a
+      300-char blob back as the credential). The body shape is now required
+      unconditionally. `a_flipped_separator_still_reads_as_a_sealed_blob`.
+- [x] **The firmware's no-device-key fallback used `is_legacy()`**, so a
+      `DBO1:` blob or a flipped-tag blob was sent as a bearer token (401 →
+      misclassified as a timeout → 3 pointless retries). It uses
+      `looks_like_seal_tag` now.
+- [x] **Compaction's preflight disagreed with `write_entry_at`** about
+      `WRITE_SIZE > 512`: it passed, erased the region, then failed every
+      write. Same predicate both sides now.
+      `compaction_refuses_an_oversized_program_unit_before_erasing`.
+- [x] **`get_stats` reported partial counts as totals.** Added
+      `scan_complete` to say when the figures are lower bounds.
+      `stats_flag_a_partial_scan`.
+- [x] **`AT+LLMCFG?` did an NVS migration write on the RT ingress thread.**
+      Split into `load_llm_api_key_read_only` for real-time callers.
+
+## ✅ Done (2026-11-16) — round 22: defects in round 21's own fixes
+- [x] **Compaction erased the region before proving survivors fit**, so a
+      padded survivor that did not fit lost every entry for an I/O error.
+      Preflight capacity check added.
+      `compaction_refuses_before_erasing_when_survivors_do_not_fit`.
+- [x] **A torn slot read as end-of-store**, hiding every later entry and
+      bricking `set`. `get` now reports `CorruptedData`; `get_stats` counts it
+      in `corrupted_entries` instead of reporting a clean store.
+      `a_torn_slot_is_reported_not_read_as_end_of_store`.
+- [x] **Known single-byte charsets carrying UTF-8 were mojibaked**
+      (`windows-1251`, `koi8-r`, `iso-8859-2/5/7`, `windows-1256`, `cp1251`).
+      The single-byte allow-list now covers the family.
+      `a_single_byte_charset_carrying_utf8_still_decodes`.
+- [x] **`open_stored_wifi_pass` never re-sealed a DBO1 / plaintext entry**
+      (unlike `open_dev_identity`), so a device that never ran
+      `AT+WIFIPASSUPGRADE` kept an unauthenticated entry forever. It now
+      migrates on the first successful open, best-effort.
+- [x] **`glucose_slot`'s `_ => 4` wildcard** would have made every future
+      `AlertType` share one slot and suppress the others. Now exhaustive.
+- [x] **The LLM API key was stored in NVS in the clear** from all three
+      provisioning paths (`AT+LLMCFG`, `MAGENT_LLM_API_KEY`, the agent install
+      path). All reads/writes now go through `main::{load,save}_llm_api_key`,
+      which seal with the device key via `wifi_pass_seal_v2::seal_secret` —
+      the function written for this and previously uncalled. A legacy
+      plaintext entry still loads and is re-sealed on first use. The firmware
+      NVS read buffer went from 256 to 640 bytes because a sealed key is up to
+      573 characters; a `magent-core` test pins the two together.
+- [x] **Stale intra-doc links** (`breaks_cooldown` was deleted in round 21;
+      private-item links in `security.rs` / `storage.rs`). CI gained a
+      best-effort `cargo doc -D warnings` step — nothing had ever built the
+      docs, which is why they rotted.
+
+## ✅ Done (2026-11-15) — round 21c: defects in round 20's storage + seal fixes
+- [x] **Compaction deleted a live tail entry.** `read_entry_header` returned
+      `Erased` for "fewer than 35 bytes left", so a valid short entry at the
+      region end was invisible to `get` and erased by `garbage_collect`.
+      Reproduced: `get("y")` = `None` before GC, entry gone after. Test:
+      `compaction_keeps_a_live_tail_entry`.
+- [x] **The last slot of a padded store was unusable and reported a hardware
+      fault.** Reproduced on a 160-byte / `WRITE_SIZE=16` region: 8 of 10
+      entries fit, `free_space: 32`, `set` failed with
+      `StorageReadFailed{ReadError}`. `set` now probes with the same decoder
+      every read path uses. Test: `the_last_slot_of_a_padded_store_is_usable`.
+- [x] **`WRITE_SIZE > 512` hung `set` forever** (unbounded pad loop on a
+      bounded buffer). Reproduced; now a typed error.
+      `a_program_unit_wider_than_the_buffer_is_refused_not_hung`.
+- [x] **A header declaring more bytes than the region has left decoded as
+      `Live`**, bricking the store with a permanent read fault. Now `Corrupt`.
+      `an_entry_that_overruns_the_region_is_corruption_not_a_live_entry`.
+- [x] **`--features web3` without `std` failed 6 tests** — they assert a
+      successful encryption, which the round-20 nonce guard deliberately
+      refuses without an entropy source. Gated on `std`, matching
+      `BOOT_SALT_AVAILABLE`.
+- [x] **`looks_like_seal_tag` was too strict and too loose**: it refused a
+      legitimate password beginning `DBO2:` and let a corrupted *separator*
+      through to the plaintext branch. Keyed on body shape now.
+      **Owner decision 2026-11-15: an ambiguous value is treated as a
+      password**, so `DBO2:mywifi` / `DBO2:zz` open while `DBO2:deadbeef`
+      (hex, short) is truncated and `DBO2;<long hex>` is refused.
+      `open_secret` had the same downgrade for API keys; fixed too.
+
+## ✅ Done (2026-11-15) — round 21: defects in round 20's own fixes
+Fourth round in a row where auditing the previous round's fixes was the most
+productive step. Every entry was reproduced before being fixed.
+- [x] **Round 20c's cooldown change caused an alert flood.** "A different
+      condition breaks the cooldown" meant an alternating feed defeated the
+      gate every sample: **60 alerts/minute**, history full in <50 s
+      (measured). Replaced with one cooldown **per condition** (2 HR
+      directions, 4 glucose conditions, 8 ECG kinds). Measured after:
+      **2/minute**. Tests: `oscillating_conditions_do_not_alert_on_every_sample`,
+      `oscillating_glucose_does_not_alert_on_every_sample`,
+      `the_anti_flood_gate_is_what_suppresses_the_repeats` (sensitivity).
+- [x] **Round 20's charset fix destroyed bodies with unknown labels.**
+      `utf8mb4` / `unknown-8bit` (common from real MUAs) went through
+      `mailparse::get_body()`'s lossy ASCII fallback and came back `������`.
+      Decoding now dispatches on label class and rejects any result
+      containing U+FFFD. Tests: `an_unknown_charset_label_falls_back_to_utf8`,
+      `utf8_mislabelled_as_ascii_still_decodes`,
+      `a_real_latin1_body_still_decodes_as_latin1`.
+- [x] **`search_emails` / `mark_read` bypassed `map_imap_error`**, so a
+      mid-call socket death never triggered the reconnect.
+- [x] **`session_is_dead` treated a refused NOOP as death** → a full
+      reconnect on every tool call. Only transport errors count now.
+- [x] **`Output::finish` printed its diagnostic twice** (doctor + main).
+- [x] **The executor killed a healthy child on a schema-level `ParseError`.**
+      Added `McpError::StreamDesync` for the cases that really do lose line
+      alignment; only that and `Io` restart the child.
+- [x] **`ecg_alert_condition`'s doc comment was wrong** (`max_by_key` returns
+      the *last* maximum, not the first). Corrected.
+
+## ✅ Done (2026-11-15) — round 21b: the two remaining P2 health findings
+- [x] **Heart-rate zone was always computed for a 30-year-old.**
+      `HeartRateData::zone_for_profile()` / `HeartRateZone::from_hr_and_max()`
+      added; `SportsCoach::set_profile()`. Without a profile the old
+      behaviour (and its documented caveat) is unchanged.
+      `the_danger_warning_uses_the_users_max_heart_rate`.
+- [x] **Skin temperature was judged against core-body thresholds.**
+      `TemperatureData` carries a `TemperatureSite` (`Core` default, `Skin`)
+      with its own normal band; `has_fever()` is `false` for skin by
+      construction, and `is_elevated()` is the signal the coach now uses.
+      `temperature_sites_have_their_own_normal_bands`,
+      `a_warm_skin_reading_warns_on_its_own_scale`.
+
+## ✅ Done (2026-11-15) — round 20c: findings from a second audit of round 19's tree
+Each entry below was reproduced against the pre-fix code before being fixed;
+the regression test names are given so the check can be re-run.
+- [x] **Undeclared-charset email bodies were Latin-1 decoded** (`温度` →
+      `æ¸©åº¦`). `mailparse` defaults `ctype.charset` to `"us-ascii"`.
+      Tests: `extract_text_body_decodes_utf8_when_no_charset_is_declared`,
+      `..._in_a_multipart_alternative`, `undeclared_non_utf8_bytes_fall_back_to_latin1`.
+- [x] **A corrupt `text/plain` part shadowed a decodable sibling.**
+      `a_corrupt_part_does_not_shadow_a_healthy_sibling`.
+- [x] **`mark_read` answered `marked_read` for a rejected STORE.** Flags are
+      read back; a missing `\Seen` is an error.
+- [x] **IMAP reconnected on every error, not just transport ones** — and
+      leaked a socket per retry (`async-imap::Session` has no `Drop`).
+      `only_transport_failures_are_retryable`; discarded sessions send
+      `LOGOUT`.
+- [x] **`email-mcp` answered -32000 for a missing `tools/call` name** (should
+      be -32602). `a_tools_call_without_a_name_is_invalid_params`.
+- [x] **`mqtt-mcp` answered a malformed notification.**
+      `a_malformed_notification_still_gets_no_reply`.
+- [x] **One non-UTF-8 request byte terminated either MCP server** with no
+      reply. Now -32700 + keep serving.
+- [x] **The executor forwarded malformed arguments as `null`.**
+      `malformed_argument_json_is_rejected_before_the_server_sees_it`.
+- [x] **A desynchronised executor stream kept the child** (every later call
+      parsed fragments of the oversized line). Restarted now.
+- [x] **A restarted exercise session suppressed the Danger warning for
+      531 s.** `a_restarted_session_rearms_the_danger_warning`.
+- [x] **A Critical alert in the opposite direction was swallowed by the
+      cooldown** (205 → 35 BPM; 300 → 40 mg/dL; bradycardia → tachycardia).
+      `a_critical_alert_in_the_opposite_direction_breaks_the_cooldown`,
+      `a_bradycardia_crisis_breaks_a_tachycardia_cooldown`. NOTE: the
+      *emergency contact* has a separate 30-minute anti-spam window; a second
+      crisis inside it raises and records an alert but does not page again —
+      see the P2 entry below.
+- [x] **A fenced tool call behind a sentence became the final answer.**
+      `parse_result_does_not_return_a_fenced_tool_call_after_prose`,
+      `strip_code_fence_finds_a_block_after_prose`.
+- [x] **`AlertOutcome::voice` counted the generic follow-up cue.**
+      `a_dropped_alert_cue_is_not_reported_as_voiced_by_its_follow_up`;
+      `follow_up` is now its own field.
+- [x] **ECG alerts reported a threshold the reading never crossed.**
+      `an_ecg_alert_reports_the_limit_it_actually_crossed`.
+- [x] **A fresh simulator reported two HRVs for one instant** (55 vs 65 ms).
+      `both_stress_readings_report_the_same_hrv`.
+- [x] **A low-quality ECG rejection was unobservable.**
+      `ecg_samples_rejected_low_quality()` counter.
+- [x] **`flash_write` refused an explicitly empty `data=`.**
+- [x] **A lost stdout payload could exit 0 when stderr was broken too.**
+      `finish_reports_a_stdout_failure_even_when_stderr_is_broken`.
+- [x] **A prompt named `*.signed` disappeared from `set-prompt list`.**
+      `a_prompt_named_signed_is_not_mistaken_for_an_envelope`.
+- [x] **`run` exited 2 with no config location** (no `$HOME`, no
+      `$MAGENT_CONFIG_FILE`); `version` still worked. Missing location now
+      resolves to defaults like a missing file.
+- [x] **CI never compiled the opt-in modules** (`security`, `wifi_pass_seal*`,
+      `verifiable_credentials`). The `host` job now lints + tests
+      `std,web3,verifiable_credentials,boot-key` and runs a feature matrix.
+- [x] **Round 21c follow-up: the header decoder is now single-source.**
+      `set`'s free-slot probe and `read_entry_header` both go through
+      `parse_kv_header_within(buf, avail)`, so "can I write here" and "can I
+      read this" are the same computation. Before this they disagreed at the
+      tail, which is how the data-loss defect above was reachable at all.
+- [ ] **P2, open: a second crisis inside the 30-minute emergency window does
+      not re-page a contact.** `trigger_emergency_protocol` is gated on
+      `emergency_cooldown_ms` (30 min) so the contact is not spammed. A
+      hypoglycaemia 60 s after a hyperglycaemia alert is now *raised and
+      recorded* (round 20c) but does not notify. Needs an owner decision:
+      re-page on a change of condition, or keep the hard window.
+
+## ✅ Done (2026-11-15) — round 20: what the covered fields are actually used for
+- [x] **A claim named `id` produced a credential that could not be read back.**
+      `CredentialSubject` flattens `claims` over a struct with a real `id`
+      field; serde emits a colliding key twice. `vc issue --claim id=…` wrote
+      `{"id":"<subject>","id":"<claim>"}` — rejected by this crate's own
+      `Deserialize` as `duplicate field 'id'`, and read last-wins as the
+      *claim* by other parsers. `is_reserved_claim_key` / `try_with_claim`
+      refuse it; `with_claim` drops it. Tests:
+      `a_claim_named_id_cannot_shadow_the_subject_id`,
+      `try_with_claim_reports_a_reserved_key` (verified to fail on the old
+      code, whose wire form contains two `"id"` keys).
+- [x] **`is_expired` compared strings, so a timezone offset could make an
+      expired credential valid.** `parse_iso8601_instant` applies the offset
+      and truncates fractional seconds; unparseable bounds fail closed.
+- [x] **`validFrom` was never checked.** `is_not_yet_valid` is now part of
+      `verify`.
+- [x] **A body-only proof's `purpose` was unauthenticated.** Only
+      `AssertionMethod` is accepted on that path.
+- [x] **`encode_for_signing` / `signing_input` return `Result`** instead of
+      serialising the body with `unwrap_or_default()`. A failed serialisation
+      would otherwise have produced a signature over empty bytes that the
+      verifier reproduces.
+- [x] `encode_for_signing`'s doc no longer presents it as the signing API —
+      on a proof-less document it returns proof-less bytes, and a proof built
+      with `CredentialProof::new` defaults to `options-v1`, so signing those
+      bytes can never verify. `signing_input` is the signing path.
+
+## ✅ Done (2026-11-15) — round 19: exhaustive field-coverage check replaces attack-by-attack auditing
+- [x] **Every mutable field of both proof types and both body types is
+      enumerated and mutated**; verification must fail for each. Adding a
+      field without covering it now fails a test instead of waiting for
+      someone to think of the attack. Verified by removing the challenge from
+      the encoding.
+- [x] **Removing a covered domain** (the strip-a-binding direction) is tested
+      separately, since the add-mutations cannot express it.
+- [x] **`PresentationProof::signing_scheme` doc** no longer claims an absent
+      value is accepted (round 18 made it mandatory).
+
+## ✅ Done (2026-11-15) — round 18: round 16 only blocked an absent scheme
+- [x] **An explicit `"signingScheme": "body-only"` still let a presentation be
+      replayed** — round 16 checked `is_none()`, so setting the field took the
+      body-only hash path and left `challenge` unsigned. `verify_proof` now
+      requires `options-v1` for every presentation proof.
+
+## ✅ Done (2026-11-15) — round 17: signing/verification scheme defaults diverged
+- [x] **`signing_input` and verification resolved `signingScheme: None`
+      differently** (`ProofOptions` vs `BodyOnly`), so a credential signed
+      through the public helper with the field cleared could not verify.
+      `signing_input` now shares the verification path, and a property-style
+      test pins all three scheme values.
+- [x] **`try_heapless_perfect_roundtrip_under_limit` asserted a false
+      invariant** (128 characters ≠ ≤256 bytes); it was passing by luck.
+
+## ✅ Done (2026-11-15) — round 16: round 15's fallback reopened the replay hole
+- [x] **A presentation could be downgraded to `body-only`** — `signingScheme`
+      is attacker-controlled JSON, and a body-only proof does not cover
+      `challenge`, so a replayer could blank the field, swap the challenge and
+      pass `verify_with_challenge`. Presentations no longer fall back; an
+      absent scheme is `options-v1`.
+- [x] **A body-only credential could carry an unsigned challenge/domain** and
+      have it reported as bound. Rejected now.
+
+## ✅ Done (2026-11-15) — round 15: round 14 broke every existing credential
+- [x] **Credentials issued before round 14 stopped verifying** — the signing
+      input changed from body-only to body+options, so every credential the
+      committed build had produced failed with the same error as a forgery.
+      `signingScheme` (`options-v1` / `body-only`, absent ⇒ body-only) makes
+      verification apply the rule the signature was computed under.
+- [x] **Two copies of the proof-option encoder** (credentials and
+      presentations) could drift; merged into `encode_proof_options`.
+
+## ✅ Done (2026-11-14) — round 14: malleability, and credentials got round 13's fix
+- [x] **`domain: None` and `domain: Some("")` hashed identically** — an
+      attacker could add or remove an empty domain without invalidating the
+      signature. Now presence-tagged.
+- [x] **`VerifiableCredential` had round 13's gap**: its `encode_for_signing`
+      still dropped the whole proof, so `CredentialProof.challenge`/`.domain`
+      were unsigned. Fixed with the same length- and presence-tagged options,
+      plus `signing_input`.
+- [x] Signing paths (CLI `vc issue`, tests) now use sign-then-attach, and the
+      expired-credential test no longer depends on two timestamps landing in
+      the same second.
+
+## ✅ Done (2026-11-14) — round 13: the presentation challenge was never signed
+- [x] **`challenge` / `domain` were outside the signed bytes.**
+      `encode_for_signing` dropped the whole proof, so a rewritten challenge
+      still verified — replay protection did nothing. Proof options are now
+      length-prefixed into the signing input (W3C Data Integrity style).
+- [x] **Signing was made symmetric** via `VerifiablePresentation::signing_input`
+      (build proof → hash body+options → sign → attach); used by the CLI and
+      tests.
+- [x] **`vc verify-presentation --challenge <STR>`** and
+      `VerifiablePresentation::verify_with_challenge` let a verifier require
+      its own nonce instead of only checking internal consistency.
+
+## ✅ Done (2026-11-14) — round 12: defects in round 11's own code
+- [x] **`VerifiablePresentation::verify` accepted a forged inner credential.**
+      It checked only the outer holder proof. Each contained credential now
+      goes through `VerifiableCredential::verify` (structure, expiry, own
+      signature).
+- [x] **The CLI `vc verify-presentation` bypassed that check** by calling
+      `validate()` + `verify_proof()` instead of `verify()`.
+- [x] **`Output::finish` took its stored error**, so the second of its two
+      calls (doctor then `main`) returned `Ok` and a lost payload could exit 0.
+- [x] Bounded line reader: pinned that a multi-byte character split across a
+      buffer refill survives intact.
+
+## ✅ Done (2026-11-14) — round 11: presentations, alerts, sleep and HR scoring
+- [x] **`vc present` signed presentations nothing could verify.** Added
+      `VerifiablePresentation::{encode_for_signing, verify_proof, verify}` and
+      `magent web3 vc verify-presentation <FILE>`. End-to-end: signed → 0,
+      tampered holder → 2.
+- [x] **Signing and verification used different encoders.** Both go through
+      `encode_for_signing` now.
+- [x] **Web3 output paths still used `unwrap_or_default()`** (empty document,
+      exit 0). They report `Serialise`.
+- [x] **A farther hospital evicted a nearer one** when the list was full,
+      moving the emergency SMS target 92 km away.
+- [x] **The first stress intervention after boot was suppressed** (plain `u32`
+      cooldown read "offered at boot"). `Option<u32>` now.
+- [x] **A meditation completion was attributed to the newest sample**, not the
+      event that offered it.
+- [x] **The sleep score's positive weights summed to 90**, so "N/100" could
+      never reach 100.
+- [x] **`current_stress` ignored HR** (190 BPM + HRV 85 read as "Relaxed").
+- [x] **`duration_minutes` reported 24 h for a zero-length night** and
+      underflowed on an out-of-range field.
+- [x] **`simulate_heart_rate` overflowed `u32`** past ~50 simulated days.
+- [x] **ECG alerts reported `threshold: 100.0` for every anomaly** (a 35 BPM
+      bradycardia claimed 100).
+- [x] **The "sustained high HR" streak never fired above Cardio**
+      (`zone() == Cardio` matched only 151 BPM).
+- [x] **The danger-zone warning had no rate limit** (filled the message buffer).
+
+
+## ✅ Done (2026-11-13) — round 10: health safety, storage durability, wear accounting
+- [x] **A Critical glucose/ECG reading was swallowed by a cooldown**, skipping
+      the emergency protocol. Cooldowns collapse repeats only; an escalation
+      (`escalates`) breaks through.
+- [x] **A low-quality ECG raised a cardiac emergency** — `quality` was never
+      consulted. Below 70 % no alert is raised.
+- [x] **Heart-rate alerts had no cooldown** (60 alerts/minute). Same rule as
+      the other channels.
+- [x] **A full alert history dropped the newest alert** (unacknowledgeable).
+      Evicts the oldest now.
+- [x] **`Elevated` glucose counted toward the "sustained >180" escalation.**
+- [x] **Compaction laundered corrupted values** (no CRC check before
+      rewriting). Refuses with `CorruptedData`.
+- [x] **A corrupt header mid-region read as end-of-store, and compaction
+      deleted everything past it.** `decode_kv_header` distinguishes
+      erased/corrupt; compaction refuses.
+- [x] **Static wear-levelling was one sector behind its ledger** (`[11,10,10,9]`
+      physical vs `[10,10,10,10]` recorded). Same formula both sides.
+- [x] **`calculate_wear_level` used the reset rotation counter** (end-of-life
+      read 0.25). Sums the per-sector ledger.
+- [x] **`is_sector_worn` / `is_worn_out` disagreed at the limit** (`>=` vs `>`).
+- [x] **`drift_ppm.abs()` panicked on `i32::MIN`** and accepted it in release.
+- [x] **`unix_to_calendar`'s lower bound was 366 days early** (`0000-01-01`).
+- [x] **`MonitoringManager` counters overflowed**; `add_health_check` appended
+      instead of updating (stale Degraded forever).
+- [x] **Prompt store and config file lacked fsync** around their renames.
+
+
+## ✅ Done (2026-11-11) — round 9: defects in rounds 4–8's own fixes
+- [x] **A failed SMTP send could be delivered twice.** The single retry was
+      not safe for a non-idempotent operation: a drop after `DATA` leaves the
+      message queued server-side while `send` errors, so the retry sent a
+      duplicate. No retry; the transport is dropped for the next call.
+- [x] **Do-not-disturb could swallow a cue and report it delivered.** Voice
+      routing substitutes a notification for `priority < 8`, but the
+      notification layer drops `priority < 7`. `DroppedInDnd` names the gap;
+      `push_notification` reports whether an entry was really stored.
+- [x] **`send_health_alert` guessed per channel from queue/history lengths.**
+      An eviction leaves the length unchanged, so a suppression could read
+      as delivered. The manager returns `AlertOutcome { voice, notification }`.
+- [x] **MCP line caps were applied after the allocation.** All three servers
+      and the executor now cap *during* the read (`fill_buf`/`consume`),
+      drain an over-long line without storing it, bound the discard budget,
+      and stay line-aligned so the next request is still served.
+- [x] **A bad-field JSON-RPC request lost its id.** Valid JSON without
+      `method` came back as `{"id":null,"error":{"code":-32700}}`; it is now
+      `-32600` with the recovered id (round 8 fixed only `tools/call`).
+- [x] **`--repl --prompt -` was a silent no-op** (both drain stdin); rejected
+      at parse time with a message naming the conflict.
+- [x] **`doctor` passed a config `run` rejects.** A corrupt config gave
+      `ok: true` / exit 0 from built-in defaults while `run` exited 2. Doctor
+      now fails fast with `config_error` / exit 2.
+- [x] **A corrupt mail body read as "no text/plain part".**
+      `TextBody::{Found, Undecodable, Absent}` distinguishes the three cases.
+- [x] **`Output::flush` attributed a stderr failure to stdout**, which would
+      have produced a false "the data was not delivered" exit.
+
+
+## ✅ Done (2026-11-11) — tool errors are sentences, not enum dumps
+- [x] **`SimulatorExecutor` rendered errors with `Debug`**, so the model was
+      fed `ToolFailed { tool: …, message: … }`. Now `Display`. Became
+      reachable when round 5 made web-tool failures real `Err`s.
+- [x] Trailing-comma repair: nested/repeated cases pinned by tests; cut
+      ranges verified disjoint.
+- [x] `run_one_tick`: the absorbed `TasksFailed` arm no longer binds and
+      discards a value.
+
+## ✅ Done (2026-11-11) — defects in the previous rounds' own fixes
+- [x] **`strip_trailing_commas` corrupted UTF-8 and merged array elements**
+      (`北京` → mojibake; `["a","b"]` → `["a""b"]`). Byte-range rewrite.
+- [x] **Anthropic invoke body had an off-by-one** — sliced from the tag's
+      `>` instead of after it. Invisible until zero-argument calls were
+      enabled; `<invoke>prose</invoke>` is also no longer a "call" now.
+- [x] **`days_to_ymd` wrapped on absurd input** (`u64::MAX` → 1969); clamped,
+      with the bound chosen to avoid overflow in the `+ 719_468` step.
+- [x] **Two recovery mappings disagreed on `ToolFailed`** (`RetryBackoff`
+      vs `Abort`). Both `Skip`; a test pins the pairing.
+- [x] **`scheduler daemon --at` exited 0 on a failed task** while
+      `run-once` exited 1. One-shot ticks now propagate; repeating ones
+      still absorb.
+
+## ✅ Done (2026-11-10) — MCP / mail / MQTT / Lua: failures the user never saw
+- [x] **MCP `isError` was ignored** — a tool-level failure (rejected
+      `send_email`) came back as a successful call. Now `McpError::ToolError`.
+- [x] **`ble_send` without `data` ran `list_inbox`** — an unrequested side
+      effect reported as the caller's action. Both the missing field and
+      malformed JSON are errors now.
+- [x] **MQTT publish topics are validated** (no wildcards, 65535-byte cap);
+      `publish_bytes` had performed no checks at all.
+- [x] **MQTT JSON-RPC keeps the request id** on a bad-parameter `tools/call`
+      (`-32602`, original id) instead of `{"id":null,"error":{-32700}}`.
+- [x] **A dead IMAP session reconnects** (one shared helper replaces five
+      copies of the lock-and-call pattern).
+- [x] **`get_email` uses `BODY.PEEK[]`** — it no longer marks mail as read.
+- [x] **Mail bodies honour `charset=`** (`get_body()`, not
+      `get_body_raw()`), and HTML-only mail says the text part is absent
+      instead of returning `""`.
+- [x] **Line reads are bounded** in all three MCP processes (1 MiB requests,
+      4 MiB executor responses).
+- [x] **`string.match` nesting is capped** (32 levels) — a deep pattern used
+      to abort the Lua VM. The cap had been defeated by a shadowed counter;
+      regression test proves both directions.
+
+## ✅ Done (2026-11-10) — agent correctness: the model is not told things that are untrue
+- [x] **SSRF guard bypass via numeric hosts.** `http://2130706433/` and
+      `http://0x7f000001/` passed the lexical check (not an IP literal *as
+      written*), `Url::parse` canonicalised them to `127.0.0.1`, and the
+      guard's "already an IP literal" shortcut returned `Ok` — so they
+      reached loopback, and `0xa9fea9fe` / `2852039166` reached the
+      `169.254.169.254` metadata endpoint. The classifier runs on the
+      normalised host now; regression test covers six spellings without
+      opening a socket.
+- [x] **Web tool failures were recorded as successes.** `Ok("error: …")`
+      → real `Err`, carried by a new `AgentError::ToolFailed`.
+- [x] **Search results carried their neighbour's snippet** (per-result
+      segmentation instead of a cross-boundary `(?s).*?`).
+- [x] **JSON tool arguments with a non-string member produced garbage URLs**
+      (hand-rolled scanner replaced with `serde_json`; trailing commas
+      tolerated).
+- [x] **Bare `&` in HTML was rewritten to `&;`** (`AT&T` → `AT&T;`).
+- [x] **A fenced tool call was returned as the final answer** (embedded
+      `result` envelope extracted first; a fenced call yields no result).
+- [x] **Fractional `result` values were rounded to 1 decimal** (0.25 → "0.2").
+- [x] **Zero-argument Anthropic tool calls were unrecognised**, leaving the
+      XML to be reported as the answer.
+- [x] **Stress sensors contradicted each other** (`check_stress_level` vs
+      `hrv`); both read the stored level.
+- [x] **`flash_write` / `ble_send` accepted a missing payload** as a
+      zero-byte success (host simulator + ESP32 handler).
+- [x] **Voice/meditation cues claimed delivery that did not happen**
+      (`QueueOutcome`; full queue and DND routing are reported truthfully).
+- [x] **`summary list` / `show` printed impossible dates** for every
+      leap-year February (`2028-01-32`); replaced with Hinnant's
+      `civil_from_days`, verified for every day 1970–2100.
+
+## ✅ Done (2026-11-10) — CLI: errors that used to look like success
+- [x] **Failed stdout writes now exit non-zero.** `Output` records the first
+      stdout error (`write_human` / `write_stdout_line` / `write_json_str` /
+      `stdout_fmt_line` / `final_answer` / `write_json` / `fail`) and `main`
+      calls `Output::finish()` for every dispatch arm. Before: `magent config
+      export > /full/disk` exited 0 with the record never delivered.
+      Regression test drives the binary under `RLIMIT_FSIZE=0`, which is the
+      only portable way to make a real payload write fail deterministically.
+- [x] **`set-prompt list` reports every file it skipped** (unreadable,
+      unparseable, newer schema) on stderr and in a `skipped` array under
+      `--json`. `*.signed.json` envelopes remain filtered silently.
+- [x] **`--prompt -` reads stdin** for `run` and `set-prompt set`, through a
+      1 MiB-bounded, UTF-8-checked reader.
+- [x] **`doctor` resolves the model of the configured provider** (`OLLAMA_MODEL`
+      no longer leaks into a `deepseek` check; `DEEPSEEK_MODEL` added) and its
+      per-check `ok` now matches how the top-level verdict treats `SKIP`.
+- [x] **Config endpoint URL/model are trimmed** consistently with `doctor`.
+- [x] **Scheduler bookkeeping failures are fatal to the run** (exit 1,
+      `scheduler_state_error`) instead of a swallowed `tick error`; task
+      failures are still absorbed. `web3_blockchain` render helpers no longer
+      `unwrap_or_default()` into an empty payload.
+- [x] **Prompt-store temp file is created 0600** rather than narrowed after a
+      0644 write.
 
 ## ✅ Done this pass (P0)
 - [x] **Firmware blockchain HTTP transport** — `EspHttpClient` (was placeholder)
@@ -66,6 +671,44 @@
       sdkconfig.c61.defaults`, where `CONFIG_BT_ENABLED` is the only relevant
       divergence. There was never an ESP-IDF-version regression.
 
+## ✅ Done (2026-11-15) — round 20b: the three latent P1 traps are closed
+- [x] **AES-GCM nonce reuse across reboots on a `web3` no-`std` build.**
+      The nonce is `boot_salt || counter || len`, the key is a compile-time
+      constant, and the counter restarts at zero each boot — so on a target
+      with no entropy source the first message of every boot reused
+      `(key, nonce)` for any two same-length messages. GCM keystream reuse
+      leaks `P1 ⊕ P2` and allows tag forgery, and the old code returned `Ok`
+      on that path, so the only symptom was a subtle ciphertext correlation.
+      `BOOT_SALT_AVAILABLE` now reports whether a cross-boot salt exists
+      (`cfg!(feature = "std")`) and `encrypt_aes_gcm` returns `CryptoError`
+      when it does not, instead of producing a ciphertext whose nonce will
+      repeat. **This does not make the `no_std` path usable** — a device path
+      still needs a per-device key (eFuse/SoftDevice) and a persistent
+      monotonic counter. It makes the trap loud rather than silent. Tests:
+      `no_entropy_source_must_refuse_rather_than_reuse_a_nonce`,
+      `boot_salt_availability_matches_the_salt_source`.
+- [x] **`KvStore` required `WRITE_SIZE`-aligned entries but wrote arbitrary
+      lengths.** `FlashStorage::write` rejects a length that is not a multiple
+      of `F::WRITE_SIZE`, and a KV entry is `3 + key_len + value_len + 2`
+      bytes, so **every** `set` failed on a part whose program unit is 4 (or
+      the ESP-IDF encrypted view's 16) — the mock's `WRITE_SIZE = 1` made the
+      whole test suite blind to it. Entries are now padded to whole program
+      units (`slot_size`) on write, and every scan/compaction/stats path
+      advances by the padded slot, so the pad is never read back as a header.
+      The wire format is unchanged, so entries written by the old code still
+      read correctly. Test: `kv_store_works_on_a_four_byte_program_unit`
+      (write, second entry, delete-by-compaction, stats, all on `WRITE_SIZE=4`).
+- [x] **`wifi_pass_seal_v2` downgraded on a corrupted prefix.** Only `DBO2:`
+      ran the MAC check; every other prefix fell into DBO1's
+      `LegacyPlaintext` branch and `open_stored_wifi_pass` returned that
+      string verbatim as the Wi-Fi password. One flipped byte in NVS
+      (`DBO2:` → `DBO7:`, or the `2` erased to `0xFF`) therefore turned an
+      integrity-checked entry into an unauthenticated one. `looks_like_seal_tag`
+      now refuses any `DBO<digits>:`-shaped value that is not a supported
+      version, while a genuine legacy password (which cannot have that shape)
+      still migrates. Tests: `an_unknown_version_tag_is_refused_not_treated_as_plaintext`,
+      `seal_tag_shape_is_recognised_without_matching_plaintext`.
+
 ## 🔴 P1 — outstanding
 - [ ] **Firmware TLS stability** — HTTPS on the C61 currently fails fast with a
       memory error; only HTTP is reliable. Blocking real certificate-verified
@@ -99,18 +742,49 @@
 
 ## 🟡 P2 — outstanding
 
+### 🟡 P2 — 2026-11-13 round 10 findings that need an owner decision
+
+- [x] **Heart-rate zone is always computed for a 30-year-old.** *Fixed in
+      round 21b:* `HeartRateData::zone_for_profile()` and
+      `HeartRateZone::from_hr_and_max()` added, `SportsCoach::set_profile()`
+      wired through. `zone()` keeps its old, now explicitly documented
+      behaviour for callers with no profile.
+- [x] **`sports_coach`'s "sustained high HR" check can never fire above
+      Cardio.** *Fixed in round 11:* the guard is a lower bound
+      (`zone() >= Cardio && hr > 150`), and `HeartRateZone` is `Ord`.
+- [x] **Skin temperature is judged against core-body thresholds.** *Fixed in
+      round 21b:* `TemperatureSite` (`Core` / `Skin`) with per-site normal
+      bands; `has_fever()` is `false` for skin by construction and
+      `is_elevated()` is the signal the coach warns on. A skin sensor still
+      cannot establish a core temperature — doing that needs a core source,
+      which is a hardware question, not a threshold one.
+- [x] **Sleep score weights sum to 90, not 100.** *Fixed in round 11:*
+      rebalanced to 30+30+30+10; a perfect night scores 100.
+- [x] **`adjust_goal_for_conditions` is not idempotent.** *Fixed in round
+      21d:* recomputes from a retained `intensity_baseline` and rebuilds the
+      reason list each pass, so repeated calls with the same conditions are
+      stable and a cleared condition restores the baseline.
+      `adjusting_for_the_same_conditions_is_idempotent`,
+      `a_cleared_condition_restores_the_baseline_intensity`.
+- [ ] **`unix_to_calendar`'s upper bound is 9999-12-31 but the formatter
+      prints a 4-digit year**, which is fine; the lower bound was off by 366
+      days and is fixed (round 10). The remaining question is whether this
+      API should also reject year 0000 for *arithmetic* reasons — currently
+      handled by the corrected bound.
+
 ### 🟡 P2 — 2026-11-09 round 2 findings that need an owner decision
 
-- [ ] **C61's reserved-pin table is empty.** `firmware/esp32-app/src/local_tools.rs`
-      guards `write_gpio` (and the Lua `hardware.gpio_*` paths) with
-      `reserved_pin_reason`, but the `#[cfg(not(feature = "board-s3"))]`
-      implementation returns `None` for every pin. On the S3 the table blocks
-      the SPI-flash/PSRAM pins (driving one crashes with `StoreProhibited`);
-      on the C61 — the default shipping board — the agent or a Lua script can
-      therefore reconfigure a flash/PSRAM/UART0 pin and crash the next fetch.
-      Closing this needs the C61 module's actual pin assignment, which is not
-      recorded in this repo (`BOARDS.md` documents only the S3 console pins).
-      Owner should supply the board pin map; then mirror the S3 table.
+- [x] **C61's reserved-pin guard was empty.** *Fixed in round 23:* rather
+      than encoding a board table this repo does not carry, the C61 path now
+      asks ESP-IDF at runtime — `gpio_get_io_config`'s `fun_sel` is
+      `PIN_FUNC_GPIO` (= 1, confirmed for `esp32c61` in
+      `soc/.../io_mux_reg.h`) only for pins no peripheral owns, and
+      `oe_ctrl_by_periph` catches the pins a peripheral drives. That answers
+      exactly the question the guard is asking and stays correct if the pin
+      map changes. A static fallback covers the window where a peripheral is
+      between initialisation steps: the C61 MSPI pins (**14–17, 19–21**, from
+      `components/soc/esp32c61/include/soc/spi_pins.h`) and UART0 (10, 11).
+      Driving any of them detaches the flash and crashes the next fetch.
 - [x] **Ingress framing fixed 2026-11-09 (round 3).** `UartAdapter::poll`
       now reassembles `\r`/`\n`-terminated lines and returns exactly one frame
       per call (bounded at 1 KiB), so long commands are not split and
@@ -644,60 +1318,25 @@
       fallback when the `web3` feature — which supplies HKDF/HMAC — is off).
       Verified by `cargo check` for S3 and C61. The bullets below are the
       original finding, kept for the record.
-- [ ] Two **live write paths** still produce DBO1, the pre-HKDF format with **no
-      integrity check at all**, while the format's own upgrade command
-      (`AT+WIFIPASSUPGRADE`) exists precisely to move data off it:
-      - `firmware/esp32-app/src/device_key.rs:303` seals the **32-byte device
-        identity seed** (the root secret for the device's DID / wallet — the
-        highest-value secret on the device, TRNG-generated at first boot and
-        never present in the image) via `wifi_pass_seal::seal_str`, i.e. DBO1.
-      - `firmware/esp32-app/src/main.rs:1524` (`seal_and_store_wifi_pass`) seals
-        the env-var default AP password via the same call. This one is *milder
-        than it looks*: the plaintext comes from `option_env!("MAGENT_WIFI_PASS")`,
-        so it is compiled into the firmware image regardless of seal format —
-        the seal adds nothing to protect a secret that ships in the binary. That
-        is also the likely origin of the `Ark314159` value committed in
-        `a823f04`.
-      The doc comment on `open_stored_wifi_pass` (`main.rs:1535-1547`) already
-      states the DBO1-write / DBO2-write split as intended, so this is a known
-      design state, not a regression.
-- [ ] **Why DBO1 is the weaker format.** `seal_str` is a hand-rolled repeating
-      XOR: `cipher[i] = plain[i] ^ key[i % key.len()] ^ nonce[i % nonce.len()]`
-      — the device key used directly as a repeating pad. The key itself *is*
-      derived (`boot_key::derive` = HKDF over eFuse material), but `seal_str`
-      applies no stream cipher, no per-message key schedule, no AEAD and
-      **no MAC**. Confirmed
-      against the code, the construction does hold up structurally for the sizes
-      in use (pad period `lcm(32, 12) = 96 > 64` = `MAX_PLAINTEXT`, so the pad
-      never repeats within one message, and a fresh TRNG nonce per write means
-      it does not repeat across messages). The concrete defect is therefore
-      **not** confidentiality but **malleability**: `open_sealed_bytes` returns
-      `Ok(DecodedBytes)` for any well-formed input, so a bit-flip in the stored
-      `magent:dev_identity` value is not detected — it silently yields a
-      *different seed*, hence a different device DID / wallet, with no error
-      anywhere. DBO2 would reject the same tampering with `BadMac`.
-      DBO1 is also unauthenticated on read: nothing binds the ciphertext to the
-      key, so wrong-key and tampered-ciphertext are indistinguishable.
-- [ ] **Not reachable remotely**, which is why this is P2 and not P0: writing
-      `magent:dev_identity` requires NVS write access — physical flash access or
-      an AT command over UART0/USB. There is no network writer (`web_admin.rs`
-      is read-only: two GET handlers, no state-changing endpoint, and it exposes
-      only version/state/IP/SSID/RSSI/heap/uptime — no secrets, so its lack of
-      auth is a telemetry-disclosure question, not a credential one). Physical
-      access is already game-over on a device with no Secure Boot eFuse burned
-      in dev config.
-- [ ] **Fix, if wanted**: switch both write paths to
-      `wifi_pass_seal_v2::seal_str` (a drop-in — same `device_key` input, and
-      `open_stored_wifi_pass` already dispatches on the prefix and opens DBO2
-      **and** DBO1, so already-provisioned devices keep working). Not applied
-      here because it changes the wire format persisted to NVS for the identity
-      seed on a security-critical path with host-only test coverage, and
-      firmware changes cannot be validated on hardware in this environment
-      (`cargo check` only). If it is applied, the DBO1 read fallback must stay,
-      and `magent-core/tests/at_tests.rs:333-350`
-      (`wifi_credential_provisioning_round_trips_for_default_ap`) — which
-      asserts `sealed.starts_with("DBO1:")` — has to be repointed at DBO2, plus
-      the `main.rs:1535-1547` doc comment corrected.
+- [x] **The two live write paths were switched to DBO2.** *Verified 2026-11-16:*
+      both are already `wifi_pass_seal_v2::seal_str` —
+      `device_key.rs::seal_dev_identity` (the 32-byte identity seed) and
+      `main.rs::seal_and_store_wifi_pass` (the env-var AP default). Nothing in
+      `firmware/` references `wifi_pass_seal::seal_str` any more, so no write
+      path produces DBO1. The DBO1 *reader* stays, and both migration paths
+      are in place: `open_dev_identity` re-seals on open when it sees
+      `Dbo1Decoded`, and `open_stored_wifi_pass` accepts DBO1 through
+      `open_sealed_v2`'s fallback. `AT+CWJAP?` still reports
+      `DBO1_LEGACY`/`PLAINTEXT_LEGACY` so an operator can see leftovers.
+      Tests that still assert `starts_with("DBO1:")` (`wifi_pass_seal`'s own
+      unit test, `at_tests::…` behind `cfg(not(feature = "web3"))`) exercise
+      the legacy *format*, which is correct and must keep working.
+- [x] **Why the old format mattered.** DBO1 was a hand-rolled repeating XOR
+      with **no MAC**, so a flipped bit in `magent:dev_identity` silently
+      produced a different seed — and therefore a different device DID and
+      wallet — with no error anywhere. The identity seed is now DBO2
+      (HKDF-stretched per-entry key + truncated HMAC-SHA256), which rejects
+      the same tampering with `BadMac`.
 
 ### 🟡 P2 — `AT+BLE` validator is dead code (2026-09-21)
 - [ ] `validate_ble_set` / `BleAction` / `BleValidated` in

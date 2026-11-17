@@ -105,12 +105,24 @@ impl Tool for PublishEventTool {
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
+            // `rumqttc`'s publish only enqueues the packet for the background
+            // event loop; the broker's PUBACK (QoS 1/2) arrives later and
+            // nothing in this tool waits for it. Reporting
+            // `"published": true` therefore claimed a delivery the code never
+            // observed — a broker that rejected the packet (or a packet the
+            // codec refused) still produced success. Say what actually
+            // happened: the message was *queued*. `expected_ack` tells the
+            // caller which QoS levels would have produced a confirmation.
             Ok(json!({
-                "published": true,
+                "queued": true,
+                "delivered": false,
+                "expected_ack": qos > 0,
                 "topic": topic,
                 "bytes": bytes.len(),
                 "qos": qos,
                 "retain": args.retain,
+                "note": "queued for the MQTT event loop; broker acknowledgement is not \
+                         observed by this tool",
             }))
         })
     }

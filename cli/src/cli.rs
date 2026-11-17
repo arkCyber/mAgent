@@ -337,6 +337,10 @@ pub enum ParseError {
     /// is entered — so `--repl` would be silently dropped.
     #[cfg(feature = "web3_app")]
     ReplVerifySigned,
+    /// `--repl` was combined with `--prompt -`. Both consume stdin: the
+    /// prompt reader drains it to EOF before the REPL starts, so the
+    /// session would immediately see EOF and exit having run nothing.
+    ReplPromptStdin,
     /// `--probe-ollama` was combined with `--mock`. One insists the
     /// LLM be reachable before answering; the other refuses to
     /// contact it at all. Honouring either would silently drop the
@@ -393,6 +397,10 @@ impl std::fmt::Display for ParseError {
             ParseError::ReplVerifySigned => write!(
                 f,
                 "`magent run --repl` is interactive and `--verify-signed` only verifies an envelope (the REPL would never start) — pick one"
+            ),
+            ParseError::ReplPromptStdin => write!(
+                f,
+                "`--prompt -` reads the system prompt from stdin, which the interactive REPL is also reading — pipe the prompt through a file or `--prompt-name` instead, or drop --repl"
             ),
             ParseError::ProbeWithMock => write!(
                 f,
@@ -899,6 +907,18 @@ fn parse_run_args<'a>(
     }
     if opts.repl_mode && !opts.task.is_empty() {
         return Err(ParseError::ReplWithTask);
+    }
+    // `--prompt -` drains stdin to EOF while resolving the system prompt,
+    // and the REPL reads the same stdin. The prompt would consume every
+    // line the user meant to type, so the session would start at EOF and
+    // exit having run nothing — a silent no-op.
+    if opts.repl_mode
+        && opts
+            .prompt_file
+            .as_deref()
+            .is_some_and(|p| p.as_os_str() == "-")
+    {
+        return Err(ParseError::ReplPromptStdin);
     }
     #[cfg(feature = "web3_app")]
     if opts.repl_mode && opts.verify_signed_path.is_some() {
@@ -1674,6 +1694,31 @@ fn parse_blockchain_vc(args: &[String]) -> Result<BlockchainAction, ParseError> 
                 ));
             }
             Ok(BlockchainAction::VcVerify(path))
+        }
+        Some("verify-presentation") => {
+            let usage = "usage: web3 vc verify-presentation <FILE> [--challenge <STR>]";
+            let path: PathBuf = args
+                .get(1)
+                .ok_or_else(|| {
+                    ParseError::Usage("web3 vc verify-presentation: missing <FILE>".to_string())
+                })?
+                .into();
+            let mut challenge = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--challenge" => {
+                        challenge = Some(take_flag_value(args, &mut i, "--challenge")?)
+                    }
+                    other => {
+                        return Err(ParseError::Usage(format!(
+                            "{usage} — unexpected argument {other:?}"
+                        )))
+                    }
+                }
+                i += 1;
+            }
+            Ok(BlockchainAction::VcVerifyPresentation { path, challenge })
         }
         Some("present") => {
             let usage = "usage: web3 vc present <FILE> --challenge <STR> \
@@ -3475,6 +3520,15 @@ pub fn web3_help_text() -> String {
             s,
             "                                      Build a signed verifiable presentation"
         );
+        let _ = writeln!(s, "    vc verify-presentation <FILE> [--challenge <STR>]");
+        let _ = writeln!(
+            s,
+            "                                      Verify a presentation, its credentials, and"
+        );
+        let _ = writeln!(
+            s,
+            "                                      (with --challenge) that it answers your nonce"
+        );
     }
     let _ = writeln!(s);
     let _ = writeln!(s, "STORAGE:");
@@ -4050,6 +4104,26 @@ mod tests {
             }
             _ => panic!("expected Run"),
         }
+    }
+
+    #[test]
+    fn repl_with_a_stdin_prompt_is_rejected() {
+        // Both consume stdin: the prompt reader drains it to EOF before the
+        // session starts, so the REPL would see EOF and exit having run
+        // nothing.
+        for argv_ in [
+            ["magent", "run", "--repl", "-p", "-"],
+            ["magent", "run", "--repl", "--prompt", "-"],
+        ] {
+            let err = Args::parse(&argv(argv_)).unwrap_err();
+            assert!(matches!(err, ParseError::ReplPromptStdin), "got {err:?}");
+            assert!(
+                err.to_string().contains("stdin"),
+                "the message must name the conflict: {err}"
+            );
+        }
+        // A file prompt is unaffected.
+        assert!(Args::parse(&argv(["magent", "run", "--repl", "-p", "p.txt"])).is_ok());
     }
 
     #[test]
@@ -5599,6 +5673,68 @@ mod tests {
             a.command,
             Command::Web3(Web3Action::Blockchain(BlockchainAction::VcVerify(_)))
         ));
+
+        let a = Args::parse(&argv([
+            "magent",
+            "web3",
+            "vc",
+            "verify-presentation",
+            "vp.json",
+        ]))
+        .unwrap();
+        match a.command {
+            Command::Web3(Web3Action::Blockchain(BlockchainAction::VcVerifyPresentation {
+                path,
+                challenge,
+            })) => {
+                assert_eq!(path, PathBuf::from("vp.json"));
+                assert!(challenge.is_none(), "no --challenge given");
+            }
+            other => panic!("expected VcVerifyPresentation, got {other:?}"),
+        }
+
+        // `--challenge` makes the verifier require its own nonce.
+        let a = Args::parse(&argv([
+            "magent",
+            "web3",
+            "vc",
+            "verify-presentation",
+            "vp.json",
+            "--challenge",
+            "nonce-7",
+        ]))
+        .unwrap();
+        match a.command {
+            Command::Web3(Web3Action::Blockchain(BlockchainAction::VcVerifyPresentation {
+                path,
+                challenge,
+            })) => {
+                assert_eq!(path, PathBuf::from("vp.json"));
+                assert_eq!(challenge.as_deref(), Some("nonce-7"));
+            }
+            other => panic!("expected VcVerifyPresentation, got {other:?}"),
+        }
+
+        // The subcommand takes <FILE> plus at most `--challenge <STR>`.
+        assert!(Args::parse(&argv(["magent", "web3", "vc", "verify-presentation"])).is_err());
+        assert!(Args::parse(&argv([
+            "magent",
+            "web3",
+            "vc",
+            "verify-presentation",
+            "vp.json",
+            "extra",
+        ]))
+        .is_err());
+        assert!(Args::parse(&argv([
+            "magent",
+            "web3",
+            "vc",
+            "verify-presentation",
+            "vp.json",
+            "--challenge",
+        ]))
+        .is_err());
 
         let a = Args::parse(&argv([
             "magent",

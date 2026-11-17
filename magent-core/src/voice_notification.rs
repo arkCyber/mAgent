@@ -340,50 +340,89 @@ impl VoiceNotificationManager {
         priority: u8,
         category: VoiceCategory,
         timestamp: u32,
-    ) -> Result<()> {
+    ) -> crate::error::Result<QueueOutcome> {
         if !self.voice_enabled {
-            return Ok(());
+            return Ok(QueueOutcome::VoiceDisabled);
         }
 
         // Check DND for non-critical messages
         let current_hour = ((timestamp / 3600000) % 24) as u8;
         if self.is_in_dnd_period(current_hour) && priority < 8 {
-            // Queue as notification instead
-            return self.send_notification(
+            // Queue as notification instead.
+            //
+            // `send_notification` applies its *own* do-not-disturb rule,
+            // which drops `priority < 7`. The two thresholds disagree (this
+            // one routes < 8), so a priority-7 cue was routed and then
+            // silently discarded by the notification layer while the caller
+            // reported "sent as a screen notification instead" — a
+            // fabricated delivery, and the exact bug this round set out to
+            // remove. Ask the notification path what it did and report that.
+            let delivered = self.push_notification(
                 "语音消息(勿扰模式)",
                 text,
                 NotificationType::Screen,
                 priority,
                 category,
                 timestamp,
-            );
+            )?;
+            return Ok(if delivered {
+                QueueOutcome::RoutedToNotification
+            } else {
+                // Neither spoken nor shown: dropped by do-not-disturb.
+                QueueOutcome::DroppedInDnd
+            });
         }
 
         let message = VoiceMessage::new(self.next_message_id, text, priority, category, timestamp);
         self.next_message_id += 1;
 
-        // Insert by priority (highest first)
+        // Insert by priority (highest first). Both branches report what
+        // actually happened: a full queue used to silently drop the new
+        // message when nothing in it had a lower priority, and the *caller*
+        // then reported "queued" because the depth had not shrunk.
         let insert_pos = self.voice_queue.iter().position(|m| m.priority < priority);
         match insert_pos {
             Some(pos) => {
                 if self.voice_queue.insert(pos, message.clone()).is_err() {
-                    // Queue full, replace lowest priority
+                    // Queue full: evict the lowest-priority entry to make
+                    // room. `Vec::insert` cannot fail after `pop`.
                     self.voice_queue.pop();
-                    let _ = self.voice_queue.insert(pos, message);
+                    self.voice_queue.insert(pos, message).map_err(|_| {
+                        crate::error::AgentError::BufferOverflow {
+                            capacity: MAX_VOICE_QUEUE,
+                            attempted: 1,
+                        }
+                    })?;
+                    Ok(QueueOutcome::EvictedLowerPriority)
+                } else {
+                    Ok(QueueOutcome::Queued)
                 }
             }
             None => {
                 if self.voice_queue.push(message.clone()).is_err() {
-                    // Queue full, remove oldest low-priority message
+                    // Full and ordered: only an entry *below* this priority
+                    // can give way.
                     if let Some(pos) = self.voice_queue.iter().position(|m| m.priority < priority) {
-                        let _ = self.voice_queue.remove(pos);
-                        let _ = self.voice_queue.push(message);
+                        self.voice_queue.remove(pos);
+                        self.voice_queue.push(message).map_err(|_| {
+                            crate::error::AgentError::BufferOverflow {
+                                capacity: MAX_VOICE_QUEUE,
+                                attempted: 1,
+                            }
+                        })?;
+                        Ok(QueueOutcome::EvictedLowerPriority)
+                    } else {
+                        // Every queued message is at least as important as
+                        // this one. Dropping one of them would lose a more
+                        // urgent cue, so the *new* message is the one that
+                        // does not fit — and the caller has to say so.
+                        Ok(QueueOutcome::Dropped)
                     }
+                } else {
+                    Ok(QueueOutcome::Queued)
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Get next voice message to speak
@@ -436,11 +475,39 @@ impl VoiceNotificationManager {
         category: VoiceCategory,
         timestamp: u32,
     ) -> Result<()> {
+        self.push_notification(
+            title,
+            body,
+            notification_type,
+            priority,
+            category,
+            timestamp,
+        )
+        .map(|_| ())
+    }
+
+    /// The body of [`Self::send_notification`], reporting whether the
+    /// notification was actually stored.
+    ///
+    /// `false` means one of two silent drops: do-not-disturb refused it
+    /// (`priority < 7` while DND is active), or the history was full and
+    /// held nothing acknowledged to evict. Callers that tell a user "this
+    /// was shown on screen" must use this, not the `.map(|_| ())` wrapper —
+    /// otherwise a refused notification is reported as delivered.
+    fn push_notification(
+        &mut self,
+        title: &str,
+        body: &str,
+        notification_type: NotificationType,
+        priority: u8,
+        category: VoiceCategory,
+        timestamp: u32,
+    ) -> Result<bool> {
         // Check if notification should be delivered based on DND
         let current_hour = ((timestamp / 3600000) % 24) as u8;
         if self.is_in_dnd_period(current_hour) && priority < 7 {
             // Silently drop low-priority notifications during DND
-            return Ok(());
+            return Ok(false);
         }
 
         let notification = Notification {
@@ -461,11 +528,18 @@ impl VoiceNotificationManager {
             // Remove oldest acknowledged notification
             if let Some(pos) = self.notifications.iter().position(|n| n.acknowledged) {
                 let _ = self.notifications.remove(pos);
-                let _ = self.notifications.push(notification);
+                if self.notifications.push(notification).is_err() {
+                    return Ok(false);
+                }
+            } else {
+                // History full with everything unacknowledged: the newest
+                // notification does not fit. Say so instead of returning
+                // success for an entry that was never stored.
+                return Ok(false);
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Mark notification as delivered
@@ -542,7 +616,14 @@ impl VoiceNotificationManager {
         &self.voice_queue
     }
 
-    /// Send health alert notification
+    /// Send health alert notification.
+    ///
+    /// Returns what each channel actually did. The caller (the simulator's
+    /// `send_health_alert` tool) used to infer this by comparing queue and
+    /// history lengths before and after, which cannot distinguish "the
+    /// notification was appended" from "an older entry was evicted to make
+    /// room" — both leave the length unchanged — so a dropped alert could
+    /// be reported as raised.
     pub fn send_health_alert(
         &mut self,
         alert_type: &str,
@@ -550,7 +631,7 @@ impl VoiceNotificationManager {
         message: &str,
         recommendation: &str,
         timestamp: u32,
-    ) -> Result<()> {
+    ) -> Result<AlertOutcome> {
         let title = format!(
             "健康{}：{}",
             match severity {
@@ -565,19 +646,19 @@ impl VoiceNotificationManager {
         // High priority = trigger multiple channels
         if severity >= 8 {
             // Voice + vibration + LED + screen
-            self.queue_voice(
+            let voice = self.queue_voice(
                 &format!("{}。{}", message, recommendation),
                 severity,
                 VoiceCategory::Alert,
                 timestamp,
             )?;
-            self.queue_voice(
+            let follow_up = self.queue_voice(
                 "请注意查看您的健康数据。",
                 9,
                 VoiceCategory::Warning,
                 timestamp,
             )?;
-            self.send_notification(
+            let screen = self.push_notification(
                 &title,
                 &format!("{}\n\n建议：{}", message, recommendation),
                 NotificationType::Vibration,
@@ -585,15 +666,20 @@ impl VoiceNotificationManager {
                 VoiceCategory::Alert,
                 timestamp,
             )?;
+            Ok(AlertOutcome {
+                voice: voice.was_queued(),
+                notification: screen,
+                follow_up: follow_up.was_queued(),
+            })
         } else if severity >= 5 {
             // Voice + screen
-            self.queue_voice(
+            let voice = self.queue_voice(
                 &format!("{}。{}", message, recommendation),
                 severity,
                 VoiceCategory::Alert,
                 timestamp,
             )?;
-            self.send_notification(
+            let screen = self.push_notification(
                 &title,
                 &format!("{}\n\n建议：{}", message, recommendation),
                 NotificationType::Screen,
@@ -601,9 +687,14 @@ impl VoiceNotificationManager {
                 VoiceCategory::Warning,
                 timestamp,
             )?;
+            Ok(AlertOutcome {
+                voice: voice.was_queued(),
+                notification: screen,
+                follow_up: false,
+            })
         } else {
             // Screen only
-            self.send_notification(
+            let screen = self.push_notification(
                 &title,
                 message,
                 NotificationType::Screen,
@@ -611,9 +702,12 @@ impl VoiceNotificationManager {
                 VoiceCategory::System,
                 timestamp,
             )?;
+            Ok(AlertOutcome {
+                voice: false,
+                notification: screen,
+                follow_up: false,
+            })
         }
-
-        Ok(())
     }
 
     /// Send coaching message
@@ -626,16 +720,19 @@ impl VoiceNotificationManager {
         let priority = if breathing { 6 } else { 4 };
 
         self.queue_voice(message, priority, category, timestamp)
+            .map(|_| ())
     }
 
     /// Send encouragement
     pub fn send_encouragement(&mut self, message: &str, timestamp: u32) -> Result<()> {
         self.queue_voice(message, 3, VoiceCategory::Encouragement, timestamp)
+            .map(|_| ())
     }
 
     /// Send meditation guidance
     pub fn send_meditation(&mut self, script: &str, timestamp: u32) -> Result<()> {
         self.queue_voice(script, 7, VoiceCategory::Meditation, timestamp)
+            .map(|_| ())
     }
 }
 
@@ -643,6 +740,66 @@ impl Default for VoiceNotificationManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What [`VoiceNotificationManager::queue_voice`] actually did with a cue.
+///
+/// Returned so a caller never reports "queued" for a message that was
+/// routed elsewhere or dropped. `queue_voice` used to return only
+/// `Result<()>`, so the one case where it silently lost a message (a full
+/// queue holding nothing less urgent) was indistinguishable from success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueOutcome {
+    /// Added to the voice queue.
+    Queued,
+    /// Added, after evicting a lower-priority entry to make room.
+    EvictedLowerPriority,
+    /// Not queued: do-not-disturb is active, so it went out as a
+    /// screen notification instead.
+    RoutedToNotification,
+    /// Not queued, and the do-not-disturb substitution was itself
+    /// refused (`send_notification` drops `priority < 7`, while voice
+    /// routing uses `< 8`). The user was told nothing.
+    DroppedInDnd,
+    /// Not queued and not routed: the queue is full of cues at least as
+    /// urgent as this one.
+    Dropped,
+    /// Not queued: voice output is disabled on this device.
+    VoiceDisabled,
+}
+
+impl QueueOutcome {
+    /// Whether the message will actually be spoken.
+    pub fn was_queued(self) -> bool {
+        matches!(
+            self,
+            QueueOutcome::Queued | QueueOutcome::EvictedLowerPriority
+        )
+    }
+}
+
+/// What [`VoiceNotificationManager::send_health_alert`] delivered.
+///
+/// Both channels are independent: under do-not-disturb either can be
+/// refused, and a full queue can drop a cue without changing its depth.
+/// Reporting the outcome lets the caller say what happened instead of
+/// guessing from before/after counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlertOutcome {
+    /// The **alert's own** voice cue was actually queued.
+    ///
+    /// This deliberately excludes the generic follow-up cue. Reporting
+    /// `voice || follow_up` meant a full queue that dropped the real
+    /// "严重警告：心跳过速…" while the lower-priority "请注意查看您的健康数据"
+    /// still got in was reported as the alert having been spoken — the user
+    /// heard the filler and missed the alarm, and the caller was told
+    /// otherwise.
+    pub voice: bool,
+    /// The screen/vibration notification was actually stored.
+    pub notification: bool,
+    /// The generic follow-up cue was queued. Informational: it is not the
+    /// alert, and must never be read as one.
+    pub follow_up: bool,
 }
 
 /// Helper to convert text to speech-ready format
@@ -1064,14 +1221,19 @@ mod tests {
 
         // A mid-priority newcomer: position() finds the priority-1 tail, the
         // insert overflows, the tail is popped, and the newcomer is placed.
-        mgr.queue_voice("mid", 5, VoiceCategory::Coaching, 0).unwrap();
+        mgr.queue_voice("mid", 5, VoiceCategory::Coaching, 0)
+            .unwrap();
         assert_eq!(mgr.voice_queue_size(), MAX_VOICE_QUEUE);
         assert!(
-            mgr.pending_voices().iter().any(|m| m.text.as_str() == "mid"),
+            mgr.pending_voices()
+                .iter()
+                .any(|m| m.text.as_str() == "mid"),
             "the newcomer must be queued after evicting the lowest-priority entry",
         );
         assert!(
-            !mgr.pending_voices().iter().any(|m| m.text.as_str() == "low"),
+            !mgr.pending_voices()
+                .iter()
+                .any(|m| m.text.as_str() == "low"),
             "the lowest-priority entry is the one evicted",
         );
     }
@@ -1088,5 +1250,213 @@ mod tests {
             n.notification_history().len()
         );
         assert_eq!(d.is_voice_enabled(), n.is_voice_enabled());
+    }
+
+    /// A cue the do-not-disturb substitution cannot deliver is not "routed".
+    ///
+    /// Voice routing bypasses DND for `priority >= 8` and substitutes a
+    /// notification below that, but `send_notification` applies its *own*
+    /// rule and drops `priority < 7`. A priority below 7 therefore fell
+    /// between the two thresholds: it was refused by the notification layer
+    /// while `queue_voice` reported `RoutedToNotification` — a delivery that
+    /// never happened. The outcome has to say it was dropped. Priority 7 sits
+    /// on the notification layer's threshold and is genuinely routed.
+    #[test]
+    fn a_dnd_substitution_that_is_itself_refused_is_reported_as_dropped() {
+        let mut mgr = VoiceNotificationManager::new();
+        mgr.set_dnd(true, 0, 23); // hour 0 is inside the window
+
+        // Priority 3: routed by voice, refused by the notification layer.
+        assert_eq!(
+            mgr.queue_voice("three", 3, VoiceCategory::System, 0)
+                .unwrap(),
+            QueueOutcome::DroppedInDnd
+        );
+        assert_eq!(mgr.voice_queue_size(), 0);
+        assert!(
+            mgr.notification_history().is_empty(),
+            "nothing reached the screen either"
+        );
+
+        // Priority 7 is accepted by the notification layer, i.e. genuinely
+        // routed.
+        assert_eq!(
+            mgr.queue_voice("seven", 7, VoiceCategory::Meditation, 0)
+                .unwrap(),
+            QueueOutcome::RoutedToNotification
+        );
+        assert_eq!(mgr.notification_history().len(), 1);
+    }
+
+    /// `send_notification` reports whether it stored anything. Returning
+    /// `Ok(())` for a refused notification is what let callers claim a
+    /// delivery that never happened.
+    #[test]
+    fn send_notification_reports_a_refusal() {
+        let mut mgr = VoiceNotificationManager::new();
+        mgr.set_dnd(true, 0, 23);
+        // Refused: inside DND and below the notification threshold.
+        assert!(
+            !mgr.push_notification(
+                "t",
+                "b",
+                NotificationType::Screen,
+                6,
+                VoiceCategory::System,
+                0
+            )
+            .unwrap(),
+            "a dropped notification must report false"
+        );
+        // Accepted: at/above the threshold.
+        assert!(mgr
+            .push_notification(
+                "t",
+                "b",
+                NotificationType::Screen,
+                7,
+                VoiceCategory::System,
+                0
+            )
+            .unwrap());
+        // Outside DND everything is accepted.
+        let mut mgr2 = VoiceNotificationManager::new();
+        assert!(mgr2
+            .push_notification(
+                "t",
+                "b",
+                NotificationType::Screen,
+                1,
+                VoiceCategory::System,
+                0
+            )
+            .unwrap());
+    }
+
+    /// A full history holding nothing acknowledged cannot take a new entry;
+    /// that must be reported rather than returned as success.
+    #[test]
+    fn a_full_notification_history_reports_the_drop() {
+        let mut mgr = VoiceNotificationManager::new();
+        for i in 0..MAX_NOTIFICATION_HISTORY {
+            assert!(mgr
+                .push_notification(
+                    "t",
+                    &format!("b{i}"),
+                    NotificationType::Screen,
+                    9,
+                    VoiceCategory::Alert,
+                    0
+                )
+                .unwrap());
+        }
+        assert_eq!(mgr.notification_history().len(), MAX_NOTIFICATION_HISTORY);
+        // Nothing is acknowledged, so there is no entry to evict.
+        assert!(
+            !mgr.push_notification(
+                "t",
+                "overflow",
+                NotificationType::Screen,
+                9,
+                VoiceCategory::Alert,
+                0
+            )
+            .unwrap(),
+            "an entry that did not fit must report false"
+        );
+        assert_eq!(mgr.notification_history().len(), MAX_NOTIFICATION_HISTORY);
+    }
+
+    /// A dropped alert cue must not be reported as spoken because the
+    /// follow-up filler made it in.
+    ///
+    /// Fill the queue with priority-9 entries, then raise a severity-8 alert.
+    /// Its own cue (priority 8) is the *new* message with nothing lower to
+    /// evict, so it is dropped; the follow-up (priority 9) is not higher than
+    /// the occupants either — both are refused. Before the fix the outcome
+    /// was `voice.was_queued() || follow_up.was_queued()`, and the simulator
+    /// then told the model the alert had been spoken when its own message had
+    /// been refused outright.
+    #[test]
+    fn a_dropped_alert_cue_is_not_reported_as_voiced_by_its_follow_up() {
+        let mut mgr = VoiceNotificationManager::new();
+        // Every slot holds a priority-8 cue: nothing lower can be evicted for
+        // the alert's own priority-8 message, but the priority-9 follow-up
+        // *can* evict one of them.
+        for i in 0..MAX_VOICE_QUEUE {
+            mgr.queue_voice(
+                "occupied",
+                8,
+                VoiceCategory::Warning,
+                (i as u32) * 1_000,
+            )
+            .unwrap();
+        }
+        assert_eq!(mgr.voice_queue_size(), MAX_VOICE_QUEUE);
+
+        let outcome = mgr
+            .send_health_alert("hr", 8, "severe tachycardia", "", 60_000)
+            .unwrap();
+        assert!(
+            !outcome.voice,
+            "the alert's own cue was refused; the filler that evicted a              queued entry must not be reported as it"
+        );
+        assert!(
+            outcome.follow_up,
+            "the follow-up did get in, and is reported as itself"
+        );
+    }
+
+    /// The follow-up flag reports the filler separately and is never the
+    /// alert's own delivery.
+    #[test]
+    fn the_follow_up_cue_is_reported_separately_from_the_alert() {
+        let mut mgr = VoiceNotificationManager::new();
+        let outcome = mgr
+            .send_health_alert("hr", 9, "tachycardia", "", 12 * 3_600_000)
+            .unwrap();
+        assert!(outcome.voice, "the alert itself is queued");
+        assert!(outcome.follow_up, "the filler is queued too");
+
+        // Low severity has no follow-up at all.
+        let mut mgr = VoiceNotificationManager::new();
+        let outcome = mgr
+            .send_health_alert("mood", 6, "low activity", "", 12 * 3_600_000)
+            .unwrap();
+        assert!(!outcome.follow_up);
+    }
+
+    /// The health-alert outcome names what each channel actually did, which
+    /// the simulator's before/after counters could not distinguish (an
+    /// eviction leaves the length unchanged).
+    #[test]
+    fn a_health_alert_reports_each_channels_outcome() {
+        // Severity 9 blocks nothing: both channels fire.
+        let mut mgr = VoiceNotificationManager::new();
+        let outcome = mgr
+            .send_health_alert("hr", 9, "tachycardia", "", 12 * 3_600_000)
+            .unwrap();
+        assert!(outcome.voice, "severity 9 queues voice");
+        assert!(outcome.notification, "severity 9 raises a notification");
+
+        // Severity 3 is screen-only.
+        let mut mgr = VoiceNotificationManager::new();
+        let outcome = mgr
+            .send_health_alert("mood", 3, "low activity", "", 12 * 3_600_000)
+            .unwrap();
+        assert!(!outcome.voice, "severity 3 does not speak");
+        assert!(outcome.notification);
+
+        // Severity 6 under DND: both channels are suppressed, and the
+        // outcome must say so on both.
+        let mut mgr = VoiceNotificationManager::new();
+        mgr.set_dnd(true, 0, 23);
+        let outcome = mgr
+            .send_health_alert("glucose", 6, "210 mg/dL", "", 0)
+            .unwrap();
+        assert!(!outcome.voice, "DND suppresses a priority-6 cue");
+        assert!(!outcome.notification, "DND suppresses a priority-6 alert");
+        assert_eq!(mgr.voice_queue_size(), 0);
+        assert!(mgr.notification_history().is_empty());
     }
 }

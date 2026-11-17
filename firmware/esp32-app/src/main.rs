@@ -480,9 +480,16 @@ pub(crate) fn nvs_load_string(key: &str) -> Option<String> {
     let nvs = EspDefaultNvs::new(partition, ns, true).ok()?;
     // PATCHED (MicroAgent): `get_str` now requires an out-buffer for
     // safety (the API previously returned `Option<&str>` borrowing
-    // from NVS storage, which had lifetime issues). The buffer is
-    // 256 bytes — long enough for an SSID or passkey.
-    let mut buf = [0u8; 256];
+    // from NVS storage, which had lifetime issues).
+    //
+    // 640 bytes, not 256: a sealed secret (`MAX_SECRET_ENCODED_LEN`) is up to
+    // 573 characters. `get_str` reports `ESP_ERR_NVS_INVALID_LENGTH` when the
+    // buffer is too small, which `.ok().flatten()` turns into `None` — so the
+    // old size did not truncate, it silently reported "no value", and the LLM
+    // backend simply never configured. Every other value read through here is
+    // far shorter (the largest is a sealed `dev_identity` at ~195), so the
+    // larger buffer costs only stack.
+    let mut buf = [0u8; 640];
     nvs.get_str(key, &mut buf).ok().flatten().map(str::to_owned)
 }
 
@@ -1598,9 +1605,116 @@ fn provision_llm_config() {
         Ok(()) => log::info!("[llm] model provisioned: {model}"),
         Err(e) => log::warn!("[llm] failed to persist model: {e}"),
     }
-    match nvs_save_string(NVS_KEY_LLM_API_KEY, key) {
-        Ok(()) => log::info!("[llm] api key provisioned"),
+    match save_llm_api_key(key) {
+        Ok(()) => log::info!("[llm] api key provisioned (sealed)"),
         Err(e) => log::warn!("[llm] failed to persist api key: {e}"),
+    }
+}
+
+/// Persist the LLM API key, sealed with the device key.
+///
+/// The key used to be written to NVS in the clear, so any flash dump
+/// (including a routine NVS backup) handed over a live billing credential.
+/// `wifi_pass_seal_v2::seal_secret` exists for exactly this — the Wi-Fi
+/// format caps plaintext at 64 bytes, too short for a key that
+/// `at_validate` allows up to 128 — and had no caller until now.
+///
+/// A plaintext entry written by an older build is still readable (see
+/// [`load_llm_api_key`]) and is re-sealed on the next successful read.
+pub(crate) fn save_llm_api_key(api_key: &str) -> Result<(), &'static str> {
+    use magent_core::wifi_pass_seal_v2;
+    let key = load_device_key_for_seal()?;
+    let mut nonce = [0u8; wifi_pass_seal_v2::NONCE_LEN];
+    getrandom::getrandom(&mut nonce).map_err(|_| "trng_unavailable")?;
+    let mut sealed: heapless::String<{ wifi_pass_seal_v2::MAX_SECRET_ENCODED_LEN }> =
+        heapless::String::new();
+    wifi_pass_seal_v2::seal_secret(api_key.as_bytes(), &key, &nonce, &mut sealed)
+        .map_err(|_| "seal_failed")?;
+    nvs_save_string(NVS_KEY_LLM_API_KEY, sealed.as_str()).map_err(|_| "nvs_save_failed")
+}
+
+/// Load the LLM API key, opening a sealed entry or accepting a plaintext one
+/// written by an older build.
+///
+/// A legacy plaintext entry is re-sealed in place on the first successful
+/// read (best effort: the caller still gets the key if the write fails).
+/// Read the LLM API key **without ever writing NVS**.
+///
+/// The AT query path (`AT+LLMCFG?`) runs on the ingress thread, which is
+/// subscribed to the real-time watchdog and is WCET-metered. A migration write
+/// there — an NVS erase plus program — is exactly the kind of unbounded
+/// latency that thread must not take. Boot-time callers use
+/// [`load_llm_api_key`], which may re-seal a legacy entry.
+pub(crate) fn load_llm_api_key_read_only() -> Option<String> {
+    load_llm_api_key_impl(false)
+}
+
+/// Read the LLM API key, re-sealing a legacy plaintext entry if there is one.
+///
+/// Only for boot-time / provisioning paths; see
+/// [`load_llm_api_key_read_only`] for the real-time-safe variant.
+pub(crate) fn load_llm_api_key() -> Option<String> {
+    load_llm_api_key_impl(true)
+}
+
+fn load_llm_api_key_impl(allow_migration_write: bool) -> Option<String> {
+    use magent_core::wifi_pass_seal_v2;
+    let stored = nvs_load_string(NVS_KEY_LLM_API_KEY)?;
+    if stored.is_empty() {
+        return None;
+    }
+    let key = match load_device_key_for_seal() {
+        Ok(k) => k,
+        Err(e) => {
+            // Without the device key a *plaintext* entry is still usable —
+            // but a sealed one cannot be opened, and returning it verbatim
+            // would hand a ~300-character DBO2 blob to the LLM backend as a
+            // bearer token. The request then fails upstream with an
+            // authentication error that points at the provider instead of at
+            // the device, which is the worst kind of diagnostic. Fail closed:
+            // report it and let the caller fall back to local reasoning.
+            // `is_legacy` alone is not enough: it only asks "does this start
+            // with `DBO2:`", so a `DBO1:` blob or a blob whose tag byte was
+            // flipped would be returned as a "plaintext" key and sent as a
+            // bearer token. The shape test is the one `open_secret` itself
+            // uses, so the two agree about what a sealed blob looks like.
+            if wifi_pass_seal_v2::is_legacy(&stored)
+                && !wifi_pass_seal_v2::looks_like_seal_tag(&stored)
+            {
+                log::warn!(
+                    "[llm] device key unavailable ({e}); using the plaintext api key entry"
+                );
+                return Some(stored);
+            }
+            log::error!(
+                "[llm] device key unavailable ({e}); cannot open the sealed api key — \
+                 LLM backend will not be configured"
+            );
+            return None;
+        }
+    };
+    let mut out: heapless::Vec<u8, { wifi_pass_seal_v2::MAX_SECRET_PLAINTEXT }> =
+        heapless::Vec::new();
+    match wifi_pass_seal_v2::open_secret(&stored, &key, &mut out) {
+        Ok(wifi_pass_seal_v2::SecretOpenOutcome::Dbo2Decoded) => {
+            String::from_utf8(out.to_vec()).ok()
+        }
+        Ok(wifi_pass_seal_v2::SecretOpenOutcome::LegacyPlaintext) => {
+            // Re-seal a plaintext credential now that we have the key — but
+            // only from a caller that can afford a flash write.
+            if allow_migration_write {
+                if let Err(e) = save_llm_api_key(&stored) {
+                    log::warn!("[llm] could not seal legacy plaintext api key: {e}");
+                } else {
+                    log::info!("[llm] legacy plaintext api key sealed as DBO2");
+                }
+            }
+            Some(stored)
+        }
+        Err(e) => {
+            log::warn!("[llm] api key open failed: {e:?}");
+            None
+        }
     }
 }
 
@@ -1690,15 +1804,51 @@ fn open_stored_wifi_pass(stored: &str) -> Result<String, &'static str> {
     let key = load_device_key_for_seal()?;
     let mut out: heapless::Vec<u8, { wifi_pass_seal_v2::MAX_PLAINTEXT }> =
         heapless::Vec::new();
-    match wifi_pass_seal_v2::open_sealed_v2(stored, &key, &mut out) {
+    let outcome = wifi_pass_seal_v2::open_sealed_v2(stored, &key, &mut out);
+    // A DBO1 entry has no MAC, so a flipped bit yields a *different*
+    // password with no error. Migrate it forward on the first successful
+    // open, exactly as `open_dev_identity` does for the identity seed —
+    // otherwise `AT+WIFIPASSUPGRADE` is the only thing that ever moves the
+    // entry and a device that never runs it stays malleable forever.
+    let migrate = matches!(outcome, Ok(wifi_pass_seal_v2::OpenOutcome::Dbo1Decoded));
+    // A legacy *plaintext* entry is also worth sealing: it is currently
+    // readable in place by anyone with flash access.
+    let migrate_plain = matches!(
+        outcome,
+        Ok(wifi_pass_seal_v2::OpenOutcome::LegacyPlaintext(_))
+    );
+    match outcome {
         Ok(wifi_pass_seal_v2::OpenOutcome::Dbo2Decoded)
         | Ok(wifi_pass_seal_v2::OpenOutcome::Dbo1Decoded) => {
             // The recovered bytes are valid UTF-8 by construction
             // (Wi-Fi passwords are ASCII; we also disallow NUL on
             // the write path).
-            String::from_utf8(out.to_vec()).map_err(|_| "open_decoded_not_utf8")
+            let password = String::from_utf8(out.to_vec()).map_err(|_| "open_decoded_not_utf8")?;
+            if migrate {
+                match seal_and_store_wifi_pass(&password) {
+                    Ok(()) => log::info!("[wifi] password entry migrated from DBO1 to DBO2"),
+                    // Re-sealing is best effort: the password is already
+                    // recovered, and failing the boot over a write error
+                    // would be worse than leaving the old entry.
+                    Err(e) => log::warn!("[wifi] DBO1->DBO2 re-seal failed: {e}"),
+                }
+            }
+            Ok(password)
         }
-        Ok(wifi_pass_seal_v2::OpenOutcome::LegacyPlaintext(s)) => Ok(s.to_string()),
+        Ok(wifi_pass_seal_v2::OpenOutcome::LegacyPlaintext(s)) => {
+            let password = s.to_string();
+            if migrate_plain {
+                // Only worth it for a non-empty value; an empty AP password
+                // is a legitimate open-network configuration.
+                if !password.is_empty() {
+                    match seal_and_store_wifi_pass(&password) {
+                        Ok(()) => log::info!("[wifi] plaintext password entry sealed as DBO2"),
+                        Err(e) => log::warn!("[wifi] plaintext->DBO2 seal failed: {e}"),
+                    }
+                }
+            }
+            Ok(password)
+        }
         Err(e) => {
             log::warn!("[wifi] seal open error: {e:?}");
             Err("seal_open_failed")
@@ -2199,7 +2349,7 @@ fn run_agent_loop(
     if !safe_mode {
         if let (Some(model), Some(key)) = (
             nvs_load_string(NVS_KEY_LLM_MODEL),
-            nvs_load_string(NVS_KEY_LLM_API_KEY),
+            load_llm_api_key(),
         ) {
             if !model.is_empty() && !key.is_empty() {
                 log::info!(

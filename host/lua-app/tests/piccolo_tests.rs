@@ -121,7 +121,7 @@ fn piccolo_vm_full_hardware_surface() {
 #[test]
 fn piccolo_string_match_honours_anchors() {
     use magent_lua::hardware::SimHardware;
-    use magent_lua::{install_mock_agent, HardwareBackend, SharedHardware};
+    use magent_lua::{install_mock_agent, SharedHardware};
     use std::sync::{Arc, Mutex};
 
     let sim: Arc<Mutex<SimHardware>> = Arc::new(Mutex::new(SimHardware::default()));
@@ -184,7 +184,7 @@ fn piccolo_hardware_arguments_are_range_checked() {
 #[test]
 fn piccolo_call_converts_non_string_returns() {
     use magent_lua::hardware::SimHardware;
-    use magent_lua::{install_mock_agent, HardwareBackend, SharedHardware};
+    use magent_lua::{install_mock_agent, SharedHardware};
     use std::sync::{Arc, Mutex};
 
     let sim: Arc<Mutex<SimHardware>> = Arc::new(Mutex::new(SimHardware::default()));
@@ -206,7 +206,7 @@ fn piccolo_call_converts_non_string_returns() {
 #[test]
 fn piccolo_exposes_transfer_and_erase() {
     use magent_lua::hardware::SimHardware;
-    use magent_lua::{install_mock_agent, HardwareBackend, SharedHardware};
+    use magent_lua::{install_mock_agent, SharedHardware};
     use std::sync::{Arc, Mutex};
 
     let sim: Arc<Mutex<SimHardware>> = Arc::new(Mutex::new(SimHardware::default()));
@@ -228,7 +228,7 @@ fn piccolo_exposes_transfer_and_erase() {
 #[test]
 fn piccolo_string_patterns_match_the_mlua_semantics() {
     use magent_lua::hardware::SimHardware;
-    use magent_lua::{install_mock_agent, HardwareBackend, SharedHardware};
+    use magent_lua::{install_mock_agent, SharedHardware};
     use std::sync::{Arc, Mutex};
 
     let sim: Arc<Mutex<SimHardware>> = Arc::new(Mutex::new(SimHardware::default()));

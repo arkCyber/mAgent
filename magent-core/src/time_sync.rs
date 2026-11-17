@@ -470,7 +470,11 @@ impl TimeSync {
 
     /// Set the drift. Out-of-range values are rejected.
     pub fn set_drift_ppm(&mut self, drift: i32) -> Result<(), TimeSyncError> {
-        if drift.abs() > MAX_DRIFT_PPM {
+        // `drift.abs()` panics on `i32::MIN` under overflow checks and returns
+        // `i32::MIN` in release — so `abs() > MAX` is *false* for the one
+        // value it cannot represent, and the check let the most extreme
+        // possible drift through. A range test has no such hole.
+        if !(-MAX_DRIFT_PPM..=MAX_DRIFT_PPM).contains(&drift) {
             return Err(TimeSyncError::DriftOutOfRange);
         }
         self.drift_ppm = drift;
@@ -581,7 +585,10 @@ fn parse_record(record: &str) -> Result<TimeSync, TimeSyncError> {
     if wall_unix_ns >= 1_000_000_000 {
         return Err(TimeSyncError::BadField);
     }
-    if drift_ppm.abs() > MAX_DRIFT_PPM {
+    if !(-MAX_DRIFT_PPM..=MAX_DRIFT_PPM).contains(&drift_ppm) {
+        // Same range test as `set_drift_ppm`: `abs()` cannot represent
+        // `i32::MIN`, so a record carrying that value would panic (debug) or
+        // slip past the bound (release) on the boot path that loads NVS.
         return Err(TimeSyncError::DriftOutOfRange);
     }
     let source = Source::from_tag(src_str);
@@ -606,10 +613,10 @@ fn parse_record(record: &str) -> Result<TimeSync, TimeSyncError> {
 /// covers years 1..=9999 without overflow. Sub-second resolution is
 /// not relevant here.
 ///
-/// Returns `None` for out-of-range inputs (year outside 1970..=9999
-/// after drift correction).
+/// Returns `None` for out-of-range inputs (year outside 0001..=9999 after
+/// drift correction).
 pub fn unix_to_calendar(unix_s: i64) -> Option<(i32, u32, u32, u32, u32, u32)> {
-    if !(-62_167_219_200..=253_402_300_799).contains(&unix_s) {
+    if !(-62_135_596_800..=253_402_300_799).contains(&unix_s) {
         // Out of representable range for the algorithm below
         // (years 0001-01-01..=9999-12-31).
         return None;
@@ -983,6 +990,44 @@ mod tests {
     fn calendar_far_past_returns_none() {
         // Below the algorithm's `0001-01-01..=9999-12-31` window.
         assert!(unix_to_calendar(-100_000_000_000).is_none());
+    }
+
+    /// The lower bound must be exactly 0001-01-01T00:00:00Z, not 366 days
+    /// earlier.
+    ///
+    /// The constant was `-62_167_219_200`, a full leap-year too early, so the
+    /// range check admitted inputs that convert to year 0000 — outside the
+    /// documented 1..=9999 window, and a date the formatter rendered as
+    /// `0000-01-01`.
+    #[test]
+    fn calendar_lower_bound_is_exactly_year_one() {
+        assert_eq!(
+            unix_to_calendar(-62_135_596_800),
+            Some((1, 1, 1, 0, 0, 0)),
+            "the lower bound is 0001-01-01T00:00:00Z"
+        );
+        assert!(
+            unix_to_calendar(-62_135_596_801).is_none(),
+            "one second earlier is year 0000 and must be rejected"
+        );
+    }
+
+    /// `i32::MIN` has no positive `abs()`, so an `abs()`-based range check
+    /// either panics (overflow checks on) or silently accepts the value
+    /// (release) — which would corrupt every timestamp derived from it.
+    #[test]
+    fn drift_min_is_rejected_not_panicking() {
+        let mut t = TimeSync::default();
+        assert_eq!(
+            t.set_drift_ppm(i32::MIN),
+            Err(TimeSyncError::DriftOutOfRange)
+        );
+        assert_eq!(
+            t.set_drift_ppm(-(MAX_DRIFT_PPM + 1)),
+            Err(TimeSyncError::DriftOutOfRange)
+        );
+        assert!(t.set_drift_ppm(-MAX_DRIFT_PPM).is_ok());
+        assert!(t.set_drift_ppm(MAX_DRIFT_PPM).is_ok());
     }
 
     #[test]

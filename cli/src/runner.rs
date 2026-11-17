@@ -86,6 +86,11 @@ use crate::output::{Output, OutputKind};
 pub enum RunError {
     /// Could not load `--prompt <FILE>`.
     PromptLoad(String),
+    /// The config file exists but is unusable (corrupt JSON, a newer
+    /// schema, unreadable). `run` must not quietly substitute built-in
+    /// defaults: doing so silently changes the provider/model and can
+    /// "succeed" with the wrong backend.
+    ConfigLoad(String),
     /// AgentRunner.run returned an error (e.g. budget exhausted, parse
     /// failure that wasn't recoverable).
     Agent(String),
@@ -118,6 +123,12 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RunError::PromptLoad(msg) => write!(f, "could not load system prompt: {}", msg),
+            RunError::ConfigLoad(msg) => write!(
+                f,
+                "could not load the config file: {} — fix it, or move it aside to run with \
+                 built-in defaults",
+                msg
+            ),
             RunError::Agent(msg) => write!(f, "agent failed: {}", msg),
             RunError::Io(e) => write!(f, "i/o error: {}", e),
             RunError::SignedEnvelope(msg) => write!(f, "signed envelope: {}", msg),
@@ -516,10 +527,16 @@ fn endpoint_url<'a>(
         "deepseek" => &config.provider.deepseek,
         _ => return None,
     };
-    if endpoint.url.trim().is_empty() {
+    // Hand back the *trimmed* value. Returning the raw string meant a
+    // hand-edited `"url": " http://host "` was passed through verbatim,
+    // while `magent doctor` trimmed the same value — so `run` and
+    // `doctor` disagreed about which endpoint was in effect (and the
+    // padded URL was sent to the HTTP client unchanged).
+    let url = endpoint.url.trim();
+    if url.is_empty() {
         None
     } else {
-        Some(&endpoint.url)
+        Some(url)
     }
 }
 
@@ -534,10 +551,14 @@ fn endpoint_model<'a>(
         // slot, matching the historical `provider.default` default.
         _ => &config.provider.ollama,
     };
-    if endpoint.model.trim().is_empty() {
+    // Trimmed for the same reason as [`endpoint_url`]: `doctor` already
+    // compares a trimmed model name, so a padded config value used to
+    // make the two subcommands check different models.
+    let model = endpoint.model.trim();
+    if model.is_empty() {
         None
     } else {
-        Some(&endpoint.model)
+        Some(model)
     }
 }
 
@@ -641,17 +662,12 @@ impl<'a> RunCmd<'a> {
         let config = match crate::config::load() {
             Ok(c) => c,
             Err(e) => {
-                // If the config file is corrupt we still want `run`
-                // to work — fall back to the in-memory defaults and
-                // surface a warning via `out.warn` so the line goes
-                // through the same channel as every other trace /
-                // warning (stderr in Human mode, swallowed in JSON
-                // mode).
-                let _ = out.warn(&format!(
-                    "could not load config file ({}); using built-in defaults",
-                    e
-                ));
-                crate::config::ConfigRecord::with_defaults()
+                // A *missing* file already resolved to defaults inside
+                // `load()`; anything reaching here means the file exists but
+                // is unusable. Substituting defaults used to warn and carry
+                // on, so a corrupted config silently switched the provider
+                // and could exit 0 from a fallback run.
+                return Err(RunError::ConfigLoad(e.to_string()));
             }
         };
         let config_report = apply_config_overrides(self.opts, &config);
@@ -2593,6 +2609,23 @@ mod tests {
     fn endpoint_url_returns_value_when_present() {
         let cfg = crate::config::ConfigRecord::with_defaults();
         assert_eq!(endpoint_url(&cfg, "ollama"), Some("http://localhost:11434"));
+    }
+
+    /// A hand-edited config can pad the URL. `run` must see the same
+    /// value `doctor` does, and must not hand the padding to the HTTP
+    /// client.
+    #[test]
+    fn endpoint_url_trims_the_returned_value() {
+        let mut cfg = crate::config::ConfigRecord::with_defaults();
+        cfg.provider.ollama.url = "  http://localhost:11434  ".to_string();
+        assert_eq!(endpoint_url(&cfg, "ollama"), Some("http://localhost:11434"));
+    }
+
+    #[test]
+    fn endpoint_model_trims_the_returned_value() {
+        let mut cfg = crate::config::ConfigRecord::with_defaults();
+        cfg.provider.ollama.model = " llama3.2 ".to_string();
+        assert_eq!(endpoint_model(&cfg, "ollama"), Some("llama3.2"));
     }
 
     #[test]

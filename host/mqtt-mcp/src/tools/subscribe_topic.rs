@@ -63,10 +63,20 @@ impl Tool for SubscribeTopicTool {
                 .subscribe(&args.topic, args.qos)
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            // As with `publish_event`, `rumqttc` only enqueues the SUBSCRIBE;
+            // the broker's SUBACK (which can be a refusal, 0x80) arrives on
+            // the event loop afterwards and is not awaited here. Reporting
+            // `"subscribed": true` claimed the broker had accepted a
+            // subscription that may have been refused — for example by an
+            // ACL — and that is additionally lost on any reconnect
+            // (`clean_session` is on by default).
             Ok(json!({
-                "subscribed": true,
+                "requested": true,
+                "confirmed": false,
                 "topic": args.topic,
                 "qos": qos,
+                "note": "SUBSCRIBE queued; the broker's SUBACK is not observed by this \
+                         tool, and the subscription is not restored after a reconnect",
             }))
         })
     }
@@ -84,7 +94,9 @@ mod tests {
         // registering an empty filter (which would be a protocol
         // violation).
         let schema = SubscribeTopicTool.input_schema();
-        let required = schema["required"].as_array().expect("required must be an array");
+        let required = schema["required"]
+            .as_array()
+            .expect("required must be an array");
         assert_eq!(required.len(), 1);
         assert_eq!(required[0], "topic");
     }

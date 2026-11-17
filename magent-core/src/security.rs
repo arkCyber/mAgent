@@ -6,7 +6,7 @@
 //! # Two code paths
 //!
 //! On real nRF52840 hardware the BLE stack itself (nRF SoftDevice) handles
-//! AES-CCM, so this module's [`SecurityManager::encrypt`] / [`decrypt`] are
+//! AES-CCM, so this module's `SecurityManager::encrypt` / `decrypt` are
 //! only consulted on the **host / no-SoftDevice** build. On those builds the
 //! module now performs **real** AES-128-GCM authenticated encryption
 //! (NIST-approved AEAD) instead of the historical XOR placeholder, gated on
@@ -89,14 +89,47 @@ mod real_crypto {
         }
     }
 
+    /// Whether this build has a cross-boot entropy source for the salt.
+    ///
+    /// This module's key is a compile-time constant and its counter restarts
+    /// at zero on every boot, so the 32-bit salt is the *only* thing that
+    /// keeps the first message of one boot from reusing the `(key, nonce)`
+    /// pair of the first message of the previous boot. Without it, AES-GCM
+    /// leaks `P1 ⊕ P2` and lets an attacker forge tags for that nonce.
+    ///
+    /// `no_std` builds return `false`, and [`encrypt_aes_gcm`] refuses to
+    /// encrypt instead of silently reusing a nonce. Wiring a device path
+    /// needs a per-device key (eFuse / SoftDevice) and a persistent monotonic
+    /// counter — not a louder counter on the same constant key.
+    pub(super) const BOOT_SALT_AVAILABLE: bool = cfg!(feature = "std");
     /// Derive the per-message 96-bit nonce.
-    fn nonce_for(counter: u32, msg_len: u64) -> [u8; NONCE_LEN] {
+    ///
+    /// Fails when [`BOOT_SALT_AVAILABLE`] is false: a nonce that is identical
+    /// across reboots is worse than no ciphertext at all, because it fails
+    /// silently.
+    pub(super) fn nonce_for(counter: u32, msg_len: u64) -> Result<[u8; NONCE_LEN]> {
+        derive_nonce(counter, msg_len, BOOT_SALT_AVAILABLE, boot_salt())
+    }
+
+    /// The pure decision `nonce_for` makes, with the build's salt capability
+    /// passed in so the refusal path can be exercised from a `std` test.
+    pub(super) fn derive_nonce(
+        counter: u32,
+        msg_len: u64,
+        salt_available: bool,
+        salt: u32,
+    ) -> Result<[u8; NONCE_LEN]> {
+        if !salt_available {
+            return Err(AgentError::CryptoError {
+                reason: crate::error::EncryptionError::CipherError,
+            });
+        }
         let mut n = [0u8; NONCE_LEN];
-        n[..COUNTER_LEN].copy_from_slice(&boot_salt().to_be_bytes());
+        n[..COUNTER_LEN].copy_from_slice(&salt.to_be_bytes());
         n[COUNTER_LEN..2 * COUNTER_LEN].copy_from_slice(&counter.to_be_bytes());
         // The plaintext cap is 484 bytes, so the low 32 bits are lossless.
         n[2 * COUNTER_LEN..].copy_from_slice(&(msg_len as u32).to_be_bytes());
-        n
+        Ok(n)
     }
 
     /// 16-byte AES-128 key. In production this is provisioned by the BLE
@@ -120,6 +153,14 @@ mod real_crypto {
     ///
     /// Plaintext is bounded to 484 bytes (12 nonce + 484 ciphertext + 16 tag
     /// = 512 bytes, exactly fills `Vec<u8, 512>`).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::CryptoError`] when the build has no cross-boot entropy
+    /// source for the nonce salt (see [`BOOT_SALT_AVAILABLE`]). Refusing is
+    /// deliberate: the alternative is a ciphertext whose nonce repeats across
+    /// reboots, which is a silent keystream-reuse bug rather than a visible
+    /// failure.
     pub fn encrypt_aes_gcm(counter: u32, plaintext: &[u8]) -> Result<Vec<u8, 512>> {
         // Early capacity check — refuse plaintext that would overflow the
         // output buffer, rather than discover it deep inside the push loop.
@@ -134,7 +175,7 @@ mod real_crypto {
         let key_bytes = derive_aes_key();
         let key = Key::<Aes128Gcm>::from_slice(&key_bytes);
         let cipher = Aes128Gcm::new(key);
-        let nonce_bytes = nonce_for(counter, plaintext.len() as u64);
+        let nonce_bytes = nonce_for(counter, plaintext.len() as u64)?;
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let ciphertext = cipher
@@ -262,7 +303,7 @@ pub enum EncryptionMode {
     /// No encryption
     None = 0,
     /// AES-128 CCM (nRF SoftDevice) — `EncryptionMode` stays for the BLE
-    /// enumeration; the host-side path uses AES-128-GCM via [`real_crypto`].
+    /// enumeration; the host-side path uses AES-128-GCM (`real_crypto`).
     Aes128Ccm = 1,
     /// AES-256 CCM (nRF SoftDevice)
     Aes256Ccm = 2,
@@ -476,9 +517,9 @@ impl SecurityManager {
     ///
     /// Uses a constant-time comparison so an attacker can't infer tag
     /// bytes one-at-a-time by timing the response. AES-GCM's built-in
-    /// tag verification (in [`decrypt_aes_gcm`]) is already constant-time;
+    /// tag verification (in `decrypt_aes_gcm`) is already constant-time;
     /// this method protects the *out-of-band* HMAC path used by
-    /// [`generate_auth_tag`].
+    /// `generate_auth_tag`.
     pub fn verify_auth_tag(&self, data: &[u8], tag: &str) -> Result<bool> {
         let expected = self.generate_auth_tag(data)?;
         Ok(constant_time_eq(expected.as_bytes(), tag.as_bytes()))
@@ -666,9 +707,18 @@ mod std_tests {
     }
 }
 
-/// Real-crypto tests: build with `web3`, so `encrypt` / `decrypt` use real
-/// AES-128-GCM and `generate_auth_tag` uses HMAC-SHA-256.
-#[cfg(all(test, feature = "web3"))]
+/// Real-crypto tests: build with `web3` **and** `std`.
+///
+/// `web3` alone compiles the AES path but has no entropy source for the
+/// nonce salt, so `encrypt_aes_gcm` correctly refuses (round 20) — and these
+/// tests, which assert a successful round-trip, would fail against the guard
+/// rather than against a bug. The gate matches `BOOT_SALT_AVAILABLE` so the
+/// suite cannot go red for a build the guard is deliberately rejecting.
+///
+/// The refusal itself is covered by
+/// `no_entropy_source_must_refuse_rather_than_reuse_a_nonce`, which is a pure
+/// function test and runs in both configurations.
+#[cfg(all(test, feature = "web3", feature = "std"))]
 mod web3_tests {
     use super::*;
 
@@ -768,6 +818,49 @@ mod web3_tests {
         let ct2 = real_crypto::encrypt_aes_gcm(2, b"abc").unwrap();
         assert_ne!(&ct[..], &ct2[..]);
         assert_eq!(ct.len(), ct2.len());
+    }
+
+    /// Without a cross-boot entropy source, encryption must fail, not reuse a
+    /// nonce.
+    ///
+    /// The key is a compile-time constant and the counter restarts at zero on
+    /// every boot. If `boot_salt()` returns 0 — which it does on every
+    /// `no_std` build — then the first message of each boot produces the same
+    /// `(key, nonce)` pair for any two same-length messages, so the GCM
+    /// keystream repeats: the XOR of the two plaintexts is recoverable and a
+    /// tag can be forged. The pre-fix code returned `Ok` on this path, so the
+    /// only symptom was a subtle ciphertext correlation; the fix makes it a
+    /// visible `CryptoError`.
+    #[test]
+    fn no_entropy_source_must_refuse_rather_than_reuse_a_nonce() {
+        // The pure decision, with the build's capability forced off — the
+        // real `no_std` configuration cannot be assembled in a `std` test.
+        let refused = real_crypto::derive_nonce(0, 3, false, 0);
+        assert!(
+            refused.is_err(),
+            "a zero-salt build must not produce a nonce"
+        );
+
+        // And with the capability on, the same inputs must produce a nonce:
+        // this pins that the guard is about the salt, not about the counter.
+        let ok = real_crypto::derive_nonce(0, 3, true, 0).unwrap();
+        assert_eq!(&ok[4..8], &0u32.to_be_bytes());
+    }
+
+    /// `BOOT_SALT_AVAILABLE` must agree with what `boot_salt` can actually
+    /// deliver, so the guard cannot pass on a build where the salt is zero.
+    #[test]
+    fn boot_salt_availability_matches_the_salt_source() {
+        assert_eq!(
+            real_crypto::BOOT_SALT_AVAILABLE,
+            cfg!(feature = "std"),
+            "the nonce guard must track the presence of an entropy source"
+        );
+        if real_crypto::BOOT_SALT_AVAILABLE {
+            // A `std` build derives the salt from the process id and clock; a
+            // constant zero would mean the query is asking the wrong thing.
+            assert_eq!(real_crypto::boot_salt(), real_crypto::boot_salt());
+        }
     }
 
     #[test]

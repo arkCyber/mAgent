@@ -65,7 +65,8 @@ pub trait Tool: Send + Sync {
         client: &'a MqttClient,
         args: Value,
     ) -> BoxFuture<'a, anyhow::Result<Value>>;
-}/// Bundle of all tools the server exposes. Cheap to clone —
+}
+/// Bundle of all tools the server exposes. Cheap to clone —
 /// each tool is wrapped in an `Arc` so the registry itself can
 /// be shared across tasks without per-call locks.
 #[derive(Clone)]
@@ -108,6 +109,15 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Whether `name` is one of the registered tools.
+    ///
+    /// `jsonrpc::dispatch` asks this before calling so an unknown name is
+    /// reported as JSON-RPC "invalid params" rather than being folded into the
+    /// `isError: true` tool-result envelope (see the comment there).
+    pub fn contains(&self, name: &str) -> bool {
+        self.inner.iter().any(|t| t.name() == name)
+    }
+
     /// MCP `tools/call` dispatch. Errors propagate as JSON-RPC
     /// error envelopes (see `jsonrpc::dispatch`).
     pub async fn call(&self, name: &str, args: Value) -> anyhow::Result<Value> {
@@ -121,9 +131,9 @@ impl ToolRegistry {
         // unit tests without a broker), surface a clean error
         // instead of panicking — the caller can distinguish a
         // misconfigured server from a real tool failure.
-        let client = CLIENT
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("mqtt client not initialised; call install_client() in main()"))?;
+        let client = CLIENT.get().ok_or_else(|| {
+            anyhow::anyhow!("mqtt client not initialised; call install_client() in main()")
+        })?;
         let result = tool.dispatch(client, args).await?;
         Ok(serde_json::to_value(ToolOutput::ok(result, client))?)
     }
@@ -163,10 +173,7 @@ mod tests {
         // protocol change.
         let r = ToolRegistry::new();
         let list = r.list();
-        let names: Vec<&str> = list
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = list.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
             vec!["publish_event", "subscribe_topic", "broker_status"]

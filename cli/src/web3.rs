@@ -164,6 +164,11 @@ pub enum Web3CliError {
     /// The user tried to read a payload from stdin but stdin was
     /// empty / not a pipe.
     EmptyStdin,
+    /// A result record could not be rendered as JSON. The display
+    /// records are all built from validated data, so this is a "should
+    /// not happen" — but reporting it beats printing nothing and
+    /// exiting 0, which is what the old `unwrap_or_default()` did.
+    Serialise(String),
 }
 
 impl std::fmt::Display for Web3CliError {
@@ -212,6 +217,9 @@ impl std::fmt::Display for Web3CliError {
                 f,
                 "no payload on stdin (pass --payload <FILE> or pipe data)"
             ),
+            Web3CliError::Serialise(msg) => {
+                write!(f, "could not render the result as JSON: {}", msg)
+            }
         }
     }
 }

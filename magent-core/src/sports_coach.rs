@@ -10,7 +10,9 @@
 //! to optimize workout effectiveness and safety.
 
 use crate::error::try_heapless;
-use crate::health_sensors::{HealthSensorManager, HeartRateData, HeartRateZone, TemperatureData};
+use crate::health_sensors::{
+    HealthSensorManager, HeartRateData, HeartRateZone, TemperatureData, UserProfile,
+};
 use core::fmt::Write;
 use heapless::{String, Vec};
 use serde::{Deserialize, Serialize};
@@ -311,8 +313,31 @@ pub struct SportsCoach {
     last_breathing_correction_s: u32,
     /// Last encouragement time
     last_encouragement_s: u32,
+    /// Last danger-zone warning time, or `None` if none has been raised.
+    ///
+    /// `None` means *never raised*, not *raised at t=0*. A plain `u32` starting
+    /// at 0 made the first check `0.saturating_sub(0) > 30` — false — so the
+    /// warning was suppressed during the first 30 s of every session, exactly
+    /// when a high heart rate matters most.
+    last_danger_warning_s: Option<u32>,
     /// Consecutive high HR corrections
     high_hr_streak: u8,
+    /// `target_intensity` as it was before any environmental / health
+    /// adjustments.
+    ///
+    /// `adjust_goal_for_conditions` used to multiply the *current* intensity
+    /// on every call, so a sustained hot day floored it at 0.30 after six
+    /// calls and appended the same reason six times. Recomputing from a
+    /// retained baseline makes the function idempotent for a given set of
+    /// conditions, which is what its name implies.
+    intensity_baseline: Option<f32>,
+    /// The user's age and maximum heart rate, when known.
+    ///
+    /// The zone used to be computed from a hard-coded 30-year-old, so a
+    /// 70-year-old at 145 BPM (97 % of a 150 max) read as `Cardio` and the
+    /// danger warning never fired. `None` keeps the old behaviour for callers
+    /// that have no profile.
+    profile: Option<UserProfile>,
 }
 
 impl SportsCoach {
@@ -326,7 +351,10 @@ impl SportsCoach {
             messages: Vec::new(),
             last_breathing_correction_s: 0,
             last_encouragement_s: 0,
+            last_danger_warning_s: None,
             high_hr_streak: 0,
+            intensity_baseline: None,
+            profile: None,
         }
     }
 
@@ -350,6 +378,23 @@ impl SportsCoach {
         self.goal = goal;
     }
 
+    /// Attach the user profile so zones use their real maximum heart rate.
+    ///
+    /// Without it every zone is computed for a 30-year-old, which suppresses
+    /// the danger warning for older or lower-max-HR users and fires it early
+    /// for athletes.
+    pub fn set_profile(&mut self, profile: UserProfile) {
+        self.profile = Some(profile);
+    }
+
+    /// The zone of a reading under this coach's profile.
+    fn zone_of(&self, hr_data: &HeartRateData) -> HeartRateZone {
+        match self.profile.as_ref() {
+            Some(profile) => hr_data.zone_for_profile(profile),
+            None => hr_data.zone(),
+        }
+    }
+
     /// Start exercise session
     pub fn start_session(&mut self) {
         self.state = ExerciseState::WarmUp;
@@ -363,6 +408,12 @@ impl SportsCoach {
         // correction the instant the session starts.
         self.last_encouragement_s = 0;
         self.last_breathing_correction_s = 0;
+        // Same reason, and the one that mattered most: `last_danger_warning_s`
+        // records a *duration*, so leaving the previous session's value behind
+        // makes `0.saturating_sub(500)` clip to 0 and the gate stays shut for
+        // 531 s — the danger warning was silent for the first nine minutes of
+        // every session after the first. `None` restores "never raised".
+        self.last_danger_warning_s = None;
 
         let msg = CoachingMessage::new(
             CoachingMessageType::StartExercise,
@@ -392,11 +443,25 @@ impl SportsCoach {
     ) {
         let mut adjusted = false;
 
+        // Recompute from the baseline, never from the last adjusted value.
+        // Multiplying in place made this non-idempotent: six calls on a hot
+        // day took 0.65 → 0.65·0.85⁶ and floored it at 0.30, and each call
+        // appended its reason again until the 8-entry buffer filled with
+        // duplicates. With a retained baseline, the same conditions always
+        // produce the same goal.
+        let baseline = *self
+            .intensity_baseline
+            .get_or_insert(self.goal.target_intensity);
+        let mut intensity = baseline;
+        // `adjustments` describe the *current* result, so they are rebuilt
+        // each pass rather than appended to.
+        self.goal.adjustments.clear();
+
         // Temperature adjustment
         if env_temp_c > 30.0 {
             // Reduce intensity in hot weather
-            if self.goal.target_intensity > 0.5 {
-                self.goal.target_intensity *= 0.85;
+            if intensity > 0.5 {
+                intensity *= 0.85;
                 self.goal.add_adjustment("Hot weather - reduced intensity");
                 adjusted = true;
             }
@@ -410,7 +475,7 @@ impl SportsCoach {
         if let Some(avg_hrv) = health_mgr.average_hrv(10) {
             if avg_hrv < 30.0 {
                 // Low HRV indicates fatigue - reduce intensity
-                self.goal.target_intensity *= 0.8;
+                intensity *= 0.8;
                 self.goal
                     .add_adjustment("Low HRV - reduced intensity for recovery");
                 adjusted = true;
@@ -420,10 +485,18 @@ impl SportsCoach {
         // Recent exercise adjustment (prevent overtraining)
         let recent_hr = health_mgr.latest_heart_rate();
         if let Some(hr_data) = recent_hr {
-            if hr_data.hr > 150 && hr_data.zone() == HeartRateZone::Cardio {
+            // `hr_data.zone() == Cardio` was an *equality* test against a
+            // single band. With the age-30 assumption Cardio is 133–151 BPM,
+            // so the guard `hr > 150 && zone() == Cardio` could only ever be
+            // true at exactly 151 — a Peak or Danger reading (152+) fell to
+            // the `else` branch and *reset* the streak, so the highest heart
+            // rates never produced the "sustained high HR" warning. Test the
+            // band as a lower bound instead.
+            let in_high_band = self.zone_of(hr_data) >= HeartRateZone::Cardio && hr_data.hr > 150;
+            if in_high_band {
                 self.high_hr_streak = self.high_hr_streak.saturating_add(1);
                 if self.high_hr_streak > 3 {
-                    self.goal.target_intensity *= 0.9;
+                    intensity *= 0.9;
                     self.goal
                         .add_adjustment("High HR sustained - reduced intensity");
                     self.add_warning("心率持续偏高，建议降低运动强度。");
@@ -435,9 +508,13 @@ impl SportsCoach {
         }
 
         if adjusted {
-            // Clamp intensity to valid range
-            self.goal.target_intensity = self.goal.target_intensity.clamp(0.3, 0.95);
+            // Clamp intensity to valid range.
+            intensity = intensity.clamp(0.3, 0.95);
         }
+        // Always write the recomputed value, so a condition that has *cleared*
+        // restores the baseline instead of leaving the last reduction in
+        // place — the other half of being idempotent.
+        self.goal.target_intensity = intensity;
     }
 
     /// Calculate personalized goal based on fitness history
@@ -503,7 +580,7 @@ impl SportsCoach {
     ) {
         self.session_duration_s = self.session_duration_s.saturating_add(delta_s);
 
-        let zone = hr_data.zone();
+        let zone = self.zone_of(hr_data);
 
         // Update state based on session progress
         match self.state {
@@ -571,8 +648,18 @@ impl SportsCoach {
             let _ = self.messages.push(msg);
         }
 
-        // Warning for danger zone
-        if zone == HeartRateZone::Danger {
+        // Warning for danger zone. Gated on the same 30 s interval the
+        // breathing correction uses: `update` runs on every sensor sample, and
+        // this warning used to be queued each time. The message buffer holds
+        // 16 entries, so twenty samples at 190 BPM filled it with duplicates
+        // and the *later* warnings (fever, session end) were dropped without a
+        // trace.
+        if zone == HeartRateZone::Danger
+            && self
+                .last_danger_warning_s
+                .is_none_or(|last| self.session_duration_s.saturating_sub(last) > 30)
+        {
+            self.last_danger_warning_s = Some(self.session_duration_s);
             let msg = CoachingMessage::new(
                 CoachingMessageType::Warning,
                 "警告！心率过高，请立即停止运动并休息。",
@@ -581,9 +668,15 @@ impl SportsCoach {
             let _ = self.messages.push(msg);
         }
 
-        // Environment-based warning
+        // Environment-based warning.
+        //
+        // `is_elevated`, not `has_fever`: a skin sensor reports "warmer than
+        // usual", and `has_fever` is deliberately `false` for skin readings
+        // (a wrist sensor cannot establish a core temperature). Using
+        // `has_fever` here meant an escalated core threshold was applied to a
+        // skin reading *and* that no skin warning could ever fire.
         if let Some(temp) = temp_data {
-            if temp.has_fever() {
+            if temp.is_elevated() {
                 let msg = CoachingMessage::new(
                     CoachingMessageType::Warning,
                     "体温偏高，建议降低运动强度或暂停运动。",
@@ -642,7 +735,7 @@ impl Default for SportsCoach {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health_sensors::{HealthSensorManager, TemperatureData};
+    use crate::health_sensors::{HealthSensorManager, TemperatureData, TemperatureSite};
 
     fn hr_data(hr: u16, ts: u32) -> HeartRateData {
         HeartRateData {
@@ -805,6 +898,63 @@ mod tests {
         assert!(coach.goal().adjustments.iter().any(|a| a.contains("Hot")));
     }
 
+    /// Calling the adjustment repeatedly must not compound.
+    ///
+    /// It multiplied the *current* intensity in place, so a sustained hot day
+    /// took 0.65 → 0.30 over six calls and appended the same reason each
+    /// time until the 8-entry buffer held nothing else. The function now
+    /// recomputes from a retained baseline.
+    #[test]
+    fn adjusting_for_the_same_conditions_is_idempotent() {
+        let mut coach = SportsCoach::new();
+        let health = HealthSensorManager::default();
+        coach.adjust_goal_for_conditions(&health, 35.0);
+        let once = coach.goal().target_intensity;
+        let reasons_once = coach.goal().adjustments.len();
+        assert!(reasons_once > 0);
+
+        for _ in 0..6 {
+            coach.adjust_goal_for_conditions(&health, 35.0);
+        }
+        assert!(
+            (coach.goal().target_intensity - once).abs() < 1e-6,
+            "six more calls changed intensity from {once} to {}",
+            coach.goal().target_intensity
+        );
+        assert_eq!(
+            coach.goal().adjustments.len(),
+            reasons_once,
+            "the same conditions must not accumulate duplicate reasons: {:?}",
+            coach.goal().adjustments
+        );
+    }
+
+    /// When the condition clears, the intensity returns to its baseline.
+    ///
+    /// The other half of idempotency: the old code never restored a
+    /// reduction, so one hot afternoon permanently lowered the goal.
+    #[test]
+    fn a_cleared_condition_restores_the_baseline_intensity() {
+        let mut coach = SportsCoach::new();
+        let health = HealthSensorManager::default();
+        let baseline = coach.goal().target_intensity;
+
+        coach.adjust_goal_for_conditions(&health, 35.0);
+        assert!(coach.goal().target_intensity < baseline);
+
+        coach.adjust_goal_for_conditions(&health, 22.0);
+        assert!(
+            (coach.goal().target_intensity - baseline).abs() < 1e-6,
+            "a normal day must restore {baseline}, got {}",
+            coach.goal().target_intensity
+        );
+        assert!(
+            !coach.goal().adjustments.iter().any(|a| a.contains("Hot")),
+            "the stale reason must be dropped: {:?}",
+            coach.goal().adjustments
+        );
+    }
+
     #[test]
     fn adjust_goal_extends_warmup_in_cold_weather() {
         let mut coach = SportsCoach::new();
@@ -922,6 +1072,125 @@ mod tests {
             .any(|m| m.msg_type == CoachingMessageType::Warning));
     }
 
+    /// The danger warning is rate-limited, and the *first* one still fires.
+    ///
+    /// A plain `u32` starting at 0 made the first check `0 - 0 > 30` false, so
+    /// the warning was suppressed for the first 30 s of every session. Without
+    /// a limit, twenty samples at 190 BPM filled the 16-entry buffer with
+    /// duplicates and later warnings (fever, session end) were dropped.
+    #[test]
+    fn the_first_danger_warning_fires_and_repeats_are_rate_limited() {
+        let mut coach = SportsCoach::new();
+        // First sample at session second 0 must warn.
+        coach.update(&hr_data(190, 0), None, 0);
+        let first = coach.get_messages();
+        let danger_count = |msgs: &heapless::Vec<CoachingMessage, 16>| {
+            msgs.iter()
+                .filter(|m| m.msg_type == CoachingMessageType::Warning)
+                .count()
+        };
+        assert_eq!(danger_count(&first), 1, "the first danger sample must warn");
+
+        // Two samples 5 s apart: still inside the 30 s gate, so no repeat.
+        for t in [5, 10] {
+            coach.update(&hr_data(190, 5), None, t);
+        }
+        assert_eq!(
+            danger_count(&coach.get_messages()),
+            0,
+            "a repeat inside the 30 s window must not re-warn"
+        );
+
+        // Past 30 s it warns again.
+        coach.update(&hr_data(190, 5), None, 31);
+        assert_eq!(danger_count(&coach.get_messages()), 1);
+    }
+
+    /// An older user's danger warning must fire at their own maximum HR.
+    ///
+    /// The zone was always computed for a 30-year-old (max 190), so a
+    /// 70-year-old at 145 BPM — 97 % of a 150 max — landed in `Cardio` and
+    /// the medical "stop and rest" warning never fired. `set_profile` makes
+    /// the coach use the real maximum.
+    #[test]
+    fn the_danger_warning_uses_the_users_max_heart_rate() {
+        let mut coach = SportsCoach::new();
+        coach.set_profile(UserProfile {
+            age: 70,
+            max_hr: 150,
+            ..UserProfile::default()
+        });
+        coach.start_session();
+
+        // 145 BPM is 96.7 % of 150 → Danger for this user, but only 76 % of
+        // the 190 the default assumed.
+        coach.update(&hr_data(145, 0), None, 1);
+        let msgs = coach.get_messages();
+        assert!(
+            msgs.iter().any(|m| m.msg_type == CoachingMessageType::Warning),
+            "145 BPM for a 150 max must raise the danger warning: {msgs:?}"
+        );
+
+        // A young athlete at the same rate must not be warned.
+        let mut coach = SportsCoach::new();
+        coach.set_profile(UserProfile {
+            age: 25,
+            max_hr: 200,
+            ..UserProfile::default()
+        });
+        coach.start_session();
+        coach.update(&hr_data(145, 0), None, 1);
+        let msgs = coach.get_messages();
+        assert!(
+            !msgs.iter().any(|m| m.msg_type == CoachingMessageType::Warning),
+            "145 BPM is 72 % for a 200 max and must not warn: {msgs:?}"
+        );
+    }
+
+    /// Without a profile the behaviour is unchanged (30-year-old default).
+    #[test]
+    fn no_profile_keeps_the_documented_default_zone() {
+        let coach = SportsCoach::new();
+        let reading = hr_data(190, 0);
+        assert_eq!(coach.zone_of(&reading), reading.zone());
+    }
+
+    /// A new session must re-arm the danger warning immediately.
+    ///
+    /// `last_danger_warning_s` stores a *session duration*. If it survives
+    /// `start_session`, the first update of the next session computes
+    /// `0.saturating_sub(500)` → 0, which is not `> 30`, so a Danger-zone
+    /// reading raises no warning for the next 531 s. That is the same
+    /// "silent at the start" defect the `Option` was introduced to remove,
+    /// just deferred to the second session.
+    #[test]
+    fn a_restarted_session_rearms_the_danger_warning() {
+        let mut coach = SportsCoach::new();
+        coach.start_session();
+        // Raise the warning late in the first session (200 BPM ≈ Danger for
+        // the synthetic 30-year-old profile `zone()` assumes).
+        coach.update(&hr_data(200, 0), None, 500);
+        assert!(coach
+            .get_messages()
+            .iter()
+            .any(|m| m.msg_type == CoachingMessageType::Warning));
+
+        // A new session starts with the clock at zero. `get_messages` drains
+        // the buffer, so drain the first session's output first.
+        let _ = coach.get_messages();
+        coach.start_session();
+        coach.update(&hr_data(200, 0), None, 1);
+
+        let new_msgs = coach.get_messages();
+        assert!(
+            new_msgs
+                .iter()
+                .any(|m| m.msg_type == CoachingMessageType::Warning),
+            "the danger warning must fire in the first second of a new session, \
+             not 531 s in: {new_msgs:?}"
+        );
+    }
+
     #[test]
     fn restarting_a_session_resets_the_interval_timers() {
         let mut coach = SportsCoach::new();
@@ -953,12 +1222,46 @@ mod tests {
     fn update_emits_fever_warning() {
         let mut coach = SportsCoach::new();
         coach.start_session();
-        let temp = TemperatureData::new(38.5, 0); // > 37.5 → fever
+        let temp = TemperatureData::new(38.5, 0); // core, > 37.5 → fever
         coach.update(&hr_data(120, 0), Some(&temp), 10);
         let msgs = coach.get_messages();
         assert!(msgs
             .iter()
             .any(|m| m.msg_type == CoachingMessageType::Warning));
+    }
+
+    /// A warm skin reading warns as "elevated", not as a fever.
+    ///
+    /// The coach used `has_fever()`, which applies core thresholds to a skin
+    /// sensor: a normal 34 °C skin reading was neither normal nor a fever,
+    /// and an exercised 38 °C skin reading claimed a fever the sensor cannot
+    /// measure. Same warning text, honest basis.
+    #[test]
+    fn a_warm_skin_reading_warns_on_its_own_scale() {
+        let mut coach = SportsCoach::new();
+        coach.start_session();
+        // 36.5 °C skin: above the 32–36 skin band, far below a core fever.
+        let skin = TemperatureData::at_site(36.5, TemperatureSite::Skin, 0);
+        coach.update(&hr_data(120, 0), Some(&skin), 10);
+        let msgs = coach.get_messages();
+        assert!(
+            msgs.iter()
+                .any(|m| m.msg_type == CoachingMessageType::Warning),
+            "a warm skin reading must still warn: {msgs:?}"
+        );
+
+        // A normal skin reading must not.
+        let mut coach = SportsCoach::new();
+        coach.start_session();
+        let normal = TemperatureData::at_site(34.0, TemperatureSite::Skin, 0);
+        coach.update(&hr_data(120, 0), Some(&normal), 10);
+        let msgs = coach.get_messages();
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.msg_type == CoachingMessageType::Warning),
+            "34 °C skin is normal and must not warn: {msgs:?}"
+        );
     }
 
     #[test]

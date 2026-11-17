@@ -63,7 +63,9 @@ mod tests {
         // silently ignored.
         let schema = BrokerStatusTool.input_schema();
         assert_eq!(schema["type"], "object");
-        assert!(schema.get("required").is_none() || schema["required"].as_array().unwrap().is_empty());
+        assert!(
+            schema.get("required").is_none() || schema["required"].as_array().unwrap().is_empty()
+        );
         assert_eq!(schema["additionalProperties"], false);
     }
 }

@@ -976,7 +976,7 @@ fn execute_daemon(
         if now_secs() >= next_tick {
             match &schedule {
                 DaemonSchedule::Once { .. } => {
-                    run_one_tick(tasks, out);
+                    run_one_tick(tasks, out, true)?;
                     let _ = out.trace_labeled(
                         "scheduler",
                         "one-shot complete; exiting daemon",
@@ -984,11 +984,11 @@ fn execute_daemon(
                     return Ok(());
                 }
                 DaemonSchedule::Interval { secs } => {
-                    run_one_tick(tasks, out);
+                    run_one_tick(tasks, out, false)?;
                     next_tick = now_secs().saturating_add(*secs);
                 }
                 DaemonSchedule::Cron(expr) => {
-                    run_one_tick(tasks, out);
+                    run_one_tick(tasks, out, false)?;
                     let spec = CronSpec::parse(expr).map_err(|e| {
                         SchedulerError::InvalidCron(format!("{:?}: {}", expr, e))
                     })?;
@@ -1017,26 +1017,42 @@ fn execute_daemon(
     }
 }
 
-/// Run a single iteration of the daemon loop and return the
-/// per-tick errors so the caller can decide whether to keep going.
-/// Errors are logged but never propagated — a flaky LLM backend
-/// shouldn't take the whole daemon down.
-fn run_one_tick(tasks: &[ScheduledTask], out: &mut Output) {
+/// Run a single iteration of the daemon loop.
+///
+/// A *task* failure is absorbed **for a repeating schedule**: the daemon
+/// has no caller to report it to, the next tick may well succeed, and it is
+/// already on a `FAILED:` line plus in the state file.
+///
+/// An [`DaemonSchedule::Once`] tick is different — it is the last thing the
+/// process will do, so its outcome *is* the exit status. Returning `Ok`
+/// there made `scheduler daemon --at …` exit 0 whether or not the queued
+/// tasks succeeded, while the equivalent `run-once` exited 1.
+///
+/// A *bookkeeping* failure (the state file cannot be read or written) is
+/// always propagated — see the match below for why.
+fn run_one_tick(
+    tasks: &[ScheduledTask],
+    out: &mut Output,
+    is_final_tick: bool,
+) -> Result<(), SchedulerError> {
     // A daemon tick lives inside a long-running process: writing one JSON
     // document per tick violates the "stdout is exactly one document"
     // contract (`jq` fails on the concatenation). The final outcome is
     // reported by `main` when the daemon exits (normal or interrupted).
     match execute_run_once(tasks, out, false) {
-        Ok(()) => {}
-        // `run-once` reports task failures through its exit code; the
-        // daemon has no caller to report to, and each failure is
-        // already on a `FAILED:` line plus in the state file. Logging
-        // it again as a "tick error" would suggest the tick itself
-        // broke, which is a different (and actionable) thing.
-        Err(SchedulerError::TasksFailed { .. }) => {}
-        Err(e) => {
-            let _ = out.trace_labeled("scheduler", &format!("tick error: {}", e));
-        }
+        Ok(()) => Ok(()),
+        // A failing task in a repeating schedule is absorbed: the next tick
+        // may well succeed, and the failure is already on a `FAILED:` line
+        // and in the state file. In a one-shot run it is the process's
+        // outcome and must reach the exit code.
+        Err(SchedulerError::TasksFailed { .. }) if !is_final_tick => Ok(()),
+        // Everything else means *bookkeeping* broke — the state file could
+        // not be read or written. That is not a task failure, and it must not
+        // be swallowed: `run-once` (and with it the daemon) returns this
+        // error so the exit code says the run's counters were lost, instead
+        // of a daemon looping forever against an unwritable state file while
+        // reporting every tick as if it had been recorded.
+        Err(e) => Err(e),
     }
 }
 

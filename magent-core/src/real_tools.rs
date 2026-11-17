@@ -8,7 +8,7 @@
 use crate::agent_runner::ToolExecutor;
 use crate::error::Result;
 use crate::simulator::AgentSimulator;
-use std::string::String;
+use std::string::{String, ToString};
 
 /// Test executor that uses the full simulator
 pub struct SimulatorExecutor {
@@ -62,9 +62,14 @@ impl Default for SimulatorExecutor {
 
 impl ToolExecutor for SimulatorExecutor {
     fn execute(&mut self, tool: &str, args: &str) -> std::result::Result<String, String> {
-        self.simulator
-            .execute_tool(tool, args)
-            .map_err(|e| format!("{:?}", e))
+        self.simulator.execute_tool(tool, args).map_err(|e| {
+            // `Display`, not `Debug`. The model reads this string (the runner
+            // wraps it as `Error: …` and feeds it back), and `Debug` renders
+            // `ToolFailed { tool: "fetch_url", message: "refusing non-public
+            // address: 127.0.0.1" }` — a Rust enum dump instead of the
+            // sentence the model needs to act on.
+            e.to_string()
+        })
     }
 }
 
@@ -84,6 +89,25 @@ mod tests {
             .expect("the advertised sleep tool must not hard-fail on the CLI backend");
         assert!(out.contains("score"), "no score in {out:?}");
         assert!(out.contains("last 7 nights avg"), "no trend in {out:?}");
+    }
+
+    /// The error string is handed to the model as `Error: {s}`. It must be
+    /// the human-readable message, not `ToolFailed { tool: …, message: … }`
+    /// — a Rust enum dump the model cannot act on.
+    #[test]
+    fn a_tool_error_reaches_the_model_as_a_sentence() {
+        let mut exec = SimulatorExecutor::new();
+        let err = exec
+            .execute("fetch_url", r#"{"url":"ftp://example.com/x"}"#)
+            .expect_err("a non-http URL must fail");
+        assert!(
+            !err.contains("ToolFailed") && !err.contains("message:"),
+            "the model must not receive a Debug dump: {err}"
+        );
+        assert!(
+            err.contains("fetch_url") && err.contains("non-http"),
+            "the message must name the tool and the reason: {err}"
+        );
     }
 
     #[test]

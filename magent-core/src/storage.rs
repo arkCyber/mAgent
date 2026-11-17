@@ -166,10 +166,47 @@ const MAX_COMPACT_ENTRIES: usize = 256;
 /// locate `value_len` at `1 + key_len` regardless of key size.
 const KV_HEADER_MAX: usize = 1 + 32 + 2;
 
+/// Largest scan buffer any KV path uses.
+///
+/// `MAX_VALUE_LEN` caps an entry at 293 bytes, so 512 covers an entry plus
+/// its pad; a program unit wider than this cannot be served at all and is
+/// refused rather than overflowing a bounded buffer.
+const MAX_SCAN_BUF: usize = 512;
+
 /// Maximum value length `set` will accept. Enforced on write and on
-/// header parse, so `entry_size` can never exceed `3 + 32 + 256 + 2 = 293`
-/// — comfortably inside the 512-byte scan buffers every reader uses.
+/// header parse, so the *raw* entry size can never exceed
+/// `3 + 32 + 256 + 2 = 293`, and the padded slot (see [`slot_size`]) stays
+/// inside the 512-byte scan buffers every reader uses.
 const MAX_VALUE_LEN: usize = 256;
+
+/// Round a raw entry size up to a whole number of program units.
+///
+/// `embedded_storage`'s `NorFlash::write` contract is that the offset and the
+/// length are both multiples of `WRITE_SIZE`; a real NOR part programs in
+/// words, and the ESP-IDF encrypted partition view advertises 16. The KV
+/// wire format is `3 + key_len + value_len + 2` bytes — almost never a
+/// multiple of 4 or 16 — so writing it through `FlashStorage::write`
+/// verbatim was rejected on every part whose `WRITE_SIZE` exceeded 1. The
+/// mock flash used by the tests reports `WRITE_SIZE = 1`, where the
+/// alignment guards are vacuous, which is why this stayed latent.
+///
+/// Padding (rather than changing the wire format) keeps already-written
+/// entries readable: the header is unchanged, readers stop after
+/// `entry_size` bytes, and the pad is erased flash (`0xFF`) that the next
+/// entry's start offset skips over.
+const fn slot_size(entry_size: usize, write_size: usize) -> usize {
+    // `WRITE_SIZE` is a compile-time constant of the part; treat a
+    // nonsensical zero as "byte-programmable" rather than dividing by it.
+    if write_size <= 1 {
+        return entry_size;
+    }
+    let rem = entry_size % write_size;
+    if rem == 0 {
+        entry_size
+    } else {
+        entry_size + (write_size - rem)
+    }
+}
 
 /// Decoded header of a single KV entry.
 ///
@@ -193,6 +230,12 @@ struct KvHeader {
 /// or a corrupt length (`0` or `> 32`), signalling the caller to stop
 /// scanning.
 ///
+/// Callers that *rewrite* the store (compaction) must go through
+/// [`read_entry_header`] instead, which distinguishes "erased" from
+/// "corrupt" — collapsing the two let a damaged header in the middle of the
+/// region read as end-of-store, and compaction then erased everything past
+/// that point without rewriting it.
+///
 /// `value_len` must also be rejected above [`MAX_VALUE_LEN`]. It is a
 /// full `u16` read straight out of flash, so without this check a
 /// corrupt-but-plausible header (valid key, garbage value length) yields
@@ -202,24 +245,134 @@ struct KvHeader {
 /// surfacing `StorageError::CorruptedData`. Every writer enforces the
 /// 256-byte cap in `set`, so an over-long `value_len` is always
 /// corruption — same policy as the `key_len` check above.
+#[cfg(test)]
 fn parse_kv_header(buf: &[u8]) -> Option<KvHeader> {
-    if buf.len() < KV_HEADER_MAX {
-        return None;
-    }
-    let key_len = buf[0];
+    parse_kv_header_within(buf, KV_HEADER_MAX)
+}
+
+/// Decode a header from `buf`, treating the entry as valid only if it lies
+/// entirely within `avail` bytes.
+///
+/// `buf` may be shorter than [`KV_HEADER_MAX`] when the region's tail is
+/// short; only the bytes the declared header actually needs are read. A
+/// header declaring an entry bigger than `avail` is corruption.
+fn parse_kv_header_within(buf: &[u8], avail: usize) -> Option<KvHeader> {
+    let key_len = *buf.first()? as usize;
     if key_len == 0 || key_len > 32 {
         return None; // erased (0xFF), tombstoned/corrupt (0), or corrupt
     }
-    let value_off = 1 + key_len as usize;
-    let value_len = u16::from_le_bytes([buf[value_off], buf[value_off + 1]]) as usize;
+    let header_end = 1 + key_len + 2;
+    if buf.len() < header_end {
+        return None;
+    }
+    let value_len = u16::from_le_bytes([buf[1 + key_len], buf[2 + key_len]]) as usize;
     if value_len > MAX_VALUE_LEN {
         return None; // corrupt value length (writers cap at MAX_VALUE_LEN)
     }
+    let entry_size = 3 + key_len + value_len + 2;
+    if entry_size > avail {
+        return None; // declares more bytes than the region holds
+    }
     Some(KvHeader {
-        key_len: key_len as usize,
+        key_len,
         value_len,
-        entry_size: 3 + key_len as usize + value_len + 2,
+        entry_size,
     })
+}
+
+/// What a header slot holds.
+///
+/// [`parse_kv_header`] folds `Erased` and `Corrupt` into `None`, which is
+/// correct for a read-only scan (both end the useful prefix) but wrong for
+/// compaction: treating a corrupt header mid-region as end-of-store made
+/// `collect_live` stop there, after which `erase_all` destroyed every live
+/// entry beyond it.
+enum HeaderSlot {
+    Erased,
+    Corrupt,
+    Live(KvHeader),
+}
+
+/// Read the header at `offset`, bounded by the region end, and classify it.
+///
+/// A KV region is not required to be a whole number of entries: the last entry
+/// may sit closer than [`KV_HEADER_MAX`] bytes to `capacity`. Reading a fixed
+/// 35-byte header there asks the flash for bytes the region does not own, and
+/// both the mock and real parts reject that as an I/O error — so a perfectly
+/// valid short tail entry turned a plain lookup into `StorageReadFailed`
+/// ("hardware fault") instead of being parsed. Only the bytes that are left
+/// are read here.
+///
+/// The three-way answer matters: a read-only scan treats both `Erased` and
+/// `Corrupt` as end-of-store, but compaction must not — it erases the region
+/// afterwards, so silently stopping at a damaged header would delete every
+/// entry past it. `Erased` also covers a tail too short to hold the header the
+/// slot begins, because that is the end of the used region rather than damage.
+fn read_entry_header<F: NorFlash>(
+    storage: &mut FlashStorage<F>,
+    base_address: u32,
+    offset: u32,
+    capacity: u32,
+    buf: &mut [u8; 512],
+) -> Result<HeaderSlot> {
+    let remaining = capacity.saturating_sub(offset) as usize;
+    if remaining == 0 {
+        return Ok(HeaderSlot::Erased);
+    }
+    // Read one byte first: `key_len` alone tells us how much of the header
+    // this entry actually declares, so a short *tail* entry is read exactly
+    // and never needs the full `KV_HEADER_MAX`.
+    storage
+        .read(base_address + offset, &mut buf[..1])
+        .map_err(|e| AgentError::StorageReadFailed {
+            address: base_address + offset,
+            reason: e.into_storage_error(),
+        })?;
+
+    // Erased slot: all 0xFF (checked over whatever remains, since a trailing
+    // run of erased bytes is empty space regardless of its length).
+    if buf[0] == 0xFF {
+        let erased_len = remaining.min(KV_HEADER_MAX);
+        storage
+            .read(base_address + offset, &mut buf[..erased_len])
+            .map_err(|e| AgentError::StorageReadFailed {
+                address: base_address + offset,
+                reason: e.into_storage_error(),
+            })?;
+        return Ok(if buf[..erased_len].iter().all(|&b| b == 0xFF) {
+            HeaderSlot::Erased
+        } else {
+            // A torn write: byte 0 erased, later bytes written.
+            HeaderSlot::Corrupt
+        });
+    }
+
+    let key_len = buf[0] as usize;
+    if key_len == 0 || key_len > 32 {
+        return Ok(HeaderSlot::Corrupt);
+    }
+    // `value_len` sits at `1 + key_len`, so the header needs
+    // `1 + key_len + 2` bytes. If the region ends before that, the entry
+    // cannot be here at all — that is the end of the used region, not damage.
+    let header_len = 1 + key_len + 2;
+    if remaining < header_len {
+        return Ok(HeaderSlot::Erased);
+    }
+    storage
+        .read(base_address + offset, &mut buf[..header_len])
+        .map_err(|e| AgentError::StorageReadFailed {
+            address: base_address + offset,
+            reason: e.into_storage_error(),
+        })?;
+    // One decoder for every caller: a header that decodes here is the same
+    // header `get`/`collect_live`/`get_stats` see.
+    match parse_kv_header_within(&buf[..header_len], remaining) {
+        Some(hdr) => Ok(HeaderSlot::Live(hdr)),
+        // The header itself parsed far enough to know `key_len`, so a failure
+        // here means the declared lengths are impossible — damage, not empty
+        // space. (A tail too short to hold the header returned above.)
+        None => Ok(HeaderSlot::Corrupt),
+    }
 }
 
 impl<F> KvStore<F>
@@ -231,7 +384,7 @@ where
     /// Precondition: `base_address` must be **sector-aligned**, and the store's
     /// region must end on a sector boundary. Every scan here bounds itself by
     /// `FlashStorage::capacity()` treated as a *length* from `base_address`, and
-    /// `compact` reclaims space with [`Self::erase_all`], which erases whole
+    /// `compact` reclaims space with `erase_all`, which erases whole
     /// sectors: with an unaligned `base_address` the first erased sector starts
     /// *before* the store, taking unrelated flash with it. Every current caller
     /// passes 0, where both hold trivially — the constraint is recorded here
@@ -273,22 +426,40 @@ where
         let mut found: Option<Vec<u8, 256>> = None;
 
         while offset < capacity {
-            // HARDENING (audit-2026-08 H1): previously a flash read
-            // error here was silently absorbed (`break` -> return
-            // `Ok(None)`), so a transient I/O fault on header byte 0
-            // looked identical to "key not present" to callers. We now
-            // propagate the underlying `AgentError` so callers can
-            // distinguish hardware failure from a legitimate miss.
-            self.storage
-                .read(self.base_address + offset, &mut buf[..KV_HEADER_MAX])
-                .map_err(|e| AgentError::StorageReadFailed {
-                    address: self.base_address + offset,
-                    reason: e.into_storage_error(),
-                })?;
-
-            // `buf[0] == 0xFF` (erased) or a corrupt length → end of store.
-            let Some(hdr) = parse_kv_header(&buf[..KV_HEADER_MAX]) else {
-                break;
+            // A read error is propagated, not absorbed as "key absent"
+            // (audit-2026-08 H1): callers must be able to tell a hardware
+            // fault from a legitimate miss. The header read is bounded by the
+            // region end so a short tail entry is not mistaken for one (see
+            // [`read_header_bounded`]).
+            let hdr = match read_entry_header(
+                &mut self.storage,
+                self.base_address,
+                offset,
+                capacity,
+                &mut buf,
+            )? {
+                // Empty space is the end of the used region.
+                HeaderSlot::Erased => break,
+                // Damage is *not* the end of the region: a torn write at this
+                // slot left every earlier entry intact and says nothing about
+                // the entries after it. Stopping here made all of them
+                // unreachable (`get` returned `None` for keys that were
+                // plainly on flash) — the same "damage reads as end-of-store"
+                // hazard the tri-state was introduced to close, still present
+                // on the read path.
+                //
+                // `parse_kv_header` reported `key_len` before failing, but the
+                // failure means the entry's extent is unknown, so the scan
+                // cannot simply step over it. Report the damage: a lookup must
+                // not silently invent "key absent" for a store whose layout is
+                // unreadable.
+                HeaderSlot::Corrupt => {
+                    return Err(AgentError::StorageReadFailed {
+                        address: self.base_address + offset,
+                        reason: StorageError::CorruptedData,
+                    })
+                }
+                HeaderSlot::Live(hdr) => hdr,
             };
             let key_len = hdr.key_len;
             let value_len = hdr.value_len;
@@ -301,7 +472,6 @@ where
                     address: self.base_address + offset,
                     reason: e.into_storage_error(),
                 })?;
-
             // Check if key matches (key starts at byte 1, after key_len).
             let stored_key = &buf[1..1 + key_len];
             if stored_key == key.as_bytes() {
@@ -338,7 +508,7 @@ where
                 found = Some(result);
             }
 
-            offset += entry_size as u32;
+            offset += slot_size(entry_size, self.storage.page_size()) as u32;
         }
 
         Ok(found)
@@ -375,6 +545,9 @@ where
 
         // Calculate entry size
         let entry_size = 3 + key_len as usize + value_len as usize + 2;
+        // The slot is what the flash actually consumes: the entry rounded up
+        // to a whole program unit (see [`slot_size`]).
+        let slot = slot_size(entry_size, self.storage.page_size());
 
         // Build entry buffer
         let mut entry = Vec::<u8, 512>::new();
@@ -393,38 +566,69 @@ where
         let _ = entry.push((crc & 0xFF) as u8);
         let _ = entry.push(((crc >> 8) & 0xFF) as u8);
 
-        // Find free space in flash
+        // A slot wider than the scan buffer cannot be built or read at all.
+        // The old `while entry.len() < slot { push(0xFF) }` discarded the
+        // push error, so `WRITE_SIZE > 512` spun forever at 100 % CPU instead
+        // of failing — the exact failure mode the "bounded data structures"
+        // rule exists to prevent. Refuse up front.
+        if slot > MAX_SCAN_BUF {
+            return Err(AgentError::StorageWriteFailed {
+                address: self.base_address,
+                reason: StorageError::OutOfSpace,
+            });
+        }
+        // Pad the remaining program-unit bytes with erased-flash (`0xFF`).
+        // Readers stop at `entry_size`, so the pad is never interpreted; it
+        // exists only so `NorFlash::write` receives an aligned length.
+        while entry.len() < slot {
+            let _ = entry.push(0xFF);
+        }
+
+        // Find free space in flash. Each slot is classified by the *same*
+        // decoder every read path uses, so "can I write here" and "can I read
+        // this" cannot disagree. A hand-rolled probe here read a fixed-width
+        // header and, near the region end, handed a short buffer to a parser
+        // that requires the full header — reporting a legal tail slot as
+        // `CorruptedData`.
         let mut offset: u32 = 0;
-        let mut buf = [0u8; 512];
-
-        // Walk live entries to find the first free slot that fits this entry
-        // in its entirety. Each live entry is advanced by its *actual*
-        // on-wire size (via `parse_kv_header`), not by this entry's size.
+        let mut buf = [0u8; MAX_SCAN_BUF];
         let capacity = self.storage.capacity() as u32;
-        let read_len = entry_size.max(KV_HEADER_MAX);
         let mut found = false;
-        while offset + entry_size as u32 <= capacity {
-            self.storage
-                .read(self.base_address + offset, &mut buf[..read_len])
-                .map_err(|e| AgentError::StorageReadFailed {
-                    address: self.base_address + offset,
-                    reason: e.into_storage_error(),
-                })?;
-
-            // Whole slot erased (0xFF) → free space.
-            if buf[..entry_size].iter().all(|&b| b == 0xFF) {
-                found = true;
-                break;
+        while offset + slot as u32 <= capacity {
+            match read_entry_header(
+                &mut self.storage,
+                self.base_address,
+                offset,
+                capacity,
+                &mut buf,
+            )? {
+                // Empty space: this slot can be programmed directly.
+                HeaderSlot::Erased => {
+                    found = true;
+                    break;
+                }
+                // An occupied slot the decoder cannot make sense of is real
+                // damage; writing past it would hide it.
+                HeaderSlot::Corrupt => {
+                    return Err(AgentError::StorageReadFailed {
+                        address: self.base_address + offset,
+                        reason: StorageError::CorruptedData,
+                    });
+                }
+                HeaderSlot::Live(hdr) => {
+                    let advance =
+                        slot_size(hdr.entry_size, self.storage.page_size()) as u32;
+                    // A zero advance would spin forever; an entry always has
+                    // at least four bytes, so this only guards corruption.
+                    if advance == 0 {
+                        return Err(AgentError::StorageReadFailed {
+                            address: self.base_address + offset,
+                            reason: StorageError::CorruptedData,
+                        });
+                    }
+                    offset += advance;
+                }
             }
-
-            // Live entry → advance by its real size.
-            let Some(hdr) = parse_kv_header(&buf[..KV_HEADER_MAX]) else {
-                return Err(AgentError::StorageReadFailed {
-                    address: self.base_address + offset,
-                    reason: StorageError::CorruptedData,
-                });
-            };
-            offset += hdr.entry_size as u32;
         }
         if !found {
             return Err(AgentError::StorageWriteFailed {
@@ -444,11 +648,13 @@ where
     }
 
     /// Serialise `key`/`value` into the wire format and write at
-    /// `base_address + offset`. Returns the next free offset.
+    /// `base_address + offset`. Returns the next free offset (the slot after
+    /// this entry, i.e. already rounded up to a program unit).
     fn write_entry_at(&mut self, offset: u32, key: &[u8], value: &[u8]) -> Result<u32> {
         let key_len = key.len() as u8;
         let value_len = value.len() as u16;
         let entry_size = 3 + key_len as usize + value_len as usize + 2;
+        let slot = slot_size(entry_size, self.storage.page_size());
         let mut entry = Vec::<u8, 512>::new();
         let _ = entry.push(key_len);
         for &b in key {
@@ -463,8 +669,20 @@ where
         let crc = crc16_ccitt(&entry);
         let _ = entry.push((crc & 0xFF) as u8);
         let _ = entry.push(((crc >> 8) & 0xFF) as u8);
+        // A slot wider than the buffer cannot be built; see the same guard in
+        // `set`. Without it the pad loop below never terminates.
+        if slot > MAX_SCAN_BUF {
+            return Err(AgentError::StorageWriteFailed {
+                address: self.base_address + offset,
+                reason: StorageError::OutOfSpace,
+            });
+        }
+        // Pad to the program unit so the write is aligned (see [`slot_size`]).
+        while entry.len() < slot {
+            let _ = entry.push(0xFF);
+        }
         self.storage.write(self.base_address + offset, &entry)?;
-        Ok(offset + entry_size as u32)
+        Ok(offset + slot as u32)
     }
 
     /// Erase every sector the store spans, so a subsequent compaction can
@@ -485,6 +703,17 @@ where
 
     /// Scan all live entries into a bounded buffer, optionally skipping the
     /// one whose key equals `skip_key`. Used by delete / compaction.
+    ///
+    /// Each entry's CRC is verified before it is collected. Compaction
+    /// rewrites the collected values with a freshly computed CRC, so a
+    /// corrupted value that was copied through would come back wearing a
+    /// *valid* checksum — the damage would become permanently undetectable.
+    /// A bad entry is therefore an error, not something to carry forward.
+    ///
+    /// A slot that decodes as neither erased nor live is also an error rather
+    /// than end-of-store: compaction erases the whole region afterwards, so
+    /// silently stopping at a damaged header would delete everything beyond
+    /// it. The caller gets `CorruptedData` and the flash is left untouched.
     fn collect_live(
         &mut self,
         skip_key: Option<&str>,
@@ -496,14 +725,27 @@ where
         let capacity = self.storage.capacity() as u32;
 
         while offset < capacity {
-            self.storage
-                .read(self.base_address + offset, &mut buf[..KV_HEADER_MAX])
-                .map_err(|e| AgentError::StorageReadFailed {
-                    address: self.base_address + offset,
-                    reason: e.into_storage_error(),
-                })?;
-            let Some(hdr) = parse_kv_header(&buf[..KV_HEADER_MAX]) else {
-                break; // end of store (erased / corrupt header)
+            // Bound the header read by the region end (see
+            // [`read_entry_header`]); a short tail entry must read cleanly.
+            let hdr = match read_entry_header(
+                &mut self.storage,
+                self.base_address,
+                offset,
+                capacity,
+                &mut buf,
+            )? {
+                // End of the used region: everything past here is untouched.
+                HeaderSlot::Erased => break,
+                // Damage is an error here: compaction erases the region
+                // afterwards, so stopping quietly would delete everything
+                // beyond the damaged header.
+                HeaderSlot::Corrupt => {
+                    return Err(AgentError::StorageReadFailed {
+                        address: self.base_address + offset,
+                        reason: StorageError::CorruptedData,
+                    })
+                }
+                HeaderSlot::Live(hdr) => hdr,
             };
             let entry_size = hdr.entry_size;
             self.storage
@@ -512,6 +754,18 @@ where
                     address: self.base_address + offset,
                     reason: e.into_storage_error(),
                 })?;
+
+            // Verify the entry before trusting its bytes enough to rewrite
+            // them. The trailer is `[crc_lo, crc_hi]` over everything before
+            // it; an entry whose CRC does not match is refused.
+            let crc_offset = entry_size - 2;
+            let stored_crc = u16::from_le_bytes([buf[crc_offset], buf[crc_offset + 1]]);
+            if crc16_ccitt(&buf[..crc_offset]) != stored_crc {
+                return Err(AgentError::StorageReadFailed {
+                    address: self.base_address + offset,
+                    reason: StorageError::CorruptedData,
+                });
+            }
 
             let key = &buf[1..1 + hdr.key_len];
             if !skip_key.is_some_and(|sk| key == sk.as_bytes()) {
@@ -534,7 +788,7 @@ where
                     })?;
             }
 
-            offset += entry_size as u32;
+            offset += slot_size(entry_size, self.storage.page_size()) as u32;
         }
         Ok(live)
     }
@@ -545,6 +799,42 @@ where
     /// behind, so the store never accumulates dead space).
     fn compact(&mut self, skip_key: Option<&str>) -> Result<usize> {
         let live = self.collect_live(skip_key)?;
+
+        // Prove the survivors fit *before* erasing anything.
+        //
+        // `erase_all` destroyed the only copy, and `write_entry_at` had no
+        // capacity check, so a survivor whose padded slot did not fit made
+        // compaction erase the region and then fail: every entry lost, with
+        // only an I/O error to show for it. This is reachable with an image
+        // written under a narrower program unit (a 9-byte entry read through a
+        // `WRITE_SIZE = 16` view pads to 16), and cheap to rule out because
+        // `live` is already in RAM.
+        let page = self.storage.page_size();
+        // `write_entry_at` refuses a slot wider than the scan buffer, so the
+        // preflight must apply the *same* predicate: summing slot sizes and
+        // comparing against capacity alone let a `WRITE_SIZE > 512` part pass
+        // here, erase the region, and then fail on every write — the data-loss
+        // path this preflight exists to close.
+        let oversized = live
+            .iter()
+            .any(|(k, v)| slot_size(3 + k.len() + v.len() + 2, page) > MAX_SCAN_BUF);
+        let needed: u64 = live
+            .iter()
+            .map(|(k, v)| slot_size(3 + k.len() + v.len() + 2, page) as u64)
+            .sum();
+        if oversized || needed > u64::from(self.storage.capacity() as u32) {
+            log::error!(
+                "[storage] compaction refused: {} surviving entries need {needed} bytes \
+                 (program unit {page}); the region has {} and the scan buffer is {MAX_SCAN_BUF}",
+                live.len(),
+                self.storage.capacity()
+            );
+            return Err(AgentError::StorageWriteFailed {
+                address: self.base_address,
+                reason: StorageError::OutOfSpace,
+            });
+        }
+
         self.erase_all()?;
         let mut offset = 0u32;
         let mut written = 0usize;
@@ -627,26 +917,40 @@ where
         let mut valid_entries = 0;
         let mut corrupted_entries = 0;
         let mut used_space = 0;
+        // Cleared when the scan stops at a damaged slot, because everything
+        // past it — including a second damaged slot — cannot be counted.
+        let mut cleaned = true;
         // As in `get`: scan only the region the store owns, not a hardcoded
         // 64 KiB — otherwise a store whose capacity is smaller faults once it
         // fills, and the reported figures are taken over bytes it does not own.
         let capacity = self.storage.capacity() as u32;
 
         while offset < capacity {
-            // HARDENING (audit-2026-08 H1): propagate read failures
-            // so `get_stats` reports incomplete data only on success
-            // (with the partial-counts caveat) rather than silently
-            // dropping faulted entries.
-            self.storage
-                .read(self.base_address + offset, &mut buf[..KV_HEADER_MAX])
-                .map_err(|e| AgentError::StorageReadFailed {
-                    address: self.base_address + offset,
-                    reason: e.into_storage_error(),
-                })?;
-
-            // `buf[0] == 0xFF` (erased) or a corrupt length → end of store.
-            let Some(hdr) = parse_kv_header(&buf[..KV_HEADER_MAX]) else {
-                break;
+            // Read failures propagate (audit-2026-08 H1), and the header read
+            // is bounded by the region end so a short tail entry is not
+            // mistaken for a fault (see [`read_entry_header`]).
+            let hdr = match read_entry_header(
+                &mut self.storage,
+                self.base_address,
+                offset,
+                capacity,
+                &mut buf,
+            )? {
+                HeaderSlot::Erased => break,
+                // A damaged slot is *counted*, not treated as end-of-store.
+                //
+                // The extent of a damaged entry is unknown, so the scan cannot
+                // step over it — it has to stop. It stops after counting, and
+                // the `clean` flag below says the figures are partial: a
+                // second damaged slot past this one is unknowable, and
+                // reporting the count as if it were total would be its own
+                // small lie.
+                HeaderSlot::Corrupt => {
+                    corrupted_entries += 1;
+                    cleaned = false;
+                    break;
+                }
+                HeaderSlot::Live(hdr) => hdr,
             };
             let key_len = hdr.key_len;
             let value_len = hdr.value_len;
@@ -669,12 +973,14 @@ where
 
             if crc == stored_crc {
                 valid_entries += 1;
-                used_space += entry_size;
+                // Count the whole slot: the pad bytes are consumed flash and
+                // `free_space` (below) must not offer them again.
+                used_space += slot_size(entry_size, self.storage.page_size());
             } else {
                 corrupted_entries += 1;
             }
 
-            offset += entry_size as u32;
+            offset += slot_size(entry_size, self.storage.page_size()) as u32;
         }
 
         Ok(KvStoreStats {
@@ -684,6 +990,7 @@ where
             // never tombstones left behind to count.
             deleted_entries: 0,
             corrupted_entries,
+            scan_complete: cleaned,
             used_space,
             // `capacity - used_space`, not `65536 - used_space`: the hardcoded
             // constant reported a nonsensical free space for any region that
@@ -1026,6 +1333,410 @@ mod tests {
         assert!(parse_kv_header(&[]).is_none());
         assert!(parse_kv_header(&[1, b'k']).is_none());
         assert!(parse_kv_header(&[0u8; KV_HEADER_MAX - 1]).is_none());
+    }
+
+    /// `slot_size` must round up to a program unit and be a no-op below it.
+    #[test]
+    fn slot_size_rounds_up_to_a_program_unit() {
+        assert_eq!(slot_size(9, 1), 9, "byte-programmable parts are unchanged");
+        assert_eq!(slot_size(9, 0), 9, "a zero WRITE_SIZE must not divide");
+        assert_eq!(slot_size(9, 4), 12);
+        assert_eq!(slot_size(12, 4), 12, "an aligned entry is not grown");
+        assert_eq!(slot_size(9, 16), 16);
+        // The largest legal entry still fits the 512-byte scan buffers.
+        assert!(slot_size(3 + 32 + MAX_VALUE_LEN + 2, 16) <= 512);
+    }
+
+    /// A store whose region ends with fewer than 35 bytes left must still be
+    /// scannable.
+    ///
+    /// Every scan walks `while offset < capacity` and then reads a fixed
+    /// `KV_HEADER_MAX` (35) byte header. With fewer than 35 bytes remaining,
+    /// that read asks the flash for bytes past the region end; a real part
+    /// rejects it, and `get` reported `StorageReadFailed` — a hardware fault —
+    /// for a perfectly healthy store that simply had a short last entry (or a
+    /// short erased tail). Here a 40-byte region holds one 7-byte entry, so
+    /// only 33 bytes remain when the scan reaches the tail.
+    #[test]
+    fn a_region_ending_mid_header_is_a_clean_end_of_store() {
+        let mut kv = KvStore::new(FlashStorage::new(MockFlash::new(40)), 0);
+        kv.set("z", b"9").expect("a 7-byte entry fits a 40-byte region");
+
+        // 7 + 7 = 14 used, 26 erased. The scan must stop cleanly.
+        assert_eq!(kv.get("z").unwrap(), Some({
+            let mut v = heapless::Vec::<u8, 256>::new();
+            let _ = v.push(b'9');
+            v
+        }));
+        assert_eq!(kv.get("absent").expect("tail must not fault"), None);
+
+        // The same tail must not make the stats scan or a compaction fault.
+        let stats = kv.get_stats().unwrap();
+        assert_eq!(stats.valid_entries, 1);
+        assert_eq!(stats.used_space, slot_size(7, 1));
+        kv.delete("absent").expect("compaction over a short tail");
+        assert_eq!(kv.get("z").unwrap().map(|v| v.len()), Some(1));
+    }
+
+    /// A torn slot must be reported, not read as "end of store".
+    ///
+    /// A power loss can leave byte 0 erased while later bytes were
+    /// programmed. `read_entry_header` calls that `Corrupt`; the scan used to
+    /// `break` on it, so every entry written *after* the torn slot became
+    /// invisible (`get` answered `None` for keys plainly present) and `set`
+    /// refused forever — the store was bricked with no way to tell.
+    #[test]
+    fn a_torn_slot_is_reported_not_read_as_end_of_store() {
+        // Lay the image out by hand: a good entry, a torn slot, then a good
+        // entry. Writing through `set` cannot build this (it refuses to
+        // write past damage), which is itself the correct behaviour.
+        let mut flash = MockFlash::new(256);
+        let first = raw_entry(b"first", b"1");
+        let third = raw_entry(b"third", b"3");
+        let torn_at = first.len();
+        flash.data[..first.len()].copy_from_slice(&first);
+        // Torn: byte 0 erased, later bytes programmed.
+        flash.data[torn_at] = 0xFF;
+        flash.data[torn_at + 1] = 0x42;
+        flash.data[torn_at + 2] = 0x43;
+        let third_at = torn_at + 8;
+        flash.data[third_at..third_at + third.len()].copy_from_slice(&third);
+        let mut kv = KvStore::new(FlashStorage::new(flash), 0);
+
+        match kv.get("third") {
+            Err(AgentError::StorageReadFailed {
+                reason: StorageError::CorruptedData,
+                ..
+            }) => {}
+            other => panic!(
+                "a torn slot must be reported as corruption, not answered as \
+                 a miss: {other:?}"
+            ),
+        }
+
+        // The stats path counts the damage instead of calling the store
+        // clean.
+        let stats = kv.get_stats().unwrap();
+        assert_eq!(stats.corrupted_entries, 1, "stats must count the torn slot");
+    }
+
+    /// Compaction's preflight must refuse an oversized program unit too.
+    ///
+    /// `write_entry_at` refuses a slot wider than `MAX_SCAN_BUF`, but the
+    /// preflight only compared the total against capacity. A
+    /// `WRITE_SIZE = 1024` part therefore passed the check, erased the region,
+    /// and then failed every write — the data loss the preflight exists to
+    /// prevent.
+    #[test]
+    fn compaction_refuses_an_oversized_program_unit_before_erasing() {
+        let mut flash = MockFlash::new(4096);
+        let good = raw_entry(b"k", b"v");
+        flash.data[..good.len()].copy_from_slice(&good);
+        let mut kv = KvStore::new(FlashStorage::new(HugeFlash(flash)), 0);
+
+        let err = kv.garbage_collect().expect_err("must refuse, not erase");
+        assert!(
+            matches!(
+                err,
+                AgentError::StorageWriteFailed {
+                    reason: StorageError::OutOfSpace,
+                    ..
+                }
+            ),
+            "expected OutOfSpace, got {err:?}"
+        );
+        assert_eq!(
+            &kv.storage.flash.0.data[..good.len()],
+            &good[..],
+            "the region must be untouched"
+        );
+    }
+
+    /// `get_stats` must say when its figures are partial.
+    ///
+    /// A damaged slot's extent is unknown, so the scan stops there; reporting
+    /// the counts as totals would under-report a second damaged slot past it.
+    #[test]
+    fn stats_flag_a_partial_scan() {
+        let mut kv = empty_kv();
+        kv.set("a", b"1").unwrap();
+        let second = slot_size(3 + 1 + 1 + 2, 1);
+        // Torn slot at the second position.
+        kv.storage.flash.data[second] = 0xFF;
+        kv.storage.flash.data[second + 1] = 0x42;
+
+        let stats = kv.get_stats().unwrap();
+        assert_eq!(stats.corrupted_entries, 1);
+        assert!(
+            !stats.scan_complete,
+            "counts taken past a damaged slot are lower bounds, not totals"
+        );
+    }
+
+    /// Compaction must not erase the region unless the survivors fit.
+    ///
+    /// `erase_all` destroyed the only copy and `write_entry_at` had no
+    /// capacity check, so a survivor whose padded slot did not fit made
+    /// compaction erase everything and then fail — total data loss for an
+    /// I/O error. Reachable with an image written under a narrower program
+    /// unit.
+    #[test]
+    fn compaction_refuses_before_erasing_when_survivors_do_not_fit() {
+        // 20-byte region seen through a 16-byte program unit: an 18-byte
+        // legacy entry lives at 0 and pads to 32, which cannot fit.
+        let mut flash = MockFlash::new(20);
+        let legacy = raw_entry(b"q", &[0x51u8; 13]); // 1+1+2+13+2 = 19
+        assert_eq!(legacy.len(), 19);
+        flash.data[..19].copy_from_slice(&legacy);
+        let mut kv = KvStore::new(FlashStorage::new(WideFlash::new_from(flash, 16)), 0);
+
+        let err = kv.garbage_collect().expect_err("must refuse, not erase");
+        assert!(
+            matches!(
+                err,
+                AgentError::StorageWriteFailed {
+                    reason: StorageError::OutOfSpace,
+                    ..
+                }
+            ),
+            "expected OutOfSpace, got {err:?}"
+        );
+        // The bytes are still there: nothing was erased.
+        assert_eq!(&kv.storage.flash.0.data[..19], &legacy[..]);
+    }
+
+    /// The last slot of a padded store must be usable, and a full store must
+    /// say "out of space" rather than "hardware fault".
+    ///
+    /// `set`'s free-slot probe read a fixed 35-byte header while only
+    /// guaranteeing `slot` bytes were available. With a 16-byte program unit
+    /// the final slot (16..34 bytes remaining) therefore crossed `capacity`
+    /// and every write past it failed as `StorageReadFailed{ReadError}` — with
+    /// `get_stats` still advertising the space as free. Measured before the
+    /// fix: 8 of 10 entries fit in a 160-byte region, `free_space: 32`.
+    #[test]
+    fn the_last_slot_of_a_padded_store_is_usable() {
+        let mut kv = KvStore::new(FlashStorage::new(WideFlash::new(160, 16)), 0);
+        let value = [0x41u8; 4];
+        let mut written = 0;
+        for i in 0..10u8 {
+            let key = alloc::format!("k{i}");
+            match kv.set(&key, &value) {
+                Ok(()) => written += 1,
+                // Running out of room is correct; a read fault is not.
+                Err(AgentError::StorageWriteFailed {
+                    reason: StorageError::OutOfSpace,
+                    ..
+                }) => break,
+                Err(e) => panic!("set({key}) failed as {e:?}, not OutOfSpace"),
+            }
+        }
+        assert_eq!(written, 10, "a 160-byte region holds ten 16-byte slots");
+        assert_eq!(kv.get_stats().unwrap().free_space, 0);
+        for i in 0..10u8 {
+            let key = alloc::format!("k{i}");
+            assert!(kv.get(&key).unwrap().is_some(), "{key} must read back");
+        }
+    }
+
+    /// A live entry in the final bytes of the region must not be deleted by
+    /// compaction.
+    ///
+    /// `read_entry_header` classified "fewer than 35 bytes left" as
+    /// `Erased`, so a valid short entry at the tail was invisible to `get`
+    /// and then permanently erased by `garbage_collect`. The whole point of
+    /// the tri-state was to stop compaction treating damage as end-of-store;
+    /// this branch reopened it for the tail.
+    #[test]
+    fn compaction_keeps_a_live_tail_entry() {
+        // 43-byte region (one erase unit), a 34-byte entry then a 7-byte one.
+        let mut flash = MockFlash::new(43);
+        let big = raw_entry(b"x", &[0x41u8; 28]);
+        let small = raw_entry(b"y", b"v");
+        assert_eq!(big.len(), 34);
+        assert_eq!(small.len(), 7);
+        flash.data[..34].copy_from_slice(&big);
+        flash.data[34..41].copy_from_slice(&small);
+
+        let mut kv = KvStore::new(FlashStorage::new(flash), 0);
+        assert!(
+            kv.get("y").unwrap().is_some(),
+            "a tail entry must be readable before compaction"
+        );
+        kv.garbage_collect().unwrap();
+        assert!(
+            kv.get("y").unwrap().is_some(),
+            "compaction erased a live tail entry"
+        );
+        assert!(kv.get("x").unwrap().is_some());
+    }
+
+    /// A header near the region end that declares more bytes than remain is
+    /// damage, and must not brick the store.
+    ///
+    /// It used to decode as `Live`, after which every read faulted and
+    /// compaction refused forever with no way to recover.
+    #[test]
+    fn an_entry_that_overruns_the_region_is_corruption_not_a_live_entry() {
+        let mut flash = MockFlash::new(64);
+        // key_len = 1, key "k", value_len = 256 (legal but far too large).
+        flash.data[16] = 1;
+        flash.data[17] = b'k';
+        flash.data[18] = 0;
+        flash.data[19] = 1;
+        let mut kv = KvStore::new(FlashStorage::new(flash), 0);
+        match kv.garbage_collect() {
+            Err(AgentError::StorageReadFailed {
+                reason: StorageError::CorruptedData,
+                ..
+            }) => {}
+            other => panic!("expected CorruptedData, got {other:?}"),
+        }
+    }
+
+    /// A program unit wider than the scan buffer must be refused, not spin.
+    ///
+    /// The pad loop `while entry.len() < slot { push(0xFF) }` discarded the
+    /// push error, so with `WRITE_SIZE = 1024` the bounded `Vec<u8, 512>`
+    /// never grew and `set` hung at 100 % CPU forever.
+    #[test]
+    fn a_program_unit_wider_than_the_buffer_is_refused_not_hung() {
+        let mut kv = KvStore::new(FlashStorage::new(HugeFlash(MockFlash::new(4096))), 0);
+        match kv.set("k", b"v") {
+            Err(AgentError::StorageWriteFailed { .. }) => {}
+            Ok(()) => panic!("a 1024-byte program unit cannot be served"),
+            Err(e) => panic!("expected StorageWriteFailed, got {e:?}"),
+        }
+    }
+
+    /// Serialise a KV entry exactly as the writer does (header, body, CRC).
+    fn raw_entry(key: &[u8], value: &[u8]) -> std::vec::Vec<u8> {
+        let mut e = std::vec::Vec::new();
+        e.push(key.len() as u8);
+        e.extend_from_slice(key);
+        e.push((value.len() & 0xFF) as u8);
+        e.push((value.len() >> 8) as u8);
+        e.extend_from_slice(value);
+        let crc = crc16_ccitt(&e);
+        e.push((crc & 0xFF) as u8);
+        e.push((crc >> 8) as u8);
+        e
+    }
+
+    /// A mock flash with a configurable program unit.
+    struct WideFlash(MockFlash, usize);
+
+    impl WideFlash {
+        fn new(capacity: usize, write_size: usize) -> Self {
+            Self(MockFlash::new(capacity), write_size)
+        }
+
+        /// Wrap an existing backing store (so a test can pre-seed the
+        /// flash bytes) in a view that reports `write_size`.
+        fn new_from(flash: MockFlash, write_size: usize) -> Self {
+            Self(flash, write_size)
+        }
+    }
+
+    impl embedded_storage::nor_flash::ErrorType for WideFlash {
+        type Error = MockErr;
+    }
+
+    impl embedded_storage::nor_flash::ReadNorFlash for WideFlash {
+        const READ_SIZE: usize = 1;
+        fn read(&mut self, address: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
+            <MockFlash as embedded_storage::nor_flash::ReadNorFlash>::read(&mut self.0, address, buf)
+        }
+        fn capacity(&self) -> usize {
+            <MockFlash as embedded_storage::nor_flash::ReadNorFlash>::capacity(&self.0)
+        }
+    }
+
+    impl embedded_storage::nor_flash::NorFlash for WideFlash {
+        // Rust does not allow a per-instance associated const, so the
+        // program unit is fixed at 16 here (`self.1` re-checks it at runtime);
+        // the wider case uses `HugeFlash` below.
+        const WRITE_SIZE: usize = 16;
+        const ERASE_SIZE: usize = 4096;
+
+        fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+            // The delegate has WRITE_SIZE 1, so enforce the modelled unit here.
+            if !(address as usize).is_multiple_of(self.1) || !data.len().is_multiple_of(self.1) {
+                return Err(MockErr);
+            }
+            <MockFlash as embedded_storage::nor_flash::NorFlash>::write(&mut self.0, address, data)
+        }
+
+        fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+            <MockFlash as embedded_storage::nor_flash::NorFlash>::erase(&mut self.0, from, to)
+        }
+    }
+
+    /// A flash whose program unit is 1024 bytes (wider than `MAX_SCAN_BUF`).
+    struct HugeFlash(MockFlash);
+
+    impl embedded_storage::nor_flash::ErrorType for HugeFlash {
+        type Error = MockErr;
+    }
+
+    impl embedded_storage::nor_flash::ReadNorFlash for HugeFlash {
+        const READ_SIZE: usize = 1;
+        fn read(&mut self, address: u32, buf: &mut [u8]) -> Result<(), Self::Error> {
+            <MockFlash as embedded_storage::nor_flash::ReadNorFlash>::read(&mut self.0, address, buf)
+        }
+        fn capacity(&self) -> usize {
+            <MockFlash as embedded_storage::nor_flash::ReadNorFlash>::capacity(&self.0)
+        }
+    }
+
+    impl embedded_storage::nor_flash::NorFlash for HugeFlash {
+        const WRITE_SIZE: usize = 1024;
+        const ERASE_SIZE: usize = 4096;
+
+        fn write(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+            <MockFlash as embedded_storage::nor_flash::NorFlash>::write(&mut self.0, address, data)
+        }
+
+        fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+            <MockFlash as embedded_storage::nor_flash::NorFlash>::erase(&mut self.0, from, to)
+        }
+    }
+
+    /// A store on a part whose program unit is 4 bytes must actually work.
+    ///
+    /// `AlignedFlash` advertises `WRITE_SIZE = 4`; the raw KV entry is
+    /// `3 + key + value + 2`, which for `("k", "v")` is 6 — not a multiple of
+    /// 4. Before `slot_size` padded entries, `FlashStorage::write` rejected
+    /// that length with `BadAddress`, so **every** `set` failed on such a
+    /// part. `MockFlash`'s `WRITE_SIZE = 1` made all existing KV tests blind
+    /// to it.
+    #[test]
+    fn kv_store_works_on_a_four_byte_program_unit() {
+        let mut kv = KvStore::new(aligned_storage(), 0);
+        kv.set("k", b"v").expect("a 6-byte entry must be padded to 8");
+
+        assert_eq!(kv.get("k").expect("get must not fault"), Some({
+            let mut v = heapless::Vec::<u8, 256>::new();
+            let _ = v.push(b'v');
+            v
+        }));
+
+        // A second entry must land after the padded slot, not overlap it.
+        kv.set("second", b"value").expect("second entry");
+        assert_eq!(kv.get("k").unwrap().map(|v| v.len()), Some(1));
+        assert_eq!(kv.get("second").unwrap().map(|v| v.len()), Some(5));
+
+        // Delete (which is compaction: erase + rewrite) must round-trip too,
+        // since that path writes through `write_entry_at`.
+        kv.delete("k").unwrap();
+        assert_eq!(kv.get("k").unwrap(), None);
+        assert_eq!(kv.get("second").unwrap().map(|v| v.len()), Some(5));
+
+        // The stats scan walks the same padded slots.
+        let stats = kv.get_stats().unwrap();
+        assert_eq!(stats.valid_entries, 1);
+        assert_eq!(stats.corrupted_entries, 0);
+        assert_eq!(stats.used_space, slot_size(3 + 6 + 5 + 2, 4));
     }
 
     #[test]
@@ -1398,26 +2109,77 @@ mod tests {
     }
 
     #[test]
-    fn get_stats_tolerates_corrupt_value_len_without_panicking() {
+    fn get_stats_counts_a_corrupt_value_len_without_panicking() {
         let mut kv = empty_kv();
         write_corrupt_value_len(&mut kv, 0);
-        // The corrupt header ends the scan (same policy as a corrupt
-        // key_len), so the store reports empty rather than panicking.
+        // A corrupt header is *reported*, not silently read as an empty
+        // store: `corrupted_entries` is the field that exists to say so.
         let stats = kv.get_stats().unwrap();
         assert_eq!(stats.total_entries, 0);
-        assert_eq!(stats.corrupted_entries, 0);
+        assert_eq!(
+            stats.corrupted_entries, 1,
+            "a damaged slot must be counted, not reported as a clean empty store"
+        );
     }
 
     #[test]
-    fn collect_live_tolerates_corrupt_value_len_without_panicking() {
+    fn collect_live_refuses_a_corrupt_value_len_instead_of_erasing_past_it() {
         let mut kv = empty_kv();
         write_corrupt_value_len(&mut kv, 0);
-        // `delete` runs `collect_live` over the whole store; the corrupt
-        // header must stop the scan, not blow the buffer.
-        kv.delete("k").unwrap();
-        // No live entry survived, so nothing is rewritten.
-        assert!(matches!(kv.get("k"), Ok(None)));
-        assert_eq!(kv.get_stats().unwrap().total_entries, 0);
+        // `delete` runs `collect_live` over the whole store. A corrupt header
+        // in the middle of the used region used to read as end-of-store, so
+        // compaction erased the whole sector and rewrote only the entries
+        // before the damage — silently deleting every live entry after it.
+        // It must refuse instead, leaving the flash untouched.
+        let err = kv.delete("k").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgentError::StorageReadFailed {
+                    reason: StorageError::CorruptedData,
+                    ..
+                }
+            ),
+            "expected CorruptedData, got {err:?}"
+        );
+        assert!(
+            !kv.storage.flash.data.iter().all(|&b| b == 0xFF),
+            "a refused compaction must not have erased the store"
+        );
+    }
+
+    /// Compaction must verify each entry's CRC before rewriting it. Recomputing
+    /// the CRC over a corrupted value would give the damage a *valid* checksum,
+    /// making it permanently undetectable.
+    #[test]
+    fn compaction_refuses_to_launder_a_corrupted_value() {
+        let mut kv = empty_kv();
+        kv.set("good", b"1").unwrap();
+        kv.set("bad", b"value").unwrap();
+        // Flip a bit in the `bad` entry's value byte. Entry layout is
+        // `[key_len][key][val_len_lo][val_len_hi][value…][crc_lo][crc_hi]`;
+        // "good" occupies 3+4+1+2 = 10 bytes, so "bad"'s value starts at
+        // 10 + 3 + 3 = 16.
+        let bad_value_offset = 10 + 3 + 3;
+        kv.storage.flash.data[bad_value_offset] ^= 0x01;
+
+        let err = kv.garbage_collect().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgentError::StorageReadFailed {
+                    reason: StorageError::CorruptedData,
+                    ..
+                }
+            ),
+            "a corrupt entry must block compaction, got {err:?}"
+        );
+        // Nothing was rewritten: the corruption is still detected on read.
+        assert!(
+            kv.get("bad").is_err(),
+            "the corrupted entry must not have been re-signed"
+        );
+        assert_eq!(kv.get("good").unwrap().unwrap(), b"1");
     }
 
     #[test]
@@ -1429,13 +2191,31 @@ mod tests {
         buf[3] = 0xFF;
         assert!(parse_kv_header(&buf).is_none());
 
-        // A boundary value of exactly MAX_VALUE_LEN is still accepted.
+        // A boundary value of exactly MAX_VALUE_LEN is still accepted, given
+        // a region big enough to hold it (`parse_kv_header` supplies
+        // `KV_HEADER_MAX`, so use the `within` form with the real extent).
         let max = MAX_VALUE_LEN as u16;
         buf[2] = (max & 0xFF) as u8;
         buf[3] = (max >> 8) as u8;
-        let hdr = parse_kv_header(&buf).expect("MAX_VALUE_LEN must parse");
+        let entry_size = 3 + 1 + MAX_VALUE_LEN + 2;
+        let hdr = parse_kv_header_within(&buf, entry_size).expect("MAX_VALUE_LEN must parse");
         assert_eq!(hdr.value_len, MAX_VALUE_LEN);
-        assert_eq!(hdr.entry_size, 3 + 1 + MAX_VALUE_LEN + 2);
+        assert_eq!(hdr.entry_size, entry_size);
+
+        // …but not when the region cannot hold that entry.
+        assert!(parse_kv_header_within(&buf, entry_size - 1).is_none());
+    }
+
+    /// A header may be parsed from a buffer shorter than `KV_HEADER_MAX` when
+    /// only the declared fields are read.
+    #[test]
+    fn a_short_header_buffer_parses_when_the_entry_fits() {
+        // key_len = 1, key "y", value_len = 1, value, crc: 7 bytes total.
+        let buf = [1u8, b'y', 1, 0, b'v', 0, 0];
+        let hdr = parse_kv_header_within(&buf, 7).expect("a 7-byte header");
+        assert_eq!(hdr.entry_size, 7);
+        // The same bytes cannot describe an 8-byte region entry.
+        assert!(parse_kv_header_within(&buf, 6).is_none());
     }
 }
 
@@ -1450,7 +2230,16 @@ pub struct KvStoreStats {
     /// entries, so this is always 0.
     pub deleted_entries: usize,
     /// Number of slots whose checksum failed and are considered lost.
+    ///
+    /// A damaged slot's extent is unknown, so the scan stops there and the
+    /// figures below describe only the prefix it could read. Check
+    /// [`Self::scan_complete`] before treating them as totals.
     pub corrupted_entries: usize,
+    /// Whether the scan reached the end of the used region.
+    ///
+    /// `false` means it stopped at a damaged slot: `total_entries`,
+    /// `used_space` and `corrupted_entries` are lower bounds, not totals.
+    pub scan_complete: bool,
     /// Bytes of flash occupied by all live slots.
     pub used_space: usize,
     /// Remaining bytes available for new writes (`capacity - used_space`).

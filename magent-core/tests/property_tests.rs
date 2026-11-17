@@ -29,8 +29,19 @@ proptest! {
     #[test]
     fn try_heapless_perfect_roundtrip_under_limit(s in "[^\\x00-\\x1F\\x7F]{0,128}") {
         let result = magent_core::error::try_heapless::<256>(&s);
-        prop_assert_eq!(result.len(), s.len());
-        prop_assert_eq!(result.chars().count(), s.chars().count());
+        prop_assert!(result.len() <= 256);
+        if s.len() <= 256 {
+            // The helper only promises a lossless round-trip when the input
+            // *fits*. A 128-character generator bound does not imply that:
+            // with 4-byte code points the input is up to 512 bytes and is
+            // truncated at a character boundary. The old assertion compared
+            // lengths unconditionally and failed on exactly that input.
+            prop_assert_eq!(result.len(), s.len());
+            prop_assert_eq!(result.chars().count(), s.chars().count());
+        } else {
+            // Truncated, but never mid-character.
+            prop_assert!(s.is_char_boundary(result.len()));
+        }
     }
 
     /// `try_heapless` truncates at UTF-8 character boundaries, never mid-codepoint.

@@ -761,7 +761,7 @@ fn run_lua_host() {
                 let configured = matches!(
                     (
                         crate::nvs_load_string(crate::NVS_KEY_LLM_MODEL),
-                        crate::nvs_load_string(crate::NVS_KEY_LLM_API_KEY),
+                        crate::load_llm_api_key(),
                     ),
                     (Some(model), Some(key)) if !model.is_empty() && !key.is_empty()
                 );

@@ -39,8 +39,6 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-use ed25519_dalek::Verifier as _;
-
 use crate::error::Web3ErrorKind;
 use crate::web3::Signature;
 
@@ -149,12 +147,38 @@ impl VerifiableCredential {
     }
 
     /// Check if the credential is expired.
+    ///
+    /// Compares *instants*, not strings. `validUntil` is caller-supplied and
+    /// ISO-8601 permits a timezone offset, so a lexical `until < now` is not
+    /// time order: `2026-11-15T20:00:00+14:00` (06:00Z, already expired) sorts
+    /// after `2026-11-15T07:31:00Z` and read as valid, while
+    /// `…07:31:04.9Z` sorts after `…07:31:04Z` and read as expired. Both
+    /// directions are wrong, and the first one accepts an expired credential.
+    ///
+    /// An unparseable `validUntil` is treated as **expired**: the field is a
+    /// validity bound, and one that cannot be evaluated cannot be relied on.
     pub fn is_expired(&self) -> bool {
-        if let Some(ref until) = self.valid_until {
-            let now = iso8601_timestamp();
-            return until < &now;
+        match self.valid_until.as_deref() {
+            None => false,
+            Some(until) => match parse_iso8601_instant(until) {
+                Some(at) => at < current_unix_secs(),
+                None => true,
+            },
         }
-        false
+    }
+
+    /// Check whether the credential is not yet valid.
+    ///
+    /// `validFrom` defaulted to the issue time and was never checked, so a
+    /// credential stamped `validFrom: 2999-…` verified as if it were in force.
+    /// An unparseable `validFrom` is likewise treated as **not yet valid**.
+    pub fn is_not_yet_valid(&self) -> bool {
+        match parse_iso8601_instant(&self.valid_from) {
+            Some(at) => at > current_unix_secs(),
+            // The default is the issue timestamp; a value that cannot be
+            // parsed cannot establish that the credential is in force.
+            None => true,
+        }
     }
 
     /// Verify the credential's Ed25519 proof.
@@ -165,9 +189,10 @@ impl VerifiableCredential {
     /// needed. The verification method's DID must also equal `issuer`, so a
     /// credential cannot claim one issuer while carrying another key.
     pub fn verify_proof(&self) -> Result<(), Web3ErrorKind> {
-        let proof = self.proof.as_ref().ok_or_else(|| {
-            Web3ErrorKind::BlockchainError("credential has no proof".to_string())
-        })?;
+        let proof = self
+            .proof
+            .as_ref()
+            .ok_or_else(|| Web3ErrorKind::BlockchainError("credential has no proof".to_string()))?;
         match proof.proof_type {
             ProofType::Ed25519Signature2020 | ProofType::Ed25519Signature2018 => {}
             other => {
@@ -195,10 +220,56 @@ impl VerifiableCredential {
         })?;
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
             .map_err(|e| Web3ErrorKind::BlockchainError(format!("invalid issuer key: {e}")))?;
+        // A body-only signature covers the body, not the proof options. A
+        // `challenge` or `domain` carried by such a proof is therefore
+        // unsigned: it can be added or rewritten after issuance and the
+        // signature still checks out. Refuse it rather than report a bound
+        // challenge that is not bound. `signingScheme` is attacker-controlled
+        // JSON, so this guard sits on the *verification* side where the
+        // attacker cannot benefit from lying: claiming `options-v1` makes the
+        // options part of the hash and a rewrite breaks the signature;
+        // claiming `body-only` with a challenge present is rejected here.
+        let scheme = Self::resolved_scheme(proof);
+        if scheme == SigningScheme::BodyOnly {
+            if proof.challenge.is_some() || proof.domain.is_some() {
+                return Err(Web3ErrorKind::BlockchainError(
+                    "credential proof carries a challenge/domain but was signed body-only, \
+                     which does not cover them"
+                        .to_string(),
+                ));
+            }
+            // `purpose` is also outside a body-only signature, so any value
+            // an attacker writes there is unauthenticated. Nothing consults
+            // `purpose` today — which is exactly why accepting an arbitrary
+            // one would be a trap for whoever adds such a check later. Only
+            // the canonical issuer purpose is meaningful for an assertion
+            // credential, so require it.
+            //
+            // `created` is likewise unsigned, and is treated as advisory
+            // (nothing reads it for a decision). `verificationMethod` is
+            // unsigned past its `#`fragment, but the DID before the `#` is
+            // part of the signed body via `issuer`, and the fragment selects
+            // nothing.
+            if proof.purpose != "AssertionMethod" {
+                return Err(Web3ErrorKind::BlockchainError(format!(
+                    "body-only credential proof carries an unauthenticated purpose {:?}; \
+                     only \"AssertionMethod\" is accepted",
+                    proof.purpose
+                )));
+            }
+        }
         let signature = Signature::from_hex(&proof.proof_value)?;
         let dalek_sig = ed25519_dalek::Signature::from_bytes(signature.to_bytes());
+        let signed_bytes = self.encoded_for_verification()?;
+        // `verify_strict`, not `verify`: the lenient verifier accepts
+        // small-order public keys, which makes universal forgery trivial. A
+        // `did:key` whose key is the identity point (0x01 ‖ 0…) combined with
+        // a signature `R = identity, S = 0` verified for **any** credential —
+        // attacker-chosen issuer, subject and claims, no private key. Measured
+        // against the pre-fix code: `verify()` returned `Ok(())`.
+        // `verify_strict` rejects small-order `A` and `R`, closing it.
         verifying_key
-            .verify(&self.encode_for_signing(), &dalek_sig)
+            .verify_strict(&signed_bytes, &dalek_sig)
             .map_err(|_| {
                 Web3ErrorKind::BlockchainError(
                     "credential proof signature does not verify".to_string(),
@@ -209,29 +280,111 @@ impl VerifiableCredential {
     /// Structural validation plus proof verification and expiry.
     pub fn verify(&self) -> Result<(), Web3ErrorKind> {
         self.validate()?;
+        if self.is_not_yet_valid() {
+            return Err(Web3ErrorKind::BlockchainError(
+                "credential is not yet valid (validFrom is in the future or unparseable)"
+                    .to_string(),
+            ));
+        }
         if self.is_expired() {
             return Err(Web3ErrorKind::BlockchainError(
-                "credential has expired".to_string(),
+                "credential has expired (validUntil is in the past or unparseable)".to_string(),
             ));
         }
         self.verify_proof()
     }
 
-    /// Encode for signing (canonical form).
+    /// The bytes the **already attached** proof's signature covers.
     ///
-    /// SECURITY: this must produce the exact same bytes regardless of
-    /// whether a proof is currently attached. If it didn't, a malicious
-    /// issuer could attach a valid proof, change the credential body,
-    /// and the verifier would still call it valid because the proof
-    /// matched the *old* canonical bytes.
+    /// The credential body is serialised with `proof` dropped, and the proof
+    /// *options* are then appended: `created`, `verificationMethod`,
+    /// `purpose`, `challenge` and `domain`.
     ///
-    /// We therefore copy the struct, drop the `proof` field, and
-    /// serialise the rest. This guarantees the sign-then-verify
-    /// round-trip is safe.
-    pub fn encode_for_signing(&self) -> Vec<u8> {
+    /// SECURITY: dropping the proof entirely — as this did before — satisfied
+    /// the "same bytes regardless of the attached proof" rule but left the
+    /// options unprotected. [`CredentialProof`] carries `challenge` and
+    /// `domain`; a credential whose proof names a challenge must have that
+    /// challenge covered by the signature, or the field can be rewritten after
+    /// signing and still verify. The options are length- and presence-tagged
+    /// so no two different option sets can collide.
+    ///
+    /// # Signing
+    ///
+    /// This is **not** a signing API. A credential with no proof attached has
+    /// no options to cover, so this returns the body alone — and signing that
+    /// produces a signature which the (options-covering) verifier rejects.
+    /// Use [`Self::signing_input`], which takes the proof being built and
+    /// returns exactly the bytes verification will check. The two used to be
+    /// documented as one and the same, so the old
+    /// `sign(self.encode_for_signing())` pattern silently produced credentials
+    /// that never verified.
+    pub fn encode_for_signing(&self) -> Result<Vec<u8>, Web3ErrorKind> {
+        // Dispatch on the attached proof's scheme (body-only for a proof that
+        // predates the field), so this agrees with what verification computes.
+        self.encoded_for_verification()
+    }
+
+    /// The bytes to sign for `proof`, before it is attached.
+    ///
+    /// The sign-then-attach half of [`Self::encode_for_signing`]. It builds
+    /// the bytes by attaching `proof` to a clone and running the *same*
+    /// function verification uses, so the two cannot disagree about what is
+    /// covered. Resolving the scheme independently here — as an earlier
+    /// version did — produced signatures the verifier could not check
+    /// whenever the two defaults differed.
+    pub fn signing_input(&self, proof: &CredentialProof) -> Result<Vec<u8>, Web3ErrorKind> {
+        let mut with_proof = self.clone();
+        with_proof.proof = Some(proof.clone());
+        with_proof.encoded_for_verification()
+    }
+
+    /// The scheme a credential proof is verified under.
+    ///
+    /// An absent field means a proof from before it existed, which signed the
+    /// body alone. Used by both signing and verification.
+    fn resolved_scheme(proof: &CredentialProof) -> SigningScheme {
+        proof.signing_scheme.unwrap_or(SigningScheme::BodyOnly)
+    }
+
+    /// The bytes a stored proof's signature covers, following the scheme
+    /// recorded in the proof itself.
+    ///
+    /// Returns an error rather than an empty buffer if the body cannot be
+    /// serialised. A signing input that silently became `b""` (via
+    /// `unwrap_or_default`) would produce a signature over nothing, and the
+    /// verifier computes the same empty body, so the two would agree and the
+    /// corruption would be invisible. Today no field can make `to_vec` fail;
+    /// the `Result` keeps that true if one is added.
+    fn encoded_for_verification(&self) -> Result<Vec<u8>, Web3ErrorKind> {
         let mut clone = self.clone();
+        let scheme = clone
+            .proof
+            .as_ref()
+            .map(Self::resolved_scheme)
+            .unwrap_or(SigningScheme::ProofOptions);
         clone.proof = None;
-        serde_json::to_vec(&clone).unwrap_or_default()
+        let mut out = serde_json::to_vec(&clone).map_err(|e| {
+            Web3ErrorKind::BlockchainError(format!(
+                "when_signing_input: credential body is not serialisable: {e}"
+            ))
+        })?;
+        if scheme == SigningScheme::ProofOptions {
+            if let Some(proof) = self.proof.as_ref() {
+                out.extend_from_slice(&Self::proof_options_bytes(proof));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Length- and presence-tagged proof options, excluding `proofValue`.
+    fn proof_options_bytes(proof: &CredentialProof) -> Vec<u8> {
+        encode_proof_options(
+            &proof.created,
+            &proof.verification_method,
+            &proof.purpose,
+            proof.challenge.as_deref(),
+            proof.domain.as_deref(),
+        )
     }
 
     /// Canonicalise for storage / transmission (proof attached).
@@ -259,12 +412,67 @@ impl CredentialSubject {
         }
     }
 
+    /// The claim names [`Self`] serialises as real fields.
+    ///
+    /// `claims` is `#[serde(flatten)]`ed, and serde does not reject a map key
+    /// that collides with a struct field — it emits the key twice. So
+    /// `with_claim("id", …)` produced
+    /// `"credentialSubject":{"id":"<real>","id":"<claim>"}`, which this
+    /// crate's own `Deserialize` rejects as `duplicate field 'id'` (a
+    /// credential that cannot be read back) while serde-based consumers in
+    /// other languages resolve last-wins (so the *claim* becomes the subject
+    /// id, in a document whose signature covers those bytes). Either reading
+    /// is unacceptable, so the collision is refused at the constructor.
+    pub const RESERVED_CLAIM_KEYS: [&'static str; 1] = ["id"];
+
+    /// Whether `key` would collide with a serialised field of [`Self`].
+    pub fn is_reserved_claim_key(key: &str) -> bool {
+        Self::RESERVED_CLAIM_KEYS.contains(&key)
+    }
+
     /// Add a claim.
+    ///
+    /// A key that collides with a real field of this struct (`id`) is
+    /// **dropped**, because storing it would either make the credential
+    /// unreadable or change which value a consumer sees for that field — see
+    /// [`Self::is_reserved_claim_key`]. Callers that need to refuse the input
+    /// outright should check the key themselves; `vc issue` does, so the
+    /// operator gets an error instead of a silently missing claim.
     pub fn with_claim<T: Serialize>(mut self, key: impl Into<String>, value: &T) -> Self {
+        let key = key.into();
+        if Self::is_reserved_claim_key(&key) {
+            return self;
+        }
         if let Ok(val) = serde_json::to_value(value) {
-            self.claims.insert(key.into(), val);
+            self.claims.insert(key, val);
         }
         self
+    }
+
+    /// Add a claim, reporting a reserved key instead of dropping it.
+    ///
+    /// Use this at an input boundary, where a silently missing claim is a lie
+    /// about what was issued.
+    pub fn try_with_claim<T: Serialize>(
+        mut self,
+        key: impl Into<String>,
+        value: &T,
+    ) -> Result<Self, Web3ErrorKind> {
+        let key = key.into();
+        if Self::is_reserved_claim_key(&key) {
+            return Err(Web3ErrorKind::BlockchainError(format!(
+                "claim name {key:?} collides with a credentialSubject field"
+            )));
+        }
+        match serde_json::to_value(value) {
+            Ok(val) => {
+                self.claims.insert(key, val);
+                Ok(self)
+            }
+            Err(e) => Err(Web3ErrorKind::BlockchainError(format!(
+                "claim {key:?} is not serialisable: {e}"
+            ))),
+        }
     }
 
     /// Get a claim value.
@@ -334,6 +542,31 @@ pub struct CredentialProof {
     /// Domain (for Holder binding).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
+    /// Which bytes the signature covers.
+    ///
+    /// Absent on credentials issued before the proof options became part of
+    /// the signing input; those signed the body alone. The field lets a
+    /// verifier apply the rule the signature was actually computed under
+    /// instead of rejecting every older credential as if it were tampered
+    /// with — the two are otherwise indistinguishable, since both fail the
+    /// same signature check.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub signing_scheme: Option<SigningScheme>,
+}
+
+/// What a credential or presentation proof's signature covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SigningScheme {
+    /// Signature over the document body **and** the proof options
+    /// (`created`, `verificationMethod`, `purpose`, `challenge`, `domain`).
+    /// This is what every proof created now uses.
+    #[default]
+    #[serde(rename = "options-v1")]
+    ProofOptions,
+    /// Signature over the document body only. Produced by builds before the
+    /// options were bound; accepted only so those credentials keep verifying.
+    #[serde(rename = "body-only")]
+    BodyOnly,
 }
 
 impl CredentialProof {
@@ -351,6 +584,7 @@ impl CredentialProof {
             proof_value: signature.to_hex(),
             challenge: None,
             domain: None,
+            signing_scheme: Some(SigningScheme::ProofOptions),
         }
     }
 
@@ -383,6 +617,52 @@ pub enum ProofType {
     /// JSON Web Signature (JWS).
     #[serde(rename = "JsonWebSignature2020")]
     JsonWebSignature2020,
+}
+
+// ============================================================================
+// Proof-option encoding (shared by credentials and presentations)
+// ============================================================================
+
+/// Encode the proof options that are covered by the signature.
+///
+/// One encoder for both proof types, so the two cannot drift: a field added
+/// for one would otherwise be silently omitted for the other, and the
+/// signature it produces would not be checkable by the matching verifier.
+///
+/// Every string is written as `(u64 big-endian length, bytes)` and every
+/// optional value is prefixed with a presence byte, so no two distinct option
+/// sets encode to the same byte string — a value containing a separator
+/// cannot impersonate two fields, and `None` cannot collide with `Some("")`.
+/// `proofValue` is deliberately excluded: it is the signature over these
+/// bytes.
+fn encode_proof_options(
+    created: &str,
+    verification_method: &str,
+    purpose: &str,
+    challenge: Option<&str>,
+    domain: Option<&str>,
+) -> Vec<u8> {
+    fn value(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    fn optional(out: &mut Vec<u8>, opt: Option<&str>) {
+        match opt {
+            Some(v) => {
+                out.push(1);
+                value(out, v.as_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+
+    let mut out = Vec::new();
+    value(&mut out, created.as_bytes());
+    value(&mut out, verification_method.as_bytes());
+    value(&mut out, purpose.as_bytes());
+    optional(&mut out, challenge);
+    optional(&mut out, domain);
+    out
 }
 
 // ============================================================================
@@ -433,6 +713,219 @@ impl VerifiablePresentation {
         self.proof = Some(proof);
     }
 
+    /// The bytes that a presentation proof signs.
+    ///
+    /// The document body is serialised with `proof` dropped, as
+    /// [`VerifiableCredential::encode_for_signing`] does, **and then the proof
+    /// options are appended**: `created`, `verificationMethod`, `purpose`,
+    /// `challenge` and `domain`.
+    ///
+    /// Dropping the proof entirely — the first version of this function —
+    /// left the challenge unsigned. A challenge exists precisely to be bound
+    /// to the signature (it is what makes a presentation non-replayable: the
+    /// verifier issues a fresh one and checks the signature covers *that*
+    /// value). With it outside the signed bytes, an attacker could take a
+    /// valid presentation and rewrite `challenge` to any value and the proof
+    /// still verified. `domain` and the verification method had the same
+    /// hole; the method is checked separately against `holder`, but only
+    /// after the fact.
+    ///
+    /// This mirrors W3C Data Integrity, where the proof options are part of
+    /// the hash input. The options are appended in a fixed order rather than
+    /// serialised as a struct so that adding a field later cannot silently
+    /// change how existing signatures are computed: a new field must be
+    /// appended explicitly.
+    /// # Signing
+    ///
+    /// As with [`VerifiableCredential::encode_for_signing`], this is not a
+    /// signing API: a proof-less presentation yields proof-less bytes, and a
+    /// presentation proof signed that way can never pass `verify_proof` (which
+    /// requires the options scheme). Use [`Self::signing_input`].
+    pub fn encode_for_signing(&self) -> Result<Vec<u8>, Web3ErrorKind> {
+        // Dispatch on the attached proof's scheme, matching verification.
+        self.encoded_for_verification()
+    }
+
+    /// The bytes a stored proof's signature covers, following the scheme
+    /// recorded in the proof itself.
+    ///
+    /// `options-v1` only — anything else is refused by `verify_proof` before
+    /// this runs. The hashing itself still follows the recorded scheme so
+    /// `signing_input` can nevertheless produce body-only bytes when a test
+    /// or migration asks for them; acceptance is decided by the caller.
+    fn encoded_for_verification(&self) -> Result<Vec<u8>, Web3ErrorKind> {
+        let scheme = self
+            .proof
+            .as_ref()
+            .and_then(|p| p.signing_scheme)
+            .unwrap_or(SigningScheme::ProofOptions);
+        let mut clone = self.clone();
+        clone.proof = None;
+        let mut out = serde_json::to_vec(&clone).map_err(|e| {
+            Web3ErrorKind::BlockchainError(format!("presentation body is not serialisable: {e}"))
+        })?;
+        if scheme == SigningScheme::ProofOptions {
+            if let Some(proof) = self.proof.as_ref() {
+                out.extend_from_slice(&Self::proof_options_bytes(proof));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The bytes to sign for `proof`, before it is attached.
+    ///
+    /// This is the sign-then-attach half of [`Self::encode_for_signing`]: the
+    /// signer builds the proof (with no `proofValue` yet), hashes the body
+    /// plus that proof's options through this function, signs the result, and
+    /// then sets the signature. Computing the hash from a *proof-less* clone
+    /// instead — as `vc present` did — produces a signature that does not
+    /// cover the challenge, so verification (which does include the options)
+    /// fails, or worse, succeeds for a presentation whose challenge was
+    /// swapped afterwards.
+    pub fn signing_input(&self, proof: &PresentationProof) -> Result<Vec<u8>, Web3ErrorKind> {
+        // Attach the proof and run the verification path, so signing and
+        // verification are the same computation by construction.
+        let mut with_proof = self.clone();
+        with_proof.proof = Some(proof.clone());
+        with_proof.encoded_for_verification()
+    }
+
+    /// `created`, `verificationMethod`, `purpose`, `challenge` and `domain`,
+    /// each length-prefixed so a value containing the separator cannot make
+    /// two different option sets hash identically. `proofValue` is excluded —
+    /// it is the signature over these bytes.
+    ///
+    /// `domain` carries a presence tag before its length. Encoding a missing
+    /// domain as an empty string made `domain: None` and `domain: Some("")`
+    /// hash identically, so an absent domain could be *added* to a signed
+    /// presentation as an empty string without invalidating the signature —
+    /// signature malleability. The tag makes "absent" and "present but empty"
+    /// distinct inputs.
+    fn proof_options_bytes(proof: &PresentationProof) -> Vec<u8> {
+        encode_proof_options(
+            &proof.created,
+            &proof.verification_method,
+            &proof.purpose,
+            // A presentation proof always carries a challenge; `Some` keeps
+            // the presence byte consistent with the credential encoding.
+            Some(proof.challenge.as_str()),
+            proof.domain.as_deref(),
+        )
+    }
+
+    /// Verify the presentation's Ed25519 proof.
+    ///
+    /// The holder is a `did:key`, so the public key is embedded in the proof's
+    /// verification method. It must also match the `holder` field, otherwise a
+    /// presentation could claim one holder while carrying another's key —
+    /// the same check `VerifiableCredential::verify_proof` applies to the
+    /// issuer.
+    pub fn verify_proof(&self) -> Result<(), Web3ErrorKind> {
+        let proof = self.proof.as_ref().ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("presentation has no proof".to_string())
+        })?;
+        // A body-only signature leaves `challenge` unsigned, so it must never
+        // be accepted for a presentation — otherwise the challenge can be
+        // rewritten and the presentation replayed to another verifier. An
+        // absent field is an old-build proof and is also refused (failing
+        // closed costs nothing here: presentations are not stored).
+        if proof.signing_scheme != Some(SigningScheme::ProofOptions) {
+            return Err(Web3ErrorKind::BlockchainError(
+                "presentation proof must use the options-v1 signing scheme; \
+                 a body-only signature does not cover the challenge"
+                    .to_string(),
+            ));
+        }
+        match proof.proof_type {
+            ProofType::Ed25519Signature2020 | ProofType::Ed25519Signature2018 => {}
+            other => {
+                return Err(Web3ErrorKind::BlockchainError(format!(
+                    "unsupported presentation proof type: {other:?}"
+                )))
+            }
+        }
+        let vm_did = proof
+            .verification_method
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if vm_did != self.holder {
+            return Err(Web3ErrorKind::BlockchainError(format!(
+                "proof verification method {:?} does not match holder {:?}",
+                vm_did, self.holder
+            )));
+        }
+        let did = crate::web3::DidKey::from_string(vm_did)?;
+        let public_key = did.ed25519_public_key()?;
+        let pk_bytes: [u8; 32] = public_key.try_into().map_err(|_| {
+            Web3ErrorKind::BlockchainError("holder public key is not 32 bytes".to_string())
+        })?;
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
+            .map_err(|e| Web3ErrorKind::BlockchainError(format!("invalid holder key: {e}")))?;
+        let signature = Signature::from_hex(&proof.proof_value)?;
+        let dalek_sig = ed25519_dalek::Signature::from_bytes(signature.to_bytes());
+        let signed_bytes = self.encode_for_signing()?;
+        // `verify_strict` for the same reason as `verify_proof`: the lenient
+        // verifier accepts small-order keys, and a presentation signed that
+        // way verifies for any content.
+        verifying_key
+            .verify_strict(&signed_bytes, &dalek_sig)
+            .map_err(|_| {
+                Web3ErrorKind::BlockchainError(
+                    "presentation proof signature does not verify".to_string(),
+                )
+            })
+    }
+
+    /// Validate the presentation, then verify its proof **and every contained
+    /// credential**.
+    ///
+    /// A presentation's own proof only says "this holder assembled these
+    /// items". It says nothing about whether the credentials inside are
+    /// genuine: a holder can mint a presentation around any document at all.
+    /// Checking only the outer proof accepted a presentation whose single
+    /// credential named a fake issuer and carried no signature — the
+    /// verifier reported a valid presentation of a forged claim.
+    ///
+    /// Each credential therefore goes through the same path
+    /// [`VerifiableCredential::verify`] uses: structural validation, expiry,
+    /// and its own Ed25519 proof against its own issuer key.
+    pub fn verify(&self) -> Result<(), Web3ErrorKind> {
+        self.validate()?;
+        self.verify_proof()?;
+        for (index, credential) in self.verifiable_credential.iter().enumerate() {
+            credential.verify().map_err(|e| {
+                Web3ErrorKind::BlockchainError(format!(
+                    "presented credential #{index} is not valid: {e}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Verify a presentation against a challenge the verifier issued.
+    ///
+    /// A signature that covers the challenge is only half the check: the
+    /// verifier must also confirm the presentation carries *its* challenge,
+    /// otherwise an attacker can replay a presentation the holder signed for
+    /// some other verifier. `expected_challenge` is compared byte-for-byte
+    /// before the proof is verified.
+    ///
+    /// Everything else [`Self::verify`] does still applies.
+    pub fn verify_with_challenge(&self, expected_challenge: &str) -> Result<(), Web3ErrorKind> {
+        let proof = self.proof.as_ref().ok_or_else(|| {
+            Web3ErrorKind::BlockchainError("presentation has no proof".to_string())
+        })?;
+        if proof.challenge != expected_challenge {
+            return Err(Web3ErrorKind::BlockchainError(format!(
+                "presentation challenge {:?} does not match the expected challenge",
+                proof.challenge
+            )));
+        }
+        self.verify()
+    }
+
     /// Validate the presentation.
     pub fn validate(&self) -> Result<(), Web3ErrorKind> {
         if !self.holder.starts_with("did:") {
@@ -472,6 +965,17 @@ pub struct PresentationProof {
     pub challenge: String,
     /// Domain.
     pub domain: Option<String>,
+    /// Which bytes the signature covers. See [`SigningScheme`].
+    ///
+    /// Presentations must be `options-v1`: a body-only signature leaves
+    /// `challenge` unsigned, so it could be rewritten after signing and the
+    /// presentation replayed to another verifier. `verify_proof` rejects both
+    /// an explicit `body-only` and an absent field (a proof from a build
+    /// before this field existed). Presentations are verified as they are
+    /// presented, so there is no stored corpus that failing closed would
+    /// strand.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub signing_scheme: Option<SigningScheme>,
 }
 
 impl PresentationProof {
@@ -490,6 +994,7 @@ impl PresentationProof {
             proof_value: signature.to_hex(),
             challenge: challenge.into(),
             domain: None,
+            signing_scheme: Some(SigningScheme::ProofOptions),
         }
     }
 
@@ -665,6 +1170,188 @@ fn iso8601_timestamp() -> String {
     "1970-01-01T00:00:00Z".to_string()
 }
 
+/// The current instant, in Unix seconds, for validity checks.
+///
+/// A `no_std` build has no clock here, so it reports 0 — the same epoch the
+/// `no_std` `iso8601_timestamp` reports. That keeps `is_expired` and
+/// `is_not_yet_valid` consistent with each other instead of comparing a real
+/// `validUntil` against a fabricated "now".
+fn current_unix_secs() -> i64 {
+    #[cfg(feature = "std")]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            // A clock before 1970 is not a time we can evaluate a bound
+            // against; 0 makes every real `validFrom` "not yet valid" and
+            // every real `validUntil` "expired", which fails closed.
+            .unwrap_or(0)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        0
+    }
+}
+
+/// Whether `text` is a `validFrom` / `validUntil` bound this module can
+/// evaluate.
+///
+/// Issuers should reject a bound this returns `false` for: `is_expired` and
+/// `is_not_yet_valid` treat an unparseable bound as "already expired" / "not
+/// yet valid", so a credential signed with one is dead on arrival. Exposing
+/// the predicate lets `vc issue` refuse it instead of printing a success the
+/// verifier will later contradict.
+pub fn is_valid_instant_bound(text: &str) -> bool {
+    parse_iso8601_instant(text).is_some()
+}
+
+/// Parse the subset of ISO-8601 / RFC 3339 that a `validFrom` / `validUntil`
+/// can carry into a Unix second count, or `None` if it is not a valid instant.
+///
+/// Accepted: `YYYY-MM-DDTHH:MM:SS` with an optional fractional part (truncated
+/// — second resolution is what the bound is compared at) and an optional
+/// `Z` / `z` / `±HH:MM` / `±HHMM` zone. A missing zone is read as UTC, which is
+/// what a W3C VC means by a bare `dateTime`.
+///
+/// Rejects: impossible dates (`2026-02-30`), out-of-range clock fields,
+/// trailing garbage, and a zone offset past `±23:59`. Every rejection makes a
+/// caller fail closed, so a lenient parse would be the wrong default.
+fn parse_iso8601_instant(text: &str) -> Option<i64> {
+    const SECS_PER_DAY: i64 = 86_400;
+    /// Widest instant this module's own formatter can produce, with room for a
+    /// timezone offset either side. Beyond it the day arithmetic could
+    /// overflow, and no real credential window needs it.
+    const MAX_ABS_SECS: i64 = 253_402_300_800; // 9999-12-31T23:59:59Z
+
+    let bytes = text.as_bytes();
+    // The shortest legal form is `YYYY-MM-DDTHH:MM:SS` (19 bytes).
+    if bytes.len() < 19 {
+        return None;
+    }
+    let digits = |from: usize, len: usize| -> Option<i64> {
+        let slice = bytes.get(from..from + len)?;
+        let mut value: i64 = 0;
+        for &b in slice {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            value = value * 10 + i64::from(b - b'0');
+        }
+        Some(value)
+    };
+
+    // `YYYY-MM-DD`
+    let year = digits(0, 4)?;
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let month = digits(5, 2)?;
+    let day = digits(8, 2)?;
+    // The date/time separator may be `T` (RFC 3339) or a space.
+    if bytes[10] != b'T' && bytes[10] != b't' && bytes[10] != b' ' {
+        return None;
+    }
+    let hour = digits(11, 2)?;
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let minute = digits(14, 2)?;
+    let second = digits(17, 2)?;
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // `hour` 24 is only `24:00:00`; treat anything above 23 as invalid, which
+    // also keeps seconds-of-day in range.
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // A leap second (60) is folded to :59 so it cannot land on the next day.
+    let second = second.min(59);
+    if day > days_in_month(year, month as u32) as i64 {
+        return None;
+    }
+
+    let mut rest = 19;
+    // Optional fractional seconds; truncated, not rounded, so the bound is
+    // never moved *up* past the instant it names.
+    if bytes.get(rest) == Some(&b'.') {
+        rest += 1;
+        let start = rest;
+        while bytes.get(rest).is_some_and(u8::is_ascii_digit) {
+            rest += 1;
+        }
+        if rest == start {
+            return None;
+        }
+    }
+
+    // Optional zone. Absent means UTC.
+    let offset_secs: i64 = match bytes.get(rest) {
+        None => 0,
+        Some(b'Z') | Some(b'z') if rest + 1 == bytes.len() => 0,
+        Some(&sign @ (b'+' | b'-')) => {
+            let oh = digits(rest + 1, 2)?;
+            // `+HH:MM` or `+HHMM`.
+            let (om, end) = match bytes.get(rest + 3) {
+                Some(b':') => (digits(rest + 4, 2)?, rest + 6),
+                _ => (digits(rest + 3, 2)?, rest + 5),
+            };
+            if end != bytes.len() || oh > 23 || om > 59 {
+                return None;
+            }
+            let magnitude = oh * 3600 + om * 60;
+            if sign == b'-' {
+                -magnitude
+            } else {
+                magnitude
+            }
+        }
+        Some(_) => return None,
+    };
+
+    let days = days_from_civil(year, month as u32, day as u32);
+    let secs = days
+        .checked_mul(SECS_PER_DAY)?
+        .checked_add(hour * 3600 + minute * 60 + second)?
+        // A local reading west of UTC is later in absolute terms.
+        .checked_sub(offset_secs)?;
+    if secs.abs() > MAX_ABS_SECS.saturating_mul(2) {
+        return None;
+    }
+    Some(secs)
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian civil date.
+///
+/// Howard Hinnant's `days_from_civil`, the inverse of [`civil_from_days`].
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    const DAYS_PER_CYCLE: i64 = 146_097;
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if month > 2 {
+        month as i64 - 3
+    } else {
+        month as i64 + 9
+    }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * DAYS_PER_CYCLE + doe - 719_468
+}
+
+/// Days in `month` of `year`, proleptic Gregorian.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
 /// Format a Unix timestamp (seconds) as ISO-8601 UTC
 /// (`YYYY-MM-DDTHH:MM:SSZ`) without pulling in the `chrono` crate.
 ///
@@ -764,7 +1451,141 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod time_tests {
-    use super::format_unix_to_iso8601;
+    use alloc::string::ToString;
+
+    use super::{
+        days_in_month, format_unix_to_iso8601, parse_iso8601_instant, VerifiableCredential,
+    };
+
+    /// Parsing must invert formatting for every instant the module produces.
+    #[test]
+    fn parse_round_trips_the_formatter() {
+        for secs in [
+            0i64,
+            1,
+            86_399,
+            86_400,
+            1_705_323_930,
+            1_582_934_400,
+            4_102_444_799,
+        ] {
+            let text = format_unix_to_iso8601(secs as u64);
+            assert_eq!(
+                parse_iso8601_instant(&text),
+                Some(secs),
+                "round trip for {text}"
+            );
+        }
+    }
+
+    /// A timezone offset must be applied, not read lexically.
+    ///
+    /// This is the defect: `validUntil = "2026-11-15T20:00:00+14:00"` is
+    /// `06:00Z`, already past when "now" is `07:31Z`, yet the string sorts
+    /// *after* `2026-11-15T07:31:00Z` and the old `until < now` comparison
+    /// called the credential valid.
+    #[test]
+    fn a_zone_offset_is_applied_to_the_instant() {
+        let utc = parse_iso8601_instant("2026-11-15T06:00:00Z").unwrap();
+        assert_eq!(
+            parse_iso8601_instant("2026-11-15T20:00:00+14:00"),
+            Some(utc)
+        );
+        assert_eq!(
+            parse_iso8601_instant("2026-11-15T14:00:00+08:00"),
+            Some(utc)
+        );
+        assert_eq!(
+            parse_iso8601_instant("2026-11-14T22:00:00-08:00"),
+            Some(utc)
+        );
+        // `+HHMM` without the colon is the same instant.
+        assert_eq!(parse_iso8601_instant("2026-11-15T14:00:00+0800"), Some(utc));
+        // Lower-case `z` and the RFC 3339 space separator.
+        assert_eq!(parse_iso8601_instant("2026-11-15t06:00:00z"), Some(utc));
+        assert_eq!(parse_iso8601_instant("2026-11-15 06:00:00Z"), Some(utc));
+    }
+
+    /// Fractional seconds must truncate, so `…:04.9Z` is not "after :04Z" in a
+    /// way that flips a bound. The old comparison said it was.
+    #[test]
+    fn fractional_seconds_are_truncated_not_lexically_ordered() {
+        let base = parse_iso8601_instant("2026-11-15T07:31:04Z").unwrap();
+        assert_eq!(parse_iso8601_instant("2026-11-15T07:31:04.9Z"), Some(base));
+        assert_eq!(
+            parse_iso8601_instant("2026-11-15T07:31:04.000001Z"),
+            Some(base)
+        );
+    }
+
+    /// Malformed or impossible bounds must be `None`, so every caller fails
+    /// closed rather than comparing a garbage string.
+    #[test]
+    fn impossible_instants_are_rejected() {
+        for bad in [
+            "",
+            "2026-11-15",
+            "2026-02-30T00:00:00Z",
+            "2025-02-29T00:00:00Z", // 2025 is not a leap year
+            "2026-13-01T00:00:00Z",
+            "2026-00-01T00:00:00Z",
+            "2026-11-32T00:00:00Z",
+            "2026-11-15T24:00:00Z",
+            "2026-11-15T00:60:00Z",
+            "2026-11-15T00:00:61Z",
+            "2026-11-15T00:00:00+24:00",
+            "2026-11-15T00:00:00+01:60",
+            "2026-11-15T00:00:00.Z",
+            "2026-11-15T00:00:00Zjunk",
+            "2026-11-15T00:00:00+01:00x",
+            "20261115T000000Z",
+        ] {
+            assert_eq!(parse_iso8601_instant(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    /// `days_in_month` must know the Gregorian rules it is asked about.
+    #[test]
+    fn days_in_month_handles_leap_years() {
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2025, 2), 28);
+        assert_eq!(days_in_month(2000, 2), 29);
+        assert_eq!(days_in_month(1900, 2), 28);
+        assert_eq!(days_in_month(2026, 4), 30);
+        assert_eq!(days_in_month(2026, 12), 31);
+    }
+
+    /// An unparseable `validUntil` must count as expired, and an unparseable
+    /// `validFrom` as not-yet-valid: neither can be relied on.
+    #[test]
+    fn unparseable_bounds_fail_closed() {
+        let mut vc = VerifiableCredential::new(
+            "urn:uuid:x",
+            "did:key:z6Mk",
+            vec!["VerifiableCredential".to_string()],
+            super::CredentialSubject::new("did:key:z6Mk"),
+        );
+        vc.valid_until = Some("not-a-date".to_string());
+        assert!(vc.is_expired());
+        vc.valid_until = None;
+        vc.valid_from = "2999-01-01T00:00:00Z".to_string();
+        assert!(vc.is_not_yet_valid());
+    }
+
+    /// A far-future `validUntil` and a past `validFrom` are not flagged.
+    #[test]
+    fn normal_windows_are_not_flagged() {
+        let mut vc = VerifiableCredential::new(
+            "urn:uuid:x",
+            "did:key:z6Mk",
+            vec!["VerifiableCredential".to_string()],
+            super::CredentialSubject::new("did:key:z6Mk"),
+        );
+        vc.valid_until = Some("2999-12-31T23:59:59Z".to_string());
+        vc.valid_from = "2001-01-01T00:00:00Z".to_string();
+        assert!(!vc.is_expired());
+        assert!(!vc.is_not_yet_valid());
+    }
 
     #[test]
     fn unix_epoch_is_1970_01_01() {
@@ -809,6 +1630,141 @@ mod time_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web3::identity::Identity;
+
+    /// A small-order `did:key` plus an identity-point signature must not
+    /// verify.
+    ///
+    /// `VerifyingKey::from_bytes` only checks that the point decompresses; it
+    /// accepts the eight small-order points. With `VerifyingKey::verify` (the
+    /// lenient verifier) a key of the identity point and a signature
+    /// `R = identity, S = 0` verified for **any** credential — an attacker
+    /// could mint a "valid" credential for an arbitrary issuer, subject and
+    /// claims with no private key. `verify_strict` rejects small-order `A`
+    /// and `R`; this pins the fix at the credential, presentation and
+    /// `SignedMessage` layers.
+    #[test]
+    fn a_small_order_key_cannot_forge_a_credential() {
+        // The identity point, as a `did:key` public key.
+        let mut pk = [0u8; 32];
+        pk[0] = 1;
+        let did = crate::web3::DidKey::from_ed25519_public_key(&pk)
+            .expect("the identity encoding is a valid curve point")
+            .as_str()
+            .to_string();
+
+        // R = identity point, S = 0.
+        let mut sig = [0u8; 64];
+        sig[0] = 1;
+
+        let mut vc = VerifiableCredential::new(
+            "urn:uuid:forged",
+            did.clone(),
+            vec!["VerifiableCredential".to_string(), "Degree".to_string()],
+            CredentialSubject::new("did:key:zVictim").with_claim("role", &"admin"),
+        );
+        let mut proof = CredentialProof::new(
+            ProofType::Ed25519Signature2020,
+            format!("{did}#key"),
+            Signature::from_bytes(&sig).expect("64 bytes"),
+        );
+        proof.verification_method = format!("{did}#key");
+        vc.sign(proof);
+
+        assert!(
+            vc.verify_proof().is_err(),
+            "a small-order issuer key must not verify a credential"
+        );
+        assert!(vc.verify().is_err());
+    }
+
+    /// The same forgery must fail against a `SignedMessage` envelope.
+    #[test]
+    fn a_small_order_key_cannot_forge_a_signed_message() {
+        use crate::web3::identity::{verify_signature_detailed, PublicKey};
+
+        let mut pk = [0u8; 32];
+        pk[0] = 1;
+        // R = identity, S = 0.
+        let mut sig = [0u8; 64];
+        sig[0] = 1;
+        let public = PublicKey::from_bytes(&pk).expect("32 bytes is a PublicKey");
+        assert!(
+            verify_signature_detailed(&public, &hex_of(&sig), b"attacker payload").is_err(),
+            "a small-order signer key must not authenticate any payload"
+        );
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+
+    /// A claim named `id` must never reach the wire form.
+    ///
+    /// `credentialSubject` is `#[serde(flatten)]`ed claims over a struct with
+    /// an `id` field, and serde emits both without complaint:
+    /// `{"id":"<subject>","id":"<claim>"}`. This crate's own `Deserialize`
+    /// then rejects the document as `duplicate field 'id'` — a credential that
+    /// was just signed cannot be read back — while last-wins parsers in other
+    /// languages resolve the *claim* as the subject id. `with_claim` drops
+    /// the key; `try_with_claim` (the input-boundary path used by `vc issue`)
+    /// reports it.
+    #[test]
+    fn a_claim_named_id_cannot_shadow_the_subject_id() {
+        let subject = CredentialSubject::new("did:key:z6MkReal")
+            .with_claim("id", &"did:key:z6MkAttacker")
+            .with_claim("role", &"admin");
+
+        // Check the *streamed* JSON, not just `to_value`: a `serde_json::Map`
+        // would collapse a duplicate key, which is exactly the behaviour this
+        // test must not rely on. Serde streams a flattened map's keys
+        // verbatim, so `to_string` is where the duplicate shows up.
+        let wire = serde_json::to_string(&subject).expect("serialise");
+        assert_eq!(
+            wire.matches("\"id\"").count(),
+            1,
+            "credentialSubject must carry exactly one `id`, got {wire}"
+        );
+        assert!(wire.contains("did:key:z6MkReal"), "{wire}");
+        assert!(!wire.contains("z6MkAttacker"), "{wire}");
+        assert!(wire.contains("\"role\":\"admin\""), "{wire}");
+
+        // And the whole credential round-trips, which it did not before.
+        let vc = VerifiableCredential::new(
+            "urn:uuid:claims",
+            "did:key:z6MkIssuer",
+            vec!["VerifiableCredential".to_string()],
+            subject,
+        );
+        let text = String::from_utf8(vc.encode_canonical()).expect("utf8");
+        let parsed: VerifiableCredential =
+            serde_json::from_str(&text).expect("a credential we produced must parse back");
+        assert_eq!(parsed.credential_subject.id, "did:key:z6MkReal");
+    }
+
+    /// The input-boundary constructor refuses the collision instead of
+    /// dropping it, so an operator is told the claim was not issued.
+    #[test]
+    fn try_with_claim_reports_a_reserved_key() {
+        let subject = CredentialSubject::new("did:key:z6MkReal");
+        let err = subject
+            .try_with_claim("id", &"did:key:z6MkAttacker")
+            .expect_err("a reserved key must be an error");
+        match err {
+            Web3ErrorKind::BlockchainError(msg) => assert!(msg.contains("collides")),
+            other => panic!("expected BlockchainError, got {other:?}"),
+        }
+
+        // A non-reserved key still works.
+        let ok = CredentialSubject::new("did:key:z6MkReal")
+            .try_with_claim("role", &"admin")
+            .expect("ordinary claim");
+        assert_eq!(ok.get("role").and_then(|v| v.as_str()), Some("admin"));
+    }
 
     #[test]
     fn test_credential_creation() {
@@ -1019,5 +1975,754 @@ mod tests {
                 "expected RFC 4122 variant-1 (8/9/a/b) in {id}, got '{variant_char}'"
             );
         }
+    }
+
+    /// Sign a presentation with a real holder key and verify it.
+    fn signed_presentation() -> (Identity, VerifiablePresentation) {
+        let identity = Identity::from_secret_bytes(&[7u8; 32]).expect("identity");
+        let holder_did = identity.did_key().as_str().to_string();
+        let mut presentation =
+            VerifiablePresentation::new(holder_did.clone(), vec![signed_credential(&identity)]);
+        sign_presentation(&identity, &mut presentation);
+        (identity, presentation)
+    }
+
+    /// A credential issued and signed by `identity`.
+    fn signed_credential(identity: &Identity) -> VerifiableCredential {
+        let issuer_did = identity.did_key().as_str().to_string();
+        let mut vc = VerifiableCredential::new(
+            "urn:uuid:presented",
+            issuer_did.clone(),
+            vec!["VerifiableCredential".to_string()],
+            CredentialSubject::new(issuer_did.clone()),
+        );
+        // Build the proof first so its options are part of the signed bytes.
+        let mut proof = CredentialProof::new(
+            ProofType::Ed25519Signature2020,
+            format!("{issuer_did}#{}", issuer_did.trim_start_matches("did:key:")),
+            Signature::from_bytes(&[0u8; 64]).expect("placeholder signature"),
+        );
+        let signed = identity
+            .sign(&vc.signing_input(&proof).expect("signing input"))
+            .expect("sign credential");
+        proof.proof_value = Signature::from_hex(&signed.signature_hex)
+            .expect("signature")
+            .to_hex();
+        vc.sign(proof);
+        vc
+    }
+
+    /// Attach a fresh holder proof over the presentation's current body.
+    fn sign_presentation(identity: &Identity, presentation: &mut VerifiablePresentation) {
+        let holder_did = identity.did_key().as_str().to_string();
+        // Build the proof first so its options (challenge, domain, …) are
+        // part of the signed bytes, then attach the signature.
+        let mut proof = PresentationProof::new(
+            ProofType::Ed25519Signature2020,
+            format!("{holder_did}#{}", holder_did.trim_start_matches("did:key:")),
+            "challenge-1",
+            Signature::from_bytes(&[0u8; 64]).expect("placeholder signature"),
+        );
+        let payload = presentation.signing_input(&proof).expect("signing input");
+        let signed = identity.sign(&payload).expect("sign presentation");
+        proof.proof_value = Signature::from_hex(&signed.signature_hex)
+            .expect("signature")
+            .to_hex();
+        presentation.sign(proof);
+    }
+
+    /// A credential proof's challenge is covered by the signature too.
+    ///
+    /// `CredentialProof` carries `challenge` and `domain`; before they were
+    /// appended to the signing input, a credential could be re-challenged
+    /// after issuance and still verify.
+    #[test]
+    fn a_credential_challenge_is_covered_by_the_signature() {
+        let identity = Identity::from_secret_bytes(&[11u8; 32]).expect("identity");
+        let issuer_did = identity.did_key().as_str().to_string();
+        let mut vc = VerifiableCredential::new(
+            "urn:uuid:challenged",
+            issuer_did.clone(),
+            vec!["VerifiableCredential".to_string()],
+            CredentialSubject::new(issuer_did.clone()),
+        );
+        let mut proof = CredentialProof::new(
+            ProofType::Ed25519Signature2020,
+            format!("{issuer_did}#{}", issuer_did.trim_start_matches("did:key:")),
+            Signature::from_bytes(&[0u8; 64]).expect("placeholder"),
+        )
+        .with_challenge("credential-challenge-1");
+        let signed = identity
+            .sign(&vc.signing_input(&proof).expect("signing input"))
+            .expect("sign credential");
+        proof.proof_value = Signature::from_hex(&signed.signature_hex)
+            .expect("signature")
+            .to_hex();
+        vc.sign(proof);
+        vc.verify().expect("a freshly signed credential verifies");
+
+        // Rewriting the challenge must invalidate the proof.
+        if let Some(p) = vc.proof.as_mut() {
+            p.challenge = Some("different-challenge".to_string());
+        }
+        assert!(
+            vc.verify_proof().is_err(),
+            "a credential challenge rewritten after signing must not verify"
+        );
+    }
+
+    /// An absent credential challenge and an empty one must differ.
+    #[test]
+    fn an_absent_credential_challenge_is_not_an_empty_one() {
+        let identity = Identity::from_secret_bytes(&[12u8; 32]).expect("identity");
+        let issuer_did = identity.did_key().as_str().to_string();
+        let mut vc = VerifiableCredential::new(
+            "urn:uuid:nochallenge",
+            issuer_did.clone(),
+            vec!["VerifiableCredential".to_string()],
+            CredentialSubject::new(issuer_did.clone()),
+        );
+        let mut proof = CredentialProof::new(
+            ProofType::Ed25519Signature2020,
+            format!("{issuer_did}#{}", issuer_did.trim_start_matches("did:key:")),
+            Signature::from_bytes(&[0u8; 64]).expect("placeholder"),
+        );
+        let signed = identity
+            .sign(&vc.signing_input(&proof).expect("signing input"))
+            .expect("sign credential");
+        proof.proof_value = Signature::from_hex(&signed.signature_hex)
+            .expect("signature")
+            .to_hex();
+        vc.sign(proof);
+        assert!(vc.verify_proof().is_ok());
+
+        if let Some(p) = vc.proof.as_mut() {
+            p.challenge = Some(String::new());
+        }
+        assert!(
+            vc.verify_proof().is_err(),
+            "adding an empty challenge must change the signed bytes"
+        );
+    }
+
+    /// A presentation must not be verifiable as body-only.
+    ///
+    /// Round 15 let a proof whose `signingScheme` was absent fall back to
+    /// `body-only` for compatibility. On a *presentation* that reintroduced
+    /// the replay hole round 13 closed: a body-only signature does not cover
+    /// `challenge`, and `signingScheme` is attacker-controlled JSON, so a
+    /// replayer could blank it, rewrite the challenge to the next verifier's
+    /// nonce, and pass. Probe confirmed it before the fix.
+    #[test]
+    fn a_presentation_cannot_be_downgraded_to_body_only() {
+        let (identity, mut presentation) = signed_presentation();
+        // Strip the scheme and re-sign over the body alone, as a pre-scheme
+        // build did.
+        presentation.proof.as_mut().expect("proof").signing_scheme = None;
+        let mut body = presentation.clone();
+        body.proof = None;
+        let bytes = serde_json::to_vec(&body).expect("serialise");
+        let signed = identity.sign(&bytes).expect("sign");
+        presentation.proof.as_mut().expect("proof").proof_value = signed.signature_hex.clone();
+
+        // Rewriting the challenge must still fail: there is no body-only
+        // escape hatch for presentations.
+        presentation.proof.as_mut().expect("proof").challenge = "verifier-nonce-xyz".to_string();
+        assert!(
+            presentation
+                .verify_with_challenge("verifier-nonce-xyz")
+                .is_err(),
+            "a body-only presentation must not be accepted"
+        );
+    }
+
+    /// `signing_input` and verification must agree for every scheme value.
+    ///
+    /// They resolved the scheme with different defaults (signing used
+    /// `unwrap_or_default()`, which is `ProofOptions`; verification treated
+    /// absent as `BodyOnly`), so a credential signed through the public
+    /// helper with the field cleared could not be verified. `signing_input`
+    /// now shares the verification path, so this pins the invariant for both
+    /// explicit values and the absent one.
+    #[test]
+    fn signing_input_matches_verification_for_every_scheme() {
+        for scheme in [
+            None,
+            Some(SigningScheme::BodyOnly),
+            Some(SigningScheme::ProofOptions),
+        ] {
+            let identity = Identity::from_secret_bytes(&[32u8; 32]).expect("identity");
+            let did = identity.did_key().as_str().to_string();
+            let mut vc = VerifiableCredential::new(
+                "urn:uuid:scheme",
+                did.clone(),
+                vec!["VerifiableCredential".to_string()],
+                CredentialSubject::new(did.clone()),
+            );
+            let mut proof = CredentialProof::new(
+                ProofType::Ed25519Signature2020,
+                format!("{did}#{}", did.trim_start_matches("did:key:")),
+                Signature::from_bytes(&[0u8; 64]).expect("placeholder"),
+            );
+            proof.signing_scheme = scheme;
+            let signed = identity
+                .sign(&vc.signing_input(&proof).expect("signing input"))
+                .expect("sign via the public helper");
+            proof.proof_value = signed.signature_hex.clone();
+            vc.sign(proof);
+            assert!(
+                vc.verify_proof().is_ok(),
+                "a credential signed through signing_input must verify (scheme {scheme:?})"
+            );
+        }
+    }
+
+    /// A presentation verifies only with the `options-v1` scheme.
+    ///
+    /// Every *other* value — an explicit `body-only`, or an absent field from
+    /// an older build — leaves `challenge` unsigned and is rejected. An
+    /// explicit `body-only` slipped through when the check only looked at
+    /// absent values, which let a replayer rewrite the challenge.
+    #[test]
+    fn a_presentation_verifies_only_with_the_options_scheme() {
+        let identity = Identity::from_secret_bytes(&[33u8; 32]).expect("identity");
+        let holder_did = identity.did_key().as_str().to_string();
+
+        for scheme in [
+            None,
+            Some(SigningScheme::BodyOnly),
+            Some(SigningScheme::ProofOptions),
+        ] {
+            let mut presentation =
+                VerifiablePresentation::new(holder_did.clone(), vec![signed_credential(&identity)]);
+            let mut proof = PresentationProof::new(
+                ProofType::Ed25519Signature2020,
+                format!("{holder_did}#{}", holder_did.trim_start_matches("did:key:")),
+                "challenge-1",
+                Signature::from_bytes(&[0u8; 64]).expect("placeholder"),
+            );
+            proof.signing_scheme = scheme;
+            let signed = identity
+                .sign(&presentation.signing_input(&proof).expect("signing input"))
+                .expect("sign");
+            proof.proof_value = signed.signature_hex.clone();
+            presentation.sign(proof);
+
+            let expected_ok = scheme == Some(SigningScheme::ProofOptions);
+            assert_eq!(
+                presentation.verify_proof().is_ok(),
+                expected_ok,
+                "scheme {scheme:?}: only options-v1 may verify"
+            );
+        }
+    }
+
+    /// A body-only credential that carries a challenge is rejected.
+    ///
+    /// Its signature does not cover the challenge, so the field could have
+    /// been added after issuance. Reporting it as bound would be a lie.
+    #[test]
+    fn a_body_only_credential_with_a_challenge_is_rejected() {
+        let identity = Identity::from_secret_bytes(&[23u8; 32]).expect("identity");
+        let did = identity.did_key().as_str().to_string();
+        let mut vc = VerifiableCredential::new(
+            "urn:uuid:smuggled",
+            did.clone(),
+            vec!["VerifiableCredential".to_string()],
+            CredentialSubject::new(did.clone()),
+        );
+        let mut body = vc.clone();
+        body.proof = None;
+        let bytes = serde_json::to_vec(&body).expect("serialise");
+        let signed = identity.sign(&bytes).expect("sign");
+        let mut proof = CredentialProof::new(
+            ProofType::Ed25519Signature2020,
+            format!("{did}#{}", did.trim_start_matches("did:key:")),
+            Signature::from_hex(&signed.signature_hex).expect("signature"),
+        );
+        proof.signing_scheme = None;
+        proof.challenge = Some("added-after-signing".to_string());
+        vc.sign(proof);
+
+        let err = vc
+            .verify_proof()
+            .expect_err("an unsigned challenge must not be reported as bound");
+        assert!(err.to_string().contains("does not cover"), "got {err}");
+    }
+
+    /// A credential signed by an earlier build — body only, no
+    /// `signingScheme` — must still verify.
+    ///
+    /// When the proof options became part of the signing input, a credential
+    /// issued before that change began failing with the *same* error a
+    /// tampered one produces. Both are "signature does not verify", so the
+    /// verifier could not tell a legitimate old credential from a forged one
+    /// and would reject valid, signed evidence. The stored proof now records
+    /// which rule it was signed under.
+    ///
+    /// A body-only credential with no challenge still verifies — the
+    /// compatibility path round 15 added must keep working.
+    #[test]
+    fn a_legacy_body_only_credential_still_verifies() {
+        let identity = Identity::from_secret_bytes(&[21u8; 32]).expect("identity");
+        let did = identity.did_key().as_str().to_string();
+        let mut vc = VerifiableCredential::new(
+            "urn:uuid:legacy",
+            did.clone(),
+            vec!["VerifiableCredential".to_string()],
+            CredentialSubject::new(did.clone()),
+        );
+        // The exact bytes the old implementation hashed: the body alone.
+        let mut body = vc.clone();
+        body.proof = None;
+        let legacy_bytes = serde_json::to_vec(&body).expect("serialise");
+        let signed = identity.sign(&legacy_bytes).expect("sign");
+        let mut proof = CredentialProof::new(
+            ProofType::Ed25519Signature2020,
+            format!("{did}#{}", did.trim_start_matches("did:key:")),
+            Signature::from_hex(&signed.signature_hex).expect("signature"),
+        );
+        // Simulate a credential written before the field existed: absent.
+        proof.signing_scheme = None;
+        vc.sign(proof);
+
+        // Round-trip through JSON as a stored credential would be.
+        let stored = serde_json::to_string(&vc).expect("serialise credential");
+        let reloaded: VerifiableCredential = serde_json::from_str(&stored).expect("parse");
+        reloaded
+            .verify()
+            .expect("a body-only credential must still verify");
+
+        // Tampering with the body still fails.
+        let mut tampered = reloaded.clone();
+        tampered.issuer = "did:key:z6MkOther".to_string();
+        assert!(tampered.verify_proof().is_err());
+    }
+
+    /// A body-only proof's `purpose` is outside the signature, so an
+    /// arbitrary value there must not be accepted.
+    ///
+    /// The compatibility path signs the body alone, which leaves `created`,
+    /// `purpose` and the `#`fragment of `verificationMethod` unauthenticated.
+    /// Nothing consults them today — and that is precisely why accepting an
+    /// arbitrary `purpose` is a trap: the first future check that reads it
+    /// would read attacker-controlled data on an otherwise valid credential.
+    /// Only the canonical issuer purpose is accepted.
+    #[test]
+    fn a_body_only_proof_cannot_smuggle_a_purpose() {
+        let identity = Identity::from_secret_bytes(&[24u8; 32]).expect("identity");
+        let did = identity.did_key().as_str().to_string();
+        let mut vc = VerifiableCredential::new(
+            "urn:uuid:purpose",
+            did.clone(),
+            vec!["VerifiableCredential".to_string()],
+            CredentialSubject::new(did.clone()),
+        );
+        let mut body = vc.clone();
+        body.proof = None;
+        let signed = identity
+            .sign(&serde_json::to_vec(&body).expect("serialise"))
+            .expect("sign");
+        let mut proof = CredentialProof::new(
+            ProofType::Ed25519Signature2020,
+            format!("{did}#{}", did.trim_start_matches("did:key:")),
+            Signature::from_hex(&signed.signature_hex).expect("signature"),
+        );
+        proof.signing_scheme = None; // legacy: body-only
+
+        // The canonical purpose is accepted on the compatibility path.
+        vc.sign(proof.clone());
+        vc.verify_proof()
+            .expect("body-only credential with AssertionMethod");
+
+        // Any other purpose is refused, even though the signature itself
+        // still checks out — that is the point.
+        proof.purpose = "Authentication".to_string();
+        vc.sign(proof);
+        let err = vc
+            .verify_proof()
+            .expect_err("an unsigned purpose must not be accepted");
+        assert!(
+            err.to_string().contains("unauthenticated purpose"),
+            "got {err}"
+        );
+    }
+
+    /// A new credential records its scheme and is verified under it.
+    #[test]
+    fn a_new_credential_records_the_proof_options_scheme() {
+        let identity = Identity::from_secret_bytes(&[22u8; 32]).expect("identity");
+        let vc = signed_credential(&identity);
+        assert_eq!(
+            vc.proof.as_ref().and_then(|p| p.signing_scheme),
+            Some(SigningScheme::ProofOptions)
+        );
+        let stored = serde_json::to_string(&vc).expect("serialise");
+        assert!(
+            stored.contains("options-v1"),
+            "the scheme must survive serialisation: {stored}"
+        );
+        vc.verify().expect("verifies");
+    }
+
+    #[test]
+    fn presentation_proof_round_trips() {
+        let (_id, presentation) = signed_presentation();
+        presentation
+            .verify()
+            .expect("a freshly signed presentation must verify");
+    }
+
+    /// Tampering with the body after signing must be detected. Without a
+    /// verification path at all, `vc present` produced presentations nothing
+    /// could check.
+    #[test]
+    fn presentation_proof_detects_a_tampered_body() {
+        let (_id, mut presentation) = signed_presentation();
+        presentation.holder = "did:key:z6MkSomebodyElse".to_string();
+        assert!(
+            presentation.verify_proof().is_err(),
+            "a changed holder must not verify"
+        );
+
+        let (_id2, mut other) = signed_presentation();
+        other.created = "1999-01-01T00:00:00Z".to_string();
+        assert!(
+            other.verify_proof().is_err(),
+            "a changed created timestamp must not verify"
+        );
+    }
+
+    /// The challenge must be covered by the signature.
+    ///
+    /// A challenge exists to bind the proof to one verifier's fresh nonce.
+    /// When `encode_for_signing` dropped the whole proof, the challenge was
+    /// outside the signed bytes: an attacker could rewrite it to any value
+    /// and the proof still verified — defeating replay protection entirely.
+    #[test]
+    fn the_challenge_is_covered_by_the_signature() {
+        let (_id, mut presentation) = signed_presentation();
+        assert!(presentation.verify_proof().is_ok());
+
+        presentation.proof.as_mut().expect("proof").challenge = "attacker-chosen".to_string();
+        assert!(
+            presentation.verify_proof().is_err(),
+            "a challenge changed after signing must invalidate the proof"
+        );
+    }
+
+    /// The domain is bound the same way.
+    #[test]
+    fn the_domain_is_covered_by_the_signature() {
+        let (_id, mut presentation) = signed_presentation();
+        presentation.proof.as_mut().expect("proof").domain = Some("attacker.example".to_string());
+        assert!(
+            presentation.verify_proof().is_err(),
+            "a domain added after signing must invalidate the proof"
+        );
+    }
+
+    /// An absent domain and an empty one must not hash identically.
+    ///
+    /// Encoding `None` as `""` allowed an attacker to *add* `domain: ""` to a
+    /// signed presentation without invalidating it — signature malleability:
+    /// two different documents sharing one signature.
+    #[test]
+    fn an_absent_domain_is_not_the_same_as_an_empty_one() {
+        let (_id, mut presentation) = signed_presentation();
+        assert!(
+            presentation.proof.as_ref().expect("proof").domain.is_none(),
+            "the helper signs without a domain"
+        );
+        presentation.proof.as_mut().expect("proof").domain = Some(String::new());
+        assert!(
+            presentation.verify_proof().is_err(),
+            "adding an empty domain must change the signed bytes"
+        );
+    }
+
+    /// A verifier checks its *own* challenge, not merely that the proof is
+    /// internally consistent: replaying a presentation signed for a different
+    /// verifier must fail.
+    #[test]
+    fn verify_with_challenge_rejects_a_foreign_challenge() {
+        let (_id, presentation) = signed_presentation();
+        presentation
+            .verify_with_challenge("challenge-1")
+            .expect("the presentation carries this challenge");
+        let err = presentation
+            .verify_with_challenge("someone-elses-nonce")
+            .expect_err("a different verifier's challenge must be rejected");
+        assert!(
+            err.to_string()
+                .contains("does not match the expected challenge"),
+            "got {err}"
+        );
+    }
+
+    /// A proof whose verification method names a different DID than the
+    /// holder must be rejected — otherwise a presentation could carry
+    /// somebody else's key.
+    #[test]
+    fn a_presentation_rejects_a_mismatched_verification_method() {
+        let (_id, mut presentation) = signed_presentation();
+        if let Some(proof) = presentation.proof.as_mut() {
+            proof.verification_method = "did:key:z6MkAttacker#key".to_string();
+        }
+        let err = presentation
+            .verify_proof()
+            .expect_err("a foreign verification method must be rejected");
+        assert!(
+            err.to_string().contains("does not match holder"),
+            "got {err}"
+        );
+    }
+
+    /// Every field of a signed presentation is covered by the signature.
+    ///
+    /// Rounds 11–18 each fixed one *particular* field that turned out to be
+    /// unprotected (the challenge, then the domain, then the scheme's absent
+    /// value, then its explicit value). Each fix was found by thinking of the
+    /// next attack. This test enumerates the fields exhaustively instead: for
+    /// every mutable field, mutate it and require verification to fail. A new
+    /// field added to `PresentationProof` must be added to this table, and the
+    /// table is the place to check whether it is covered.
+    #[test]
+    fn every_presentation_field_is_covered_by_the_signature() {
+        type Mutation = (&'static str, fn(&mut PresentationProof));
+
+        let mutations: &[Mutation] = &[
+            ("created", |p| p.created = "1999-01-01T00:00:00Z".into()),
+            ("verificationMethod", |p| {
+                p.verification_method = "did:key:z6MkAttacker#key".into()
+            }),
+            ("purpose", |p| p.purpose = "assertionMethod".into()),
+            ("challenge", |p| p.challenge = "attacker-chosen".into()),
+            ("domain", |p| p.domain = Some("attacker.example".into())),
+            ("signingScheme", |p| p.signing_scheme = None),
+            ("signingScheme (body-only)", |p| {
+                p.signing_scheme = Some(SigningScheme::BodyOnly)
+            }),
+            ("proofType", |p| {
+                p.proof_type = ProofType::DataIntegrityProof
+            }),
+        ];
+
+        for (name, mutate) in mutations {
+            let (_id, mut presentation) = signed_presentation();
+            let before = presentation.verify_proof().is_ok();
+            assert!(before, "the control must verify before mutating {name}");
+            mutate(presentation.proof.as_mut().expect("proof"));
+            assert!(
+                presentation.verify_proof().is_err(),
+                "mutating `{name}` must invalidate the presentation proof"
+            );
+        }
+    }
+
+    /// Every field of a signed presentation *body* is covered too.
+    #[test]
+    fn every_presentation_body_field_is_covered_by_the_signature() {
+        type Mutation = (&'static str, fn(&mut VerifiablePresentation));
+
+        let mutations: &[Mutation] = &[
+            ("id", |p| p.id = "urn:uuid:tampered".into()),
+            ("holder", |p| p.holder = "did:key:z6MkOther".into()),
+            ("created", |p| p.created = "1999-01-01T00:00:00Z".into()),
+            ("type", |p| p.presentation_type = vec!["Other".into()]),
+            ("@context", |p| p.context = vec!["urn:evil".into()]),
+        ];
+
+        for (name, mutate) in mutations {
+            let (_id, mut presentation) = signed_presentation();
+            assert!(presentation.verify_proof().is_ok());
+            mutate(&mut presentation);
+            assert!(
+                presentation.verify_proof().is_err(),
+                "mutating body field `{name}` must invalidate the signature"
+            );
+        }
+    }
+
+    /// Removing a value the signer *did* cover must also break the signature.
+    ///
+    /// The field table above mutates a control that has no domain, so it can
+    /// only test the "add" direction. This signs with a domain present and
+    /// then drops it — the direction an attacker uses to strip a binding.
+    #[test]
+    fn removing_a_covered_domain_breaks_the_presentation_signature() {
+        let identity = Identity::from_secret_bytes(&[43u8; 32]).expect("identity");
+        let holder_did = identity.did_key().as_str().to_string();
+        let mut presentation =
+            VerifiablePresentation::new(holder_did.clone(), vec![signed_credential(&identity)]);
+        let mut proof = PresentationProof::new(
+            ProofType::Ed25519Signature2020,
+            format!("{holder_did}#{}", holder_did.trim_start_matches("did:key:")),
+            "challenge-1",
+            Signature::from_bytes(&[0u8; 64]).expect("placeholder"),
+        )
+        .with_domain("my-verifier.example");
+        let signed = identity
+            .sign(&presentation.signing_input(&proof).expect("signing input"))
+            .expect("sign");
+        proof.proof_value = signed.signature_hex.clone();
+        presentation.sign(proof);
+        assert!(presentation.verify_proof().is_ok(), "control must verify");
+
+        presentation.proof.as_mut().expect("proof").domain = None;
+        assert!(
+            presentation.verify_proof().is_err(),
+            "dropping a signed domain must invalidate the proof"
+        );
+    }
+
+    /// Every field of a signed credential proof is covered.
+    #[test]
+    fn every_credential_proof_field_is_covered_by_the_signature() {
+        type Mutation = (&'static str, fn(&mut CredentialProof));
+
+        let mutations: &[Mutation] = &[
+            ("created", |p| p.created = "1999-01-01T00:00:00Z".into()),
+            ("verificationMethod", |p| {
+                p.verification_method = "did:key:z6MkAttacker#key".into()
+            }),
+            ("purpose", |p| p.purpose = "authentication".into()),
+            ("challenge", |p| p.challenge = Some("added".into())),
+            ("domain", |p| p.domain = Some("attacker.example".into())),
+            ("proofType", |p| {
+                p.proof_type = ProofType::DataIntegrityProof
+            }),
+        ];
+
+        for (name, mutate) in mutations {
+            let identity = Identity::from_secret_bytes(&[41u8; 32]).expect("identity");
+            let mut vc = signed_credential(&identity);
+            assert!(vc.verify_proof().is_ok(), "control must verify");
+            mutate(vc.proof.as_mut().expect("proof"));
+            assert!(
+                vc.verify_proof().is_err(),
+                "mutating credential proof field `{name}` must invalidate the signature"
+            );
+        }
+    }
+
+    /// Every field of a signed credential body is covered.
+    #[test]
+    fn every_credential_body_field_is_covered_by_the_signature() {
+        type Mutation = (&'static str, fn(&mut VerifiableCredential));
+
+        let mutations: &[Mutation] = &[
+            ("id", |c| c.id = "urn:uuid:tampered".into()),
+            ("issuer", |c| c.issuer = "did:key:z6MkOther".into()),
+            ("validFrom", |c| {
+                c.valid_from = "1999-01-01T00:00:00Z".into()
+            }),
+            ("type", |c| {
+                // Must differ from the control's `["VerifiableCredential"]` —
+                // assigning the same value is not a mutation.
+                c.credential_type = vec!["VerifiableCredential".into(), "ExtraType".into()]
+            }),
+            ("credentialSubject", |c| {
+                c.credential_subject = CredentialSubject::new("did:key:z6MkOther")
+            }),
+        ];
+
+        for (name, mutate) in mutations {
+            let identity = Identity::from_secret_bytes(&[42u8; 32]).expect("identity");
+            let mut vc = signed_credential(&identity);
+            assert!(vc.verify_proof().is_ok(), "control must verify");
+            mutate(&mut vc);
+            assert!(
+                vc.verify_proof().is_err(),
+                "mutating credential body field `{name}` must invalidate the signature"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsigned_presentation_does_not_verify() {
+        let identity = Identity::from_secret_bytes(&[9u8; 32]).expect("identity");
+        let did = identity.did_key().as_str().to_string();
+        let vc = VerifiableCredential::new(
+            "urn:uuid:unsigned",
+            did.clone(),
+            vec!["VerifiableCredential".to_string()],
+            CredentialSubject::new(did.clone()),
+        );
+        let presentation = VerifiablePresentation::new(did, vec![vc]);
+        assert!(presentation.verify_proof().is_err());
+    }
+
+    /// A valid holder proof over a *forged* credential must be rejected.
+    ///
+    /// The outer proof only says the holder assembled the document; it says
+    /// nothing about the credentials inside, which the holder chooses freely.
+    /// Verifying only the outer proof accepted a presentation whose single
+    /// credential named a fake issuer and carried no signature — a valid
+    /// presentation of a forged claim.
+    #[test]
+    fn a_presentation_rejects_a_forged_inner_credential() {
+        let (identity, mut presentation) = signed_presentation();
+        let holder_did = identity.did_key().as_str().to_string();
+        // A credential that nobody signed, from an issuer that does not exist.
+        presentation.verifiable_credential = vec![VerifiableCredential::new(
+            "urn:uuid:forged",
+            "did:key:z6MkFakeIssuer".to_string(),
+            vec!["VerifiableCredential".to_string()],
+            CredentialSubject::new(holder_did).with_claim("role", &"admin"),
+        )];
+        // The holder signs the presentation around it, so the *outer* proof is
+        // genuinely valid.
+        sign_presentation(&identity, &mut presentation);
+        presentation
+            .verify_proof()
+            .expect("the outer proof itself is valid");
+
+        let err = presentation
+            .verify()
+            .expect_err("a forged inner credential must not verify");
+        assert!(
+            err.to_string().contains("presented credential #0"),
+            "the error must name the offending credential: {err}"
+        );
+    }
+
+    /// An expired credential inside a fresh presentation must be rejected.
+    ///
+    /// `VerifiableCredential::verify` checks expiry; `VerifiablePresentation
+    /// ::verify` must route each credential through it rather than only
+    /// checking structure.
+    #[test]
+    fn a_presentation_rejects_an_expired_inner_credential() {
+        let (identity, mut presentation) = signed_presentation();
+        let holder_did = identity.did_key().as_str().to_string();
+        let mut expired = signed_credential(&identity).with_expiry("2001-01-01T00:00:00Z");
+        // Re-sign over the expired body through the sign-then-attach helper.
+        // Signing with `encode_for_signing` while a *stale* proof is attached
+        // would hash the old proof's `created`, then attach a proof whose
+        // `created` is a fresh timestamp — verification would drift with the
+        // clock (and the test would pass or fail by luck of the second).
+        let mut proof = CredentialProof::new(
+            ProofType::Ed25519Signature2020,
+            format!("{holder_did}#{}", holder_did.trim_start_matches("did:key:")),
+            Signature::from_bytes(&[0u8; 64]).expect("placeholder signature"),
+        );
+        let signed = identity
+            .sign(&expired.signing_input(&proof).expect("signing input"))
+            .expect("re-sign expired credential");
+        proof.proof_value = Signature::from_hex(&signed.signature_hex)
+            .expect("signature")
+            .to_hex();
+        expired.sign(proof);
+        presentation.verifiable_credential = vec![expired];
+        sign_presentation(&identity, &mut presentation);
+
+        let err = presentation
+            .verify()
+            .expect_err("an expired credential must not verify");
+        assert!(
+            err.to_string().contains("expired"),
+            "the error must say the credential expired: {err}"
+        );
     }
 }

@@ -48,7 +48,7 @@
 //! you make a breaking change to the JSON shape.
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -511,19 +511,71 @@ pub fn save(record: PromptRecord) -> Result<PathBuf, PromptError> {
         .unwrap_or("prompt.json");
     let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
     let write_result = (|| -> Result<(), PromptError> {
-        fs::write(&tmp, json).map_err(|source| PromptError::Write {
-            path: tmp.clone(),
-            source,
-        })?;
+        // Create the temp file already at 0600 rather than writing it
+        // world-readable and narrowing afterwards: the old order left a
+        // window (and, if `set_permissions` failed, a permanent) 0644
+        // file. A prompt is usually not a secret, but it can carry
+        // operator-specific instructions, so the store should not depend
+        // on the umask being strict.
+        //
+        // `sync_all` before the rename is what makes the whole scheme
+        // crash-safe: without it the rename can reach the journal while the
+        // *data* blocks have not, so a power cut leaves a correctly-named
+        // prompt file holding zeros or a truncated record. `config.rs` and
+        // `summary` already fsync their temp files; this store did not.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|source| PromptError::Write {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            f.write_all(json.as_bytes())
+                .map_err(|source| PromptError::Write {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            f.sync_all().map_err(|source| PromptError::Write {
+                path: tmp.clone(),
+                source,
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write as _;
+            let mut f = fs::File::create(&tmp).map_err(|source| PromptError::Write {
+                path: tmp.clone(),
+                source,
+            })?;
+            f.write_all(json.as_bytes())
+                .map_err(|source| PromptError::Write {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            f.sync_all().map_err(|source| PromptError::Write {
+                path: tmp.clone(),
+                source,
+            })?;
         }
         fs::rename(&tmp, &path).map_err(|source| PromptError::Write {
             path: path.clone(),
             source,
-        })
+        })?;
+        // Best-effort directory fsync: the rename is durable only once the
+        // directory entry is. Filesystems that reject it (tmpfs) are ignored.
+        if let Some(dir) = path.parent() {
+            if let Ok(d) = fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
     })();
     if write_result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -546,11 +598,20 @@ pub fn delete(name: &str) -> Result<bool, PromptError> {
 
 /// List all prompts currently on disk. Entries are sorted by name so
 /// the CLI output is stable for `diff` / CI consumption.
+///
+/// A file that is not a prompt record (a `set-prompt sign` artifact, a
+/// half-written import) is skipped, not fatal — but every skipped path is
+/// reported, because silently hiding a user's prompt reads as data loss.
 pub fn list() -> Result<Vec<PromptRecord>, PromptError> {
+    list_with_skipped().map(|(records, _)| records)
+}
+
+/// [`list`], plus the paths that were skipped and why.
+pub fn list_with_skipped() -> Result<(Vec<PromptRecord>, Vec<String>), PromptError> {
     let dir = prompts_dir()?;
     let entries = match fs::read_dir(&dir) {
         Ok(it) => it,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(source) => {
             return Err(PromptError::DirIo {
                 path: dir.clone(),
@@ -560,6 +621,7 @@ pub fn list() -> Result<Vec<PromptRecord>, PromptError> {
     };
 
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| PromptError::DirIo {
             path: dir.clone(),
@@ -570,28 +632,104 @@ pub fn list() -> Result<Vec<PromptRecord>, PromptError> {
             continue;
         }
         // A single stray/broken `.json` in the prompts directory must not
-        // make the whole listing fail. (`set-prompt sign` writes
-        // `<name>.signed.json` into this same directory.) Skip anything
-        // that is not a readable, supported `PromptRecord`.
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
+        // make the whole listing fail. Skip anything that is not a
+        // readable, supported `PromptRecord`, and report it.
+        let raw = match fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                skipped.push(format!("{}: {e}", path.display()));
+                continue;
+            }
         };
-        let Ok(record) = serde_json::from_str::<PromptRecord>(&raw) else {
-            continue;
+        let record = match serde_json::from_str::<PromptRecord>(&raw) {
+            Ok(r) => r,
+            Err(e) => {
+                // A signing envelope (`set-prompt sign` writes
+                // `<name>.signed.json` into this same directory) is a
+                // *known* non-record, not a damaged prompt, so it must not
+                // produce a warning on every `list` — that trains the user to
+                // ignore the warnings that matter.
+                //
+                // The decision is made on the **content**, not the file name.
+                // Filtering on a `.signed.json` suffix silently hid any
+                // legitimate prompt whose name ended in `.signed`
+                // (`set-prompt set foo.signed` writes exactly
+                // `foo.signed.json`): it vanished from the listing and from
+                // the skip report alike, which reads as data loss.
+                if is_signing_envelope(&raw) {
+                    continue;
+                }
+                skipped.push(format!("{}: {e}", path.display()));
+                continue;
+            }
         };
-        if record.schema_version <= CURRENT_SCHEMA_VERSION {
-            out.push(record);
+        if record.schema_version > CURRENT_SCHEMA_VERSION {
+            skipped.push(format!(
+                "{}: schema_version {} is newer than this binary supports ({})",
+                path.display(),
+                record.schema_version,
+                CURRENT_SCHEMA_VERSION
+            ));
+            continue;
         }
+        out.push(record);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
+    Ok((out, skipped))
+}
+
+/// Whether `raw` is a `set-prompt sign` envelope rather than a prompt
+/// record.
+///
+/// Envelopes are `Envelope<PromptFields>`: they always carry a
+/// `payload_type` string and a hex `signature`. Matching on those fields
+/// rather than on the file name keeps a prompt named `foo.signed` visible.
+fn is_signing_envelope(raw: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    value.get("payload_type").is_some_and(|v| v.is_string())
+        && value.get("signature_hex").is_some_and(|v| v.is_string())
+        && value.get("payload").is_some()
 }
 
 /// Read the contents of `--prompt <FILE>` if it points to a file, or
 /// treat the literal value as the prompt itself. The decision rule is
 /// "does the value exist as a file?" — same heuristic `clap`'s
 /// `Arg::value_parser` would use for "file or string" inputs.
+///
+/// `-` means **stdin**, matching the convention every other filter
+/// tool uses (`cat -`, `gzip -`). The run/export docs already showed
+/// `magent run -p -` as the way to pipe a prompt in, but the value was
+/// only ever consulted as a path, so it failed with
+/// `-: No such file or directory`.
+///
+/// stdin is read to EOF and capped at [`MAX_STDIN_PROMPT`] bytes so a
+/// mistaken `magent run -p - < /dev/zero` cannot exhaust memory.
 pub fn read_prompt_source(value: &str) -> Result<String, PromptError> {
+    if value == "-" {
+        let mut raw = Vec::new();
+        let mut stdin = io::stdin().lock();
+        // `take` bounds the read itself rather than checking afterwards.
+        stdin
+            .by_ref()
+            .take(MAX_STDIN_PROMPT as u64 + 1)
+            .read_to_end(&mut raw)
+            .map_err(|source| PromptError::PromptFileLoad {
+                path: PathBuf::from("<stdin>"),
+                source,
+            })?;
+        if raw.len() > MAX_STDIN_PROMPT {
+            return Err(PromptError::InvalidMetadata(format!(
+                "prompt read from stdin exceeds the {} byte limit",
+                MAX_STDIN_PROMPT
+            )));
+        }
+        let text = String::from_utf8(raw).map_err(|_| {
+            PromptError::InvalidMetadata("prompt read from stdin is not valid UTF-8".to_string())
+        })?;
+        return Ok(text.trim_end().to_string());
+    }
     let candidate = Path::new(value);
     if candidate.is_file() {
         let mut buf = String::new();
@@ -608,6 +746,11 @@ pub fn read_prompt_source(value: &str) -> Result<String, PromptError> {
     }
     Ok(value.to_string())
 }
+
+/// Upper bound on a system prompt piped through `--prompt -` (1 MiB).
+/// Generous for a hand-written persona; small enough that a redirected
+/// binary blob is rejected instead of copied into the agent.
+pub const MAX_STDIN_PROMPT: usize = 1_048_576;
 
 fn now_unix_seconds() -> u64 {
     SystemTime::now()
@@ -847,38 +990,55 @@ impl<'a> SetPromptCmd<'a> {
     }
 
     fn run_list(&self, out: &mut Output) -> Result<(), PromptError> {
-        let records = list()?;
+        let (records, skipped) = list_with_skipped()?;
         if matches!(out.kind(), OutputKind::Json) {
             // Wrap the array under a `prompts` key so the JSON
             // envelope stays a single object — `write_json` only
             // merges in fields when handed an Object, and a raw
             // `Value::Array` would otherwise be silently dropped.
-            let json_records = serde_json::to_value(&records).map_err(|source| {
-                PromptError::Parse {
+            //
+            // `skipped` is part of the contract: a file in the store
+            // that could not be listed is data the user still expects,
+            // and a JSON consumer that only sees `prompts` would
+            // conclude it was deleted.
+            let json_records =
+                serde_json::to_value(&records).map_err(|source| PromptError::Parse {
                     path: PathBuf::from("(list)"),
                     source,
-                }
-            })?;
-            out.write_json(serde_json::json!({ "prompts": json_records }))?;
-        } else if records.is_empty() {
-            out.info("no prompts stored yet — try `magent set-prompt set ...` first")?;
+                })?;
+            out.write_json(serde_json::json!({
+                "prompts": json_records,
+                "skipped": skipped,
+            }))?;
         } else {
-            let _ = out.stdout_fmt_line(format_args!(
-                "{:<24} {:<10} {:<20} TAGS",
-                "NAME", "PROVIDER", "MODEL"
-            ));
-            let _ = out.stdout_fmt_line(format_args!(
-                "{}",
-                "-".repeat(24 + 10 + 20 + 8)
-            ));
-            for r in &records {
+            if records.is_empty() && skipped.is_empty() {
+                out.info("no prompts stored yet — try `magent set-prompt set ...` first")?;
+                return Ok(());
+            }
+            if !records.is_empty() {
                 let _ = out.stdout_fmt_line(format_args!(
-                    "{:<24} {:<10} {:<20} {}",
-                    truncate(&r.name, 24),
-                    truncate(if r.provider.is_empty() { "(default)" } else { &r.provider }, 10),
-                    truncate(if r.model.is_empty() { "(default)" } else { &r.model }, 20),
-                    r.metadata.tags.join(",")
+                    "{:<24} {:<10} {:<20} TAGS",
+                    "NAME", "PROVIDER", "MODEL"
                 ));
+                let _ = out.stdout_fmt_line(format_args!(
+                    "{}",
+                    "-".repeat(24 + 10 + 20 + 8)
+                ));
+                for r in &records {
+                    let _ = out.stdout_fmt_line(format_args!(
+                        "{:<24} {:<10} {:<20} {}",
+                        truncate(&r.name, 24),
+                        truncate(if r.provider.is_empty() { "(default)" } else { &r.provider }, 10),
+                        truncate(if r.model.is_empty() { "(default)" } else { &r.model }, 20),
+                        r.metadata.tags.join(",")
+                    ));
+                }
+            }
+            // Diagnostics go to stderr, next to the other `warning:`
+            // lines, so the table on stdout (which scripts consume via
+            // `| awk` / redirects) stays a clean record set.
+            for note in &skipped {
+                out.warn(&format!("skipped prompt file {}", note))?;
             }
         }
         Ok(())
@@ -923,13 +1083,10 @@ impl<'a> SetPromptCmd<'a> {
                 out.write_json_str(pretty);
             }
             OutputKind::Human => {
-                let stdout = out.stdout_writer();
-                stdout
-                    .write_all(record.prompt.as_bytes())
-                    .map_err(|source| PromptError::Write {
-                        path: PathBuf::from("<stdout>"),
-                        source,
-                    })?;
+                // Through `Output` so a failed write is recorded and the
+                // process exits non-zero: `export > /full/disk` used to
+                // report success with the prompt never delivered.
+                out.write_stdout_bytes(record.prompt.as_bytes());
             }
         }
         Ok(())
@@ -1111,13 +1268,7 @@ impl<'a> SetPromptCmd<'a> {
             // Pipeable output: write the rendered prompt directly to
             // stdout with no decoration, so callers can use
             // `magent run --prompt "$(magent set-prompt template foo --var X=1)"`.
-            let stdout = out.stdout_writer();
-            stdout
-                .write_all(rendered.as_bytes())
-                .map_err(|source| PromptError::Write {
-                    path: PathBuf::from("<stdout>"),
-                    source,
-                })?;
+            out.write_stdout_bytes(rendered.as_bytes());
             // After the body, surface any unfilled placeholders
             // as a single warning line. We use stderr so the
             // stdout body remains clean for command
@@ -1440,14 +1591,21 @@ pub fn resolve_for_run(opts: &RunOptions) -> Result<ResolvedPrompt, PromptError>
             model: non_empty(record.model),
         });
     }
-    // 2. Legacy file path.
+    // 2. Legacy file path. `-` means stdin (see
+    //    [`read_prompt_source`]); it goes through the same bounded
+    //    reader so `magent run -p -` behaves exactly like
+    //    `set-prompt set X --prompt -`.
     if let Some(path) = opts.prompt_file.as_ref() {
-        let text = crate::runner::load_prompt_file(path).map_err(|source| {
-            PromptError::PromptFileLoad {
-                path: path.clone(),
-                source,
-            }
-        })?;
+        let text = if path.as_os_str() == "-" {
+            read_prompt_source("-")?
+        } else {
+            crate::runner::load_prompt_file(path).map_err(|source| {
+                PromptError::PromptFileLoad {
+                    path: path.clone(),
+                    source,
+                }
+            })?
+        };
         return Ok(ResolvedPrompt {
             text,
             provider: None,
@@ -1771,11 +1929,52 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempPromptsDir::new("list_stray");
         save(PromptRecord::new("real", "p", "", "", PromptMetadata::default(), 1)).unwrap();
-        fs::write(tmp.0.join("real.signed.json"), r#"{"not":"a prompt"}"#).unwrap();
+        // A genuine signing envelope: silently ignored, not warned about.
+        fs::write(
+            tmp.0.join("real.signed.json"),
+            r#"{"payload_type":"magent-prompt-v1","issued_at_unix":1,"payload":{},"signer":"did:key:z","signature_hex":"00"}"#,
+        )
+        .unwrap();
         fs::write(tmp.0.join("junk.json"), "not json at all").unwrap();
 
         let names: Vec<String> = list().unwrap().into_iter().map(|r| r.name).collect();
         assert_eq!(names, vec!["real"]);
+
+        // The envelope is filtered out entirely; the junk file is *reported*.
+        let (_, skipped) = list_with_skipped().unwrap();
+        assert_eq!(skipped.len(), 1, "only junk.json should be reported: {skipped:?}");
+        assert!(skipped[0].contains("junk.json"), "{skipped:?}");
+    }
+
+    /// A prompt whose *name* ends in `.signed` must still be listed.
+    ///
+    /// `set-prompt set foo.signed` stores `foo.signed.json`. The old filter
+    /// skipped every file with that suffix, so the prompt disappeared from
+    /// both the listing and the skip report — indistinguishable from data
+    /// loss. The filter now keys on the file's content.
+    #[test]
+    fn a_prompt_named_signed_is_not_mistaken_for_an_envelope() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _tmp = TempPromptsDir::new("list_signed_name");
+        save(PromptRecord::new(
+            "foo.signed",
+            "p",
+            "",
+            "",
+            PromptMetadata::default(),
+            1,
+        ))
+        .unwrap();
+
+        let names: Vec<String> = list().unwrap().into_iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            vec!["foo.signed"],
+            "a prompt named `foo.signed` must be listed"
+        );
+        let (records, skipped) = list_with_skipped().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(skipped.is_empty(), "nothing should be reported: {skipped:?}");
     }
 
     #[test]

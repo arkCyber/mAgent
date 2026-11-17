@@ -44,6 +44,15 @@ impl CheckResult {
     }
 }
 
+/// Whether a check counts as healthy: passed, or not applicable.
+///
+/// `SKIP` means "this check does not apply to the configured provider",
+/// which is not a problem to report — the top-level `ok` already treats
+/// it that way.
+fn check_ok(result: CheckResult) -> bool {
+    matches!(result, CheckResult::Pass | CheckResult::Skip)
+}
+
 pub struct DoctorCmd<'a> {
     pub provider: &'a str,
     pub ollama_url: &'a str,
@@ -119,40 +128,48 @@ impl<'a> DoctorCmd<'a> {
             // is a short uppercase label ("PASS" / "FAIL" / "SKIP")
             // so a CI script can grep on it without parsing the
             // boolean; the boolean is still there for back-compat.
+            //
+            // `ok` follows the same rule as the top-level verdict: a
+            // check that did not apply (SKIP) is not a failure. It used
+            // to be `Pass only`, so `provider=deepseek` reported
+            // `model.ok=false, skipped=true` while the overall verdict
+            // was a pass — a consumer filtering on `ok` saw a failure
+            // the exit code denied.
             let envelope = serde_json::json!({
                 "ok": overall,
                 "checks": {
                     "provider": {
-                        "ok": provider_check == CheckResult::Pass,
+                        "ok": check_ok(provider_check),
                         "skipped": provider_check == CheckResult::Skip,
                         "result": provider_check.label(),
                         "name": self.provider,
                     },
                     "ollama": {
-                        "ok": ollama_check == CheckResult::Pass,
+                        "ok": check_ok(ollama_check),
                         "skipped": ollama_check == CheckResult::Skip,
                         "result": ollama_check.label(),
                         "url": self.ollama_url,
                     },
                     "model": {
-                        "ok": model_check == CheckResult::Pass,
+                        "ok": check_ok(model_check),
                         "skipped": model_check == CheckResult::Skip,
                         "result": model_check.label(),
                         "name": self.model,
                     },
                     "tool_backend": {
-                        "ok": backend_check == CheckResult::Pass,
+                        "ok": check_ok(backend_check),
+                        "skipped": backend_check == CheckResult::Skip,
                         "result": backend_check.label(),
                     },
                 }
             });
-            // Bypass `Output::write_json` (that one is for run reports)
-            // and write the envelope directly to stdout.
-            let mut stdout = std::io::stdout().lock();
-            let _ = writeln!(
-                stdout,
-                "{}",
-                serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| "{}".into())
+            // Through `Output` rather than a raw `writeln!`: the
+            // envelope then counts as the command's one stdout
+            // document (so a later failure cannot append a second
+            // one) and a write failure is reported by
+            // `Output::finish` instead of being dropped on the floor.
+            out.write_json_str(
+                serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| "{}".into()),
             );
         } else {
             // Per-check summary line. Each check gets its own
@@ -184,6 +201,12 @@ impl<'a> DoctorCmd<'a> {
             }
         }
         let _ = out.flush();
+        // A write failure (full disk, closed stream) must not come back
+        // as a clean verdict: `doctor` is what CI gates on, and a JSON
+        // envelope that never reached stdout is not a passing report.
+        if out.finish().is_err() {
+            return false;
+        }
         overall
     }
 

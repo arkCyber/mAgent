@@ -76,7 +76,9 @@ const NVS_KEY_SYSSTORE: &str = "sysstore";
 const NVS_KEY_IDENTITY: &str = "dev_identity";     // shared; in `magent` ns
 // LLM backend parameters (`AT+LLMCFG`). Lives in the `mag_at` namespace.
 const NVS_KEY_LLM_MODEL: &str = "llm_model";
-const NVS_KEY_LLM_API_KEY: &str = "llm_api_key";
+// The API key is read and written through `crate::{load,save}_llm_api_key`,
+// which seal it with the device key; the raw NVS name lives in `main.rs`.
+
 
 // PATCHED (MicroAgent): flight-price provider config for the on-device
 // `get_flight_price` tool (see `local_tools::get_flight_price`). Stored in the
@@ -1610,7 +1612,11 @@ fn llmcfg_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
     match cmd.kind {
         AtCommandKind::Query => {
             let model = nvs_load(NVS_KEY_LLM_MODEL, NS).unwrap_or_default();
-            let key = nvs_load(NVS_KEY_LLM_API_KEY, NS).unwrap_or_default();
+            // Sealed at rest; a plaintext entry from an older build is
+            // opened (and re-sealed) transparently.
+            // Read-only: this runs on the RT ingress thread, where an NVS
+            // erase+program during a migration would blow the WCET budget.
+            let key = crate::load_llm_api_key_read_only().unwrap_or_default();
             let mut line = ReplyLine::new();
             let _ = write!(line, "+LLMCFG:{},{}", model, mask_key(&key));
             AtOutcome::Ok { data: line }
@@ -1622,7 +1628,10 @@ fn llmcfg_dispatch(cmd: &AtCommand<'_>) -> AtOutcome {
             };
             match (
                 nvs_save(NVS_KEY_LLM_MODEL, validated.model.as_str(), NS),
-                nvs_save(NVS_KEY_LLM_API_KEY, validated.api_key.as_str(), NS),
+                // The API key is sealed with the device key, not stored in
+                // the clear: a flash dump otherwise yields a live billing
+                // credential.
+                crate::save_llm_api_key(validated.api_key.as_str()).map_err(|e| e),
             ) {
                 (Ok(()), Ok(())) => {
                     log::info!(

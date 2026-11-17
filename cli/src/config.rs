@@ -177,6 +177,10 @@ pub enum ConfigError {
     UnsupportedSchema { path: PathBuf, found: u32, supported: u32 },
     /// Writing the config file failed.
     Write { path: PathBuf, source: io::Error },
+    /// Reading the config *file* failed (permissions, a directory in its
+    /// place, invalid UTF-8, …). Distinct from [`Self::DirIo`] so the message
+    /// points at the file the user must fix.
+    Read { path: PathBuf, source: io::Error },
     /// I/O on the directory containing the config failed.
     DirIo { path: PathBuf, source: io::Error },
     /// `config validate` found one or more rule violations. The
@@ -219,6 +223,14 @@ impl std::fmt::Display for ConfigError {
             ),
             ConfigError::Write { path, source } => {
                 write!(f, "could not write {}: {}", path.display(), source)
+            }
+            ConfigError::Read { path, source } => {
+                write!(
+                    f,
+                    "could not read config file {}: {}",
+                    path.display(),
+                    source
+                )
             }
             ConfigError::DirIo { path, source } => {
                 write!(f, "config directory {}: {}", path.display(), source)
@@ -506,15 +518,29 @@ pub fn ensure_config_dir() -> Result<PathBuf, ConfigError> {
 /// Load the config file. Returns the built-in defaults if the file
 /// doesn't exist yet (so first-run code paths don't have to special-case
 /// `NotFound`).
+///
+/// A *missing location* is treated like a missing file. `config_path()`
+/// fails with [`ConfigError::NoHomeDirectory`] when neither
+/// `$MAGENT_CONFIG_FILE` nor `$HOME` is set — normal under `cron`, a
+/// systemd unit with a scrubbed environment, or a container. That is "there
+/// is no config to read", not "the config is damaged", so it resolves to the
+/// built-in defaults exactly as `NotFound` does. Treating it as corruption
+/// made `run` exit 2 in those environments while `version`, `config where`
+/// and `set-prompt list` still worked — the same binary contradicting itself
+/// about whether it could run at all.
 pub fn load() -> Result<ConfigRecord, ConfigError> {
-    let path = config_path()?;
+    let path = match config_path() {
+        Ok(path) => path,
+        Err(ConfigError::NoHomeDirectory) => return Ok(ConfigRecord::with_defaults()),
+        Err(e) => return Err(e),
+    };
     let raw = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Ok(ConfigRecord::with_defaults());
         }
         Err(source) => {
-            return Err(ConfigError::DirIo { path, source })
+            return Err(ConfigError::Read { path, source })
         }
     };
     let record: ConfigRecord =
@@ -616,7 +642,19 @@ fn write_config_file(path: &Path, contents: &str) -> Result<(), ConfigError> {
         fs::rename(&tmp, path).map_err(|source| ConfigError::Write {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        // The rename is durable only once the *directory* entry is on disk.
+        // Without this, a power cut right after a successful save could leave
+        // the old file (or no file) in place while the caller was told the
+        // write succeeded — the same half-written state the tempfile dance
+        // exists to prevent, just one level up. Best effort: tmpfs and some
+        // network filesystems reject a directory fsync.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
     })();
 
     if result.is_err() {
@@ -1479,7 +1517,7 @@ impl<'a> ConfigCmd<'a> {
                 "exists": Path::new(&resolved).exists(),
             }))?;
         } else {
-            let _ = out.stdout_fmt_line(format_args!("{}", resolved));
+            out.stdout_fmt_line(format_args!("{}", resolved))?;
         }
         Ok(())
     }
@@ -1499,7 +1537,7 @@ impl<'a> ConfigCmd<'a> {
                 }
             })?)?;
         } else {
-            let _ = out.stdout_fmt_line(format_args!("{}", json));
+            out.stdout_fmt_line(format_args!("{}", json))?;
         }
         Ok(())
     }
@@ -1554,18 +1592,18 @@ impl<'a> ConfigCmd<'a> {
             }
             out.write_json(serde_json::Value::Object(map))?;
         } else {
-            let _ = out.stdout_fmt_line(format_args!("{:<40} VALUE", "KEY"));
-            let _ = out.stdout_fmt_line(format_args!("{}", "-".repeat(40 + 30)));
+            out.stdout_fmt_line(format_args!("{:<40} VALUE", "KEY"))?;
+            out.stdout_fmt_line(format_args!("{}", "-".repeat(40 + 30)))?;
             for (k, v) in flat {
                 let s = match &v {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let _ = out.stdout_fmt_line(format_args!(
+                out.stdout_fmt_line(format_args!(
                     "{:<40} {}",
                     k,
                     truncate(&s, 60)
-                ));
+                ))?;
             }
         }
         Ok(())
@@ -1582,12 +1620,12 @@ impl<'a> ConfigCmd<'a> {
         } else {
             match &value {
                 serde_json::Value::String(s) => {
-                    let _ = out.stdout_fmt_line(format_args!("{}", s));
+                    out.stdout_fmt_line(format_args!("{}", s))?;
                 }
                 other => {
                     let pretty = serde_json::to_string_pretty(other)
                         .unwrap_or_else(|_| other.to_string());
-                    let _ = out.stdout_fmt_line(format_args!("{}", pretty));
+                    out.stdout_fmt_line(format_args!("{}", pretty))?;
                 }
             }
         }
@@ -1728,7 +1766,7 @@ impl<'a> ConfigCmd<'a> {
             }))?;
         } else {
             for issue in &issues {
-                let _ = out.stderr_fmt_line(format_args!("✗ {}", issue));
+                out.stderr_fmt_line(format_args!("✗ {}", issue))?;
             }
         }
         // Surface a structured error so the exit code is non-zero.

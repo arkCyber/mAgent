@@ -127,18 +127,16 @@ impl WearLeveler {
 
     /// Static wear leveling - distribute writes evenly
     ///
-    /// TRACE: REQ-VFY-001 — Aerodynamic providers expect `Static` to
-    /// rotate to the next sector on every call so writes spread
-    /// evenly. Returns `(write_count - 1) % sector_count` so the
-    /// *first* write lands in sector 0 (not 1).
+    /// Returns the sector for the **next** write. The natural call order is
+    /// `get_next_sector()` → write → `increment_write_count()`, and
+    /// `increment_write_count` attributes that write to `write_count % N`.
+    /// This used to return `(write_count - 1) % N`, one sector behind, so
+    /// after 40 writes across 4 sectors the physical distribution was
+    /// `[11,10,10,9]` (sector 0 already past a limit of 10) while the
+    /// accounting recorded `[10,10,10,10]` and `is_worn_out()` said "fine".
+    /// The two must use the same formula.
     fn static_wear_leveling(&self) -> Result<u32> {
-        let write_count = self.write_count.get();
-        let sector = if write_count == 0 {
-            0
-        } else {
-            (write_count - 1) % self.sector_count
-        };
-        Ok(sector)
+        Ok(self.write_count.get() % self.sector_count)
     }
 
     /// Hybrid wear leveling - combine dynamic and static
@@ -162,6 +160,11 @@ impl WearLeveler {
     /// static strategy never advanced — every write landed on sector 0 in
     /// the accounting, so `is_worn_out()` fired after `max_writes` total
     /// writes even though the physical writes were spread evenly.
+    ///
+    /// The sector formula must match the one `get_next_sector` handed out:
+    /// for Static that is `write_count % N` evaluated *before* this
+    /// increment, i.e. `(next - 1) % N`. Hybrid's every-100th static jump
+    /// uses the same pre-increment count.
     pub fn increment_write_count(&self) {
         let next = self.write_count.get().saturating_add(1);
         self.write_count.set(next);
@@ -206,14 +209,27 @@ impl WearLeveler {
     }
 
     /// Calculate wear level (0.0 to 1.0)
+    ///
+    /// The numerator is the **total writes actually attributed to sectors**,
+    /// not `write_count`. The Dynamic strategy resets `write_count` to zero
+    /// at every rotation, so after 40 writes over 4 sectors (10 each, the
+    /// whole life of a 10-write budget) `write_count` held 10 and this
+    /// reported `10/40 = 0.25` — a device at end-of-life reading as a
+    /// quarter worn.
     pub fn calculate_wear_level(&self) -> f32 {
-        let total_writes = self.write_count.get() as f32;
-        let max_total_writes = (self.sector_count * self.max_writes_per_sector) as f32;
+        let per_sector = self.sector_writes.get();
+        let total_writes: u64 = per_sector
+            .iter()
+            .take(self.sector_count as usize)
+            .map(|&n| u64::from(n))
+            .sum();
+        let max_total_writes = u64::from(self.sector_count)
+            .saturating_mul(u64::from(self.max_writes_per_sector));
 
-        if max_total_writes == 0.0 {
+        if max_total_writes == 0 {
             0.0
         } else {
-            total_writes / max_total_writes
+            (total_writes as f32 / max_total_writes as f32).min(1.0)
         }
     }
 
@@ -279,11 +295,23 @@ impl WearLeveler {
         false
     }
 
-    /// Check if a specific sector is worn out
+    /// Check if a specific sector is worn out.
+    ///
+    /// Uses the same rule as [`Self::is_worn_out`]: a sector is worn once it
+    /// has **exceeded** `max_writes_per_sector`. This predicate used `>=`,
+    /// so for a sector sitting exactly on the limit the two answers
+    /// disagreed — `is_sector_worn(s)` said "worn" while `is_worn_out()` (which
+    /// aggregates the same array) said "not worn yet". A caller that gated a
+    /// write on the per-sector answer refused the sector while the global
+    /// health check called the flash fine.
+    ///
+    /// The strict comparison is the documented contract: "reached the limit"
+    /// still has write budget left, it just has no safety margin, and
+    /// rotation — not refusal — is the response.
     pub fn is_sector_worn(&self, sector: u32) -> bool {
         let writes = self.sector_writes.get();
         if let Some(&count) = writes.get(sector as usize) {
-            count >= self.max_writes_per_sector
+            count > self.max_writes_per_sector
         } else {
             false
         }
@@ -369,17 +397,58 @@ mod tests {
         assert_eq!(sector, 1);
     }
 
+    /// Static leveling must hand out the same sector the accounting records.
+    ///
+    /// Call order is `get_next_sector()` → write → `increment_write_count()`,
+    /// so the sector handed out for write *k* must be the one
+    /// `increment_write_count` attributes write *k* to. The old
+    /// `(count-1) % N` was one behind: after 40 writes the physical
+    /// distribution was `[11,10,10,9]` while the accounting said
+    /// `[10,10,10,10]`, hiding a sector that had already exceeded its budget.
     #[test]
-    fn test_static_wear_leveling_even_distribution() {
+    fn static_wear_leveling_even_distribution() {
         let mut wl = WearLeveler::new(4, 100);
         wl.set_strategy(WearLevelingStrategy::Static);
 
-        // Static should distribute writes evenly
+        let mut physical = [0u32; 4];
         for i in 0..8 {
-            wl.increment_write_count();
             let sector = wl.get_next_sector().unwrap();
-            assert_eq!(sector, i % 4);
+            assert_eq!(sector, i % 4, "sector for write {i}");
+            physical[sector as usize] += 1;
+            wl.increment_write_count();
         }
+
+        let stats = wl.calculate_wear_distribution();
+        for (i, s) in stats.sectors.iter().enumerate() {
+            assert_eq!(
+                s.write_count, physical[i],
+                "the accounting must match where the writes actually went"
+            );
+        }
+        assert_eq!(physical, [2, 2, 2, 2]);
+    }
+
+    /// Wear level must reflect total writes, not the rotating `write_count`.
+    #[test]
+    fn wear_level_uses_total_writes_not_the_reset_counter() {
+        let wl = WearLeveler::new(4, 10);
+        // Dynamic strategy, real call order: `get_next_sector` rotates and
+        // resets the rotation counter every 10 writes; `increment_write_count`
+        // credits the write. 40 writes = 10 per sector = the entire budget.
+        for _ in 0..40 {
+            let _ = wl.get_next_sector().unwrap();
+            wl.increment_write_count();
+        }
+        assert!(
+            wl.write_count() <= 10,
+            "dynamic only ever counts within the current rotation (got {})",
+            wl.write_count()
+        );
+        assert!(
+            (wl.calculate_wear_level() - 1.0).abs() < f32::EPSILON,
+            "a device at end-of-life must read 1.0, got {}",
+            wl.calculate_wear_level()
+        );
     }
 
     /// Static leveling must attribute each write to the sector it rotates
@@ -524,6 +593,27 @@ mod tests {
         assert_eq!(wl.get_most_worn_sector(), 0);
     }
 
+    /// The per-sector and whole-device predicates must agree about the sector
+    /// that sits exactly on the limit.
+    ///
+    /// They did not: `is_sector_worn` used `>=` and `is_worn_out` used `>`.
+    /// At the threshold the sector was "worn" to a caller gating a write on
+    /// it while the device health check still said the flash was fine.
+    #[test]
+    fn per_sector_and_device_wear_predicates_agree_at_the_limit() {
+        let wl = WearLeveler::new(4, 3);
+        for _ in 0..3 {
+            wl.increment_write_count();
+        }
+        // Exactly at the limit: not worn either way, but rotation is due.
+        assert!(!wl.is_sector_worn(0), "at the limit is not past it");
+        assert!(!wl.is_worn_out());
+
+        wl.increment_write_count(); // 4 > 3
+        assert!(wl.is_sector_worn(0));
+        assert!(wl.is_worn_out());
+    }
+
     #[test]
     fn test_reset_stats_clears_everything() {
         let wl = WearLeveler::new(4, 2);
@@ -540,18 +630,19 @@ mod tests {
     fn hybrid_strategy_uses_static_on_the_hundredth_write() {
         let mut wl = WearLeveler::new(4, 1000);
         wl.set_strategy(WearLevelingStrategy::Hybrid);
-        // Write count 0 is a multiple of 100 → static branch, which maps the
-        // first write to sector 0.
+        // Write count 0 is a multiple of 100 → static branch: `0 % 4 = 0`.
         assert_eq!(wl.get_next_sector().unwrap(), 0);
         // A non-multiple count takes the dynamic branch (no rotation yet).
         wl.increment_write_count();
         assert_eq!(wl.get_next_sector().unwrap(), 0);
-        // Exactly 100 → static branch again, non-zero count: (100-1) % 4 = 3.
+        // Exactly 100 → static branch: `100 % 4 = 0`, the same formula
+        // `increment_write_count` uses for the 100th write, so the sector
+        // handed out and the sector credited agree.
         for _ in 1..100 {
             wl.increment_write_count();
         }
         assert_eq!(wl.write_count(), 100);
-        assert_eq!(wl.get_next_sector().unwrap(), 3);
+        assert_eq!(wl.get_next_sector().unwrap(), 0);
     }
 
     #[test]

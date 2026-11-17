@@ -141,6 +141,6 @@ pub use signature::{Signature, SignedMessage};
 // construction helpers within easy reach.
 #[cfg(feature = "verifiable_credentials")]
 pub use verifiable_credentials::{
-    CredentialProof, CredentialSchema, CredentialStatus, CredentialSubject, ProofType,
-    VerifiableCredential, VerifiablePresentation,
+    is_valid_instant_bound, CredentialProof, CredentialSchema, CredentialStatus, CredentialSubject,
+    ProofType, VerifiableCredential, VerifiablePresentation,
 };

@@ -82,6 +82,55 @@ jobs:
         # `firmware-*` jobs below, so we gate the strict lint here.
         run: cargo clippy -p magent-core --all-targets -- -D warnings
 
+      - name: cargo clippy — magent-core with the opt-in feature set
+        # `magent-core`'s default feature set is EMPTY, so the previous step
+        # never compiled `security.rs`'s real-crypto path, `wifi_pass_seal*`,
+        # or `web3/verifiable_credentials.rs` — the module carrying six rounds
+        # of signature-coverage fixes and ~1.5k lines of proof/credential
+        # code. Nothing in CI had compiled it, let alone linted or tested it.
+        # This step and the test step below close that hole.
+        run: |
+          cargo clippy -p magent-core --all-targets \
+            --features std,web3,verifiable_credentials,boot-key -- -D warnings
+
+      - name: cargo doc — best-effort (pre-existing intra-doc link debt)
+        # Nothing checked rustdoc before, so a doc comment could link a
+        # function this round deleted and stay broken indefinitely — which is
+        # exactly what happened to three links in `early_warning.rs`. The
+        # workspace still has pre-existing unresolved links (`magent-hal`,
+        # `AtParseErrorKind::NotAnAtCommand`, …), so this is reported, not
+        # enforced, until that backlog is cleared.
+        continue-on-error: true
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          cargo doc -p magent-core --no-deps --features std,web3,verifiable_credentials
+
+      - name: cargo test — magent-core with the opt-in feature set
+        # The default-feature test run in the workspace step below cannot see
+        # any of these modules (they are all `#[cfg(feature = …)]`), so a
+        # regression there would pass CI silently.
+        run: |
+          cargo test -p magent-core \
+            --features std,web3,verifiable_credentials,boot-key --locked
+
+      - name: cargo check — magent-core feature matrix
+        # Every gated module must at least compile in each supported
+        # combination, including the `no_std` ones that are never built by the
+        # host test targets.
+        run: |
+          for features in "" "std" "web3" "std,web3" "esp32" "boot-key" \
+                          "std,web3,verifiable_credentials"; do
+            echo "::group::magent-core --no-default-features --features '$features'"
+            if [ -z "$features" ]; then
+              cargo check -p magent-core --no-default-features --all-targets
+            else
+              cargo check -p magent-core --no-default-features \
+                --features "$features" --all-targets
+            fi
+            echo "::endgroup::"
+          done
+
       - name: cargo clippy — magent-hal, all targets, deny warnings
         run: cargo clippy -p magent-hal --all-targets -- -D warnings
 
